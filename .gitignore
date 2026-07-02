@@ -1,0 +1,7 @@
+# Cargo build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Project: AGENTS.md is present on local disk for human/sub-agent readers but is not tracked
+AGENTS.md
