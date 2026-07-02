@@ -1,0 +1,9 @@
+[package]
+name = "cmdash-pty"
+description = "portable-pty + vte text grid; intercepts kitty graphics commands bound to originating pane LayerId."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true

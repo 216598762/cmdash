@@ -1,0 +1,16 @@
+[package]
+name = "cmdash"
+description = "cmdash binary: event loop and crate glue. All graphics output routes through dashcompositor."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+dashcompositor.workspace = true
+
+[[bin]]
+name = "cmdash"
+path = "src/main.rs"

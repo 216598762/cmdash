@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cmdash",
+    "crates/cmdash-config",
+    "crates/cmdash-layout",
+    "crates/cmdash-keybinds",
+    "crates/cmdash-pty",
+    "crates/cmdash-widget-sdk",
+    "crates/cmdash-protocol",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["cmdash authors"]
+repository = "https://github.com/216598762/cmdash"
+description = "Layer-based terminal multiplexer and dashboard."
+
+[workspace.dependencies]
+# dashcompositor v0.4 is not yet published on crates.io; pin to the
+# upstream git source. As soon as v0.4 lands on the registry we'll
+# switch back to a registry-style version pin.
+dashcompositor = { git = "https://github.com/216598762/dashcompositor", default-features = false, features = ["kitty-encoder", "sixel-encoder", "image-decoder", "font-rasterizer"], branch = "main" }
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
