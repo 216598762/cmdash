@@ -1,0 +1,23 @@
+// cmdash config example. Used by the round-trip test.
+// Schema lives in cmdash-config's lib.rs doc-comment.
+
+layout {
+  split axis=horizontal ratio=0.6 {
+    stack {
+      pane kind=shell label="dash 1";
+      pane kind=shell label="dash 2";
+    }
+    pane kind=shell label="main";
+  }
+}
+
+keybinds {
+  bind "ctrl-shift-c" action="pane.close";
+  bind "ctrl-alt-n" action="app.new-pane";
+  bind "ctrl-q" action="app.close";
+  bind "ctrl-h" action="pane.focus.left";
+  bind "ctrl-l" action="pane.focus.right";
+  bind "ctrl-j" action="pane.focus.down";
+  bind "ctrl-k" action="pane.focus.up";
+  bind "f1" action="pane.preset.dev";
+}
