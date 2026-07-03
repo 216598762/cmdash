@@ -100,25 +100,26 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     drop(close_tx);
 
     let bindings = Router::new(cfg.keybinds);
-    // `focus` and `running` are MOVED into `TickContext` below; they
-    // are never mutated locally. `guard` and `ctx` stay `mut` because
-    // `guard.as_mut()` and `ctx.run()` both take `&mut self`, and
-    // `runners` is `mut` because the spawn loop calls `runners.push(r)`.
+    // `focus` and `running` are MOVED into `TickContext::new` below;
+    // they are never mutated locally. `guard` and `ctx` stay `mut`
+    // because `guard.as_mut()` and `ctx.run()` both take `&mut self`,
+    // and `runners` is `mut` because the spawn loop calls
+    // `runners.push(r)`.
     let focus: usize = 0;
     let running = true;
 
     let mut guard = TerminalGuard::enter()?;
     let tick = Duration::from_millis(33);
-    let mut ctx = TickContext {
+    let mut ctx = TickContext::new(
         runners,
         bindings,
         focus,
         running,
         close_rx,
         graphics,
-        terminal: guard.as_mut(),
+        guard.as_mut(),
         tick,
-    };
+    );
     ctx.run()
 }
 
@@ -229,12 +230,70 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
 }
 
 impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
+    /// Construct a [`TickContext`] from the eight per-frame
+    /// building blocks (runners + bindings + focus-and-running +
+    /// close_rx + graphics + borrowed terminal + tick).
+    /// Enforces `focus < runners.len()` so the
+    /// `runners.get_mut(*focus)` write-input path inside
+    /// [`Self::run`] cannot index out of bounds; the
+    /// `apply_action::PaneClose` arm restores this invariant
+    /// after a tail-remove by clamping focus to `len() - 1`.
+    // The 8-arg ctor is the most central tenant of the AGENTS.md
+    // "minimal API surface" rule -- it mirrors the eight struct
+    // fields one-to-one, so introducing a shadow `TickContextInit`
+    // sub-struct would just create a second type that has to be
+    // kept in lock-step with these fields forever. The ctor is
+    // currently called exactly once, from `cmdash::run`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        runners: Vec<PaneRunner>,
+        bindings: Router,
+        focus: usize,
+        running: bool,
+        close_rx: Receiver<cmdash_pty::PaneLayerId>,
+        graphics: GraphicsState,
+        terminal: &'a mut Terminal<B>,
+        tick: Duration,
+    ) -> Self {
+        assert!(
+            focus < runners.len(),
+            "TickContext::new: focus ({focus}) is out of bounds for {} runners",
+            runners.len(),
+        );
+        Self {
+            runners,
+            bindings,
+            focus,
+            running,
+            close_rx,
+            graphics,
+            terminal,
+            tick,
+        }
+    }
+
+    /// Read-only accessor for the focused-pane index. The
+    /// invariant `focus < runners.len()` is upheld by
+    /// [`Self::new`] and restored by `apply_action::PaneClose`
+    /// after tail removal, so the returned index can be used
+    /// to index `runners` without an extra bounds check.
+    // Public surface for future use (e.g. external scripts,
+    // terminal UI indicators); not yet called in the binary's
+    // hot loop body because the loop reads `self.focus` via
+    // the field directly. `dead_code` would otherwise fire on
+    // a `pub fn` of a module-private type with no in-tree
+    // production caller.
+    #[allow(dead_code)]
+    pub const fn focus(&self) -> usize {
+        self.focus
+    }
+
     /// Drive the AGENTS.md rendering pipeline until `running`
     /// flips `false` or every pane exits. The loop body is the
     /// same logic that lived in the prior free `tick_loop`
     /// function; bundling it on this struct lets `cmdash::run`
     /// invoke it as a one-shot `ctx.run()`.
-    fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         loop {
             // Phase 0: drain input events. Non-blocking; bound by
             // `event::poll(Duration::from_millis(0))`. Each Press
@@ -750,5 +809,67 @@ mod input_tests {
 
         drop(close_tx);
         drop(runners);
+    }
+
+    /// Building a [`TickContext`] with `focus >= runners.len()`
+    /// must panic with a `focus` keyword in the message, so a
+    /// caller passing a stale `focus` after a panic-driven
+    /// re-construction cannot silently index past the runner
+    /// Vec. Locks the AGENTS.md "every invariant needs a
+    /// regression test" rule for the focus invariant.
+    /// Uses a `ratatui::backend::TestBackend` to construct a
+    /// real `Terminal` without writing to stdout.
+    #[test]
+    #[should_panic(expected = "focus")]
+    fn tick_context_new_panics_when_focus_out_of_bounds() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let (_close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel::<cmdash_pty::PaneLayerId>();
+        let bindings = Router::new(vec![]);
+        let graphics =
+            cmdash::graphics::GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
+        // Empty runners + focus=0 -> 0 < 0 is false -> assert! fires.
+        let _ctx = TickContext::new(
+            Vec::<PaneRunner>::new(),
+            bindings,
+            0,
+            true,
+            close_rx,
+            graphics,
+            &mut terminal,
+            std::time::Duration::from_millis(33),
+        );
+        drop(_close_tx);
+    }
+
+    /// Companion to the empty-Vec test above: locks the
+    /// strict-less-than semantics across the non-zero boundary.
+    /// focus=2 + 2 panes -> 2 < 2 is false -> assert! fires.
+    /// Catches a future regression that swaps `<` for `<=`
+    /// (would accept focus == len and silently index past the
+    /// Vec on the next `runners.get_mut(*focus)` call). Uses
+    /// `make_runner_with_id` so each pane has a distinct
+    /// `PaneLayerId` independent of layout-pre-order numbering.
+    #[test]
+    #[should_panic(expected = "focus")]
+    fn tick_context_new_panics_when_focus_equals_non_zero_len() {
+        let (close_tx, _close_rx) = mpsc::channel::<cmdash_pty::PaneLayerId>();
+        let r0 = make_runner_with_id("a", PaneLayerId(1), close_tx.clone());
+        let r1 = make_runner_with_id("b", PaneLayerId(2), close_tx.clone());
+        let bindings = Router::new(vec![]);
+        let graphics =
+            cmdash::graphics::GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let _ctx = TickContext::new(
+            vec![r0, r1],
+            bindings,
+            2, // focus == runners.len()
+            true,
+            _close_rx,
+            graphics,
+            &mut terminal,
+            std::time::Duration::from_millis(33),
+        );
     }
 }
