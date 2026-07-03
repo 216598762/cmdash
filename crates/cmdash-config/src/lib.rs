@@ -568,3 +568,187 @@ fn entry_to_string(entry: &KdlEntry) -> String {
     }
     String::new()
 }
+
+// ===========================================================================
+// Round-trip tests for the KDL parser.
+//
+// These tests pin the dispatch wiring of `read_layout`. Any
+// future variant addition MUST be covered by a round-trip test
+// here: if a `match n.name().value()` arm is added to
+// `read_layout` without a corresponding `parse_*_layout_round_trip`
+// test below, the dispatch silently falls through to
+// `UnknownLayoutNode` and reaches the user as a parse error.
+// Phase 3 carry-forward regression surface.
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: extract the label from a `LayoutNode::Pane(Pane)`
+    /// variant. Returns `None` for any non-Pane variant. Used by
+    /// the round-trip tests below to keep the `assert_eq!` lines
+    /// readable instead of inlining a match in every assertion.
+    fn pane_label(node: &LayoutNode) -> Option<String> {
+        match node {
+            LayoutNode::Pane(p) => p.label.clone(),
+            _ => None,
+        }
+    }
+
+    /// `layout { zstack { ... } }` reaches `read_zstack` and
+    /// yields `LayoutNode::ZStack`. Phase 3 carry-forward.
+    #[test]
+    fn parse_zstack_layout_round_trip() {
+        let src = r#"
+            layout {
+                zstack {
+                    pane kind=shell label="top"
+                    pane kind=shell label="bottom"
+                }
+            }
+        "#;
+        let cfg = parse(src).expect("layout with zstack parses");
+        let layout = cfg.layout.expect("Config.layout populated");
+        match layout {
+            LayoutNode::ZStack { panes } => {
+                assert_eq!(panes.len(), 2, "zstack has two panes");
+                assert_eq!(pane_label(&panes[0]), Some("top".to_string()));
+                assert_eq!(pane_label(&panes[1]), Some("bottom".to_string()));
+            }
+            other => panic!(
+                "expected LayoutNode::ZStack, got a different variant: {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    /// Parity baseline: `layout { stack { ... } }` reaches
+    /// `read_stack` and yields `LayoutNode::Stack`. Without this
+    /// test, the `stack` arm could regress to `UnknownLayoutNode`
+    /// while the `zstack` arm keeps passing.
+    #[test]
+    fn parse_stack_layout_round_trip() {
+        let src = r#"
+            layout {
+                stack {
+                    pane kind=shell label="a"
+                    pane kind=shell label="b"
+                }
+            }
+        "#;
+        let cfg = parse(src).expect("layout with stack parses");
+        let layout = cfg.layout.expect("Config.layout populated");
+        match layout {
+            LayoutNode::Stack { panes } => {
+                assert_eq!(panes.len(), 2);
+                assert_eq!(pane_label(&panes[0]), Some("a".to_string()));
+                assert_eq!(pane_label(&panes[1]), Some("b".to_string()));
+            }
+            other => panic!(
+                "expected LayoutNode::Stack, got a different variant: {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    /// Sibling baseline: `layout { split { ... } }` still parses
+    /// after the Phase 3 additions. Guards against an accidental
+    /// regression in `read_split`.
+    #[test]
+    fn parse_split_layout_round_trip() {
+        let src = r#"
+            layout {
+                split axis=horizontal ratio=0.6 {
+                    pane kind=shell label="left"
+                    pane kind=shell label="right"
+                }
+            }
+        "#;
+        let cfg = parse(src).expect("layout with split parses");
+        let layout = cfg.layout.expect("Config.layout populated");
+        match layout {
+            LayoutNode::Split { axis, ratio, children } => {
+                assert_eq!(axis, SplitAxis::default());
+                assert_eq!(ratio, Ratio(60));
+                assert_eq!(children.len(), 2);
+            }
+            other => panic!(
+                "expected LayoutNode::Split, got a different variant: {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    /// Negative baseline: an unknown inner LayoutNode name
+    /// (`foo`) must surface as `UnknownLayoutNode`. Catches an
+    /// accidental `let _ = ...` fallback arm in `read_layout`.
+    #[test]
+    fn parse_unknown_inner_layout_node_returns_err() {
+        let src = r#"
+            layout {
+                foo { }
+            }
+        "#;
+        let err = parse(src).expect_err("foo arm is not in the dispatch");
+        assert!(
+            matches!(err, ConfigError::UnknownLayoutNode(_)),
+            "expected UnknownLayoutNode, got: {:?}",
+            err
+        );
+    }
+
+    /// A `zstack` nested inside a `split` round-trips: the
+    /// visitor walks the children of split's body, finds the
+    /// inner `zstack`, and dispatches to `read_zstack`. Pins
+    /// the resolver-aware scope-by-parent-area invariant.
+    #[test]
+    fn parse_zstack_within_split_round_trip() {
+        let src = r#"
+            layout {
+                split axis=horizontal ratio=0.5 {
+                    zstack {
+                        pane kind=shell label="overlay"
+                        pane kind=shell label="overlay_below"
+                    }
+                    pane kind=shell label="tail"
+                }
+            }
+        "#;
+        let cfg = parse(src).expect("split-with-zstack parses");
+        let layout = cfg.layout.expect("Config.layout populated");
+        match layout {
+            LayoutNode::Split { children, .. } => {
+                assert_eq!(children.len(), 2);
+                match &children[0] {
+                    LayoutNode::ZStack { panes } => {
+                        assert_eq!(panes.len(), 2);
+                        assert_eq!(
+                            pane_label(&panes[0]),
+                            Some("overlay".to_string())
+                        );
+                        assert_eq!(
+                            pane_label(&panes[1]),
+                            Some("overlay_below".to_string())
+                        );
+                    }
+                    other => panic!(
+                        "expected ZStack child[0], got: {:?}",
+                        std::mem::discriminant(other)
+                    ),
+                }
+                match &children[1] {
+                    LayoutNode::Pane(_) => {}
+                    other => panic!(
+                        "expected Pane child[1], got: {:?}",
+                        std::mem::discriminant(other)
+                    ),
+                }
+            }
+            other => panic!(
+                "expected LayoutNode::Split, got a different variant: {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+}
