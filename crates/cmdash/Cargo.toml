@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 cmdash-config = { version = "0.1.0", path = "../cmdash-config" }
+cmdash-keybinds = { version = "0.1.0", path = "../cmdash-keybinds" }
 cmdash-layout = { version = "0.1.0", path = "../cmdash-layout" }
 cmdash-pty = { version = "0.1.0", path = "../cmdash-pty" }
 crossterm = "0.29.0"

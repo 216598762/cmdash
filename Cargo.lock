@@ -126,6 +126,7 @@ name = "cmdash"
 version = "0.1.0"
 dependencies = [
  "cmdash-config",
+ "cmdash-keybinds",
  "cmdash-layout",
  "cmdash-pty",
  "crossterm 0.29.0",
@@ -147,6 +148,10 @@ dependencies = [
 [[package]]
 name = "cmdash-keybinds"
 version = "0.1.0"
+dependencies = [
+ "cmdash-config",
+ "crossterm 0.29.0",
+]
 
 [[package]]
 name = "cmdash-layout"
