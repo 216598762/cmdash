@@ -62,7 +62,7 @@ pub enum RunnerError {
 /// One pane's runtime: [`PanePty`] + reader thread + mpsc receiver.
 pub struct PaneRunner {
     /// Source pane description (rect, kind, label).
-    pub computed: ComputedPane,
+    computed: ComputedPane,
     pty: PanePty,
     bytes_rx: Receiver<Vec<u8>>,
     reader_thread: Option<thread::JoinHandle<()>>,
@@ -140,6 +140,16 @@ impl PaneRunner {
     /// Forward input bytes to the child.
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<usize, PtyError> {
         self.pty.write(bytes)
+    }
+
+    /// Read-only accessor for the resolved pane position/rect/label.
+    /// Mirrors the [`TickContext::computed`] pattern: callers should
+    /// use this accessor rather than reading the field directly so
+    /// any future invariant on the layer binding (`LayerId` <-> pane
+    /// 1:1 per AGENTS.md "Hard rule: one layer per instance") can be
+    /// enforced here without churn at the call sites.
+    pub fn computed(&self) -> &ComputedPane {
+        &self.computed
     }
 
     pub fn layer_id(&self) -> PaneLayerId {

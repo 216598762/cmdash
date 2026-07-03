@@ -356,10 +356,10 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                 let buf = frame.buffer_mut();
                 for (runner, snap) in self.runners.iter().zip(snapshots.iter()) {
                     let area = ratatui::layout::Rect::new(
-                        runner.computed.rect.x,
-                        runner.computed.rect.y,
-                        runner.computed.rect.w,
-                        runner.computed.rect.h,
+                        runner.computed().rect.x,
+                        runner.computed().rect.y,
+                        runner.computed().rect.w,
+                        runner.computed().rect.h,
                     );
                     if let Some(snap) = snap {
                         blit_grid(&snap.grid, buf, area);
