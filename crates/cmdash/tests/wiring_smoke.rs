@@ -211,7 +211,14 @@ fn pane_runner_resize_refreshes_computed_rect() {
     );
 
     // Grow.
-    runner.resize(132, 50).expect("resize grow");
+    runner
+        .resize(LayoutRect {
+            x: 0,
+            y: 0,
+            w: 132,
+            h: 50,
+        })
+        .expect("resize grow");
     assert_eq!(
         runner.computed().rect,
         LayoutRect {
@@ -225,7 +232,14 @@ fn pane_runner_resize_refreshes_computed_rect() {
 
     // Shrink -- verify refresh works both directions, not just
     // growth.
-    runner.resize(40, 12).expect("resize shrink");
+    runner
+        .resize(LayoutRect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 12,
+        })
+        .expect("resize shrink");
     assert_eq!(
         runner.computed().rect,
         LayoutRect {
@@ -243,7 +257,14 @@ fn pane_runner_resize_refreshes_computed_rect() {
     // (`rect.w += new_w` rather than `rect.w = new_w`) could
     // pass the 3-state test because the cached previous dims
     // are never compared against an unrelated new target.
-    runner.resize(200, 60).expect("resize grow again");
+    runner
+        .resize(LayoutRect {
+            x: 0,
+            y: 0,
+            w: 200,
+            h: 60,
+        })
+        .expect("resize grow again");
     assert_eq!(
         runner.computed().rect,
         LayoutRect {
@@ -253,5 +274,120 @@ fn pane_runner_resize_refreshes_computed_rect() {
             h: 60
         },
         "post-resize (grow again) rect should be (0, 0, 200, 60)"
+    );
+}
+
+// ----------------------------------------------------------------------
+// Regression test for the v2 split-pane nesting contract lift:
+// `PaneRunner::resize(rect)` MUST carry the layout-engine's
+// `(x, y)` origin forward into `self.computed.rect` -- not
+// zero it out the way v1 did. End-to-end via a real KDL
+// `split` config + production `PaneRunner::spawn` path so the
+// order `pty.resize()? -> rect overwrite` is pinned through a
+// real `PanePty::resize` call against the running PTY (NOT
+// just the `StubPty` lib unit-tests cover).
+//
+// Fixture: parent area (132, 50), `SplitAxis::Horizontal`
+// `ratio=0.6` -> child A at `(x:0, w:79, h:50)` and child B at
+// `(x:79, w:53, h:50)`. Resize child B from initial
+// `(79, 0, 53, 50)` to `(79, 10, 80, 30)` so a v1 regression
+// that zeroed either `(x, y)` axis would fail the post-resize
+// assert. Sibling-pane orthogonality: A must not mutate when B
+// is resized.
+// ----------------------------------------------------------------------
+#[test]
+fn pane_runner_resize_preserves_split_origin_in_layout_engine_path() {
+    let source = r#"layout {
+        split axis=horizontal ratio=0.6 {
+            pane kind=shell label="split-a"
+            pane kind=shell label="split-b"
+        }
+    }"#;
+    let cfg = cmdash_config::parse(source).expect("parse split config");
+    let root = cfg.layout.expect("layout block");
+    let area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: 132,
+        h: 50,
+    };
+    let layout = ComputedLayout::compute(&root, area).expect("compute split layout");
+    assert_eq!(layout.panes.len(), 2, "expected 2 leaf panes from split");
+
+    let pane_a = layout.panes[0].clone();
+    let pane_b = layout.panes[1].clone();
+
+    // Pre-state pin from `cmdash_layout::split_rect`
+    // (`SplitAxis::Horizontal`, `ratio=60` over width 132):
+    //   w_left  = 132 * 60 / 100 = 79
+    //   child A: (x:0,  y:0, w:79, h:50)
+    //   child B: (x:79, y:0, w:53, h:50)
+    assert_eq!(
+        pane_a.rect,
+        LayoutRect {
+            x: 0,
+            y: 0,
+            w: 79,
+            h: 50
+        },
+        "fixture invariant: split child A at (0, 0, 79, 50)"
+    );
+    assert_eq!(
+        pane_b.rect,
+        LayoutRect {
+            x: 79,
+            y: 0,
+            w: 53,
+            h: 50
+        },
+        "fixture invariant: split child B at (79, 0, 53, 50)"
+    );
+
+    // Long-lived shells -- `sleep 10` keeps both children alive
+    // across the resize call so the PTY-side `winresize` flow
+    // doesn't error out with `PtyError::InvalidSize` against a
+    // short-lived child.
+    let shell = ShellSpec::Command {
+        argv: vec!["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
+    };
+    let id_a = cmdash::derive_layer_id(&pane_a.id);
+    let id_b = cmdash::derive_layer_id(&pane_b.id);
+    let runner_a = PaneRunner::spawn(pane_a.clone(), id_a, shell.clone()).expect("spawn runner A");
+    let mut runner_b =
+        PaneRunner::spawn(pane_b.clone(), id_b, shell.clone()).expect("spawn runner B");
+
+    // Initial-state sanity: spawn-time rect rounds-trip the
+    // Split-derived non-zero origin (x:79 for child B).
+    assert_eq!(runner_b.computed().rect, pane_b.rect);
+
+    // Resize child B with a target rect that exercises ALL
+    // four axes: x preserved, y introduced, w + h changed. A
+    // v1 regression that zeroed either origin axis would fail
+    // the assert below.
+    let target = LayoutRect {
+        x: 79,
+        y: 10,
+        w: 80,
+        h: 30,
+    };
+    runner_b
+        .resize(target)
+        .expect("resize child B with non-zero origin");
+
+    // Post-resize assertion: the FULL rect round-trips.
+    assert_eq!(
+        runner_b.computed().rect,
+        target,
+        "split child B post-resize rect must match the caller-supplied full rect"
+    );
+    // (per-axis asserts removed -- the FULL-rect assert above
+    //  catches any deviation across all four axes.)
+
+    // Sibling-pane orthogonality: resize of B MUST NOT mutate
+    // A's cached rect.
+    assert_eq!(
+        runner_a.computed().rect,
+        pane_a.rect,
+        "sibling pane A's rect must be unaffected by runner B resize"
     );
 }

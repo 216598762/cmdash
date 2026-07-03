@@ -148,25 +148,27 @@ impl PaneRunner {
         self.pty.try_wait()
     }
 
-    /// Resize the PTY and refresh the cached
-    /// [`ComputedPane`] rect so callers reading
-    /// `runner.computed().rect` after a resize see the new
-    /// dimensions instead of the spawn-time rect.
+    /// Resize the PTY and overwrite the cached [`ComputedPane`]
+    /// rect with the layout-engine-supplied cell-grid `<rect>`.
+    /// Callers reading `runner.computed().rect` after a resize
+    /// see the new pane geometry — dims AND origin — instead of
+    /// the spawn-time rect.
     ///
-    /// v1 contract: the rect is rewritten to `(x: 0, y: 0, w:
-    /// cols, h: rows)` because each pane is the root of a
-    /// single-tab layout. v2 may need to preserve `x, y`
-    /// originated by the layout engine (a Split's second child
-    /// sits at `x = layout_w * ratio`, for example); until then
-    /// only the dims matter to the Phase 3a blit.
-    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), PtyError> {
-        self.pty.resize(cols, rows)?;
-        self.computed.rect = LayoutRect {
-            x: 0,
-            y: 0,
-            w: cols,
-            h: rows,
-        };
+    /// v2 contract: the `(x, y)` from the layout engine is
+    /// preserved across resize. A `Split`'s second child sits at
+    /// `x = layout_w * ratio` (or a similar non-zero origin);
+    /// the blit path in [`crate::main::TickContext::run`] reads
+    /// `runner.computed().rect.x/.y` straight into a
+    /// `ratatui::layout::Rect`, so a resize that zeroed the
+    /// origin would silently misplace the pane in a Split
+    /// layout. Order is load-bearing: `pty.resize` propagates
+    /// any [`PtyError`] via `?` BEFORE the rect write, so a
+    /// failed pty resize never refreshes the rect (the cached
+    /// value keeps the previous last-good state — pane state
+    /// mutates atomically, not in halves).
+    pub fn resize(&mut self, rect: LayoutRect) -> Result<(), PtyError> {
+        self.pty.resize(rect.w, rect.h)?;
+        self.computed.rect = rect;
         Ok(())
     }
 
@@ -376,7 +378,12 @@ mod internal_sanity_tests {
         stub.fail_next_resize(PtyError::InvalidSize(132, 0));
         let mut runner =
             PaneRunner::with_pty_for_test(computed, PaneLayerId(1), Box::new(stub), None);
-        let result = runner.resize(132, 50);
+        let result = runner.resize(LayoutRect {
+            x: 0,
+            y: 0,
+            w: 132,
+            h: 50,
+        });
         assert!(
             matches!(result, Err(PtyError::InvalidSize(132, 0))),
             "resize must propagate PtyError::InvalidSize unchanged; got {:?}",
@@ -391,41 +398,68 @@ mod internal_sanity_tests {
 
     /// Symmetric success-path pin: when `pty.resize` returns
     /// `Ok(())`, `self.computed.rect` MUST be overwritten with
-    /// `(0, 0, cols, rows)`. Pins ordering correctness from the
-    /// success side (without this, a regression in the `rect`
-    /// assignment line itself could go undetected). The pre-state
-    /// is also locked to the canonical layout-computed root
-    /// fixture `(0, 0, 80, 24)` so a future layout-engine change
-    /// that shifts the root dims fails this test BEFORE the
-    /// success-path assertion even runs.
+    /// the FULL caller-supplied `<rect>` — dims AND origin.
+    /// Pins the v2 split-pane contract: the layout-engine's
+    /// `(x, y)` carry forward into the cached rect, so a
+    /// `Split`'s second child stays at its layout-derived `x`
+    /// offset after resize. A v1 regression that zeroed the
+    /// origin would silently misplace the pane in phase 3a.
+    ///
+    /// The pre-state is locked to `(48, 0, 32, 24)` via a
+    /// `SplitAxis::Horizontal ratio=0.6` layout fixture over
+    /// `(80, 24)` parent area — that's the second child's
+    /// computed origin per [`cmdash_layout::split_rect`]. The
+    /// target rect is `(48, 0, 132, 50)`: pivots from the
+    /// Split-derived origin `x:48` to a size-grew input. A
+    /// `x:0` regression would fail the assert below.
     #[test]
-    fn resize_success_overwrites_rect() {
-        let computed = make_test_pane();
-        let pre_rect = computed.rect;
+    fn resize_success_overwrites_full_rect_preserving_origin() {
+        use cmdash_config::parse as parse_config;
+        use cmdash_layout::ComputedLayout;
+        let cfg_text = r#"layout {
+            split axis=horizontal ratio=0.6 {
+                pane kind=shell label="split-a"
+                pane kind=shell label="split-b"
+            }
+        }"#;
+        let cfg = parse_config(cfg_text).expect("parse split config");
+        let root = cfg.layout.expect("layout block");
+        let parent = LayoutRect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
+        let layout = ComputedLayout::compute(&root, parent).expect("compute split layout");
+        // Second child carries the non-zero origin.
+        let computed_b = layout.panes[1].clone();
+        let pre_rect = computed_b.rect;
         assert_eq!(
             pre_rect,
             LayoutRect {
-                x: 0,
+                x: 48,
                 y: 0,
-                w: 80,
+                w: 32,
                 h: 24
             },
-            "fixture invariant: pre_rect is the layout-computed root (0,0,80,24)"
+            "fixture invariant: Split's second child sits at (x:48, y:0, w:32, h:24)"
         );
         let stub = StubPty::new(PaneLayerId(2));
         let mut runner =
-            PaneRunner::with_pty_for_test(computed, PaneLayerId(2), Box::new(stub), None);
-        let result = runner.resize(132, 50);
+            PaneRunner::with_pty_for_test(computed_b, PaneLayerId(2), Box::new(stub), None);
+        // Carry the layout-derived origin forward; also grow dims.
+        let target = LayoutRect {
+            x: 48,
+            y: 0,
+            w: 132,
+            h: 50,
+        };
+        let result = runner.resize(target);
         assert!(matches!(result, Ok(())));
         assert_eq!(
             runner.computed().rect,
-            LayoutRect {
-                x: 0,
-                y: 0,
-                w: 132,
-                h: 50
-            },
-            "resize success must overwrite self.computed.rect"
+            target,
+            "resize success must overwrite self.computed.rect with the caller-supplied full rect"
         );
     }
 }
