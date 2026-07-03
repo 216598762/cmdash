@@ -277,13 +277,9 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// [`Self::new`] and restored by `apply_action::PaneClose`
     /// after tail removal, so the returned index can be used
     /// to index `runners` without an extra bounds check.
-    // Public surface for future use (e.g. external scripts,
-    // terminal UI indicators); not yet called in the binary's
-    // hot loop body because the loop reads `self.focus` via
-    // the field directly. `dead_code` would otherwise fire on
-    // a `pub fn` of a module-private type with no in-tree
-    // production caller.
-    #[allow(dead_code)]
+    /// Called from phase 3a's `terminal.draw` closure for
+    /// structured tracing; also exposed for external scripts
+    /// and terminal UI indicators.
     pub const fn focus(&self) -> usize {
         self.focus
     }
@@ -347,7 +343,16 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             }
 
             // Phase 3a: render the cell body through ratatui.
+            // Capture the focused index BEFORE drawing so the
+            // debug! can fire from inside the draw closure
+            // body without forcing a borrow conflict with the
+            // mutable `&mut self.terminal` reborrow taken by
+            // `terminal.draw`. The accessor `pub const fn focus`
+            // is therefore called on the hot path and no longer
+            // needs `#[allow(dead_code)]`.
+            let focus_idx_dbg = self.focus();
             self.terminal.draw(|frame| {
+                debug!(focus_idx = focus_idx_dbg, "rendering frame");
                 let buf = frame.buffer_mut();
                 for (runner, snap) in self.runners.iter().zip(snapshots.iter()) {
                     let area = ratatui::layout::Rect::new(
