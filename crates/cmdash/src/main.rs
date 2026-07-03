@@ -813,6 +813,37 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         }
     }
 
+    /// ## Algorithmic-shape divergence vs `crosstack_member`
+    ///
+    /// This is a **modulo-wrap** primitive. At the LAST
+    /// member, the focus wraps BACK to the FIRST via
+    /// `(member_idx + 1) % panes.len()` -- it stays
+    /// **inside** the ZStack -- and `self.stack_focus` is
+    /// **always** updated (even on the wrap-around, since
+    /// the post-wrap focus still lives inside the ZStack
+    /// and the keyed entry tracks the new member index).
+    /// `PaneStackCycle` therefore has no handoff path -- it
+    /// is a closed cycle within the ZStack.
+    ///
+    /// `crosstack_member` looks superficially combinable
+    /// (both primitives drive ZStack member indices) but
+    /// has the OPPOSITE boundary post-condition: at the
+    /// FIRST or LAST member it **escapes** the ZStack via
+    /// `focus_by_direction(handoff_direction)` and never
+    /// mutates `stack_focus` on the handoff path -- the
+    /// new focus lands outside the ZStack, so any keyed
+    /// entry would go stale.
+    ///
+    /// **Trapdoor precedent** -- [`cmdash_layout::split_rect`] in
+    /// `cmdash_layout` documents that the cfg
+    /// `split axis=horizontal` keyword is a *column* split
+    /// (same y range, different x columns), the OPPOSITE of
+    /// the axis-token's prose name. Two fn-names that sound
+    /// combinable (`handle_stack_cycle` and
+    /// `crosstack_member`) can quietly carry two different
+    /// post-conditions. **Do NOT refold these two
+    /// primitives in a future refactor.**
+    ///
     /// Phase 4 carry-forward: `PaneStackCycle`. Find the
     /// focused pane's parent ZStack + member index, then
     /// advance `self.focus` to the next member in
@@ -889,10 +920,40 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// - The handoff path does NOT mutate `stack_focus` (the
     ///   new focus is OUTSIDE the ZStack, so the keyed
     ///   stack-focus-map entry would never be queried).
-    /// - `PaneStackCycle` is intentionally NOT folded into
-    ///   this helper: its modulo-wrap arithmetic is a
-    ///   fundamentally different algorithm from the
-    ///   boundary-handoff shape this helper consolidates.
+    /// - Algorithmic-shape divergence vs `handle_stack_cycle`.
+    ///   These two primitives look combinable (both drive
+    ///   ZStack member indices in declaration order) but
+    ///   carry fundamentally different post-conditions:
+    ///   - `crosstack_member` (this helper) at the FIRST or
+    ///     LAST member is a **boundary-hand-off** primitive:
+    ///     it **escapes** the ZStack by delegating to
+    ///     `focus_by_direction(handoff_direction)`, and it
+    ///     **never mutates `stack_focus`** on the handoff
+    ///     path -- the new focus lands OUTSIDE the ZStack,
+    ///     so any keyed entry for the old focus would be
+    ///     stale and we deliberately drop it.
+    ///   - `handle_stack_cycle` is a **modulo-wrap**
+    ///     primitive: at the LAST member the arithmetic
+    ///     `(member_idx + 1) % panes.len()` wraps the focus
+    ///     BACK to the FIRST member (it stays **inside**
+    ///     the ZStack), and it **always mutates
+    ///     `stack_focus`** -- even on the wrap-around, the
+    ///     keyed member-index entry tracks the post-wrap
+    ///     focus.
+    ///   Folding these into one fn would tangle two
+    ///   different post-conditions behind a single
+    ///   conditional branch -- an anti-pattern. They are
+    ///   intentionally separate./// - **Trapdoor precedent** -- the [`cmdash_layout::split_rect`] 
+    ///   rustdoc on `cmdash_layout` warns that the cfg
+    ///   `axis=horizontal` is a *column* split (same y
+    ///   range, different x columns), the OPPOSITE of the
+    ///   axis-token's prose name. Names that suggest one
+    ///   direction can quietly denote the opposite
+    ///   direction; in the same vein, two fn-names that
+    ///   sound combinable (`crosstack_member` and
+    ///   `handle_stack_cycle`) can quietly carry two
+    ///   different post-conditions. **Do NOT refold these
+    ///   two primitives in a future refactor.**
     fn crosstack_member(&mut self, handoff_direction: Direction, advance: bool) {
         if self.runners.is_empty() {
             return;
