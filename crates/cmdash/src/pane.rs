@@ -42,7 +42,7 @@ use std::io::Read;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
-use cmdash_layout::ComputedPane;
+use cmdash_layout::{ComputedPane, Rect as LayoutRect};
 use cmdash_pty::{PaneLayerId, PanePty, PaneReader, PaneTerminalState, PtyError, ShellSpec};
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -132,9 +132,26 @@ impl PaneRunner {
         self.pty.try_wait()
     }
 
-    /// Resize the PTY.
+    /// Resize the PTY and refresh the cached
+    /// [`ComputedPane`] rect so callers reading
+    /// `runner.computed().rect` after a resize see the new
+    /// dimensions instead of the spawn-time rect.
+    ///
+    /// v1 contract: the rect is rewritten to `(x: 0, y: 0, w:
+    /// cols, h: rows)` because each pane is the root of a
+    /// single-tab layout. v2 may need to preserve `x, y`
+    /// originated by the layout engine (a Split's second child
+    /// sits at `x = layout_w * ratio`, for example); until then
+    /// only the dims matter to the Phase 3a blit.
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), PtyError> {
-        self.pty.resize(cols, rows)
+        self.pty.resize(cols, rows)?;
+        self.computed.rect = LayoutRect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
+        Ok(())
     }
 
     /// Forward input bytes to the child.

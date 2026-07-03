@@ -42,18 +42,47 @@ use tracing::warn;
 /// Cell-pixel metrics used when converting a pane's text rect to
 /// the underlying pixel framebuffer size. v1 sticks to the
 /// common 8x16 default; per-terminal overrides are a v2 topic.
+///
+/// Fields are private; construct via [`Self::new`] or
+/// [`Default::default`]. The ctor enforces `cell_w > 0 &&
+/// cell_h > 0` so [`GraphicsState::render_and_write`] cannot
+/// produce a zero-area framebuffer component.
 #[derive(Debug, Clone, Copy)]
 pub struct Metrics {
-    pub cell_w: u32,
-    pub cell_h: u32,
+    cell_w: u32,
+    cell_h: u32,
+}
+
+impl Metrics {
+    /// Construct [`Metrics`] with non-zero cell dimensions.
+    /// `cell_w > 0 && cell_h > 0` is enforced by `assert!`
+    /// (matching the ctor invariant on
+    /// [`crate::graphics::GraphicsState`]). The exact panic
+    /// phrase `"cell_w and cell_h must be non-zero"` is
+    /// consumed by the `metrics_new_panics_on_zero_*`
+    /// regression tests in
+    /// [`internal_sanity_tests`].
+    ///
+    /// Not `const fn` -- no const-eval consumer exists today
+    /// (`Default::default()` is `fn`, not `const fn`;
+    /// [`crate::graphics::GraphicsState::new`] takes `Metrics`
+    /// by value in a non-const context), and dropping `const`
+    /// lets the panic phrase stay stable for debug-time
+    /// correlation.
+    pub fn new(cell_w: u32, cell_h: u32) -> Self {
+        assert!(
+            cell_w > 0 && cell_h > 0,
+            "Metrics::new: cell_w and cell_h must be non-zero, got {}x{}",
+            cell_w,
+            cell_h,
+        );
+        Self { cell_w, cell_h }
+    }
 }
 
 impl Default for Metrics {
     fn default() -> Self {
-        Self {
-            cell_w: 8,
-            cell_h: 16,
-        }
+        Self::new(8, 16)
     }
 }
 
@@ -408,6 +437,27 @@ mod internal_sanity_tests {
     #[should_panic(expected = "cells must be non-zero")]
     fn graphics_state_new_panics_on_zero_rows() {
         let _ = GraphicsState::new(Metrics::default(), (80, 0));
+    }
+
+    /// Ctor invariant pin: zero `cell_w` must panic with the exact
+    /// phrase `"cell_w and cell_h must be non-zero"` so debug-time
+    /// failures (and tests) can correlate directly to the
+    /// [`Metrics::new`] assert rather than chasing an opaque
+    /// panic. Mirrors `graphics_state_new_panics_on_zero_cols`
+    /// in shape and structure.
+    #[test]
+    #[should_panic(expected = "cell_w and cell_h must be non-zero")]
+    fn metrics_new_panics_on_zero_cell_w() {
+        let _ = Metrics::new(0, 16);
+    }
+
+    /// Ctor invariant pin: zero `cell_h` must panic with the same
+    /// exact phrase, symmetric to the cell_w case above and to
+    /// `graphics_state_new_panics_on_zero_rows`.
+    #[test]
+    #[should_panic(expected = "cell_w and cell_h must be non-zero")]
+    fn metrics_new_panics_on_zero_cell_h() {
+        let _ = Metrics::new(8, 0);
     }
 
     /// Regression test for `PaneRunner::Drop` -> `GraphicsState::close_pane`

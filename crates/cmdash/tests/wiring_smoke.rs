@@ -154,3 +154,104 @@ fn kitty_decode_smoke() {
     graphics.apply_kitty_event(pane, &load);
     assert!(graphics.has_image(pane, 7));
 }
+
+// --------------------------------------------------------------------------
+// Regression test pinning the post-resize rect refresh introduced
+// when wiring the `PaneRunner::computed` accessor (see
+// `PaneRunner::resize` doc in pane.rs). Before the refresh,
+// `runner.computed().rect` returned the spawn-time rect forever,
+// which broke any caller that read the rect after a terminal
+// resize.
+//
+// Asserts (four post-resize states):
+// - the spawn-time rect == pane.rect (initial-state sanity).
+// - after `resize(new_w, new_h)`, `runner.computed().rect` ==
+//   `LayoutRect{x:0, y:0, w:new_w, h:new_h}`.
+// - shrinking is also refreshed (pins not just a one-way
+//   growth path).
+// - grow-again after shrink -- successive override must not
+//   carry any state from the previous call (cache is per-call
+//   fresh, not incremental).
+// --------------------------------------------------------------------------
+
+#[test]
+fn pane_runner_resize_refreshes_computed_rect() {
+    let source = r#"layout { pane kind=shell label="resize-regression" }"#;
+    let cfg = cmdash_config::parse(source).expect("parse config");
+    let root = cfg.layout.expect("layout block");
+    let area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: 80,
+        h: 24,
+    };
+    let layout = ComputedLayout::compute(&root, area).expect("compute layout");
+    let pane = layout.panes[0].clone();
+
+    let layer_id = cmdash::derive_layer_id(&pane.id);
+
+    // Long-lived but cheap shell so the PTY stays alive across
+    // both resize() calls (10s wallclock budget is plenty).
+    let shell = ShellSpec::Command {
+        argv: vec!["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
+    };
+    let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
+
+    // Initial-state sanity: the accessor should hand back the
+    // exact spawn-time rect.
+    assert_eq!(
+        runner.computed().rect,
+        LayoutRect {
+            x: pane.rect.x,
+            y: pane.rect.y,
+            w: pane.rect.w,
+            h: pane.rect.h,
+        },
+        "spawn-time rect should match the layout-computed pane.rect"
+    );
+
+    // Grow.
+    runner.resize(132, 50).expect("resize grow");
+    assert_eq!(
+        runner.computed().rect,
+        LayoutRect {
+            x: 0,
+            y: 0,
+            w: 132,
+            h: 50
+        },
+        "post-resize (grow) rect should be (0, 0, 132, 50)"
+    );
+
+    // Shrink -- verify refresh works both directions, not just
+    // growth.
+    runner.resize(40, 12).expect("resize shrink");
+    assert_eq!(
+        runner.computed().rect,
+        LayoutRect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 12
+        },
+        "post-resize (shrink) rect should be (0, 0, 40, 12)"
+    );
+
+    // Grow again -- pins that successive override doesn't carry
+    // any state from the previous call. Without this 4th
+    // assertion a regression that overwrote via an accumulator
+    // (`rect.w += new_w` rather than `rect.w = new_w`) could
+    // pass the 3-state test because the cached previous dims
+    // are never compared against an unrelated new target.
+    runner.resize(200, 60).expect("resize grow again");
+    assert_eq!(
+        runner.computed().rect,
+        LayoutRect {
+            x: 0,
+            y: 0,
+            w: 200,
+            h: 60
+        },
+        "post-resize (grow again) rect should be (0, 0, 200, 60)"
+    );
+}
