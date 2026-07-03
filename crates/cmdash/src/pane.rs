@@ -44,6 +44,16 @@ use std::thread;
 
 use cmdash_layout::{ComputedPane, Rect as LayoutRect};
 use cmdash_pty::{PaneLayerId, PanePty, PaneReader, PaneTerminalState, PtyError, ShellSpec};
+
+/// Re-export the pty-operations trait so downstream callers
+/// (e.g., future external test harnesses or alternative backend
+/// integrations) can refer to it as `cmdash::pane::PanePtyOps`
+/// rather than reaching into `cmdash_pty::PanePtyOps` directly.
+/// Also brings `PanePtyOps` into local scope, so the `use`
+/// block above intentionally does NOT list it (keeps the
+/// single-source-of-truth pattern and avoids the redundant-
+/// import E0252 trap).
+pub use cmdash_pty::PanePtyOps;
 use thiserror::Error;
 use tracing::{debug, warn};
 
@@ -59,11 +69,17 @@ pub enum RunnerError {
     Spawn(#[source] PtyError),
 }
 
-/// One pane's runtime: [`PanePty`] + reader thread + mpsc receiver.
+/// One pane's runtime: a [`PanePtyOps`] trait object + reader
+/// thread + mpsc receiver. v1 uses [`cmdash_pty::PanePty`] as
+/// the production impl behind the trait (boxed at the call site
+/// in [`PaneRunner::spawn_with_graphics`]); tests substitute a
+/// [`StubPty`] (see `internal_sanity_tests` below) to pin
+/// invariants like the resize Err path that real-PTY tests
+/// can't reach deterministically.
 pub struct PaneRunner {
     /// Source pane description (rect, kind, label).
     computed: ComputedPane,
-    pty: PanePty,
+    pty: Box<dyn PanePtyOps + Send>,
     bytes_rx: Receiver<Vec<u8>>,
     reader_thread: Option<thread::JoinHandle<()>>,
     /// Optional close-channel sender. When `Some`, `Drop` sends
@@ -108,7 +124,7 @@ impl PaneRunner {
             .expect("spawn reader thread");
         Ok(Self {
             computed,
-            pty,
+            pty: Box::new(pty),
             bytes_rx: rx,
             reader_thread: Some(reader_thread),
             close_tx,
@@ -172,6 +188,42 @@ impl PaneRunner {
     pub fn layer_id(&self) -> PaneLayerId {
         self.pty.layer_id()
     }
+
+    /// Test-only ctor that injects a [`PanePtyOps`] trait object
+    /// WITHOUT spawning a real PTY reader thread. Used by the
+    /// `#[cfg(test)] mod internal_sanity_tests` block below to
+    /// pin resize-ordering invariants that real-PTY tests can't
+    /// reach deterministically. Production paths still go
+    /// through [`PaneRunner::spawn_with_graphics`].
+    ///
+    /// Lives inside [`impl PaneRunner`] (not as a free fn) so the
+    /// test call site `PaneRunner::with_pty_for_test(...)`
+    /// resolves via the standard associated-fn syntax.
+    #[cfg(test)]
+    pub(crate) fn with_pty_for_test(
+        computed: ComputedPane,
+        // `layer_id` is unused here: the StubPty passed in
+        // encapsulates its own `PaneLayerId` internally. Kept in
+        // the signature (parallel to `spawn_with_graphics`) so
+        // test invocations pattern-match the production-ctor shape.
+        #[allow(unused)] layer_id: PaneLayerId,
+        pty: Box<dyn PanePtyOps + Send>,
+        close_tx: Option<PaneCloseTx>,
+    ) -> Self {
+        // No real reader thread: tests that exercise this ctor
+        // only care about `resize` / `computed().rect` invariants
+        // and don't need byte feeding. Integration paths still go
+        // through `spawn_with_graphics` (with a real PanePty +
+        // thread).
+        let (_tx, rx) = channel::<Vec<u8>>();
+        Self {
+            computed,
+            pty,
+            bytes_rx: rx,
+            reader_thread: None,
+            close_tx,
+        }
+    }
 }
 
 impl Drop for PaneRunner {
@@ -215,5 +267,165 @@ fn run_reader(mut reader: PaneReader, tx: std::sync::mpsc::Sender<Vec<u8>>) {
                 break;
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal sanity tests. The `StubPty` here implements
+// [`PanePtyOps`] so we can pin the resize-ordering invariant
+// (`pty.resize()?` BEFORE `self.computed.rect = ...`) without
+// depending on a real portable_pty child, which would be
+// non-deterministic for the failure path. Mirrors the existing
+// pattern in `cmdash::graphics::internal_sanity_tests`.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod internal_sanity_tests {
+    use super::*;
+    use cmdash_pty::TextGrid;
+
+    /// Stub whose `resize` returns the queued error on the next
+    /// call (consuming the slot) and `Ok(())` thereafter. All
+    /// other methods hand back minimal valid-shape defaults; the
+    /// resize-path tests don't invoke them.
+    struct StubPty {
+        layer_id: PaneLayerId,
+        next_resize_result: Option<PtyError>,
+    }
+
+    impl StubPty {
+        fn new(layer_id: PaneLayerId) -> Self {
+            Self {
+                layer_id,
+                next_resize_result: None,
+            }
+        }
+        fn fail_next_resize(&mut self, err: PtyError) {
+            self.next_resize_result = Some(err);
+        }
+    }
+
+    impl PanePtyOps for StubPty {
+        fn layer_id(&self) -> PaneLayerId {
+            self.layer_id
+        }
+        fn resize(&mut self, _cols: u16, _rows: u16) -> Result<(), PtyError> {
+            if let Some(err) = self.next_resize_result.take() {
+                Err(err)
+            } else {
+                Ok(())
+            }
+        }
+        fn write(&mut self, _bytes: &[u8]) -> Result<usize, PtyError> {
+            Ok(0)
+        }
+        fn advance(&mut self, _bytes: &[u8]) -> Result<(), PtyError> {
+            Ok(())
+        }
+        fn snapshot(&mut self) -> PaneTerminalState {
+            PaneTerminalState {
+                grid: TextGrid::new(0, 0),
+                cols: 0,
+                rows: 0,
+                pending_events: Vec::new(),
+            }
+        }
+        fn try_wait(&mut self) -> Result<Option<i32>, PtyError> {
+            Ok(None)
+        }
+        fn kill(&mut self) -> Result<(), PtyError> {
+            Ok(())
+        }
+    }
+
+    /// Build a [`ComputedPane`] fixture for the unit tests by
+    /// routing through the same `cmdash_config` + `ComputedLayout`
+    /// path that the integration tests use, so the test exercises
+    /// the real leaf-pane shape (id, kind, label) -- not a
+    /// hand-crafted [`ComputedPane`] with private-field access.
+    fn make_test_pane() -> ComputedPane {
+        use cmdash_config::parse as parse_config;
+        use cmdash_layout::ComputedLayout;
+        let cfg_text = r#"layout { pane kind=shell label="resize-stub-test" }"#;
+        let cfg = parse_config(cfg_text).expect("parse config");
+        let root = cfg.layout.expect("layout block");
+        let layout = ComputedLayout::compute(
+            &root,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute layout");
+        layout.panes[0].clone()
+    }
+
+    /// Regression test pinning reviewer nit (G): a failed
+    /// `pty.resize` MUST NOT mutate `self.computed.rect`. The
+    /// ordering `self.pty.resize(...)?` BEFORE the rect rewrite
+    /// is on-sight and un-unit-tested until the trait extraction
+    /// in commit `0102ae4` unlocked a stub backend. AGENTS.md
+    /// §"every invariant needs a regression test" demands this.
+    #[test]
+    fn resize_failure_leaves_rect_unchanged_and_propagates_err() {
+        let computed = make_test_pane();
+        let pre_rect = computed.rect;
+        let mut stub = StubPty::new(PaneLayerId(1));
+        stub.fail_next_resize(PtyError::InvalidSize(132, 0));
+        let mut runner =
+            PaneRunner::with_pty_for_test(computed, PaneLayerId(1), Box::new(stub), None);
+        let result = runner.resize(132, 50);
+        assert!(
+            matches!(result, Err(PtyError::InvalidSize(132, 0))),
+            "resize must propagate PtyError::InvalidSize unchanged; got {:?}",
+            result
+        );
+        assert_eq!(
+            runner.computed().rect,
+            pre_rect,
+            "resize failure must leave self.computed.rect unchanged"
+        );
+    }
+
+    /// Symmetric success-path pin: when `pty.resize` returns
+    /// `Ok(())`, `self.computed.rect` MUST be overwritten with
+    /// `(0, 0, cols, rows)`. Pins ordering correctness from the
+    /// success side (without this, a regression in the `rect`
+    /// assignment line itself could go undetected). The pre-state
+    /// is also locked to the canonical layout-computed root
+    /// fixture `(0, 0, 80, 24)` so a future layout-engine change
+    /// that shifts the root dims fails this test BEFORE the
+    /// success-path assertion even runs.
+    #[test]
+    fn resize_success_overwrites_rect() {
+        let computed = make_test_pane();
+        let pre_rect = computed.rect;
+        assert_eq!(
+            pre_rect,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24
+            },
+            "fixture invariant: pre_rect is the layout-computed root (0,0,80,24)"
+        );
+        let stub = StubPty::new(PaneLayerId(2));
+        let mut runner =
+            PaneRunner::with_pty_for_test(computed, PaneLayerId(2), Box::new(stub), None);
+        let result = runner.resize(132, 50);
+        assert!(matches!(result, Ok(())));
+        assert_eq!(
+            runner.computed().rect,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 132,
+                h: 50
+            },
+            "resize success must overwrite self.computed.rect"
+        );
     }
 }

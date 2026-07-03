@@ -886,6 +886,55 @@ impl PanePty {
     }
 }
 
+/// Trait abstracting the [`PanePty`] API surface for mockability.
+/// Introduced so [`cmdash::pane::PaneRunner::resize`]'s
+/// `?`-propagation invariant (a failed `pty.resize` does not
+/// touch `self.computed.rect`) is testable with a stub. Mirrors
+/// AGENTS.md §"every invariant needs a regression test."
+///
+/// v1 narrows the surface to the seven methods `PaneRunner`
+/// actually calls; future `PanePty` additions get layered onto
+/// this trait deliberately so the abstraction doesn't drift.
+pub trait PanePtyOps {
+    fn layer_id(&self) -> PaneLayerId;
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<(), PtyError>;
+    fn write(&mut self, bytes: &[u8]) -> Result<usize, PtyError>;
+    fn advance(&mut self, bytes: &[u8]) -> Result<(), PtyError>;
+    fn snapshot(&mut self) -> PaneTerminalState;
+    fn try_wait(&mut self) -> Result<Option<i32>, PtyError>;
+    fn kill(&mut self) -> Result<(), PtyError>;
+}
+
+/// Production impl behind the trait. Uses UFCS (`PanePty::resize`) so
+/// dispatch is load-bearing-explicit, not reliant on Rust's
+/// inherent-over-trait method-resolution rule. Future maintainers
+/// adding a trait method with the same name as an inherent
+/// method on `PanePty` will see the call site fail to compile
+/// instead of silently picking the wrong body.
+impl PanePtyOps for PanePty {
+    fn layer_id(&self) -> PaneLayerId {
+        PanePty::layer_id(self)
+    }
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<(), PtyError> {
+        PanePty::resize(self, cols, rows)
+    }
+    fn write(&mut self, bytes: &[u8]) -> Result<usize, PtyError> {
+        PanePty::write(self, bytes)
+    }
+    fn advance(&mut self, bytes: &[u8]) -> Result<(), PtyError> {
+        PanePty::advance(self, bytes)
+    }
+    fn snapshot(&mut self) -> PaneTerminalState {
+        PanePty::snapshot(self)
+    }
+    fn try_wait(&mut self) -> Result<Option<i32>, PtyError> {
+        PanePty::try_wait(self)
+    }
+    fn kill(&mut self) -> Result<(), PtyError> {
+        PanePty::kill(self)
+    }
+}
+
 fn build_command(shell: ShellSpec) -> CommandBuilder {
     let (program, args): (String, Vec<String>) = match shell {
         ShellSpec::LoginShell => {
