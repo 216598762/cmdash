@@ -222,6 +222,67 @@ fn layout_stack_divides_height_three_panes() {
     assert_eq!(lyt.panes[2].rect.y, 16);
 }
 
+/// `stack { ... }` is described by AGENTS.md as a "tabbed viewer"
+/// but cmdash-layout v1 implements it as an equal-height
+/// VERTICAL STRIP-STACK: one pane per child, each occupying a
+/// slice of the parent's height. This test pins that v1
+/// contract so a future refactor that *does* collapse multiple
+/// stack children into one tabbed pane is an intentional change,
+/// not a silent regression. (Existing tests in this file
+/// describe how stacks divide height; this one adds the
+/// "NOT collapsed" framing -- the explicit guard against the
+/// tabbed-viewer reading of AGENTS.md.)
+#[test]
+fn stack_emits_one_pane_per_child_in_v1() {
+    let cfg = parse(
+        r#"layout {
+            stack {
+                pane kind=shell label="a"
+                pane kind=shell label="b"
+            }
+        }"#,
+    )
+    .unwrap();
+    let root = cfg.layout.unwrap();
+    let lyt = ComputedLayout::compute(
+        &root,
+        Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        },
+    )
+    .unwrap();
+    // Two children -> two panes (NOT one "tabbed viewer" pane).
+    assert_eq!(
+        lyt.panes.len(),
+        2,
+        "v1 stack emits one pane per child (strip-stack), NOT a single tabbed viewer pane; v2 may genuinely collapse siblings into one tab"
+    );
+    assert_eq!(lyt.panes[0].label.as_deref(), Some("a"));
+    assert_eq!(lyt.panes[1].label.as_deref(), Some("b"));
+    // Vertical strips tile the area exactly.
+    assert_eq!(
+        lyt.panes[0].rect,
+        Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 12
+        }
+    );
+    assert_eq!(
+        lyt.panes[1].rect,
+        Rect {
+            x: 0,
+            y: 12,
+            w: 80,
+            h: 12
+        }
+    );
+}
+
 #[test]
 fn layout_paneid_stable_across_resizes() {
     let cfg = parse(
