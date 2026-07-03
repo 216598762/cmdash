@@ -200,6 +200,15 @@ pub enum KeyAction {
     /// ZStack member has no geometrically-below neighbour.
     /// Phase 4 carry-forward.
     PaneStackDown,
+    /// `pane.stack.up` - mirror of `pane.stack.down`: focus
+    /// the **previous** member of the focused ZStack in
+    /// declaration order; if the focused pane is the first
+    /// (bottom) member, hand focus off to the topmost pane
+    /// geometrically above the ZStack via [`adjacent_pane`].
+    /// No-op if the focused pane is not a ZStack member, or
+    /// if the focused ZStack member has no geometrically-above
+    /// neighbour. Phase 4 carry-forward.
+    PaneStackUp,
     /// `pane.preset.<name>` - focus a named preset.
     PanePreset(String),
 }
@@ -557,9 +566,12 @@ fn parse_action(s: &str) -> Option<KeyAction> {
         // forward with wrap-around; `pane.stack.down` is the
         // directional within-ZStack Down with a bottom-edge
         // geometric handoff to the topmost pane below the
+        // ZStack; `pane.stack.up` mirrors Down with a top-edge
+        // geometric handoff to the topmost pane above the
         // ZStack.
         "pane.stack.cycle" => Some(KeyAction::PaneStackCycle),
         "pane.stack.down" => Some(KeyAction::PaneStackDown),
+        "pane.stack.up" => Some(KeyAction::PaneStackUp),
         "pane.preset" => Some(KeyAction::PanePreset(String::new())),
         other => other
             .strip_prefix("pane.preset.")
