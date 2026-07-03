@@ -104,6 +104,10 @@ version = "0.1.0"
 [[package]]
 name = "cmdash-layout"
 version = "0.1.0"
+dependencies = [
+ "cmdash-config",
+ "thiserror",
+]
 
 [[package]]
 name = "cmdash-protocol"

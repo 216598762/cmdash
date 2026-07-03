@@ -7,3 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+
+[dependencies]
+cmdash-config = { path = "../cmdash-config" }
+thiserror = "2.0.18"
