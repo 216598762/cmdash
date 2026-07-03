@@ -67,7 +67,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let layout = ComputedLayout::compute(layout_root, total)?;
     info!(panes = layout.panes.len(), "layout resolved");
 
-    let mut graphics = GraphicsState::new(Metrics::default(), (total.w, total.h));
+    let graphics = GraphicsState::new(Metrics::default(), (total.w, total.h));
 
     // PaneRunner::Drop sends its `PaneLayerId` into this channel;
     // tick_loop drains it at the start of phase 1 to call
@@ -100,23 +100,26 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     drop(close_tx);
 
     let bindings = Router::new(cfg.keybinds);
-    let mut focus: usize = 0;
-    let mut running = true;
+    // `focus` and `running` are MOVED into `TickContext` below; they
+    // are never mutated locally. `guard` and `ctx` stay `mut` because
+    // `guard.as_mut()` and `ctx.run()` both take `&mut self`, and
+    // `runners` is `mut` because the spawn loop calls `runners.push(r)`.
+    let focus: usize = 0;
+    let running = true;
 
     let mut guard = TerminalGuard::enter()?;
     let tick = Duration::from_millis(33);
-    let result = tick_loop(
-        &mut runners,
-        &bindings,
-        &mut focus,
-        &mut running,
-        &close_rx,
-        &mut graphics,
-        guard.as_mut(),
+    let mut ctx = TickContext {
+        runners,
+        bindings,
+        focus,
+        running,
+        close_rx,
+        graphics,
+        terminal: guard.as_mut(),
         tick,
-    );
-    drop(guard);
-    result
+    };
+    ctx.run()
 }
 
 /// Concrete backend alias used by [`TerminalGuard`] and the
@@ -127,7 +130,7 @@ type CmdashBackend = ratatui::backend::CrosstermBackend<std::io::Stdout>;
 /// Owns a `Terminal<CmdashBackend>` whose setup (raw mode +
 /// alternate screen + mouse capture) is reverted by [`Drop`] on
 /// error or normal return. Without this guard, an early `?` in
-/// the setup between `enable_raw_mode()` and `tick_loop()`
+/// the setup between `enable_raw_mode()` and the `run()` loop
 /// would strand the user in the alternate screen.
 ///
 /// Pinned to [`CmdashBackend`] (rather than generic over
@@ -181,102 +184,142 @@ impl Drop for TerminalGuard {
     }
 }
 
-// `tick_loop` carries one argument per phase of the AGENTS.md
-// rendering pipeline (input/drain/snapshot/render/emit/sleep)
-// plus the per-tick pacing knob. Bundling into a context struct
-// is a v2-only cleanup — for v1 we silence the lint narrowly.
-//
-// AGENTS.md §"Rendering pipeline (one frame)" enumerates the
-// six phases; each consumes at most one of these params, so
-// the parameter list itself documents the pipeline.
-#[allow(clippy::too_many_arguments)]
-fn tick_loop<B: ratatui::backend::Backend>(
-    runners: &mut Vec<PaneRunner>,
-    bindings: &Router,
-    focus: &mut usize,
-    running: &mut bool,
-    close_rx: &Receiver<cmdash_pty::PaneLayerId>,
-    graphics: &mut GraphicsState,
-    terminal: &mut Terminal<B>,
+/// Pivot struct for one tick of the AGENTS.md rendering pipeline.
+///
+/// Bundles the eight per-frame arguments of the prior free
+/// function `tick_loop` into one struct so `cmdash::run` calls
+/// `TickContext::run` as a single-shot pipeline call instead of
+/// threading individual references through a 7-argument
+/// function (which tripped `clippy::too_many_arguments`).
+///
+/// All fields are **owned** except `terminal`, which is borrowed
+/// from a surrounding [`TerminalGuard`] whose `Drop` reverts the
+/// alt-screen and mouse-capture on exit. The other seven are
+/// owned because `cmdash::run` builds the struct once and
+/// runs the loop to completion — there is no caller that needs
+/// post-loop access to the runners, graphics, or bindings.
+///
+/// AGENTS.md §"Rendering pipeline (one frame)" enumerates the
+/// six tick phases (input, drain, snapshot, event route,
+/// ratatui draw, dashcompositor emit, sleep). The field names
+/// mirror those phases: `runners` + `bindings` + `focus` +
+/// `running` are phase 0/1/2 inputs; `close_rx` + `graphics` +
+/// `tick` are phase 1/2/3b/4 resources; `terminal` is phase 3a.
+struct TickContext<'a, B: ratatui::backend::Backend> {
+    /// All live panes (phase 0 input + phase 3a layout source).
+    runners: Vec<PaneRunner>,
+    /// Crossterm keybind router (phase 0 input).
+    bindings: Router,
+    /// Focused-pane index (phase 0/2 focus tracking).
+    focus: usize,
+    /// Set to `false` by an action handler to quit the loop.
+    running: bool,
+    /// MPSC receiver of `PaneRunner::Drop` close notifications;
+    /// drained at the start of phase 1.
+    close_rx: Receiver<cmdash_pty::PaneLayerId>,
+    /// dashcompositor layer book-keeping (phase 1 revoke +
+    /// phase 2/3b update).
+    graphics: GraphicsState,
+    /// ratatui terminal borrowed from a [`TerminalGuard`]; the
+    /// guard's `Drop` reverts alt-screen + mouse-capture on
+    /// exit, so the borrow lifetime is tied to the guard.
+    terminal: &'a mut Terminal<B>,
+    /// Per-tick pacing knob (phase 4 sleep duration).
     tick: Duration,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    loop {
-        // Phase 0: drain input events. Non-blocking; bound by
-        // `event::poll(Duration::from_millis(0))`. Each Press event
-        // is either routed through `Router::dispatch_crossterm` or
-        // forwarded as bytes to the focused pane.
-        input_phase(runners, bindings, focus, running)?;
-        if !*running {
-            return Ok(());
-        }
+}
 
-        // Phase 1: drain close-channel (Drop messages) FIRST so
-        // their revisions are visible before phase 2/3 in the
-        // same tick. Then poll exits + tick + snapshot.
-        while let Ok(id) = close_rx.try_recv() {
-            graphics.close_pane(id);
-        }
-        let mut snapshots: Vec<Option<cmdash_pty::PaneTerminalState>> =
-            Vec::with_capacity(runners.len());
-        let mut all_exited = true;
-        for runner in runners.iter_mut() {
-            match runner.try_wait_exit()? {
-                Some(_code) => {
-                    debug!(layer_id = ?runner.layer_id(), "pane exited");
-                }
-                None => {
-                    all_exited = false;
-                }
+impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
+    /// Drive the AGENTS.md rendering pipeline until `running`
+    /// flips `false` or every pane exits. The loop body is the
+    /// same logic that lived in the prior free `tick_loop`
+    /// function; bundling it on this struct lets `cmdash::run`
+    /// invoke it as a one-shot `ctx.run()`.
+    fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            // Phase 0: drain input events. Non-blocking; bound by
+            // `event::poll(Duration::from_millis(0))`. Each Press
+            // event is either routed through
+            // `Router::dispatch_crossterm` or forwarded as bytes
+            // to the focused pane.
+            input_phase(
+                &mut self.runners,
+                &self.bindings,
+                &mut self.focus,
+                &mut self.running,
+            )?;
+            if !self.running {
+                return Ok(());
             }
-            snapshots.push(Some(runner.tick()?));
-        }
 
-        // Phase 2: route events. Kitty graphics emitted by a
-        // nested PTY are pushed onto the per-pane image map;
-        // everything else is logged. Failures log+continue (a
-        // busted image must not bring the multiplexer down).
-        for (runner, snap) in runners.iter().zip(snapshots.iter()) {
-            if let Some(snap) = snap {
-                for ev in &snap.pending_events {
-                    if let PaneEvent::KittyGraphic { cmd } = ev {
-                        graphics.apply_kitty_event(runner.layer_id(), cmd);
+            // Phase 1: drain the close-channel (Drop messages)
+            // FIRST so their revisions are visible before phase 2/3
+            // in the same tick. Then poll exits + tick + snapshot.
+            while let Ok(id) = self.close_rx.try_recv() {
+                self.graphics.close_pane(id);
+            }
+            let mut snapshots: Vec<Option<cmdash_pty::PaneTerminalState>> =
+                Vec::with_capacity(self.runners.len());
+            let mut all_exited = true;
+            for runner in self.runners.iter_mut() {
+                match runner.try_wait_exit()? {
+                    Some(_code) => {
+                        debug!(layer_id = ?runner.layer_id(), "pane exited");
+                    }
+                    None => {
+                        all_exited = false;
+                    }
+                }
+                snapshots.push(Some(runner.tick()?));
+            }
+
+            // Phase 2: route events -> graphics. Kitty graphics
+            // emitted by a nested PTY are pushed onto the per-pane
+            // image map; everything else is logged. Failures
+            // log + continue (a busted image must not bring the
+            // multiplexer down).
+            for (runner, snap) in self.runners.iter().zip(snapshots.iter()) {
+                if let Some(snap) = snap {
+                    for ev in &snap.pending_events {
+                        if let PaneEvent::KittyGraphic { cmd } = ev {
+                            self.graphics.apply_kitty_event(runner.layer_id(), cmd);
+                        }
                     }
                 }
             }
-        }
 
-        // Phase 3a: render the cell body through ratatui.
-        terminal.draw(|frame| {
-            let buf = frame.buffer_mut();
-            for (runner, snap) in runners.iter().zip(snapshots.iter()) {
-                let area = ratatui::layout::Rect::new(
-                    runner.computed.rect.x,
-                    runner.computed.rect.y,
-                    runner.computed.rect.w,
-                    runner.computed.rect.h,
-                );
-                if let Some(snap) = snap {
-                    blit_grid(&snap.grid, buf, area);
-                    blit_cursor(&snap.grid, buf, area);
+            // Phase 3a: render the cell body through ratatui.
+            self.terminal.draw(|frame| {
+                let buf = frame.buffer_mut();
+                for (runner, snap) in self.runners.iter().zip(snapshots.iter()) {
+                    let area = ratatui::layout::Rect::new(
+                        runner.computed.rect.x,
+                        runner.computed.rect.y,
+                        runner.computed.rect.w,
+                        runner.computed.rect.h,
+                    );
+                    if let Some(snap) = snap {
+                        blit_grid(&snap.grid, buf, area);
+                        blit_cursor(&snap.grid, buf, area);
+                    }
                 }
+            })?;
+
+            // Phase 3b: emit dashcompositor kitty graphics through
+            // a fresh stdout handle. The terminal's own backend
+            // already finished writing row-bearing text; kitty
+            // escapes overlay on kitty-capable hosts and degrade
+            // gracefully elsewhere. AGENTS.md §"Rendering
+            // pipeline" step 6 prescribes this exact path.
+            let mut stdout = std::io::stdout();
+            if let Err(e) = self.graphics.render_and_write(&mut stdout) {
+                warn!(error = %e, "graphics emit failed");
             }
-        })?;
 
-        // Phase 3b: emit dashcompositor kitty graphics through a
-        // fresh stdout handle. The terminal's own backend already
-        // finished writing row-bearing text; kitty escapes overlay
-        // on kitty-capable hosts and degrade gracefully elsewhere.
-        // AGENTS.md §"Rendering pipeline" step 6 prescribes this
-        // exact path.
-        let mut stdout = std::io::stdout();
-        if let Err(e) = graphics.render_and_write(&mut stdout) {
-            warn!(error = %e, "graphics emit failed");
+            if all_exited {
+                return Ok(());
+            }
+            std::thread::sleep(self.tick);
         }
-
-        if all_exited {
-            return Ok(());
-        }
-        std::thread::sleep(tick);
     }
 }
 
@@ -358,10 +401,10 @@ fn apply_action(
         // v1 implements PaneClose here: remove the focused
         // runner from the Vec, which fires `PaneRunner::Drop`
         // and routes the pane's `PaneLayerId` into the close
-        // channel. tick_loop phase 1 drains that channel and
-        // calls `GraphicsState::close_pane`, satisfying
-        // AGENTS.md §"Hard rule: one layer per instance".
-        // Closing the last pane quits the binary
+        // channel. TickContext::run drains that channel in
+        // phase 1 and calls `GraphicsState::close_pane`,
+        // satisfying AGENTS.md §"Hard rule: one layer per
+        // instance". Closing the last pane quits the binary
         // (`*running = false`); the focus index is clamped to
         // the new last entry when the tail was removed so the
         // next PTY-write-input path can't index out of bounds.
@@ -600,7 +643,7 @@ mod input_tests {
             .expect("PaneRunner::Drop must enqueue the closing pane's layer id");
         assert_eq!(received, dropped_layer_id);
 
-        // 4) Simulating tick_loop phase 1 -- drain + close_pane
+        // 4) Simulating phase 1 -- drain + close_pane
         //    -- revokes the dashcompositor image registration.
         graphics.close_pane(received);
         assert!(!graphics.has_image(dropped_layer_id, 1));
