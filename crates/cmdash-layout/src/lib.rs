@@ -516,10 +516,39 @@ pub fn remove_leaf(root: &mut LayoutNode, path: &[u16]) -> Result<(), LayoutErro
     Ok(())
 }
 
-/// Walk an immutable `&` chain of children at `path` into the tree,
-/// returning the node at `path`. Returns [`LayoutError::SplitChildCount`]
-/// on a path that requests a child index some non-Split/Stack node
-/// has, or out-of-range.
+/// Walk an immutable `&` chain of children at `path` into the
+/// tree, returning the node at `path`. Returns
+/// [`LayoutError::SplitChildCount`] on a path that requests a
+/// child index some non-Split/Stack node has, or out-of-range.
+///
+/// # Path semantics
+///
+/// Naming is a frequently-stepped trapdoor. `path` is the
+/// **child-index-only** form -- not the raw `PaneId.path()`,
+/// which carries a seed `[0]` internally. Live callers in the
+/// `cmdash` binary pre-strip that seed before invoking this
+/// helper, so `path` here is the array of child indices from the
+/// root down (e.g., `[0, 1]` for the second child of the first
+/// child). Specifically:
+///
+/// - `path` is empty (`&[]`): returns `Ok(root)` verbatim.
+/// - Out-of-range child index: `Err(SplitChildCount { got: idx })`.
+/// - Walking past a leaf (`LayoutNode::Pane` /
+///   `LayoutNode::Preset`): `Err(SplitChildCount { got: 1 })`.
+///
+/// Callers that want a soft-fail `Option` apply `.ok()` (or
+/// `.ok()?` if they already short-circuit on `None`); the
+/// `cmdash` binary uses this pattern at its 4 inline callsites
+/// (`focused_zstack_context` / `handle_stack_cycle` /
+/// `handle_stack_down` / `handle_stack_up`).
+///
+/// The path-traversal contract is pinned by the unit tests
+/// `replace_leaf_with_split_preserves_original_pre_order` (asserts
+/// pre-order invariance under a walk-plus-Split) and
+/// `remove_leaf_collapses_top_level_split` (asserts a 3-level
+/// nested walk through Split-of-Split). Treat those as the
+/// load-bearing ground truth for callers doing layout mutation
+/// on top of [`LayoutNode`].
 pub fn walk_imut<'a>(
     root: &'a LayoutNode,
     path: &[u16],
