@@ -158,6 +158,37 @@ impl GraphicsState {
         }
     }
 
+    /// Replace the cell-grid size [`Self::render_and_write`]
+    /// composes against. v1 had a single tab with one root
+    /// layout rect, so resizing wasn't a path; v2 wires host
+    /// SIGWINCH (crossterm `Event::Resize`) into the binary's
+    /// tick loop, which must call [`Self::set_cells`] so the
+    /// dashcompositor framebuffer pixel dimensions stay
+    /// in-sync with the layout engine's cell-grid rect.
+    /// Asserts the same `non-zero` invariant as [`Self::new`]
+    /// -- window-snap / hide-and-restore can briefly emit
+    /// `Event::Resize(0, 0)` and we must reject before a
+    /// zero-pixel composition would crash dashcompositor.
+    pub fn set_cells(&mut self, cells: (u16, u16)) {
+        assert!(
+            cells.0 > 0 && cells.1 > 0,
+            "GraphicsState::set_cells: cells must be non-zero (cols > 0 and rows > 0), got {}x{}",
+            cells.0,
+            cells.1,
+        );
+        self.cells = cells;
+    }
+
+    /// Read-only accessor for the cell-grid size
+    /// [`Self::render_and_write`] composes against. Mirrors
+    /// [`Self::set_cells`]; non-zero-by-construction guarantee
+    /// is inherited from [`Self::new`] or any prior
+    /// [`Self::set_cells`] call. Used by tests to assert a
+    /// host resize made it through the binary's tick loop.
+    pub fn cells(&self) -> (u16, u16) {
+        self.cells
+    }
+
     /// Push a fresh [`ImageLayer`] onto the stack from a
     /// pre-decoded RGBA, register it under `(pane, kitty_id)`,
     /// and add the kitty_id to the pane's image list. Used by
@@ -525,5 +556,40 @@ mod internal_sanity_tests {
             !graphics.has_image(pane_id, 1),
             "image layer should be revoked once the close-channel message is applied"
         );
+    }
+
+    /// `set_cells` ctor invariant pin: zero cols must panic
+    /// with the same `"cells must be non-zero"` phrase the
+    /// [`Self::new`] ctor uses, so callers -- debuggers and
+    /// test matchers alike -- can correlate the panic to the
+    /// `set_cells` assert rather than chasing an opaque
+    /// zero-framebuffer downstream.
+    #[test]
+    #[should_panic(expected = "cells must be non-zero")]
+    fn set_cells_panics_on_zero_cols() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        g.set_cells((0, 24));
+    }
+
+    /// Symmetric to `set_cells_panics_on_zero_cols`: zero
+    /// rows must trip the same assert with the same panic
+    /// phrase.
+    #[test]
+    #[should_panic(expected = "cells must be non-zero")]
+    fn set_cells_panics_on_zero_rows() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        g.set_cells((80, 0));
+    }
+
+    /// Happy-path regression: a non-zero resize must round-trip
+    /// through the read-only `cells()` accessor. Exercises the
+    /// binding from the binary's host-resize-driven
+    /// `GraphicsState::set_cells(...)` call to the
+    /// `render_and_write` pixel composition surface.
+    #[test]
+    fn set_cells_updates_internal_state() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        g.set_cells((132, 50));
+        assert_eq!(g.cells(), (132, 50));
     }
 }

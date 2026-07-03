@@ -9,6 +9,24 @@
 //! as raw bytes to the focused pane's PTY via
 //! `PaneRunner::write_input`.
 //!
+//! ## Host SIGWINCH (crossterm `Event::Resize`) wiring
+//!
+//! v2 lifts the v1 hardcoded `DEFAULT_AREA_*(80, 24)` initial
+//! cell-grid area to the host terminal's actual size, queried
+//! via `crossterm::terminal::size()` at `cmdash::run` entry. A
+//! subsequent resize signal is delivered to the binary's tick
+//! loop as `Event::Resize(w, h)`; `handle_event` writes the
+//! coalesced value into `TickContext::pending_resize`, and the
+//! `tick_loop` drains it at the top of each tick to call
+//! `TickContext::relayout(w, h)`, which
+//!
+//! 1. recomputes `ComputedLayout::compute` against `(w, h)`,
+//! 2. per-pane calls `PaneRunner::resize(pane.rect)` (v2's
+//!    full-rect signature carries the layout-engine `(x, y)`
+//!    origin forward into the cached cell-grid rect), and
+//! 3. propagates the new dimensions to `GraphicsState::set_cells`
+//!    so the dashcompositor framebuffer stays in-sync.
+//!
 //! ## Pane drop → dashcompositor teardown
 //!
 //! Each `PaneRunner::Drop` sends its `PaneLayerId` into a
@@ -25,16 +43,13 @@ use std::time::Duration;
 use cmdash::graphics::{GraphicsState, Metrics};
 use cmdash::pane::{PaneCloseTx, PaneRunner};
 use cmdash::render::{blit_cursor, blit_grid};
-use cmdash_config::{parse as parse_config, KeyAction};
+use cmdash_config::{parse as parse_config, KeyAction, LayoutNode};
 use cmdash_keybinds::Router;
 use cmdash_layout::{ComputedLayout, Rect as LayoutRect};
 use cmdash_pty::{PaneEvent, ShellSpec};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::Terminal;
 use tracing::{debug, info, warn};
-
-const DEFAULT_AREA_COLS: u16 = 80;
-const DEFAULT_AREA_ROWS: u16 = 24;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -54,18 +69,59 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg_text = include_str!("../config.kdl");
     let cfg = parse_config(cfg_text)?;
-    let layout_root = cfg
+    // Move `cfg.layout` out of `cfg` (Option<LayoutNode>) so the
+    // layout tree can be moved into `TickContext::new` at the
+    // bottom of this function and reused on every host-driven
+    // resize. `cfg.keybinds` is still consumed directly further
+    // down. AGENTS.md §"PaneId stability" — moving the tree by
+    // value does not alter its pre-order leaf numbering, so the
+    // layout engine produces the same `cmdash_layout::PaneId`
+    // values before and after.
+    let layout_root: LayoutNode = cfg
         .layout
-        .as_ref()
-        .ok_or("config.kdl missing `layout { ... }` block")?;
-    let total = LayoutRect {
-        x: 0,
-        y: 0,
-        w: DEFAULT_AREA_COLS,
-        h: DEFAULT_AREA_ROWS,
+        .ok_or_else(|| "config.kdl missing `layout { ... }` block".to_string())?;
+
+    // Source the initial cell-grid area from the live host
+    // terminal, NOT a hardcoded default. A real SIGWINCH
+    // signal later (crossterm `Event::Resize`) drives the
+    // tick-loop's `TickContext::relayout(...)` helper. The
+    // fallback below covers only non-TTY CI / window-snap
+    // / hide-and-restore zero-area transients.
+    let host_size = crossterm::terminal::size();
+    let total = match host_size {
+        Ok((0, _)) | Ok((_, 0)) => {
+            warn!(
+                raw = ?host_size,
+                "host terminal reports zero-area; defaulting to 80x24"
+            );
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            }
+        }
+        Ok((w, h)) => LayoutRect { x: 0, y: 0, w, h },
+        Err(e) => {
+            warn!(
+                error = %e,
+                "crossterm::terminal::size failed; defaulting to 80x24"
+            );
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            }
+        }
     };
-    let layout = ComputedLayout::compute(layout_root, total)?;
-    info!(panes = layout.panes.len(), "layout resolved");
+    let layout = ComputedLayout::compute(&layout_root, total)?;
+    info!(
+        panes = layout.panes.len(),
+        cols = total.w,
+        rows = total.h,
+        "layout resolved"
+    );
 
     let graphics = GraphicsState::new(Metrics::default(), (total.w, total.h));
 
@@ -119,6 +175,8 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         graphics,
         guard.as_mut(),
         tick,
+        layout_root,
+        None,
     );
     ctx.run()
 }
@@ -187,15 +245,15 @@ impl Drop for TerminalGuard {
 
 /// Pivot struct for one tick of the AGENTS.md rendering pipeline.
 ///
-/// Bundles the eight per-frame arguments of the prior free
+/// Bundles the ten per-frame arguments of the prior free
 /// function `tick_loop` into one struct so `cmdash::run` calls
 /// `TickContext::run` as a single-shot pipeline call instead of
-/// threading individual references through a 7-argument
+/// threading individual references through a 9-argument
 /// function (which tripped `clippy::too_many_arguments`).
 ///
 /// All fields are **owned** except `terminal`, which is borrowed
 /// from a surrounding [`TerminalGuard`] whose `Drop` reverts the
-/// alt-screen and mouse-capture on exit. The other seven are
+/// alt-screen and mouse-capture on exit. The other nine are
 /// owned because `cmdash::run` builds the struct once and
 /// runs the loop to completion — there is no caller that needs
 /// post-loop access to the runners, graphics, or bindings.
@@ -205,7 +263,9 @@ impl Drop for TerminalGuard {
 /// ratatui draw, dashcompositor emit, sleep). The field names
 /// mirror those phases: `runners` + `bindings` + `focus` +
 /// `running` are phase 0/1/2 inputs; `close_rx` + `graphics` +
-/// `tick` are phase 1/2/3b/4 resources; `terminal` is phase 3a.
+/// `tick` are phase 1/2/3b/4 resources; `terminal` is phase 3a;
+/// `layout_root` + `pending_resize` drive phase 0.5 (host
+/// SIGWINCH relayout).
 struct TickContext<'a, B: ratatui::backend::Backend> {
     /// All live panes (phase 0 input + phase 3a layout source).
     runners: Vec<PaneRunner>,
@@ -227,18 +287,34 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     terminal: &'a mut Terminal<B>,
     /// Per-tick pacing knob (phase 4 sleep duration).
     tick: Duration,
+    /// Owned copy of the KDL layout tree, consumed by
+    /// [`ComputedLayout::compute`] on every host-driven resize.
+    /// Held by value so [`Self::relayout`] does not need to
+    /// borrow from `cmdash::run`'s stack after construction.
+    /// AGENTS.md §"PaneId stability" — moving the tree by value
+    /// does not shift pre-order leaf numbering, so the layout
+    /// engine produces the same `cmdash_layout::PaneId`
+    /// values before and after a relayout.
+    layout_root: LayoutNode,
+    /// Coalesced (cols, rows) of the most recent crossterm
+    /// `Event::Resize`. Empty during normal ticks; consumed
+    /// (via `take()`) at the start of phase 0.5 so successive
+    /// resize signals naturally coalesce — only the LATEST
+    /// (cols, rows) reaches [`Self::relayout`] this tick.
+    pending_resize: Option<(u16, u16)>,
 }
 
 impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
-    /// Construct a [`TickContext`] from the eight per-frame
+    /// Construct a [`TickContext`] from the ten per-frame
     /// building blocks (runners + bindings + focus-and-running +
-    /// close_rx + graphics + borrowed terminal + tick).
-    /// Enforces `focus < runners.len()` so the
-    /// `runners.get_mut(*focus)` write-input path inside
-    /// [`Self::run`] cannot index out of bounds; the
-    /// `apply_action::PaneClose` arm restores this invariant
-    /// after a tail-remove by clamping focus to `len() - 1`.
-    // The 8-arg ctor is the most central tenant of the AGENTS.md
+    /// close_rx + graphics + borrowed terminal + tick +
+    /// layout_root + pending_resize). Enforces `focus <
+    /// runners.len()` so the `runners.get_mut(*focus)`
+    /// write-input path inside [`Self::run`] cannot index out
+    /// of bounds; the `apply_action::PaneClose` arm restores
+    /// this invariant after a tail-remove by clamping focus to
+    /// `len() - 1`.
+    // The 10-arg ctor is the most central tenant of the AGENTS.md
     // "minimal API surface" rule -- it mirrors the eight struct
     // fields one-to-one, so introducing a shadow `TickContextInit`
     // sub-struct would just create a second type that has to be
@@ -254,6 +330,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         graphics: GraphicsState,
         terminal: &'a mut Terminal<B>,
         tick: Duration,
+        layout_root: LayoutNode,
+        pending_resize: Option<(u16, u16)>,
     ) -> Self {
         assert!(
             focus < runners.len(),
@@ -269,6 +347,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             graphics,
             terminal,
             tick,
+            layout_root,
+            pending_resize,
         }
     }
 
@@ -284,6 +364,90 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         self.focus
     }
 
+    /// Recompute the layout against `(w, h)` and resize every
+    /// live [`PaneRunner`] to its new cell-grid rect. Driven
+    /// from the top of `tick_loop` whenever
+    /// [`Self::pending_resize`] is non-empty. Idempotent for
+    /// repeated calls with the same `(w, h)`.
+    ///
+    /// **Pairing invariant.** `runners[i]` and `layout.panes[i]`
+    /// share the same `cmdash_layout::PaneId` because
+    /// [`ComputedLayout::compute`] against the same KDL tree
+    /// yields the same pre-order leaf numbering (AGENTS.md
+    /// §"PaneId stability"). The defensive `assert_eq!` in
+    /// the per-pair loop surfaces a future regression that
+    /// breaks the index alignment (e.g. someone introduces a
+    /// v2 hot-swap that mutates runner order without
+    /// compensating in layout).
+    ///
+    /// **Failure tolerance.** A single pane's `runner.resize`
+    /// error is logged via `tracing::warn!` and the loop
+    /// continues for siblings — a misbehaved PTY child must
+    /// not bring the multiplexer down. An infrequent
+    /// LayoutError or a runner-count mismatch also logs
+    /// without escalating — the next tick's resize signal will
+    /// have a fresh chance to succeed.
+    pub fn relayout(&mut self, w: u16, h: u16) {
+        // Zero-area safeguard before any side effect: a live
+        // SIGWINCH that round-trips through `(0, 0)` (a window
+        // snap or hide-and-restore on GNOME / KDE / macOS
+        // minimize-restore) would otherwise panic through
+        // `GraphicsState::set_cells`'s `assert!(cells.0 > 0 &&
+        // cells.1 > 0)`. `cmdash::run`'s startup `host_size`
+        // match already defaults to (80, 24) on the equivalent
+        // initial-frame transient; this branch extends the
+        // same protection to the dynamic per-tick path so the
+        // live binary can't crash on a defensive transient the
+        // host itself filters to (0, 0) only briefly.
+        //
+        // Early-return is preferred over "skip set_cells
+        // only" because `PanePty::resize(0, 0)` against a
+        // running child is itself a likely-Err path; keeping
+        // the panes at their last-known rects and letting the
+        // next non-zero SIGWINCH re-run the full path
+        // preserves the cell-grid -> browser-cache -> PTY
+        // triplet in lock-step rather than tearing it apart.
+        if w == 0 || h == 0 {
+            warn!(
+                w,
+                h, "relayout: zero-area resize signal; skipping layout refresh + set_cells"
+            );
+            return;
+        }
+        let total = LayoutRect { x: 0, y: 0, w, h };
+        let layout = match ComputedLayout::compute(&self.layout_root, total) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(error = ?e, w, h, "relayout: ComputedLayout::compute failed; skipping");
+                return;
+            }
+        };
+        if layout.panes.len() != self.runners.len() {
+            warn!(
+                live_runners = self.runners.len(),
+                computed_panes = layout.panes.len(),
+                "relayout: live runner count and computed pane count diverged; \
+                 skipping per-pane resize"
+            );
+            return;
+        }
+        for (runner, pane) in self.runners.iter_mut().zip(layout.panes.iter()) {
+            assert_eq!(
+                runner.computed().id,
+                pane.id,
+                "relayout: runners[i]/layout.panes[i] index pairing violated"
+            );
+            if let Err(e) = runner.resize(pane.rect) {
+                warn!(
+                    error = ?e,
+                    layer_id = ?runner.layer_id(),
+                    "relayout: pane resize failed; continuing for siblings"
+                );
+            }
+        }
+        self.graphics.set_cells((w, h));
+    }
+
     /// Drive the AGENTS.md rendering pipeline until `running`
     /// flips `false` or every pane exits. The loop body is the
     /// same logic that lived in the prior free `tick_loop`
@@ -295,15 +459,27 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             // `event::poll(Duration::from_millis(0))`. Each Press
             // event is either routed through
             // `Router::dispatch_crossterm` or forwarded as bytes
-            // to the focused pane.
+            // to the focused pane. `Event::Resize(w, h)` arms
+            // the `pending_resize` slot for phase 0.5 below.
             input_phase(
                 &mut self.runners,
                 &self.bindings,
                 &mut self.focus,
                 &mut self.running,
+                &mut self.pending_resize,
             )?;
             if !self.running {
                 return Ok(());
+            }
+
+            // Phase 0.5: host SIGWINCH coalescer. Drains the
+            // resize slot queued during phase 0 and runs
+            // `relayout(...)` BEFORE phase 1's drain, so a
+            // resize signal that arrived mid-tick produces a
+            // fresh per-pane rect in `self.runners[i].computed()` by
+            // the time phase 3a reads it.
+            if let Some((w, h)) = self.pending_resize.take() {
+                self.relayout(w, h);
             }
 
             // Phase 1: drain the close-channel (Drop messages)
@@ -389,18 +565,19 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
 
 /// Phase 0: drain any pending crossterm events and dispatch them
 /// — either to a keybind action or straight into the focused
-/// pane's PTY. Non-blocking; bounded by the caller's tick.
-/// Returns `Err` on crossterm I/O failures so the binary can stop
-/// cleanly.
+/// pane's PTY, OR schedule a host SIGWINCH relayout. Non-blocking;
+/// bounded by the caller's tick. Returns `Err` on crossterm I/O
+/// failures so the binary can stop cleanly.
 fn input_phase(
     runners: &mut Vec<PaneRunner>,
     bindings: &Router,
     focus: &mut usize,
     running: &mut bool,
+    pending_resize: &mut Option<(u16, u16)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     while event::poll(Duration::from_millis(0))? {
         let evt = event::read()?;
-        handle_event(&evt, bindings, focus, runners, running);
+        handle_event(&evt, bindings, focus, runners, running, pending_resize);
     }
     Ok(())
 }
@@ -411,9 +588,22 @@ fn handle_event(
     focus: &mut usize,
     runners: &mut Vec<PaneRunner>,
     running: &mut bool,
+    pending_resize: &mut Option<(u16, u16)>,
 ) {
     if let Some(action) = bindings.dispatch_crossterm(evt) {
         apply_action(action, focus, runners, running);
+        return;
+    }
+    // Host SIGWINCH (crossterm `Event::Resize`) — coalesce-on-
+    // overwrite so a rapid resize burst collapses to the LATEST
+    // (cols, rows) by the time the next tick reaches phase 0.5.
+    // This arm deliberately does NOT mutate `runners`; relayout
+    // happens at the top of the tick after this input drain so
+    // the cross-key close-channel invariant
+    // (`Drop::drop enqueues onto a live receiver`) is preserved
+    // for any pane drops that share the same tick.
+    if let Event::Resize(w, h) = evt {
+        *pending_resize = Some((*w, *h));
         return;
     }
     let Event::Key(KeyEvent {
@@ -541,14 +731,20 @@ fn event_to_bytes(code: KeyCode) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod input_tests {
-    //! Regression tests for the `KeyAction::PaneClose` wiring on
-    //! the focused `PaneRunner`. Drives `handle_event` with a
-    //! synthetic crossterm event so the keybind -> action ->
-    //! `Vec::remove` -> `Drop` -> close-channel path is exercised
-    //! without spinning up a real terminal.
+    //! Regression tests for the binary's `cmdash::run` tick-loop
+    //! surface. Drives `handle_event` with synthetic crossterm
+    //! events so the keybind -> action -> `Vec::remove` -> `Drop`
+    //! -> close-channel path is exercised without spinning up a
+    //! real terminal. The full live-binary tick path falls
+    //! outside this module's scope because it requires a real
+    //! `TerminalGuard`; the integration tests in
+    //! `crates/cmdash/tests/wiring_smoke.rs` exercise the
+    //! resize/relayout wiring end-to-end via real PTY
+    //! children.
     //!
-    //! The full path mirrors the live binary: a Ctrl-W keypress
-    //! is dispatched by `Router::dispatch_crossterm` to a
+    //! The keybind -> action -> `Vec::remove` -> `Drop` path
+    //! mirrors the live binary: a Ctrl-W keypress is dispatched
+    //! by `Router::dispatch_crossterm` to a
     //! `KeyAction::PaneClose`, `apply_action` removes the
     //! focused `PaneRunner` from the Vec, the dropped runner's
     //! `Drop::drop` enqueues its `PaneLayerId` on the
@@ -563,7 +759,10 @@ mod input_tests {
     // the binary's entrypoint; the library's `pane` module is
     // reached as `cmdash::pane`, never as `crate::pane` (which
     // would resolve to the binary's flat namespace).
-    use cmdash_config::{KeyAction, KeyToken, Keybind, Modifiers as CfgModifiers};
+    use cmdash_config::{
+        KeyAction, KeyToken, Keybind, LayoutNode, Modifiers as CfgModifiers, Pane as CfgPane,
+        PaneKind,
+    };
     use cmdash_keybinds::Router;
     use cmdash_layout::{ComputedLayout, Rect as LayoutRect};
     use cmdash_pty::{PaneLayerId, ShellSpec};
@@ -645,6 +844,17 @@ mod input_tests {
         })
     }
 
+    /// Build a single-leaf `LayoutNode` fixture for ctor-arg
+    /// tests that don't exercise the layout::compute path.
+    /// Keeping it tiny avoids hitting MAX_TREE_DEPTH on
+    /// out-of-band nesting during negative-test setup.
+    fn dummy_layout_root() -> LayoutNode {
+        LayoutNode::Pane(CfgPane {
+            kind: PaneKind::Shell,
+            label: None,
+        })
+    }
+
     /// Ctrl-W on a 2-pane Vec: Vec shrinks by one, the
     /// survivor is unmoved, the close-channel receives the
     /// dropped pane's `PaneLayerId`, and `graphics.close_pane`
@@ -688,6 +898,7 @@ mod input_tests {
             &mut focus,
             &mut runners,
             &mut running,
+            &mut None,
         );
 
         // 1) Vec shrank by one, the survivor is the original
@@ -745,6 +956,7 @@ mod input_tests {
             &mut focus,
             &mut runners,
             &mut running,
+            &mut None,
         );
 
         assert!(runners.is_empty());
@@ -801,6 +1013,7 @@ mod input_tests {
             &mut focus,
             &mut runners,
             &mut running,
+            &mut None,
         );
 
         assert_eq!(runners.len(), 2);
@@ -843,6 +1056,8 @@ mod input_tests {
             graphics,
             &mut terminal,
             std::time::Duration::from_millis(33),
+            dummy_layout_root(),
+            None,
         );
         drop(_close_tx);
     }
@@ -875,6 +1090,234 @@ mod input_tests {
             graphics,
             &mut terminal,
             std::time::Duration::from_millis(33),
+            dummy_layout_root(),
+            None,
+        );
+    }
+
+    /// Phase 2 v2 wiring regression: a crossterm
+    /// `Event::Resize(w, h)` synthesised at the `handle_event`
+    /// boundary must land in `pending_resize` so the top of
+    /// the next tick drives `relayout(w, h)`. Splits the
+    /// assertion into the two smallest claims the bug
+    /// surface allows: (1) the option transitions from
+    /// `None` -> `Some((w, h))`, (2) subsequent resize
+    /// signals coalesce (overwrite, NOT push) so rapid
+    /// SIGWINCH bursts collapse to the LATEST dims.
+    #[test]
+    fn handle_event_resize_event_arms_pending_resize() {
+        let (close_tx, _close_rx): (PaneCloseTx, _) = mpsc::channel();
+        let mut runners: Vec<PaneRunner> = vec![];
+        let bindings = Router::new(vec![]);
+        let mut focus: usize = 0;
+        let mut running = true;
+        let mut pending_resize: Option<(u16, u16)> = None;
+
+        handle_event(
+            &Event::Resize(132, 50),
+            &bindings,
+            &mut focus,
+            &mut runners,
+            &mut running,
+            &mut pending_resize,
+        );
+        assert_eq!(
+            pending_resize,
+            Some((132, 50)),
+            "Event::Resize must arm pending_resize for phase 0.5 relayout"
+        );
+
+        // Coalesce-on-overwrite: a second resize arrives
+        // BEFORE phase 0.5 has taken the first queued tuple,
+        // so the value should simply be replaced, not stacked.
+        handle_event(
+            &Event::Resize(200, 60),
+            &bindings,
+            &mut focus,
+            &mut runners,
+            &mut running,
+            &mut pending_resize,
+        );
+        assert_eq!(
+            pending_resize,
+            Some((200, 60)),
+            "second Event::Resize must coalesce onto (NOT push past) the first"
+        );
+
+        drop(close_tx);
+    }
+
+    /// Phase 2 v2 wiring regression end-to-end at the tick
+    /// surface: build a real `TickContext` over a Split KDL
+    /// config so two `PaneRunner`s spawn side-by-side, drive
+    /// `relayout(132, 50)`, and assert both runners' cached
+    /// rects match the layout engine's output AND the
+    /// `cmdash_layout::PaneId` pairing invariant holds
+    /// (runners[i].id == layout.panes[i].id) AND
+    /// `GraphicsState::cells` propagated to the new dims.
+    ///
+    /// The counterpart integration test in
+    /// `crates/cmdash/tests/wiring_smoke.rs::relayout_drives_per_pane_resize_via_real_pty`
+    /// exercises the same wiring end-to-end through real
+    /// PTY children; this lib unit-test pins the deterministic
+    /// for_id and for_cells invariants without depending on a
+    /// real PTY round-trip.
+    #[test]
+    fn relayout_emits_resize_per_pane_when_host_signals_resize() {
+        let source = r#"layout {
+            split axis=horizontal ratio=0.6 {
+                pane kind=shell label="split-a"
+                pane kind=shell label="split-b"
+            }
+        }"#;
+        let cfg = cmdash_config::parse(source).expect("parse split config");
+        let layout_root = cfg
+            .layout
+            .clone()
+            .expect("layout block must contain a Split");
+
+        // Initial-frame spawn: both panes derive from a SHARED
+        // `ComputedLayout::compute(&layout_root, ...)` invocation
+        // so `pane_a.id.path_len == pane_b.id.path_len == 2`
+        // (matching the Split config's leaf path-depth) -- the
+        // SAME pairing requirement enforced inside
+        // `TickContext::relayout`'s per-pair
+        // `assert_eq!(runner.computed().id, pane.id)`. Earlier
+        // rounds derived each pane via independent
+        // `make_runner("split-a")` parses, which yield
+        // `path_len: 1` PaneIds (single-pane KDL) and break the
+        // assertion even though `pre_order` matches. This
+        // bug was invisible to `cargo test -p cmdash --lib`
+        // because `input_tests` lives in the binary crate;
+        // only `cargo test --workspace` exercises it.
+        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+        let initial_layout = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute initial 80x24 split layout");
+        assert_eq!(
+            initial_layout.panes.len(),
+            2,
+            "expected 2 leaf panes from Split config"
+        );
+        let pane_a = initial_layout.panes[0].clone();
+        let pane_b = initial_layout.panes[1].clone();
+        let id_a = cmdash::derive_layer_id(&pane_a.id);
+        let id_b = cmdash::derive_layer_id(&pane_b.id);
+        // `/bin/true` is the fast-exit child used by the rest of
+        // `input_tests`; the test exercises the layout -> runner
+        // resize pairing path, NOT the live PTY resize path (that
+        // is `wiring_smoke.rs::relayout_drives_per_pane_resize_via_real_pty`).
+        let shell = ShellSpec::Command {
+            argv: vec!["true".to_string()],
+        };
+        let r0 =
+            PaneRunner::spawn_with_graphics(pane_a, id_a, shell.clone(), Some(close_tx.clone()))
+                .expect("spawn runner A");
+        let r1 = PaneRunner::spawn_with_graphics(pane_b, id_b, shell, Some(close_tx))
+            .expect("spawn runner B");
+        let runners = vec![r0, r1];
+        let bindings = Router::new(vec![]);
+        let graphics =
+            cmdash::graphics::GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(132, 50);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+
+        let mut ctx = TickContext::new(
+            runners,
+            bindings,
+            0,
+            true,
+            close_rx,
+            graphics,
+            &mut terminal,
+            std::time::Duration::from_millis(33),
+            layout_root.clone(),
+            Some((132, 50)),
+        );
+
+        // Pairing pin BEFORE relayout: each runner's id must
+        // already match the layout engine's pre-order leaf
+        // numbering, otherwise `relayout`'s per-pair assert_eq!
+        // would fire. This separately verifies the spawn loop's
+        // index-alignment with the layout tree.
+        let pre_layout = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute pre-layout");
+        assert_eq!(pre_layout.panes.len(), ctx.runners.len());
+        assert_eq!(ctx.runners[0].computed().id, pre_layout.panes[0].id);
+        assert_eq!(ctx.runners[1].computed().id, pre_layout.panes[1].id);
+
+        // Drive relayout: 80x24 -> 132x50. The pre-queued
+        // `pending_resize = Some((132, 50))` lets us call
+        // relayout directly bypassing phase 0; equivalent to
+        // having phase 0.5 drain the slot at the top of the
+        // loop.
+        ctx.relayout(132, 50);
+
+        // Post-relayout: every pane rect must match the
+        // layout engine's 132x50 Split output. Ratio 0.6 over
+        // width 132 -> child A at (0, 0, 79, 50) and child B
+        // at (79, 0, 53, 50). Same `cmdash_layout::split_rect`
+        // math as the v2-contract pin in `wiring_smoke.rs`.
+        assert_eq!(
+            ctx.runners[0].computed().rect,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 79,
+                h: 50
+            },
+            "child A post-relayout rect must match 132x50 Horizontal-60 split"
+        );
+        assert_eq!(
+            ctx.runners[1].computed().rect,
+            LayoutRect {
+                x: 79,
+                y: 0,
+                w: 53,
+                h: 50
+            },
+            "child B post-relayout rect must match 132x50 Horizontal-60 split"
+        );
+
+        // Pairing pin AFTER relayout: each runner's id must
+        // still match the layout engine's pre-order (no
+        // identity shift across resize; AGENTS.md §"PaneId
+        // stability" + §"Hard rule: one layer per instance").
+        let post_layout = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 132,
+                h: 50,
+            },
+        )
+        .expect("compute post-layout");
+        assert_eq!(ctx.runners[0].computed().id, post_layout.panes[0].id);
+        assert_eq!(ctx.runners[1].computed().id, post_layout.panes[1].id);
+
+        // GraphicsState cells propagated to the new dims --
+        // dashcompositor framebuffer pixel composition must
+        // catch up to the layout engine's cell-grid surface.
+        assert_eq!(
+            ctx.graphics.cells(),
+            (132, 50),
+            "GraphicsState cells must follow the relayout dimension"
         );
     }
 }
