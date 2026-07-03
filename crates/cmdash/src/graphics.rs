@@ -78,19 +78,48 @@ struct ImageEntry {
 /// [`dashcompositor::LayerStack`], per-pane image maps, and the
 /// cell-pixel metrics used for framebuffer sizing.
 pub struct GraphicsState {
-    pub stack: LayerStack,
-    pub metrics: Metrics,
-    /// Total terminal size in cells; updated by callers
-    /// (main.rs) before each `render_and_write`. v1 has a single
-    /// tab with one root layout rect, so (cols, rows) is the
-    /// full-screen total.
-    pub cells: (u16, u16),
+    /// dashcompositor layer stack -- private; mutating is exposed
+    /// through `push_image` / `close_pane` / `render_and_write`.
+    stack: LayerStack,
+    /// Cell-pixel metrics for framebuffer sizing -- private;
+    /// passed in via `Self::new` and read inside `render_and_write`.
+    metrics: Metrics,
+    /// Total terminal size in cells; private. Set once in
+    /// `Self::new`, which enforces `cells.0 > 0 && cells.1 > 0`
+    /// via `assert!` so a downstream `render_and_write` cannot
+    /// produce a zero-size framebuffer. v1 has a single tab with
+    /// one root layout rect, so resizing isn't a `set_cells`
+    /// path -- constructing a fresh `GraphicsState` is the v1
+    /// contract; v2 may add `pub fn set_cells` with the same
+    /// assert guard.
+    cells: (u16, u16),
+    /// Bookkeeping for per-(pane, kitty_image_id) layers.
+    /// Invariant: for every `pane`, every `kitty_id` recorded in
+    /// `pane_images[pane]` is also the second component of a key
+    /// in `images`. Maintained by `push_image`, the `on_kitty`
+    /// `Delete` path, and `close_pane`. The cross-key invariant
+    /// is locked by `pane_images_subset_of_images_keys_after_*`
+    /// below -- a future regression that mutated one map without
+    /// the other would not survive that check.
     images: HashMap<(PaneLayerId, u32), ImageEntry>,
     pane_images: HashMap<PaneLayerId, Vec<u32>>,
 }
 
 impl GraphicsState {
+    /// Construct a [`GraphicsState`] with cell-pixel metrics and
+    /// a non-zero cell dimension. `cells.0 > 0 && cells.1 > 0`
+    /// is enforced by `assert!` so a downstream
+    /// [`Self::render_and_write`] cannot produce a zero-size
+    /// framebuffer. The exactly-string `"cells must be non-zero"`
+    /// in the panic message is consumed by the
+    /// `graphics_state_new_panics_on_zero_*` regression tests.
     pub fn new(metrics: Metrics, cells: (u16, u16)) -> Self {
+        assert!(
+            cells.0 > 0 && cells.1 > 0,
+            "GraphicsState::new: cells must be non-zero (cols > 0 and rows > 0), got {}x{}",
+            cells.0,
+            cells.1,
+        );
         Self {
             stack: LayerStack::default(),
             metrics,
@@ -128,11 +157,10 @@ impl GraphicsState {
     /// are surfaced, never swallowed silently: callers decide
     /// whether to log+continue ([`apply_kitty_event`] is a thin
     /// wrapper that logs via `tracing::warn!` and returns `()`).
-    pub fn on_kitty(
-        &mut self,
-        pane: PaneLayerId,
-        cmd: &KittyGraphicCmd,
-    ) -> Result<(), GraphicsError> {
+    /// Private -- only [`Self::apply_kitty_event`] (the public
+    /// surface) and the internal sanity tests in this module
+    /// call this; the pub surface is exactly `apply_kitty_event`.
+    fn on_kitty(&mut self, pane: PaneLayerId, cmd: &KittyGraphicCmd) -> Result<(), GraphicsError> {
         match cmd {
             KittyGraphicCmd::Load {
                 id,
@@ -320,6 +348,66 @@ mod internal_sanity_tests {
         g.close_pane(pane);
         assert!(!g.pane_images.contains_key(&pane));
         assert!(g.images.is_empty());
+    }
+
+    /// Cross-key invariant pin: for every `pane`, every `kitty_id`
+    /// recorded in `pane_images[pane]` MUST also appear as the
+    /// second component of a key in `images`. Exercised against
+    /// the three mutating paths (`push_image`, `on_kitty::Place`,
+    /// `on_kitty::Delete`) so a future regression that mutates one
+    /// map without the other is caught at unit-test time.
+    #[test]
+    fn pane_images_subset_of_images_keys_after_push_place_delete() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let pane = PaneLayerId(42);
+        // Three pushes.
+        g.push_image(pane, 1, rgba1x1());
+        g.push_image(pane, 2, rgba1x1());
+        g.push_image(pane, 3, rgba1x1());
+        // Place-and-replace on kitty_id=2 (keeps both class membership
+        // and the entry in pane_images).
+        g.on_kitty(pane, &place_cmd(2, 5, 6, 0)).expect("place");
+        // Delete on kitty_id=1 (removes from BOTH maps).
+        g.on_kitty(pane, &KittyGraphicCmd::Delete { id: 1 })
+            .expect("delete");
+        // After all three ops the surviving pane_images[pane] is [2, 3]
+        // (insert order; delete removed 1, place on 2 didn't change
+        // its membership). Every entry must back a real `images` key.
+        let recorded = g
+            .pane_images
+            .get(&pane)
+            .expect("pane_images should still hold an entry for this pane")
+            .clone();
+        assert_eq!(recorded, vec![2, 3]);
+        for kitty_id in &recorded {
+            assert!(
+                g.images.contains_key(&(pane, *kitty_id)),
+                "pane_images[pane] = {:?} contains kitty_id {} but \
+                 images lacks key ({:?}, {}) -- cross-key invariant violated",
+                recorded,
+                kitty_id,
+                pane,
+                kitty_id,
+            );
+        }
+    }
+
+    /// Ctor invariant pin: zero cols must panic with the exact phrase
+    /// `"cells must be non-zero"` so external debuggers and test
+    /// matchers can correlate the failure to the `Self::new` assert
+    /// rather than chasing an opaque zero-framebuffer downstream.
+    #[test]
+    #[should_panic(expected = "cells must be non-zero")]
+    fn graphics_state_new_panics_on_zero_cols() {
+        let _ = GraphicsState::new(Metrics::default(), (0, 24));
+    }
+
+    /// Ctor invariant pin: zero rows must panic with the same
+    /// phrase, symmetric to the cols case above.
+    #[test]
+    #[should_panic(expected = "cells must be non-zero")]
+    fn graphics_state_new_panics_on_zero_rows() {
+        let _ = GraphicsState::new(Metrics::default(), (80, 0));
     }
 
     /// Regression test for `PaneRunner::Drop` -> `GraphicsState::close_pane`
