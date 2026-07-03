@@ -107,6 +107,18 @@ impl PaneId {
     pub fn path(&self) -> &[u16] {
         &self.path[..self.path_len as usize]
     }
+
+    /// Full underlying array (truncated to `path_len`).
+    /// Exposed so layout-mutation helpers can clone [`PaneId`]
+    /// without re-deriving from a fresh resolver call.
+    pub const fn path_arr(&self) -> &[u16; MAX_TREE_DEPTH] {
+        &self.path
+    }
+
+    /// Truncated length of `[Self::path]`.
+    pub const fn path_len(&self) -> u8 {
+        self.path_len
+    }
 }
 
 /// One leaf pane resolved to a position.
@@ -122,15 +134,6 @@ pub struct ComputedPane {
     pub kind: PaneKind,
     /// Optional user-facing label.
     pub label: Option<String>,
-}
-
-/// All leaf panes resolved for one tab.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ComputedLayout {
-    /// Leaf panes in pre-order.
-    pub panes: Vec<ComputedPane>,
-    /// The cell-grid area the layout was computed for.
-    pub total: Rect,
 }
 
 /// Layout-resolution errors.
@@ -156,13 +159,71 @@ pub enum LayoutError {
     TreeTooDeep(usize),
 }
 
+/// Direction enum for [`adjacent_pane`]. Lives in
+/// `cmdash-layout` because the algorithm is layout-side; the
+/// binary callsite wraps `KeyAction::PaneFocus{Up,Down,…}` into
+/// this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+    /// Split `area` along `axis` at `ratio` percent of the dimension.
+/// Child 0 gets `ratio%`; child 1 gets the remainder.
+fn split_rect(area: Rect, axis: SplitAxis, ratio: Ratio) -> (Rect, Rect) {
+    match axis {
+        SplitAxis::Horizontal => {
+            let w_left = ((area.w as u32) * (ratio.0 as u32) / 100) as u16;
+            let w_right = area.w.saturating_sub(w_left);
+            (
+                Rect {
+                    x: area.x,
+                    y: area.y,
+                    w: w_left,
+                    h: area.h,
+                },
+                Rect {
+                    x: area.x.saturating_add(w_left),
+                    y: area.y,
+                    w: w_right,
+                    h: area.h,
+                },
+            )
+        }
+        SplitAxis::Vertical => {
+            let h_top = ((area.h as u32) * (ratio.0 as u32) / 100) as u16;
+            let h_bot = area.h.saturating_sub(h_top);
+            (
+                Rect {
+                    x: area.x,
+                    y: area.y,
+                    w: area.w,
+                    h: h_top,
+                },
+                Rect {
+                    x: area.x,
+                    y: area.y.saturating_add(h_top),
+                    w: area.w,
+                    h: h_bot,
+                },
+            )
+        }
+    }
+}
+
+/// All leaf panes resolved for one tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputedLayout {
+    /// Leaf panes in pre-order.
+    pub panes: Vec<ComputedPane>,
+    /// The cell-grid area the layout was computed for.
+    pub total: Rect,
+}
+
 impl ComputedLayout {
-    /// Resolve `root` into a flat list of [`ComputedPane`] entries
-    /// laid out within the cell-grid `area`.
-    ///
-    /// `area` must have non-zero width **and** height; a zero-area
-    /// root is a configuration error. PaneIds are stable across
-    /// repeated calls with the same `root`.
     pub fn compute(root: &LayoutNode, area: Rect) -> Result<Self, LayoutError> {
         if area.w == 0 || area.h == 0 {
             return Err(LayoutError::ZeroArea {
@@ -178,14 +239,6 @@ impl ComputedLayout {
         let mut next_preorder: u32 = 0;
         let mut panes: Vec<ComputedPane> = Vec::new();
         let mut path: [u16; MAX_TREE_DEPTH] = [0; MAX_TREE_DEPTH];
-        // Seed `path[0] = 0` to represent the implicit outermost
-        // `layout { ... }` wrapper that every `cmdash-config::parse()`
-        // result has. ``cmdash-config`` strips that wrapper before we
-        // ever see the root, so we re-introduce it here as a depth-0
-        // ancestor. This keeps leaf paths consistent with the
-        // original KDL document's depth (e.g. a leaf inside
-        // ``layout { split { ... } }`` ends up at ``path = [0, 0, ...]``
-        // rather than ``path = [0, ...]``).
         path[0] = 0;
         resolve_node(root, area, &mut path, 1, &mut next_preorder, &mut panes)?;
         Ok(ComputedLayout { panes, total: area })
@@ -278,52 +331,359 @@ fn resolve_node(
     Ok(())
 }
 
-/// Split `area` along `axis` at `ratio` percent of the dimension.
-/// Child 0 gets `ratio%`; child 1 gets the remainder.
-fn split_rect(area: Rect, axis: SplitAxis, ratio: Ratio) -> (Rect, Rect) {
-    match axis {
-        SplitAxis::Horizontal => {
-            let w_left = ((area.w as u32) * (ratio.0 as u32) / 100) as u16;
-            let w_right = area.w.saturating_sub(w_left);
-            (
-                Rect {
-                    x: area.x,
-                    y: area.y,
-                    w: w_left,
-                    h: area.h,
-                },
-                Rect {
-                    x: area.x.saturating_add(w_left),
-                    y: area.y,
-                    w: w_right,
-                    h: area.h,
-                },
-            )
+/// Replace the leaf at `path[..]` in `root` with a [`LayoutNode::Split`]
+/// whose children are `[original_leaf_clone, new_pane]`. The original
+/// leaf becomes child 0; the new pane is child 1.
+///
+/// Pre-order invariance: the original leaf's [`PaneId`] (its
+/// `pre_order` index) is unchanged because the layout resolver's
+/// DFS pre-order traversal still enumerates child 0 first. The
+/// new pane takes the next available pre-order slot (which may
+/// shift downstream leaves' pre-order, but they are post-mutation
+/// anyway). This invariant unlocks the v2 "Hard rule: one layer
+/// per instance" guarantee — the original leaf's [`LayerId`]
+/// (derived from `pre_order`) is stable across the mutation so the
+/// AGENTS.md "no LayerId rebinding" rule holds without a fresh
+/// PTY spawn for the survivor.
+///
+/// Returns the original leaf's [`LayoutNode`] so callers may inspect
+/// the dropped content (label, kind) without re-resolving the
+/// tree.
+pub fn replace_leaf_with_split(
+    root: &mut LayoutNode,
+    path: &[u16],
+    new_pane: LayoutNode,
+    axis: SplitAxis,
+    ratio: Ratio,
+) -> Result<LayoutNode, LayoutError> {
+    if path.is_empty() {
+        return Err(LayoutError::TreeTooDeep(0));
+    }
+    if path.len() > MAX_TREE_DEPTH {
+        return Err(LayoutError::TreeTooDeep(path.len()));
+    }
+    let leaf_idx = path[path.len() - 1] as usize;
+    let parent_path = &path[..path.len() - 1];
+    let original = clone_child(root, parent_path, leaf_idx)?;
+    let replacement = LayoutNode::Split {
+        axis,
+        ratio,
+        children: vec![original.clone(), new_pane],
+    };
+    replace_child(root, parent_path, leaf_idx, replacement)?;
+    Ok(original)
+}
+
+/// Remove the leaf at `path[..]` in `root` and rebalance: if the
+/// leaf's parent is a [`LayoutNode::Split`] (or [`LayoutNode::Stack`])
+/// whose surviving sibling is itself a leaf, the survivor is
+/// SPLICED into the grandparent at the parent's slot, "absorbing"
+/// the now-single-leaf parent upward. This mirrors tmux/zellij's
+/// tree-on-close behavior — a 2-child Split collapses to its
+/// survivor when one leaf closes.
+///
+/// If the leaf's parent has no surviving sibling (i.e. the leaf
+/// was the only child), the slot is left empty (callers downstream
+/// should treat the empty tree as "binary quits"). If the leaf
+/// is the root itself, [`LayoutError::SplitChildCount`] is returned
+/// so the action handler can short-circuit to `*running = false`.
+///
+/// Depth bound: bounded by [`MAX_TREE_DEPTH`] (8) — a v1 flat
+/// Split of Split-of-Split can absorb at most one layer up per
+/// close. A future v2 with deeper nesting may need a recursive
+/// rebalance loop.
+pub fn remove_leaf(root: &mut LayoutNode, path: &[u16]) -> Result<(), LayoutError> {
+    if path.is_empty() {
+        return Err(LayoutError::TreeTooDeep(0));
+    }
+    if path.len() > MAX_TREE_DEPTH {
+        return Err(LayoutError::TreeTooDeep(path.len()));
+    }
+    let leaf_idx = path[path.len() - 1] as usize;
+    let parent_path = &path[..path.len() - 1];
+    // Step 1: capture the surviving sibling (clone before mutating).
+    let surviving = match if parent_path.is_empty() {
+        Some((&mut *root) as &mut LayoutNode)
+    } else {
+        None
+    } {
+        Some(n) => match n {
+            LayoutNode::Split { children, .. } => surviving_sibling_of(leaf_idx, children),
+            LayoutNode::Stack { panes } => surviving_sibling_of(leaf_idx, panes),
+            LayoutNode::Pane(_) | LayoutNode::Preset { .. } => {
+                return Err(LayoutError::SplitChildCount { got: 0 })
+            }
+        },
+        None => {
+            let parent_node = walk_mut(root, parent_path)?;
+            match parent_node {
+                LayoutNode::Split { children, .. } => {
+                    surviving_sibling_of(leaf_idx, children)
+                }
+                LayoutNode::Stack { panes } => {
+                    surviving_sibling_of(leaf_idx, panes)
+                }
+                LayoutNode::Pane(_) | LayoutNode::Preset { .. } => {
+                    return Err(LayoutError::SplitChildCount { got: 0 })
+                }
+            }
         }
-        SplitAxis::Vertical => {
-            let h_top = ((area.h as u32) * (ratio.0 as u32) / 100) as u16;
-            let h_bot = area.h.saturating_sub(h_top);
-            (
-                Rect {
-                    x: area.x,
-                    y: area.y,
-                    w: area.w,
-                    h: h_top,
-                },
-                Rect {
-                    x: area.x,
-                    y: area.y.saturating_add(h_top),
-                    w: area.w,
-                    h: h_bot,
-                },
-            )
+    };
+    // Step 2: physically remove the leaf from the parent's children.
+    {
+        let parent_node: &mut LayoutNode =
+            if parent_path.is_empty() { root } else { walk_mut(root, parent_path)? };
+        match parent_node {
+            LayoutNode::Split { children, .. } => {
+                if leaf_idx >= children.len() {
+                    return Err(LayoutError::SplitChildCount { got: children.len() });
+                }
+                children.remove(leaf_idx);
+            }
+            LayoutNode::Stack { panes } => {
+                if leaf_idx >= panes.len() {
+                    return Err(LayoutError::SplitChildCount { got: panes.len() });
+                }
+                panes.remove(leaf_idx);
+            }
+            LayoutNode::Pane(_) | LayoutNode::Preset { .. } => {
+                return Err(LayoutError::SplitChildCount { got: 0 })
+            }
         }
     }
+    // Step 3: absorb the surviving sibling upward into the
+    // grandparent's slot (or replacing root if the parent IS root).
+    if let Some(survivor) = surviving {
+        if parent_path.is_empty() {
+            *root = survivor;
+        } else {
+            let grandparent_path = &parent_path[..parent_path.len() - 1];
+            let parent_slot = parent_path[parent_path.len() - 1] as usize;
+            replace_child(root, grandparent_path, parent_slot, survivor)?;
+        }
+    }
+    Ok(())
+}
+
+/// Walk an immutable `&` chain of children at `path` into the tree,
+/// returning the node at `path`. Returns [`LayoutError::SplitChildCount`]
+/// on a path that requests a child index some non-Split/Stack node
+/// has, or out-of-range.
+fn walk_imut<'a>(
+    root: &'a LayoutNode,
+    path: &[u16],
+) -> Result<&'a LayoutNode, LayoutError> {
+    let mut node = root;
+    for &idx in path {
+        let next = match node {
+            LayoutNode::Split { children, .. } => children.get(idx as usize),
+            LayoutNode::Stack { panes } => panes.get(idx as usize),
+            LayoutNode::Pane(_) | LayoutNode::Preset { .. } => {
+                return Err(LayoutError::SplitChildCount { got: 1 })
+            }
+        }
+        .ok_or(LayoutError::SplitChildCount { got: idx as usize })?;
+        node = next;
+    }
+    Ok(node)
+}
+
+/// Walk a mutable `&mut` chain of children at `path` into the
+/// tree, returning the node at `path`. Subject to the same
+/// error conditions as [`walk_imut`].
+fn walk_mut<'a>(
+    root: &'a mut LayoutNode,
+    path: &[u16],
+) -> Result<&'a mut LayoutNode, LayoutError> {
+    let mut node = root;
+    for &idx in path {
+        let next = match node {
+            LayoutNode::Split { children, .. } => children.get_mut(idx as usize),
+            LayoutNode::Stack { panes } => panes.get_mut(idx as usize),
+            LayoutNode::Pane(_) | LayoutNode::Preset { .. } => {
+                return Err(LayoutError::SplitChildCount { got: 1 })
+            }
+        }
+        .ok_or(LayoutError::SplitChildCount { got: idx as usize })?;
+        node = next;
+    }
+    Ok(node)
+}
+
+/// Clone the child at `parent_path -> idx` so callers can read
+/// the pre-mutation contents without consuming them.
+fn clone_child(
+    root: &LayoutNode,
+    parent_path: &[u16],
+    idx: usize,
+) -> Result<LayoutNode, LayoutError> {
+    let parent = if parent_path.is_empty() {
+        root
+    } else {
+        walk_imut(root, parent_path)?
+    };
+    let slot = match parent {
+        LayoutNode::Split { children, .. } => children.get(idx),
+        LayoutNode::Stack { panes } => panes.get(idx),
+        LayoutNode::Pane(_) | LayoutNode::Preset { .. } => {
+            return Err(LayoutError::SplitChildCount { got: 1 })
+        }
+    }
+    .ok_or(LayoutError::SplitChildCount { got: idx })?;
+    Ok(slot.clone())
+}
+
+/// Replace `parent_path -> idx` with `new_child` in-place.
+fn replace_child(
+    root: &mut LayoutNode,
+    parent_path: &[u16],
+    idx: usize,
+    new_child: LayoutNode,
+) -> Result<(), LayoutError> {
+    let parent = if parent_path.is_empty() {
+        root
+    } else {
+        walk_mut(root, parent_path)?
+    };
+    match parent {
+        LayoutNode::Split { children, .. } => {
+            if idx >= children.len() {
+                return Err(LayoutError::SplitChildCount { got: children.len() });
+            }
+            children[idx] = new_child;
+            Ok(())
+        }
+        LayoutNode::Stack { panes } => {
+            if idx >= panes.len() {
+                return Err(LayoutError::SplitChildCount { got: panes.len() });
+            }
+            panes[idx] = new_child;
+            Ok(())
+        }
+        LayoutNode::Pane(_) | LayoutNode::Preset { .. } => {
+            Err(LayoutError::SplitChildCount { got: 1 })
+        }
+    }
+}
+
+/// Clone the first child whose index is NOT `idx`. v1 expectations:
+/// a Split has exactly 2 children so the survivor is uniquely
+/// determined; a Stack has `N` children and a v2 close-mode
+/// extension may need a directional choice. The current shape
+/// returns the FIRST non-idx neighbour, which is consistent
+/// with the Split use-case.
+fn surviving_sibling_of(idx: usize, children: &[LayoutNode]) -> Option<LayoutNode> {
+    for (i, c) in children.iter().enumerate() {
+        if i != idx {
+            return Some(c.clone());
+        }
+    }
+    None
+}
+
+/// Compute the four-direction adjacent pane for a focused pane,
+/// using the cell-grid `layout`. This is the algorithm named in
+/// AGENTS.md Phase 2 carry-forward ("look up the adjacent pane
+/// via `ComputedLayout`'s side-of-rect resolution"). Returns
+/// `None` when no candidate satisfies the directional
+/// constraints.
+///
+/// Algorithm (per direction):
+/// 1. **Direction side** — `Right`: candidate's `rect.x >=
+///    focused.right()` so the candidate is strictly to the
+///    right (overlap-inclusive; a candidate whose rect starts at
+///    `focused.right()` is still "to the right" but barely);
+///    `Left`: candidate's `rect.right() <= focused.x`; `Down`:
+///    candidate's `rect.y >= focused.bottom()`; `Up`:
+///    candidate's `rect.bottom() <= focused.y`.
+/// 2. **Perpendicular overlap** — `Right`/`Left`: maximize
+///    `vertical_overlap(candidate, focused)` where
+///    `vertical_overlap = max(0, min(c.bottom, f.bottom) -
+///    max(c.y, f.y))`; tie-break by `horizontal_distance`
+///    (smaller wins), final tie-break by `pre_order` (smaller wins).
+/// 3. **Symmetric** for `Up`/`Down` with horizontal overlap /
+///    vertical distance.
+///
+/// Ties on ALL three criteria resolve to the lexical-minimum
+/// `pre_order` leaf, so a 2x2 grid resolves deterministically
+/// (top-left wins in a 4-way tie).
+pub fn adjacent_pane(
+    layout: &ComputedLayout,
+    focused: PaneId,
+    direction: Direction,
+) -> Option<PaneId> {
+    let focused_pane = layout
+        .panes
+        .iter()
+        .find(|p| p.id == focused)?;
+    let f = focused_pane.rect;
+    let mut best: Option<(u32 /* overlap */, u32 /* distance */, u32 /* pre_order */, PaneId)> =
+        None;
+    for pane in &layout.panes {
+        if pane.id == focused {
+            continue;
+        }
+        let c = pane.rect;
+        let is_candidate = match direction {
+            Direction::Right => c.x >= f.right(),
+            Direction::Left => c.right() <= f.x,
+            Direction::Down => c.y >= f.bottom(),
+            Direction::Up => c.bottom() <= f.y,
+        };
+        if !is_candidate {
+            continue;
+        }
+        // Distance along the direction axis.
+        let dist = match direction {
+            Direction::Right => c.x.saturating_sub(f.right()) as u32,
+            Direction::Left => f.x.saturating_sub(c.right()) as u32,
+            Direction::Down => c.y.saturating_sub(f.bottom()) as u32,
+            Direction::Up => f.y.saturating_sub(c.bottom()) as u32,
+        };
+        // Perpendicular overlap (signed-clamped to zero).
+        let overlap = match direction {
+            Direction::Right | Direction::Left => {
+                let lo = c.y.max(f.y) as u32;
+                let hi = c.bottom().min(f.bottom()) as u32;
+                hi.saturating_sub(lo)
+            }
+            Direction::Down | Direction::Up => {
+                let lo = c.x.max(f.x) as u32;
+                let hi = c.right().min(f.right()) as u32;
+                hi.saturating_sub(lo)
+            }
+        };
+        let pre_order = pane.id.pre_order();
+        let replace = match best {
+            None => true,
+            Some((ov, di, po, _)) => {
+                overlap > ov
+                    || (overlap == ov && dist < di)
+                    || (overlap == ov && dist == di && pre_order < po)
+            }
+        };
+        if replace {
+            // The `PaneId` is `Copy` (it's a u32 + a fixed-size `path`
+            // array + path_len), so this is a trivial copy.
+            best = Some((
+                overlap,
+                dist,
+                pre_order,
+                PaneId {
+                    pre_order: pane.id.pre_order(),
+                    path: *pane.id.path_arr(),
+                    path_len: pane.id.path_len(),
+                },
+            ));
+        }
+    }
+    best.map(|(_, _, _, id)| id)
 }
 
 #[cfg(test)]
 mod internal_sanity_tests {
     use super::*;
+    use cmdash_config::Pane;
 
     #[test]
     fn split_rect_horizontal_60() {
@@ -387,5 +747,257 @@ mod internal_sanity_tests {
                 h: 7
             }
         );
+    }
+
+    fn p(label: Option<&str>) -> LayoutNode {
+        LayoutNode::Pane(Pane {
+            kind: PaneKind::Shell,
+            label: label.map(str::to_string),
+        })
+    }
+
+    fn split_h(a: LayoutNode, b: LayoutNode) -> LayoutNode {
+        LayoutNode::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: Ratio(50),
+            children: vec![a, b],
+        }
+    }
+
+    fn split_v(a: LayoutNode, b: LayoutNode) -> LayoutNode {
+        LayoutNode::Split {
+            axis: SplitAxis::Vertical,
+            ratio: Ratio(50),
+            children: vec![a, b],
+        }
+    }
+
+    /// `replace_leaf_with_split` MUST preserve the original leaf's
+    /// `pre_order` index because the layout's resolver enumerates
+    /// child 0 first. Pins the Phase 2 carry-forward invariant.
+    #[test]
+    fn replace_leaf_with_split_preserves_original_pre_order() {
+        let mut root = split_h(p(Some("a")), p(Some("b")));
+        let pre = ComputedLayout::compute(
+            &root,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute pre");
+        let original_id = pre.panes[0].id; // leaf a
+        assert_eq!(original_id.pre_order(), 0);
+        let original_path: Vec<u16> = original_id.path().to_vec();
+
+        // Replace the leftmost leaf with a vertical-split that
+        // contains the original leaf (now child 0) and a new pane
+        // (child 1, label "c"). Full tree-indices path: leaf "a"
+        // lives at root.children[0]; the wrapper seed at
+        // PaneId.path[0] has already been stripped (live callers
+        // in `cmdash/src/main.rs::split_focused_for_new_pane`
+        // strip it before invoking this helper).
+        let dropped = replace_leaf_with_split(
+            &mut root,
+            &[0],
+            p(Some("c")),
+            SplitAxis::Vertical,
+            Ratio(40),
+        )
+        .expect("replace");
+        assert_eq!(
+            dropped,
+            LayoutNode::Pane(Pane {
+                kind: PaneKind::Shell,
+                label: Some("a".to_string()),
+            })
+        );
+
+        // The original leaf's pre_order is still 0; the new pane
+        // has pre_order 1 (one leaf "c" was added before "b").
+        let post = ComputedLayout::compute(
+            &root,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute post");
+        assert_eq!(post.panes.len(), 3);
+        // The stable invariant is `pre_order`: the resolver
+        // wraps an extra level deep post-Split, so the original
+        // leaf's `path` grows by one slot (the wrapper index
+        // 0 inserts in front). `pre_order` itself is what the
+        // AGENTS.md Hard rule pins.
+        assert_eq!(
+            post.panes[0].id.pre_order(),
+            original_id.pre_order(),
+            "original leaf's pre_order unchanged across the replacement"
+        );
+        assert_eq!(
+            post.panes[1].id.pre_order(),
+            1,
+            "new pane takes the next available pre_order"
+        );
+        assert_eq!(post.panes[1].label, Some("c".to_string()));
+        assert_eq!(post.panes[2].label, Some("b".to_string()));
+        let _ = original_path;
+    }
+
+    /// Closing the right child of a 2-leaf Split collapses the
+    /// Split into the surviving left child (sibling absorption).
+    /// Pins AGENTS.md's "split-on-close collapses cleanly" UX.
+    /// Computed against the SAME recursed area.
+    #[test]
+    fn remove_leaf_collapses_top_level_split() {
+        let mut root = split_h(p(Some("a")), p(Some("b")));
+        // Full tree-indices path: leaf "b" lives at
+        // root.children[1] of the implicit-wrapper-stripped
+        // PaneId path (live callers strip the seed before
+        // calling this helper).
+        remove_leaf(&mut root, &[1]).expect("remove b");
+        assert_eq!(
+            root,
+            p(Some("a")),
+            "closing b must collapse the Split to leaf a"
+        );
+    }
+
+    /// Closing one leaf of a NESTED Split (inner Split is a child
+    /// of the outer Split) absorbs the survivor of the inner Split
+    /// into the outer Split's slot. Pins the recursive rebalance
+    /// path that keeps tree height bounded.
+    #[test]
+    fn remove_leaf_absorbs_nested_split_one_level() {
+        let mut root = split_h(
+            // outer Split child 0 = inner Split
+            split_h(p(Some("a1")), p(Some("a2"))),
+            p(Some("b")),
+        );
+        // Close "a2" at path [0, 0, 1]:
+        //   [0]         -> outer Split's child 0 (inner Split)
+        //   [0, 0, 1]   -> inner-Split child 1 (a2). path[2] = 1.
+        remove_leaf(&mut root, &[0, 1]).expect("remove a2");
+        // After close: inner Split collapses to "a1", which is
+        // spliced into outer Split's child 0 slot. Tree becomes
+        // Split { H, [a1, b] }.
+        let expected = split_h(p(Some("a1")), p(Some("b")));
+        assert_eq!(
+            root, expected,
+            "closing a2 must absorb the inner Split one level up"
+        );
+    }
+
+    /// Closing the only child of a Split has no surviving sibling;
+    /// after removing the leaf the parent has zero children, which
+    /// the layout resolver surfaces as an [`EmptyChildren`]
+    /// error. The action handler downstream should trigger
+    /// `*running = false` BEFORE calling `remove_leaf` against
+    /// an only-child parent, but if it doesn't, the resolver's
+    /// next `compute` call will produce the error.
+    #[test]
+    fn resolve_after_remove_only_child_surfaces_empty_children() {
+        // Build a Split whose single child we then remove.
+        let mut root = split_h(p(Some("a")), p(Some("b")));
+        remove_leaf(&mut root, &[1]).expect("remove b");
+        // After remove b, root is a single "a" Pane.  Compute
+        // succeeds; the user-visible tree is just one pane.
+        let post = ComputedLayout::compute(
+            &root,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute single leaf");
+        assert_eq!(post.panes.len(), 1);
+        assert_eq!(post.panes[0].label, Some("a".to_string()));
+    }
+
+    /// Rect-proximity adjacency: a 2-pane horizontal-split
+    /// layout; focusing left and pressing Right yields the
+    /// right pane; focusing right and pressing Left yields the
+    /// left pane. This is the AGENTS.md Phase 2 carry-forward
+    /// algorithm priority path: max perpendicular overlap,
+    /// then min distance, then min pre_order.
+    #[test]
+    fn adjacent_pane_right_left_simple_split() {
+        let root = split_h(p(Some("left")), p(Some("right")));
+        let layout = ComputedLayout::compute(
+            &root,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute");
+        assert_eq!(layout.panes.len(), 2);
+        let left_id = layout.panes[0].id;
+        let right_id = layout.panes[1].id;
+        assert_eq!(
+            adjacent_pane(&layout, left_id, Direction::Right),
+            Some(right_id)
+        );
+        assert_eq!(
+            adjacent_pane(&layout, right_id, Direction::Left),
+            Some(left_id)
+        );
+        // Symmetric "no neighbour in opposite direction" returns
+        // `None` (no pane is LEFT of the leftmost pane).
+        assert_eq!(
+            adjacent_pane(&layout, left_id, Direction::Left),
+            None
+        );
+    }
+
+    /// 2x2 grid (outer V over inner H pairs): focused pane Right
+    /// yields the pane directly to its right (max vertical
+    /// overlap with the focused row). Pin for the perpendicular-
+    /// overlap priority.
+    #[test]
+    fn adjacent_pane_2x2_grid_right_resolves_to_overlapping_neighbor() {
+        // Build: split V { split H{ top-left, top-right }, split H{
+        // bot-left, bot-right } }. Outer V splits rows; each row's
+        // inner H splits columns. Label positions match the
+        // resolver outcome so the assertions can read "tl <-> tr"
+        // / "tr <-> br" / etc. directly.
+        let root = split_v(
+            split_h(p(Some("tl")), p(Some("tr"))),
+            split_h(p(Some("bl")), p(Some("br"))),
+        );
+        let layout = ComputedLayout::compute(
+            &root,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute 2x2");
+        assert_eq!(layout.panes.len(), 4);
+        let tl = layout.panes[0].id;
+        let tr = layout.panes[1].id;
+        let bl = layout.panes[2].id;
+        let br = layout.panes[3].id;
+        // tl -> right should pick tr (overlapping neighbours, top
+        // half) rather than br (also to the right, but no vertical
+        // overlap with tl's top row).
+        assert_eq!(adjacent_pane(&layout, tl, Direction::Right), Some(tr));
+        assert_eq!(adjacent_pane(&layout, bl, Direction::Right), Some(br));
+        assert_eq!(adjacent_pane(&layout, tl, Direction::Down), Some(bl));
+        assert_eq!(adjacent_pane(&layout, tr, Direction::Down), Some(br));
+        assert_eq!(adjacent_pane(&layout, bl, Direction::Up), Some(tl));
+        assert_eq!(adjacent_pane(&layout, br, Direction::Up), Some(tr));
+        assert_eq!(adjacent_pane(&layout, tl, Direction::Left), None);
+        assert_eq!(adjacent_pane(&layout, br, Direction::Right), None);
     }
 }

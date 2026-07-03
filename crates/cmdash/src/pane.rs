@@ -187,6 +187,34 @@ impl PaneRunner {
         &self.computed
     }
 
+    /// Refresh the cached [`ComputedPane`] (id, rect, label, kind)
+    /// without touching the underlying PTY child. Used by the
+    /// runtime mutation paths (AppNewPane, PaneClose, PanePreset
+    /// reconciliation) to align a survivor runner with the
+    /// post-mutation layout tree resolution. The
+    /// [`cmdash_pty::PaneLayerId`] is implicit on the PTY child
+    /// and stays stable across the rebind, per AGENTS.md §"Hard
+    /// rule: one layer per instance" (LayerId is bound to a pane
+    /// instance for the instance's whole lifetime; it is NEVER
+    /// re-bound to a different pane).
+    ///
+    /// Pair with [`Self::resize`] if the underlying PTY child
+    /// also needs to match the new rect (e.g. after a tree
+    /// mutation has shifted proportions). The orchestrator in
+    /// [`crate::main::TickContext::reconcile_runners`]
+    /// pairs the two so a survivor's PTY child AND cached
+    /// computed reflect the new layout at the end of one tick.
+    ///
+    /// The new pane's `id` MUST come from a fresh
+    /// [`cmdash_layout::ComputedLayout::compute`] call against
+    /// the post-mutation tree; reusing a stale `pane.id` would
+    /// re-introduce the broken hero-pane-id-rotates pairing
+    /// invariant that the `relayout_drives_per_pane_resize_via_real_pty`
+    /// regression catches.
+    pub fn rebind_pane(&mut self, pane: ComputedPane) {
+        self.computed = pane;
+    }
+
     pub fn layer_id(&self) -> PaneLayerId {
         self.pty.layer_id()
     }

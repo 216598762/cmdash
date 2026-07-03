@@ -44,15 +44,36 @@
 //! }
 //! ```
 
+use std::collections::BTreeMap;
+
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
 use thiserror::Error;
 
 /// Top-level cmdash configuration document.
+///
+/// `layout` is the active layout tree (resolved each frame into a
+/// [`cmdash_layout::ComputedLayout`]). `presets` is a name-keyed
+/// map of saved layout bodies that the `KeyAction::PanePreset(name)`
+/// runtime mutation swaps the active `layout` against; both fields
+/// are owned so the binary passes them by value into
+/// [`TickContext`](https://docs.rs/cmdash) and never has to
+/// re-parse on a preset swap.
+///
+/// The pair of fields is intentionally flat — `presets` is NOT
+/// nested under `layout` — so a runtime swap doesn't have to
+/// walk into a possibly-mutated tree to look up a named body.
+/// Presets are populated from a top-level
+/// `presets { preset "name" { body } }` block in the KDL source;
+/// see [`parse`] for the walker.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     pub layout: Option<LayoutNode>,
     pub keybinds: Vec<Keybind>,
+    /// Saved layout bodies keyed by their `name`. Populated by
+    /// [`parse`] from a top-level `presets { … }` block; an empty
+    /// map means no presets are defined.
+    pub presets: BTreeMap<String, LayoutNode>,
 }
 
 /// A node in the layout tree.
@@ -174,8 +195,16 @@ pub enum ConfigError {
     UnknownLayoutNode(String),
     #[error("`keybinds` may only contain `bind`, got `{0}`")]
     UnexpectedKindbindChild(String),
+    #[error("`presets` block is empty")]
+    EmptyChildren(&'static str),
     #[error("duplicate `layout` block")]
     DuplicateLayout,
+    #[error("duplicate `presets` block")]
+    DuplicatePresets,
+    #[error("`presets` may only contain `preset`, got `{0}`")]
+    UnexpectedPresetsChild(String),
+    #[error("duplicate preset name `{0}`")]
+    DuplicatePreset(String),
     #[error("invalid `axis` value `{0}`")]
     InvalidAxis(String),
     #[error("invalid `ratio` value `{0}`")]
@@ -192,50 +221,68 @@ pub enum ConfigError {
 pub fn parse(source: &str) -> Result<Config, ConfigError> {
     let doc: KdlDocument = source
         .parse()
-        .map_err(|e: kdl::KdlError| ConfigError::Kdl(e.to_string()))?;
-
-    let mut cfg = Config::default();
-    for n in doc.nodes() {
-        let name = n.name().value();
-        match name {
-            "layout" => {
-                if cfg.layout.is_some() {
-                    return Err(ConfigError::DuplicateLayout);
+        .map_err(|e: kdl::KdlError| ConfigError::Kdl(e.to_string()))?;        let mut cfg = Config::default();
+        for n in doc.nodes() {
+            let name = n.name().value();
+            match name {
+                "layout" => {
+                    if cfg.layout.is_some() {
+                        return Err(ConfigError::DuplicateLayout);
+                    }
+                    // The outer `layout { ... }` is a single-node container.
+                    // Descend into its first (and only) child, which is the
+                    // actual root LayoutNode.
+                    let children = n.children().ok_or_else(|| {
+                        ConfigError::UnknownLayoutNode("layout block must contain a LayoutNode".into())
+                    })?;
+                    let kids = children.nodes();
+                    let first = kids.first().ok_or_else(|| {
+                        ConfigError::UnknownLayoutNode("layout block must contain a LayoutNode".into())
+                    })?;
+                    if kids.len() > 1 {
+                        return Err(ConfigError::UnknownLayoutNode(
+                            "layout block may contain exactly one LayoutNode".into(),
+                        ));
+                    }
+                    cfg.layout = Some(read_layout(first)?);
                 }
-                // The outer `layout { ... }` is a single-node container.
-                // Descend into its first (and only) child, which is the
-                // actual root LayoutNode.
-                let children = n.children().ok_or_else(|| {
-                    ConfigError::UnknownLayoutNode("layout block must contain a LayoutNode".into())
-                })?;
-                let kids = children.nodes();
-                let first = kids.first().ok_or_else(|| {
-                    ConfigError::UnknownLayoutNode("layout block must contain a LayoutNode".into())
-                })?;
-                if kids.len() > 1 {
-                    return Err(ConfigError::UnknownLayoutNode(
-                        "layout block may contain exactly one LayoutNode".into(),
-                    ));
+                "keybinds" => {
+                    if let Some(c) = n.children() {
+                        for k in c.nodes() {
+                            if k.name().value() != "bind" {
+                                return Err(ConfigError::UnexpectedKindbindChild(
+                                    k.name().value().to_string(),
+                                ));
+                            }
+                            cfg.keybinds.push(read_keybind(k)?);
+                        }
+                    }
                 }
-                cfg.layout = Some(read_layout(first)?);
-            }
-            "keybinds" => {
-                if let Some(c) = n.children() {
+                "presets" => {
+                    if !cfg.presets.is_empty() {
+                        return Err(ConfigError::DuplicatePresets);
+                    }
+                    let c = n.children().ok_or_else(|| {
+                        ConfigError::EmptyChildren("presets")
+                    })?;
                     for k in c.nodes() {
-                        if k.name().value() != "bind" {
-                            return Err(ConfigError::UnexpectedKindbindChild(
+                        if k.name().value() != "preset" {
+                            return Err(ConfigError::UnexpectedPresetsChild(
                                 k.name().value().to_string(),
                             ));
                         }
-                        cfg.keybinds.push(read_keybind(k)?);
+                        let (name, body) = read_named_preset(k)?;
+                        if cfg.presets.contains_key(&name) {
+                            return Err(ConfigError::DuplicatePreset(name));
+                        }
+                        cfg.presets.insert(name, body);
                     }
                 }
+                other => return Err(ConfigError::UnknownTopLevel(other.into())),
             }
-            other => return Err(ConfigError::UnknownTopLevel(other.into())),
         }
+        Ok(cfg)
     }
-    Ok(cfg)
-}
 
 fn read_layout(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
     match n.name().value() {
@@ -324,6 +371,54 @@ fn read_preset(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
         }
     }
     Ok(LayoutNode::Preset { name })
+}
+
+/// Read a `preset "name" { body }` block under the top-level
+/// `presets { ... }` namespace. The body's children are parsed as
+/// a [`LayoutNode`] tree (Split / Stack / Pane / nested Preset).
+///
+/// The first child of the preset block wins; subsequent children
+/// are ignored so the future "multi-body preset" extension
+/// doesn't have to break this schema. The intent is the inverse
+/// of [`read_layout`] — a name-bearing layout WRAPPER that owns
+/// its body inline.
+fn read_named_preset(n: &KdlNode) -> Result<(String, LayoutNode), ConfigError> {
+    let mut name = String::new();
+    for entry in n.entries() {
+        if entry.name().map(|id| id.value()) == Some("name") {
+            name = entry_to_string(entry);
+            break;
+        }
+    }
+    if name.is_empty() {
+        for entry in n.entries() {
+            if entry.name().is_none() {
+                name = entry_to_string(entry);
+                break;
+            }
+        }
+    }
+    if name.is_empty() {
+        return Err(ConfigError::InvalidAction(
+            "preset block requires a name argument".into(),
+        ));
+    }
+    let kids = n
+        .children()
+        .ok_or_else(|| ConfigError::UnknownLayoutNode(
+            "preset block must contain a LayoutNode body".into(),
+        ))?
+        .nodes();
+    let first = kids.first().ok_or_else(|| {
+        ConfigError::UnknownLayoutNode("preset block must contain a LayoutNode body".into())
+    })?;
+    if kids.len() > 1 {
+        return Err(ConfigError::UnknownLayoutNode(
+            "preset block may contain exactly one LayoutNode body".into(),
+        ));
+    }
+    let body = read_layout(first)?;
+    Ok((name, body))
 }
 
 fn read_keybind(n: &KdlNode) -> Result<Keybind, ConfigError> {
