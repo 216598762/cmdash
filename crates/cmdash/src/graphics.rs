@@ -206,6 +206,14 @@ impl GraphicsState {
         Ok(())
     }
 
+    /// Returns `true` if a record exists for `(pane, kitty_id)`,
+    /// i.e. an image layer was loaded into the pane and has not
+    /// since been deleted. Useful for tests; cheap because the
+    /// inner map has at most one entry per `(pane, kitty_id)`.
+    pub fn has_image(&self, pane: PaneLayerId, kitty_id: u32) -> bool {
+        self.images.contains_key(&(pane, kitty_id))
+    }
+
     /// Tear down every layer that originated from `pane`. Called
     /// from the binary when a pane's child exits — the per-pane
     /// [`PaneLayerId`] is dropped from the maps and the
