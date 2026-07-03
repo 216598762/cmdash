@@ -1,3 +1,14 @@
 layout {
     pane kind=shell label="default"
 }
+
+// v1 keybind surface. `ctrl-w` revokes the focused pane's
+// dashcompositor layers via the close-channel plumbing added
+// alongside this file (see crates/cmdash/src/pane.rs and
+// crates/cmdash/src/main.rs). v2 will register additional
+// chord-to-action verbs here as the layout engine gains
+// dynamic splits, presets, and per-tab navigation.
+keybinds {
+    bind "ctrl-w" action="pane.close"
+    bind "ctrl-q" action="app.close"
+}
