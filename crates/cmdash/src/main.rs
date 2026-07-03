@@ -3538,4 +3538,238 @@ mod input_tests {
         );
     }
 
+
+    // ============================================================
+    // Phase 6 carry-forward regression tests for the
+    // `PaneStackCycle` modulo-wrap primitive. These pin the
+    // boundary-condition corners of the cycle algorithm --
+    // specifically the 1-member wrap-to-self corner and the
+    // 3-member last-to-first wrap corner -- WITHOUT using
+    // the `split axis=horizontal/vertical` trapdoor fixture
+    // (cycle never handoffs via `focus_by_direction`, so the
+    // axis-trapdoor split semantics are irrelevant to its
+    // algorithm -- they would only confound the assertions).
+    // ============================================================
+
+    /// Phase 6 carry-forward: `PaneStackCycle` on a ZStack
+    /// with exactly ONE member wraps modulo-style:
+    /// `(0 + 1) % 1 == 0` -- the SAME member. Pin: focus
+    /// idx stays at 0 (no escape, no handoff to a sibling
+    /// Split member), AND `stack_focus` records the post-
+    /// wrap focus idx (0) -- the keyed member-index entry
+    /// tracks the cycle result even when the focus identity
+    /// doesn't change. This distinguishes `handle_stack_cycle`
+    /// from `crosstack_member(handoff_direction, advance)`:
+    /// `cycle` always mutates `stack_focus`; `crosstack` at
+    /// boundary NEVER mutates `stack_focus` (the handoff
+    /// early-exits BEFORE the mutating block).
+    ///
+    /// **Trapdoor avoidance**: the fixture is a pure within-
+    /// stack ZStack at root -- NO `split axis=horizontal` or
+    /// `split axis=vertical` Split pane -- so the axis-trapdoor
+    /// (which only matters for the boundary-handoff path in
+    /// `crosstack_member`) cannot confound the assertion.
+    /// Cycle's algorithm is closed (no handoff), so any axis
+    /// trapdoor in the fixture would only add noise.
+    #[test]
+    fn pane_stack_cycle_on_one_member_zstack_wraps_to_same_member() {
+        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout {
+            zstack {
+                pane kind=shell label="only"
+            }
+        }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+        )
+        .expect("compute");
+        assert_eq!(initial.panes.len(), 1);
+        let pane_only = initial.panes[0].clone();
+        let id_only = cmdash::derive_layer_id(&pane_only.id);
+        let r0 = PaneRunner::spawn_with_graphics(
+            pane_only,
+            id_only,
+            shell,
+            Some(close_tx.clone()),
+        )
+        .expect("spawn r0");
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            vec![r0],
+            bindings,
+            0, // focus on "only" (SOLE member)
+            true,
+            close_tx,
+            _close_rx_unused,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        let pre_focus_id = ctx.runners[ctx.focus].computed().id.clone();
+        ctx.apply_action_full(KeyAction::PaneStackCycle);
+        // Phase 6 cycle boundary pin: (0+1) % 1 == 0 -- focus
+        // identity UNCHANGED, but stack_focus is updated.
+        assert_eq!(
+            ctx.focus, 0,
+            "PaneStackCycle on a 1-member ZStack wraps ((0+1)%1==0) -- focus STAYS at 0"
+        );
+        let post_focus_id = ctx.runners[ctx.focus].computed().id.clone();
+        assert_eq!(
+            post_focus_id, pre_focus_id,
+            "PaneStackCycle on a 1-member ZStack must NOT change focus identity"
+        );
+        assert!(
+            ctx.stack_focus.contains_key(&post_focus_id),
+            "PaneStackCycle on a 1-member ZStack must update stack_focus (records post-wrap idx 0) -- this distinguishes cycle from crosstack_member which NEVER mutates stack_focus on the handoff path"
+        );
+        assert_eq!(
+            ctx.stack_focus.get(&post_focus_id).copied(),
+            Some(0),
+            "stack_focus must record post-wrap idx 0"
+        );
+    }
+
+    /// Phase 6 carry-forward: `PaneStackCycle` on a 3-member
+    /// ZStack at the LAST member wraps modulo-style:
+    /// `(2 + 1) % 3 == 0` -- the FIRST member. Pin: focus
+    /// idx shifts from 2 to 0 (full wrap), `stack_focus`
+    /// records (id_a, 0) for the post-wrap focus, AND
+    /// post_focus_id.path()[1] == 0 pins the declaration-
+    /// order index of the FIRST member (path[0] is the
+    /// resolver seed, always 0; path[1] is the meaningful
+    /// ZStack-member index per the resolver convention).
+    ///
+    /// **Trapdoor avoidance**: deliberately a pure within-
+    /// stack ZStack at root -- NO `split axis=horizontal`
+    /// ANYWHERE -- because cycle's algorithm has no handoff
+    /// path. The axis-trapdoor (column vs row split) only
+    /// affects `crosstack_member`'s boundary-handoff path;
+    /// using axis-trapdoor fixtures for a cycle test would
+    /// be a semantic-noose (the fixture's trapdoor would
+    /// be irrelevant to cycle's behavior and would invite a
+    /// future reader to misinterpret the assertion).
+    #[test]
+    fn pane_stack_cycle_on_three_member_zstack_wraps_last_to_first() {
+        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout {
+            zstack {
+                pane kind=shell label="a"
+                pane kind=shell label="b"
+                pane kind=shell label="c"
+            }
+        }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+        )
+        .expect("compute");
+        assert_eq!(initial.panes.len(), 3);
+        let pane_a = initial.panes[0].clone();
+        let pane_b = initial.panes[1].clone();
+        let pane_c = initial.panes[2].clone();
+        let id_a = cmdash::derive_layer_id(&pane_a.id);
+        let id_b = cmdash::derive_layer_id(&pane_b.id);
+        let id_c = cmdash::derive_layer_id(&pane_c.id);
+        let r0 = PaneRunner::spawn_with_graphics(
+            pane_a,
+            id_a,
+            shell.clone(),
+            Some(close_tx.clone()),
+        )
+        .expect("spawn r0");
+        let r1 = PaneRunner::spawn_with_graphics(
+            pane_b,
+            id_b,
+            shell.clone(),
+            Some(close_tx.clone()),
+        )
+        .expect("spawn r1");
+        let r2 = PaneRunner::spawn_with_graphics(
+            pane_c,
+            id_c,
+            shell,
+            Some(close_tx.clone()),
+        )
+        .expect("spawn r2");
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            vec![r0, r1, r2],
+            bindings,
+            2, // focus on "c" (LAST member)
+            true,
+            close_tx,
+            _close_rx_unused,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        let pre_focus_id = ctx.runners[ctx.focus].computed().id.clone();
+        assert_ne!(
+            pre_focus_id, ctx.runners[0].computed().id,
+            "pre-focus sanity: must NOT already be at the FIRST member (otherwise the wrap assertion proves nothing)"
+        );
+        ctx.apply_action_full(KeyAction::PaneStackCycle);
+        // Phase 6 cycle boundary pin: (2+1) % 3 == 0 -- the
+        // full wrap from LAST to FIRST member.
+        assert_ne!(
+            ctx.focus, 2,
+            "PaneStackCycle on the LAST member must NOT no-op -- it wraps modulo"
+        );
+        assert_eq!(
+            ctx.focus, 0,
+            "PaneStackCycle wraps last (idx 2) -> first (idx 0) via (2+1) % 3"
+        );
+        let post_focus_id = ctx.runners[ctx.focus].computed().id.clone();
+        assert_eq!(
+            post_focus_id, ctx.runners[0].computed().id,
+            "post-focus PaneId must match pane 'a' at pre_order=0 (FIRST member)"
+        );
+        // Path[1] pin: declaration-order ZStack member index.
+        // Path[0] is the resolver seed, always 0 -- NOT a
+        // meaningful per-this-test signal.
+        assert_eq!(
+            post_focus_id.path()[1], 0,
+            "post-focus path[1] must read 0 (declaration-order idx of FIRST member)"
+        );
+        assert!(
+            ctx.stack_focus.contains_key(&post_focus_id),
+            "PaneStackCycle wrap must update stack_focus"
+        );
+        assert_eq!(
+            ctx.stack_focus.get(&post_focus_id).copied(),
+            Some(0),
+            "stack_focus must record post-wrap idx 0 (FIRST member)"
+        );
+    }
 }
