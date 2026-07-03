@@ -131,6 +131,7 @@ dependencies = [
  "cmdash-pty",
  "crossterm 0.29.0",
  "dashcompositor",
+ "image",
  "ratatui",
  "thiserror 2.0.18",
  "tracing",

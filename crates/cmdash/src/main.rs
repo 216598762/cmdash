@@ -1,16 +1,17 @@
-//! cmdash binary: drives the layout → PTY → ratatui render loop
-//! with crossterm input dispatch via cmdash-keybinds.
+//! cmdash binary: drives the layout → PTY → ratatui text body and
+//! dashcompositor kitty graphics render loop, with crossterm input
+//! dispatch via cmdash-keybinds.
 //!
-//! AGENTS.md §"Rendering pipeline" requires the cell body to be
-//! drawn into a ratatui `Frame` (this module's `terminal.draw`).
-//! v1 single-tab, sync IO via per-pane reader threads, degraded
-//! text-mode (no dashcompositor wiring). Key bindings from the
-//! config are routed through cmdash-keybinds; unmatched presses
-//! are forwarded as raw bytes to the focused pane's PTY via
+//! AGENTS.md §"Rendering pipeline" -- phase 3a draws the cell body
+//! through ratatui and phase 3b emits dashcompositor graphics via
+//! the passthrough encoder. v1 is single-tab with sync IO via
+//! per-pane reader threads; unmatched key presses are forwarded
+//! as raw bytes to the focused pane's PTY via
 //! `PaneRunner::write_input`.
 
 use std::time::Duration;
 
+use cmdash::graphics::{GraphicsState, Metrics};
 use cmdash::pane::PaneRunner;
 use cmdash::render::{blit_cursor, blit_grid};
 use cmdash_config::{parse as parse_config, KeyAction};
@@ -32,7 +33,7 @@ fn main() {
         )
         .with_target(false)
         .init();
-    info!("cmdash starting (degraded text-mode; ratatui-only)");
+    info!("cmdash starting (ratatui text body + dashcompositor kitty graphics)");
     if let Err(e) = run() {
         eprintln!("cmdash: fatal: {e}");
         std::process::exit(1);
@@ -70,6 +71,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bindings = Router::new(cfg.keybinds);
     let mut focus: usize = 0;
     let mut running = true;
+    let mut graphics = GraphicsState::new(Metrics::default(), (total.w, total.h));
 
     let mut guard = TerminalGuard::enter()?;
     let tick = Duration::from_millis(33);
@@ -78,6 +80,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &bindings,
         &mut focus,
         &mut running,
+        &mut graphics,
         guard.as_mut(),
         tick,
     );
@@ -152,6 +155,7 @@ fn tick_loop<B: ratatui::backend::Backend>(
     bindings: &Router,
     focus: &mut usize,
     running: &mut bool,
+    graphics: &mut GraphicsState,
     terminal: &mut Terminal<B>,
     tick: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -172,6 +176,7 @@ fn tick_loop<B: ratatui::backend::Backend>(
         for runner in runners.iter_mut() {
             match runner.try_wait_exit()? {
                 Some(_code) => {
+                    graphics.close_pane(runner.layer_id());
                     debug!(layer_id = ?runner.layer_id(), "pane exited");
                 }
                 None => {
@@ -181,16 +186,21 @@ fn tick_loop<B: ratatui::backend::Backend>(
             snapshots.push(Some(runner.tick()?));
         }
 
-        // Phase 2: react to events (kitty placeholder).
-        for snap in snapshots.iter().flatten() {
-            for ev in &snap.pending_events {
-                if let PaneEvent::KittyGraphic { cmd } = ev {
-                    debug!(?cmd, "kitty event placeholder (no graphics-path yet)");
+        // Phase 2: route events. Kitty graphics emitted by a
+        // nested PTY are pushed onto the per-pane image map;
+        // everything else is logged. Failures log+continue (a
+        // busted image must not bring the multiplexer down).
+        for (runner, snap) in runners.iter().zip(snapshots.iter()) {
+            if let Some(snap) = snap {
+                for ev in &snap.pending_events {
+                    if let PaneEvent::KittyGraphic { cmd } = ev {
+                        graphics.apply_kitty_event(runner.layer_id(), cmd);
+                    }
                 }
             }
         }
 
-        // Phase 3: render.
+        // Phase 3a: render the cell body through ratatui.
         terminal.draw(|frame| {
             let buf = frame.buffer_mut();
             for (runner, snap) in runners.iter().zip(snapshots.iter()) {
@@ -206,6 +216,17 @@ fn tick_loop<B: ratatui::backend::Backend>(
                 }
             }
         })?;
+
+        // Phase 3b: emit dashcompositor kitty graphics through a
+        // fresh stdout handle. The terminal's own backend already
+        // finished writing row-bearing text; kitty escapes overlay
+        // on kitty-capable hosts and degrade gracefully elsewhere.
+        // AGENTS.md §"Rendering pipeline" step 6 prescribes this
+        // exact path.
+        let mut stdout = std::io::stdout();
+        if let Err(e) = graphics.render_and_write(&mut stdout) {
+            warn!(error = %e, "graphics emit failed");
+        }
 
         if all_exited {
             return Ok(());

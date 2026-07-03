@@ -96,3 +96,33 @@ fn wiring_round_trip_renders_echoed_text() {
     }
     assert!(saw_h, "rendered buffer did not contain 'h'");
 }
+
+// ---------------------------------------------------------------------------
+// Kitty graphics end-to-end smoke: push a synthetic image onto
+// GraphicsState, render and emit through dashcompositor's
+// passthrough encoder, and assert the byte stream contains the
+// kitty APC-G escape per AGENTS.md §"Rendering pipeline" step 6.
+//
+// This covers the dashcompositor wiring path without depending on
+// a real PTY child or an embedded PNG byte fixture.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kitty_graphics_route_emits_escape_sequence() {
+    use cmdash::graphics::{GraphicsState, Metrics};
+    use cmdash_pty::PaneLayerId;
+
+    let mut graphics = GraphicsState::new(Metrics::default(), (80, 24));
+    graphics.push_image(PaneLayerId(1), 7, image::RgbaImage::new(1, 1));
+
+    let mut out = Vec::new();
+    graphics
+        .render_and_write(&mut out)
+        .expect("render_and_write ok");
+
+    assert!(
+        out.windows(3).any(|w| w == b"\x1b_G"),
+        "encoded stream missing kitty APC-G escape; bytes (first 64): {:?}",
+        &out[..out.len().min(64)]
+    );
+}
