@@ -85,17 +85,13 @@ pub enum LayoutNode {
         ratio: Ratio,
         children: Vec<LayoutNode>,
     },
-    /// `stack { pane* }` — tabbed viewer; resolver slices
-    /// members into equal-height vertical strips so each
-    /// pane owns its row.
+    /// `stack { pane* }` — equal-height vertical strips (tabbed
+    /// UI); each member owns its row.
     Stack { panes: Vec<LayoutNode> },
-    /// `zstack { pane* }` — z-stack overlay; resolver gives
-    /// every member the same `rect` (parent area). Members
-    /// share the cell-grid surface; z-order is determined by
-    /// resolver pre-order (later members on top of earlier
-    /// ones). Distinct PaneIds per member; each gets its own
-    /// `dashcompositor::LayerId` per the AGENTS.md Hard rule.
-    /// Phase 3 carry-forward.
+    /// `zstack { pane* }` — Kinetic-style overlay; every
+    /// member shares the parent's rect verbatim. Distinct
+    /// `PaneId`s per member (Hard rule: one `LayerId` per
+    /// pane instance; z-order = resolver pre-order).
     ZStack { panes: Vec<LayoutNode> },
     /// `pane kind=shell [label="..."]`
     Pane(Pane),
