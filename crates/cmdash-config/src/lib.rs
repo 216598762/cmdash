@@ -85,8 +85,18 @@ pub enum LayoutNode {
         ratio: Ratio,
         children: Vec<LayoutNode>,
     },
-    /// `stack { pane* }`
+    /// `stack { pane* }` — tabbed viewer; resolver slices
+    /// members into equal-height vertical strips so each
+    /// pane owns its row.
     Stack { panes: Vec<LayoutNode> },
+    /// `zstack { pane* }` — z-stack overlay; resolver gives
+    /// every member the same `rect` (parent area). Members
+    /// share the cell-grid surface; z-order is determined by
+    /// resolver pre-order (later members on top of earlier
+    /// ones). Distinct PaneIds per member; each gets its own
+    /// `dashcompositor::LayerId` per the AGENTS.md Hard rule.
+    /// Phase 3 carry-forward.
+    ZStack { panes: Vec<LayoutNode> },
     /// `pane kind=shell [label="..."]`
     Pane(Pane),
     /// `preset "name"` or `preset name="..."`
@@ -288,10 +298,27 @@ fn read_layout(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
     match n.name().value() {
         "split" => read_split(n),
         "stack" => read_stack(n),
+        "zstack" => read_zstack(n),
         "pane" => read_pane(n),
         "preset" => read_preset(n),
         other => Err(ConfigError::UnknownLayoutNode(other.into())),
     }
+}
+
+/// Parse `zstack { pane_split_pane }` blocks. Mirrors `read_stack`
+/// but disambiguates intent: members share the parent's rect
+/// (overlay z-stacked panes), not the strip-split geometry of
+/// `stack`. Empty `zstack { }` returns `LayoutNode::ZStack { panes:
+/// vec![] }`; the resolver surfaces
+/// `LayoutError::EmptyChildren("zstack")` if encountered.
+fn read_zstack(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
+    let mut panes = Vec::new();
+    if let Some(c) = n.children() {
+        for child in c.nodes() {
+            panes.push(read_layout(child)?);
+        }
+    }
+    Ok(LayoutNode::ZStack { panes })
 }
 
 fn read_split(n: &KdlNode) -> Result<LayoutNode, ConfigError> {

@@ -308,6 +308,27 @@ fn resolve_node(
                 resolve_node(child, child_area, path, path_len + 1, next_preorder, out)?;
             }
         }
+        LayoutNode::ZStack { panes } => {
+            // Z-stack overlay: every member shares the parent's
+            // `area` verbatim. The Hard rule (one `LayerId` per
+            // pane instance) is preserved — each member still
+            // emits its own `ComputedPane` with its own `PaneId`,
+            // so reconcile_runners and the binary happy path
+            // continue to treat them as distinct panes. Z-order
+            // is determined by resolver pre_order (later members
+            // render on top of earlier ones).
+            if panes.is_empty() {
+                return Err(LayoutError::EmptyChildren("zstack"));
+            }
+            for (i, child) in panes.iter().enumerate() {
+                if path_len as usize >= MAX_TREE_DEPTH {
+                    return Err(LayoutError::TreeTooDeep(path_len as usize + 1));
+                }
+                path[path_len as usize] = i as u16;
+                // Same area for every peer — no slicing.
+                resolve_node(child, area, path, path_len + 1, next_preorder, out)?;
+            }
+        }
         LayoutNode::Pane(p) => {
             let id = PaneId {
                 pre_order: *next_preorder,
@@ -409,7 +430,9 @@ pub fn remove_leaf(root: &mut LayoutNode, path: &[u16]) -> Result<(), LayoutErro
     } {
         Some(n) => match n {
             LayoutNode::Split { children, .. } => surviving_sibling_of(leaf_idx, children),
-            LayoutNode::Stack { panes } => surviving_sibling_of(leaf_idx, panes),
+            LayoutNode::Stack { panes } | LayoutNode::ZStack { panes } => {
+                surviving_sibling_of(leaf_idx, panes)
+            }
             LayoutNode::Pane(_) | LayoutNode::Preset { .. } => {
                 return Err(LayoutError::SplitChildCount { got: 0 })
             }
@@ -420,7 +443,7 @@ pub fn remove_leaf(root: &mut LayoutNode, path: &[u16]) -> Result<(), LayoutErro
                 LayoutNode::Split { children, .. } => {
                     surviving_sibling_of(leaf_idx, children)
                 }
-                LayoutNode::Stack { panes } => {
+                LayoutNode::Stack { panes } | LayoutNode::ZStack { panes } => {
                     surviving_sibling_of(leaf_idx, panes)
                 }
                 LayoutNode::Pane(_) | LayoutNode::Preset { .. } => {
@@ -440,7 +463,7 @@ pub fn remove_leaf(root: &mut LayoutNode, path: &[u16]) -> Result<(), LayoutErro
                 }
                 children.remove(leaf_idx);
             }
-            LayoutNode::Stack { panes } => {
+            LayoutNode::Stack { panes } | LayoutNode::ZStack { panes } => {
                 if leaf_idx >= panes.len() {
                     return Err(LayoutError::SplitChildCount { got: panes.len() });
                 }
@@ -477,7 +500,9 @@ fn walk_imut<'a>(
     for &idx in path {
         let next = match node {
             LayoutNode::Split { children, .. } => children.get(idx as usize),
-            LayoutNode::Stack { panes } => panes.get(idx as usize),
+            LayoutNode::Stack { panes } | LayoutNode::ZStack { panes } => {
+                panes.get(idx as usize)
+            }
             LayoutNode::Pane(_) | LayoutNode::Preset { .. } => {
                 return Err(LayoutError::SplitChildCount { got: 1 })
             }
@@ -499,7 +524,9 @@ fn walk_mut<'a>(
     for &idx in path {
         let next = match node {
             LayoutNode::Split { children, .. } => children.get_mut(idx as usize),
-            LayoutNode::Stack { panes } => panes.get_mut(idx as usize),
+            LayoutNode::Stack { panes } | LayoutNode::ZStack { panes } => {
+                panes.get_mut(idx as usize)
+            }
             LayoutNode::Pane(_) | LayoutNode::Preset { .. } => {
                 return Err(LayoutError::SplitChildCount { got: 1 })
             }
@@ -524,7 +551,7 @@ fn clone_child(
     };
     let slot = match parent {
         LayoutNode::Split { children, .. } => children.get(idx),
-        LayoutNode::Stack { panes } => panes.get(idx),
+        LayoutNode::Stack { panes } | LayoutNode::ZStack { panes } => panes.get(idx),
         LayoutNode::Pane(_) | LayoutNode::Preset { .. } => {
             return Err(LayoutError::SplitChildCount { got: 1 })
         }
@@ -553,7 +580,7 @@ fn replace_child(
             children[idx] = new_child;
             Ok(())
         }
-        LayoutNode::Stack { panes } => {
+        LayoutNode::Stack { panes } | LayoutNode::ZStack { panes } => {
             if idx >= panes.len() {
                 return Err(LayoutError::SplitChildCount { got: panes.len() });
             }
@@ -920,6 +947,57 @@ mod internal_sanity_tests {
         assert_eq!(post.panes[0].label, Some("a".to_string()));
     }
 
+    /// Phase 3: `zstack { a, b }` resolves every member with
+    /// the parent's `area` verbatim. Members share the cell-
+    /// grid surface (z-stack overlay); each still gets its own
+    /// `PaneId` and `pre_order` index. Pins Phase 3's "shared
+    /// rect, distinct ids" invariant.
+    #[test]
+    fn resolve_zstack_shares_parent_rect() {
+        let root = LayoutNode::ZStack {
+            panes: vec![
+                LayoutNode::Pane(Pane {
+                    kind: PaneKind::Shell,
+                    label: Some("a".to_string()),
+                }),
+                LayoutNode::Pane(Pane {
+                    kind: PaneKind::Shell,
+                    label: Some("b".to_string()),
+                }),
+            ],
+        };
+        let layout = ComputedLayout::compute(
+            &root,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute zstack");
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(
+            layout.panes[0].rect, layout.panes[1].rect,
+            "ZStack members share the same rect"
+        );
+        assert_eq!(
+            layout.panes[0].rect,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24
+            }
+        );
+        assert_ne!(
+            layout.panes[0].id, layout.panes[1].id,
+            "ZStack members have distinct PaneIds (Hard rule: one layer per instance)"
+        );
+        assert_eq!(layout.panes[0].id.pre_order(), 0);
+        assert_eq!(layout.panes[1].id.pre_order(), 1);
+    }
+
     /// Rect-proximity adjacency: a 2-pane horizontal-split
     /// layout; focusing left and pressing Right yields the
     /// right pane; focusing right and pressing Left yields the
@@ -999,5 +1077,101 @@ mod internal_sanity_tests {
         assert_eq!(adjacent_pane(&layout, br, Direction::Up), Some(tr));
         assert_eq!(adjacent_pane(&layout, tl, Direction::Left), None);
         assert_eq!(adjacent_pane(&layout, br, Direction::Right), None);
+    }
+
+    /// Phase 3: a ZStack nested inside a Split has its members
+    /// overlay the Split's child rect — NOT the root rect. The
+    /// resolver passes the path's accumulating area verbatim to
+    /// non-stripping children, so overlay rects are scoped to the
+    /// nearest ancestor that performed a slicing split. Pins
+    /// Phase 3's "scope-by-parent-area" invariant.
+    #[test]
+    fn resolve_zstack_within_split_uses_split_child_rect() {
+        // Outer V split at 50% gives the top half (y=0..12) to
+        // the ZStack and the bottom half (y=12..24) to "tail".
+        // (split_v in this codebase slices rows top/bottom; split_h
+        // slices columns left/right.)
+        let root = split_v(
+            LayoutNode::ZStack {
+                panes: vec![
+                    LayoutNode::Pane(Pane {
+                        kind: PaneKind::Shell,
+                        label: Some("ovl_a".to_string()),
+                    }),
+                    LayoutNode::Pane(Pane {
+                        kind: PaneKind::Shell,
+                        label: Some("ovl_b".to_string()),
+                    }),
+                ],
+            },
+            p(Some("tail")),
+        );
+        let layout = ComputedLayout::compute(
+            &root,
+            Rect { x: 0, y: 0, w: 80, h: 24 },
+        )
+        .expect("compute ZStack-within-Split");
+        // 3 panes total: 2 overlay + 1 tail.
+        assert_eq!(layout.panes.len(), 3);
+        let ovl_a = &layout.panes[0];
+        let ovl_b = &layout.panes[1];
+        let tail = &layout.panes[2];
+        assert_eq!(ovl_a.label, Some("ovl_a".to_string()));
+        assert_eq!(ovl_b.label, Some("ovl_b".to_string()));
+        assert_eq!(tail.label, Some("tail".to_string()));
+        // Both overlay members share the TOP half (y=0..12), not
+        // the root area (y=0..24).
+        assert_eq!(ovl_a.rect, ovl_b.rect);
+        assert_eq!(
+            ovl_a.rect,
+            Rect { x: 0, y: 0, w: 80, h: 12 }
+        );
+        // Tail got the bottom half.
+        assert_eq!(
+            tail.rect,
+            Rect { x: 0, y: 12, w: 80, h: 12 }
+        );
+        // Overlay peers still have distinct PaneIds.
+        assert_ne!(ovl_a.id, ovl_b.id);
+    }
+
+    /// Phase 3: a 3-member ZStack emits three ComputedPanes each
+    /// sharing the same rect but with strictly increasing
+    /// pre_orders. The dashcompositor's LayerStack draws pre_order
+    /// 2 LAST, so the latest member is the topmost visible pane.
+    /// Pins Phase 3's "shared rect, ordered z-stack" invariant.
+    #[test]
+    fn resolve_zstack_three_members_ordered_pre_orders() {
+        let root = LayoutNode::ZStack {
+            panes: vec![
+                p(Some("bottom")),
+                p(Some("middle")),
+                p(Some("top")),
+            ],
+        };
+        let layout = ComputedLayout::compute(
+            &root,
+            Rect { x: 0, y: 0, w: 80, h: 24 },
+        )
+        .expect("compute 3-member zstack");
+        assert_eq!(layout.panes.len(), 3);
+        // All share the rect.
+        assert_eq!(layout.panes[0].rect, layout.panes[1].rect);
+        assert_eq!(layout.panes[1].rect, layout.panes[2].rect);
+        // Pre-orders strictly increase, in declaration order.
+        assert!(layout.panes[0].id.pre_order() < layout.panes[1].id.pre_order());
+        assert!(layout.panes[1].id.pre_order() < layout.panes[2].id.pre_order());
+        // Labels preserved in declaration order.
+        assert_eq!(layout.panes[0].label, Some("bottom".to_string()));
+        assert_eq!(layout.panes[1].label, Some("middle".to_string()));
+        assert_eq!(layout.panes[2].label, Some("top".to_string()));
+        // Distinct ids.
+        for (i, a) in layout.panes.iter().enumerate() {
+            for (j, b) in layout.panes.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a.id, b.id);
+                }
+            }
+        }
     }
 }
