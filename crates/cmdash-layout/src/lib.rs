@@ -173,6 +173,34 @@ pub enum Direction {
 
     /// Split `area` along `axis` at `ratio` percent of the dimension.
 /// Child 0 gets `ratio%`; child 1 gets the remainder.
+
+///
+/// # Axis semantics
+///
+/// Naming is a frequently-stepped trapdoor. This crate's
+/// `SplitAxis` enum is named after the **line** the split draws,
+/// not the dimension along which the children stack:
+///
+/// - `SplitAxis::Horizontal` is a **column split**: the split
+///   line is horizontal (across the screen), so children stack
+///   side-by-side along the x-axis (left<->right). Child 0
+///   occupies the left `ratio%` column strip at full height;
+///   child 1 occupies the right remainder.
+/// - `SplitAxis::Vertical` is a **row split**: the split line is
+///   vertical (top-to-bottom across the screen), so children
+///   stack top-to-bottom along the y-axis (top<->bottom). Child
+///   0 occupies the top `ratio%` row strip at full width; child
+///   1 occupies the bottom remainder.
+///
+/// The rect math is pinned by the unit tests
+/// `split_rect_horizontal_60` (column math: same `y`, different
+/// `x`) and `split_rect_vertical_30` (row math: same `x`,
+/// different `y`); see those for the canonical examples. Phase 4
+/// ZStack runtime added these clarifications after a test
+/// fixture used `axis=horizontal` while asserting row-stacked
+/// neighbours -- which produced silently dead test code masked
+/// by a missing `#[test]` attribute. Future contributors should
+/// treat those two tests as the load-bearing ground truth.
 fn split_rect(area: Rect, axis: SplitAxis, ratio: Ratio) -> (Rect, Rect) {
     match axis {
         SplitAxis::Horizontal => {
@@ -492,7 +520,7 @@ pub fn remove_leaf(root: &mut LayoutNode, path: &[u16]) -> Result<(), LayoutErro
 /// returning the node at `path`. Returns [`LayoutError::SplitChildCount`]
 /// on a path that requests a child index some non-Split/Stack node
 /// has, or out-of-range.
-fn walk_imut<'a>(
+pub fn walk_imut<'a>(
     root: &'a LayoutNode,
     path: &[u16],
 ) -> Result<&'a LayoutNode, LayoutError> {
