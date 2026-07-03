@@ -16,7 +16,7 @@ pub mod render;
 
 pub use graphics::{GraphicsError, GraphicsState, Metrics};
 pub use layer_id::{derive_layer_id, SINGLE_TAB};
-pub use pane::{PaneRunner, RunnerError};
+pub use pane::{PaneCloseTx, PaneRunner, RunnerError};
 pub use render::{blit_cursor, blit_grid, pty_attrs_to_modifier, pty_color_to_ratatui};
 
 #[doc(hidden)]

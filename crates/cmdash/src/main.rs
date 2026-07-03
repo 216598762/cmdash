@@ -8,11 +8,22 @@
 //! per-pane reader threads; unmatched key presses are forwarded
 //! as raw bytes to the focused pane's PTY via
 //! `PaneRunner::write_input`.
+//!
+//! ## Pane drop → dashcompositor teardown
+//!
+//! Each `PaneRunner::Drop` sends its `PaneLayerId` into a
+//! shared `mpsc::Sender<PaneLayerId>`. The receiver lives in
+//! `cmdash::run` and is drained at the start of each tick so
+//! the corresponding `dashcompositor` layers are revoked
+//! without forcing `GraphicsState` into an `Arc<Mutex<...>>`
+//! (which fails `clippy::arc-with-non-send-sync` because
+//! `dashcompositor::LayerStack` is not `Sync`).
 
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use cmdash::graphics::{GraphicsState, Metrics};
-use cmdash::pane::PaneRunner;
+use cmdash::pane::{PaneCloseTx, PaneRunner};
 use cmdash::render::{blit_cursor, blit_grid};
 use cmdash_config::{parse as parse_config, KeyAction};
 use cmdash_keybinds::Router;
@@ -56,10 +67,26 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let layout = ComputedLayout::compute(layout_root, total)?;
     info!(panes = layout.panes.len(), "layout resolved");
 
+    let mut graphics = GraphicsState::new(Metrics::default(), (total.w, total.h));
+
+    // PaneRunner::Drop sends its `PaneLayerId` into this channel;
+    // tick_loop drains it at the start of phase 1 to call
+    // `GraphicsState::close_pane` for each id. Drop order: the
+    // Vec<PaneRunner> drops before `graphics` (reverse
+    // declaration order), so Drop-driven sends land on a live
+    // receiver owned by `close_rx`.
+    let (close_tx, close_rx): (Sender<cmdash_pty::PaneLayerId>, _) = std::sync::mpsc::channel();
+
     let mut runners: Vec<PaneRunner> = Vec::with_capacity(layout.panes.len());
     for pane in &layout.panes {
         let layer_id = cmdash::derive_layer_id(&pane.id);
-        match PaneRunner::spawn(pane.clone(), layer_id, ShellSpec::LoginShell) {
+        let tx: PaneCloseTx = close_tx.clone();
+        match PaneRunner::spawn_with_graphics(
+            pane.clone(),
+            layer_id,
+            ShellSpec::LoginShell,
+            Some(tx),
+        ) {
             Ok(r) => runners.push(r),
             Err(e) => warn!(error = %e, ?layer_id, "failed to spawn pane"),
         }
@@ -67,11 +94,14 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if runners.is_empty() {
         return Err("no panes were spawned; aborting".into());
     }
+    // Drop the binary's primary sender so Drop sends a `Send`
+    // error if anyone tries to push after `runner.close()`,
+    // but keep a clone in each `PaneRunner`.
+    drop(close_tx);
 
     let bindings = Router::new(cfg.keybinds);
     let mut focus: usize = 0;
     let mut running = true;
-    let mut graphics = GraphicsState::new(Metrics::default(), (total.w, total.h));
 
     let mut guard = TerminalGuard::enter()?;
     let tick = Duration::from_millis(33);
@@ -80,6 +110,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &bindings,
         &mut focus,
         &mut running,
+        &close_rx,
         &mut graphics,
         guard.as_mut(),
         tick,
@@ -150,11 +181,21 @@ impl Drop for TerminalGuard {
     }
 }
 
+// `tick_loop` carries one argument per phase of the AGENTS.md
+// rendering pipeline (input/drain/snapshot/render/emit/sleep)
+// plus the per-tick pacing knob. Bundling into a context struct
+// is a v2-only cleanup — for v1 we silence the lint narrowly.
+//
+// AGENTS.md §"Rendering pipeline (one frame)" enumerates the
+// six phases; each consumes at most one of these params, so
+// the parameter list itself documents the pipeline.
+#[allow(clippy::too_many_arguments)]
 fn tick_loop<B: ratatui::backend::Backend>(
     runners: &mut [PaneRunner],
     bindings: &Router,
     focus: &mut usize,
     running: &mut bool,
+    close_rx: &Receiver<cmdash_pty::PaneLayerId>,
     graphics: &mut GraphicsState,
     terminal: &mut Terminal<B>,
     tick: Duration,
@@ -169,14 +210,18 @@ fn tick_loop<B: ratatui::backend::Backend>(
             return Ok(());
         }
 
-        // Phase 1: poll exits + drain bytes + snapshot.
+        // Phase 1: drain close-channel (Drop messages) FIRST so
+        // their revisions are visible before phase 2/3 in the
+        // same tick. Then poll exits + tick + snapshot.
+        while let Ok(id) = close_rx.try_recv() {
+            graphics.close_pane(id);
+        }
         let mut snapshots: Vec<Option<cmdash_pty::PaneTerminalState>> =
             Vec::with_capacity(runners.len());
         let mut all_exited = true;
         for runner in runners.iter_mut() {
             match runner.try_wait_exit()? {
                 Some(_code) => {
-                    graphics.close_pane(runner.layer_id());
                     debug!(layer_id = ?runner.layer_id(), "pane exited");
                 }
                 None => {

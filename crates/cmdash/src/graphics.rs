@@ -321,4 +321,71 @@ mod internal_sanity_tests {
         assert!(!g.pane_images.contains_key(&pane));
         assert!(g.images.is_empty());
     }
+
+    /// Regression test for `PaneRunner::Drop` -> `GraphicsState::close_pane`
+    /// coupling through the close-channel. Spawns a real PaneRunner with
+    /// the channel sender, drops the runner, drains the receiver
+    /// (simulating `tick_loop`'s phase 1), and finally calls
+    /// `close_pane` with the received id to assert the bookkeeping
+    /// revokes the pane's image.
+    ///
+    /// This is the integration check that proves: (1) `Drop` enqueues
+    /// the pane's `PaneLayerId` onto the close channel, and (2) the
+    /// message contains the same id the binary will resolve through
+    /// its tick loop's drain.
+    #[test]
+    fn drop_pane_runner_sends_close_to_channel() {
+        use crate::pane::{PaneCloseTx, PaneRunner};
+        use cmdash_config::parse as parse_config;
+        use cmdash_layout::{ComputedLayout, Rect as LayoutRect};
+        use cmdash_pty::ShellSpec;
+        use std::sync::mpsc;
+
+        let mut graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+        let pane_id = PaneLayerId(99);
+
+        // Pre-populate one image layer for the pane.
+        graphics.push_image(pane_id, 1, image::RgbaImage::new(1, 1));
+        assert!(graphics.has_image(pane_id, 1), "image registered pre-drop");
+
+        let cfg_text = "layout { pane kind=shell label=\"drop_test\" }";
+        let cfg = parse_config(cfg_text).expect("parse KDL");
+        let cfg_root = cfg.layout.expect("layout block");
+        let layout = ComputedLayout::compute(
+            &cfg_root,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute layout");
+        let computed = layout.panes[0].clone();
+        let runner = PaneRunner::spawn_with_graphics(
+            computed,
+            pane_id,
+            ShellSpec::Command {
+                argv: vec!["true".to_string()],
+            },
+            Some(close_tx),
+        )
+        .expect("spawn_with_graphics");
+
+        // Drop enqueues the pane's layer id onto the close channel.
+        drop(runner);
+
+        // Simulate `tick_loop` phase 1: drain the close message and
+        // call `close_pane` to revoke the dashcompositor layers.
+        let received = close_rx
+            .try_recv()
+            .expect("PaneRunner::Drop must send a close message to the channel");
+        assert_eq!(received, pane_id);
+        graphics.close_pane(received);
+        assert!(
+            !graphics.has_image(pane_id, 1),
+            "image layer should be revoked once the close-channel message is applied"
+        );
+    }
 }

@@ -1,6 +1,7 @@
 //! Per-pane runner: owns a [`cmdash_pty::PanePty`] and a dedicated
 //! thread that drains the master-side reader and forwards bytes
-//! over a `std::sync::mpsc` channel to the binary's main tick loop.
+//! over a `std::sync::mpsc::Sender<Vec<u8>>` to the binary's main
+//! tick loop.
 //!
 //! AGENTS.md §"Rendering pipeline" step 2 prescribes the cell body
 //! path as: PTY bytes → vte → `TextGrid` → ratatui `Frame`. This
@@ -13,18 +14,43 @@
 //! pending data would freeze the renderer. One thread per pane
 //! keeps reads off the UI thread; the main loop drives `try_recv`.
 //!
+//! ## Drop + dashcompositor teardown
+//!
+//! When a [`PaneRunner`] is dropped, it sends its [`PaneLayerId`]
+//! into an optional close-channel if the binary registered one
+//! via [`PaneRunner::spawn_with_graphics`]. The main loop drains
+//! that channel at the start of each tick and calls
+//! [`crate::graphics::GraphicsState::close_pane`] for each id.
+//! This keeps the dashcompositor layer binding 1:1 with the live
+//! pane even on process exit or panic unwinding (AGENTS.md
+//! §"Hard rule").
+//!
+//! ## Why a channel, not Arc<Mutex<>>
+//!
+//! `dashcompositor::LayerStack` is not `Sync`-derivable through
+//! its public API, so wrapping `GraphicsState` in
+//! `Arc<Mutex<..>>` triggers `clippy::arc-with-non-send-sync`.
+//! A `mpsc::Sender<PaneLayerId>` is `Send`-only (no `Sync`
+//! required), trivial for a u64 newtype, and avoids the lock
+//! entirely.
+//!
 //! This module is **sync** (no async runtime). v2 will swap in
 //! `tokio` for true non-blocking IO per AGENTS.md §"Key
 //! dependencies".
 
 use std::io::Read;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
 use cmdash_layout::ComputedPane;
 use cmdash_pty::{PaneLayerId, PanePty, PaneReader, PaneTerminalState, PtyError, ShellSpec};
 use thiserror::Error;
 use tracing::{debug, warn};
+
+/// Back-channel used by the binary to wire `PaneRunner::Drop`
+/// into `GraphicsState::close_pane`. v1 only needs the sender;
+/// the receiver is owned by the main loop's `tick_loop`.
+pub type PaneCloseTx = Sender<PaneLayerId>;
 
 /// Reader-side error.
 #[derive(Debug, Error)]
@@ -40,15 +66,38 @@ pub struct PaneRunner {
     pty: PanePty,
     bytes_rx: Receiver<Vec<u8>>,
     reader_thread: Option<thread::JoinHandle<()>>,
+    /// Optional close-channel sender. When `Some`, `Drop` sends
+    /// `self.pty.layer_id()` into it so the main loop's
+    /// `GraphicsState` can revoke the pane's dashcompositor
+    /// layers on the next tick (AGENTS.md §"Hard rule").
+    close_tx: Option<PaneCloseTx>,
 }
 
 impl PaneRunner {
-    /// Spawn a child PTY and a reader thread that forwards master
-    /// bytes into the mpsc receiver.
+    /// Spawn a child PTY and a reader thread that forwards
+    /// master bytes into the mpsc receiver. **No** close-channel
+    /// hooked up — `Drop` will skip the teardown path. Use
+    /// [`PaneRunner::spawn_with_graphics`] from the production
+    /// binary so `Drop` notifies the main loop's
+    /// `GraphicsState`.
     pub fn spawn(
         computed: ComputedPane,
         layer_id: PaneLayerId,
         shell: ShellSpec,
+    ) -> Result<Self, RunnerError> {
+        Self::spawn_with_graphics(computed, layer_id, shell, None)
+    }
+
+    /// Same as [`PaneRunner::spawn`] but registers an mpsc close
+    /// sender. When this runner is dropped, `Drop` enqueues
+    /// `self.pty.layer_id()` so a `GraphicsState`-aware main
+    /// loop can revoke the pane's dashcompositor layers on the
+    /// next tick.
+    pub fn spawn_with_graphics(
+        computed: ComputedPane,
+        layer_id: PaneLayerId,
+        shell: ShellSpec,
+        close_tx: Option<PaneCloseTx>,
     ) -> Result<Self, RunnerError> {
         let (pty, reader) = PanePty::spawn(shell, computed.rect.w, computed.rect.h, layer_id)
             .map_err(RunnerError::Spawn)?;
@@ -62,6 +111,7 @@ impl PaneRunner {
             pty,
             bytes_rx: rx,
             reader_thread: Some(reader_thread),
+            close_tx,
         })
     }
 
@@ -108,6 +158,17 @@ impl Drop for PaneRunner {
         }
         if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
+        }
+        // AGENTS.md §"Hard rule: one layer per instance" -- the
+        // PaneLayerId binding ends at pane close. Notify the main
+        // loop so its next tick can call
+        // `GraphicsState::close_pane`. We swallow a closed-channel
+        // error (binary already exited) which is benign.
+        if let Some(tx) = self.close_tx.as_ref() {
+            if let Err(e) = tx.send(self.pty.layer_id()) {
+                debug!(error = ?e, layer_id = ?self.pty.layer_id(),
+                       "close_tx send on drop failed (receiver gone?)");
+            }
         }
     }
 }
