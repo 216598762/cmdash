@@ -142,12 +142,12 @@ impl PaneRunner {
         self.pty.write(bytes)
     }
 
-    /// Read-only accessor for the resolved pane position/rect/label.
-    /// Mirrors the [`TickContext::computed`] pattern: callers should
-    /// use this accessor rather than reading the field directly so
-    /// any future invariant on the layer binding (`LayerId` <-> pane
-    /// 1:1 per AGENTS.md "Hard rule: one layer per instance") can be
-    /// enforced here without churn at the call sites.
+    /// Read-only accessor; transparent pass-through to the spawn-
+    /// time `computed` field. The AGENTS.md "Hard rule: one layer
+    /// per instance" invariant is enforced at construction
+    /// (`spawn_with_graphics` takes `(computed, layer_id)` as
+    /// paired args), not here. Kept narrow so any future read-time
+    /// check can be added without churning call sites.
     pub fn computed(&self) -> &ComputedPane {
         &self.computed
     }
