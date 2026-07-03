@@ -9,7 +9,15 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+cmdash-config = { version = "0.1.0", path = "../cmdash-config" }
+cmdash-layout = { version = "0.1.0", path = "../cmdash-layout" }
+cmdash-pty = { version = "0.1.0", path = "../cmdash-pty" }
+crossterm = "0.29.0"
 dashcompositor.workspace = true
+ratatui = { version = "0.25", features = ["crossterm"] }
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [[bin]]
 name = "cmdash"

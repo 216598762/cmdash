@@ -140,10 +140,6 @@ impl TextGrid {
     fn cell_idx(&self, x: u16, y: u16) -> usize {
         (y as usize) * (self.cols as usize) + (x as usize)
     }
-    fn cell_mut(&mut self, x: u16, y: u16) -> &mut Cell {
-        let idx = self.cell_idx(x, y);
-        &mut self.cells[idx]
-    }
     fn mark_dirty(&mut self, y: u16) {
         if !self.dirty_rows.contains(&y) {
             self.dirty_rows.push(y);
@@ -381,14 +377,14 @@ fn parse_kitty_chunk(raw: &[u8]) -> Option<KittyGraphicCmd> {
         None => raw.len(),
     };
     let meta_bytes = &raw[..sep];
-    let payload = if sep + 1 <= raw.len() {
+    let payload = if sep < raw.len() {
         &raw[sep + 1..]
     } else {
         &[]
     };
     let meta = std::str::from_utf8(meta_bytes).ok()?;
     let mut kv: HashMap<String, String> = HashMap::new();
-    for segment in meta.split(|c: char| c == ';' || c == ',') {
+    for segment in meta.split([';', ',']) {
         let mut it = segment.splitn(2, '=');
         if let (Some(k), Some(v)) = (it.next(), it.next()) {
             kv.insert(k.to_string(), v.to_string());
@@ -466,11 +462,7 @@ impl<'a> VtePerf<'a> {
     }
     fn apply_sgr(&mut self, params: &Params) {
         let mut iter = params.iter();
-        loop {
-            let code = match iter.next().and_then(|p| p.first().copied()) {
-                Some(c) => c,
-                None => break,
-            };
+        while let Some(code) = iter.next().and_then(|p| p.first().copied()) {
             match code {
                 0 => {
                     *self.fg = Color::Default;
@@ -546,29 +538,29 @@ impl<'a> VtePerf<'a> {
         };
         match action {
             'H' | 'f' => {
-                let row = p0().saturating_sub(1) as u16;
-                let col = p1().saturating_sub(1) as u16;
+                let row = p0().saturating_sub(1);
+                let col = p1().saturating_sub(1);
                 self.grid.cursor_y = row.min(self.rows.saturating_sub(1));
                 self.grid.cursor_x = col.min(self.cols.saturating_sub(1));
             }
             'A' => {
-                let n = p0().max(1) as u16;
+                let n = p0().max(1);
                 self.grid.cursor_y = self.grid.cursor_y.saturating_sub(n);
             }
             'B' => {
-                let n = p0().max(1) as u16;
+                let n = p0().max(1);
                 self.grid.cursor_y = (self.grid.cursor_y + n).min(self.rows - 1);
             }
             'C' => {
-                let n = p0().max(1) as u16;
+                let n = p0().max(1);
                 self.grid.cursor_x = (self.grid.cursor_x + n).min(self.cols - 1);
             }
             'D' => {
-                let n = p0().max(1) as u16;
+                let n = p0().max(1);
                 self.grid.cursor_x = self.grid.cursor_x.saturating_sub(n);
             }
             'J' => {
-                let mode = p0() as u16;
+                let mode = p0();
                 match mode {
                     0 => self
                         .grid
@@ -581,7 +573,7 @@ impl<'a> VtePerf<'a> {
                 }
             }
             'K' => {
-                let mode = p0() as u16;
+                let mode = p0();
                 self.grid.erase_in_line(self.grid.cursor_y, mode);
             }
             'm' => self.apply_sgr(params),
