@@ -37,7 +37,7 @@
 //! (which fails `clippy::arc-with-non-send-sync` because
 //! `dashcompositor::LayerStack` is not `Sync`).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
@@ -194,6 +194,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None,
         total,
         cfg.presets,
+        BTreeMap::new(),
         ShellSpec::LoginShell,
     );
     ctx.run()
@@ -340,7 +341,18 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// `PanePreset(name)` runtime mutation looks up
     /// `self.presets[name]` and wholesale-swaps `self.layout_root`
     /// for the new tree.
-    presets: BTreeMap<String, LayoutNode>,/// Default shell for runtime-spawned panes. v1 single shell
+    presets: BTreeMap<String, LayoutNode>,
+    /// Phase 4 carry-forward: per-ZStack focus tracking. Maps
+    /// the focused ZStack member's resolved [`cmdash_layout::PaneId`]
+    /// to its index within the parent ZStack. Survives across
+    /// `AppNewPane`/`PaneClose` InPlace cycles (label-keyed
+    /// reconciliation preserves the member's PaneId when the
+    /// sibling stays under the same Split/ZStack parent);
+    /// cleared on `Wholesale` swap (`PanePreset`)
+    /// reconciliation so a reloaded preset's stale PaneIds
+    /// don't linger in the map.
+    stack_focus: BTreeMap<PaneId, usize>,
+    /// Default shell for runtime-spawned panes. v1 single shell
 /// (`LoginShell`) — `cmdash::run` wires the constant. A future
 /// per-pane shell override slots in here.
     shell: ShellSpec,
@@ -460,6 +472,14 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             pending_resize,
             last_area,
             BTreeMap::new(),
+            // Phase 4 carry-forward: `new()` (10-arg, used by
+            // legacy test fixtures that don't exercise the
+            // runtime mutation paths) initializes the
+            // per-ZStack focus map empty. Tests that drive
+            // ZStack focus actions build via `new_full`
+            // directly and can pre-seed `stack_focus` if
+            // they want a non-empty starting state.
+            BTreeMap::new(),
             ShellSpec::LoginShell,
         )
     }
@@ -490,6 +510,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         pending_resize: Option<(u16, u16)>,
         last_area: LayoutRect,
         presets: BTreeMap<String, LayoutNode>,
+        stack_focus: BTreeMap<PaneId, usize>,
         shell: ShellSpec,
     ) -> Self {
         assert!(
@@ -511,6 +532,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             pending_resize,
             last_area,
             presets,
+            stack_focus,
             shell,
         }
     }
@@ -639,6 +661,14 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             KeyAction::PaneFocusDown => self.focus_by_direction(Direction::Down),
             KeyAction::PaneFocusLeft => self.focus_by_direction(Direction::Left),
             KeyAction::PaneFocusRight => self.focus_by_direction(Direction::Right),
+            // Phase 4 carry-forward: ZStack focus primitives.
+            // `PaneStackCycle` rotates focus within the focused
+            // ZStack with wrap-around; `PaneStackDown` advances
+            // focus within the stack but hands off to a
+            // geometric-below neighbour when the focused pane
+            // is the last (top) member.
+            KeyAction::PaneStackCycle => self.handle_stack_cycle(),
+            KeyAction::PaneStackDown => self.handle_stack_down(),
             KeyAction::AppNewPane => self.split_focused_for_new_pane(),
             KeyAction::PaneClose => self.close_focused_and_rebalance(),
             KeyAction::PanePreset(name) => self.swap_to_preset(&name),
@@ -730,6 +760,163 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             .position(|r| r.computed().id == target_id)
         {
             self.focus = idx;
+        }
+    }
+
+    /// Phase 4 carry-forward: walk a tree-indexed path
+    /// (WITHOUT the resolver `path[0]` seed; callers strip
+    /// the seed before passing) into `root`, returning the
+    /// [`LayoutNode`] at that slot. Returns `None` if any
+    /// intermediate slot is a leaf (a malformed caller
+    /// path). Used by the `handle_stack_cycle` /
+    /// `handle_stack_down` cycle helpers below.
+    fn walk_to_layout_node<'r>(
+        root: &'r LayoutNode,
+        path: &[u16],
+    ) -> Option<&'r LayoutNode> {
+        let mut node = root;
+        for &idx in path {
+            node = match node {
+                LayoutNode::Split { children, .. } => children.get(idx as usize)?,
+                LayoutNode::Stack { panes } | LayoutNode::ZStack { panes } => {
+                    panes.get(idx as usize)?
+                }
+                _ => return None,
+            };
+        }
+        Some(node)
+    }
+
+    /// Phase 4 carry-forward: locate the focused pane's
+    /// parent ZStack + its member index. Returns
+    /// `Some((parent_path, member_idx))` if the focused
+    /// pane is a direct child of a `LayoutNode::ZStack`,
+    /// otherwise `None` -- the caller interprets `None`
+    /// as "focused pane is not a ZStack member" and
+    /// no-ops. `focused_path` is a tree-indexed path
+    /// WITHOUT the resolver `path[0]` seed.
+    fn focused_zstack_context(
+        layout_root: &LayoutNode,
+        focused_path: &[u16],
+    ) -> Option<(Vec<u16>, usize)> {
+        if focused_path.is_empty() {
+            return None;
+        }
+        let last_idx = *focused_path.last()? as usize;
+        let parent_path = focused_path.split_last()?.1.to_vec();
+        let parent_node = Self::walk_to_layout_node(layout_root, &parent_path)?;
+        match parent_node {
+            LayoutNode::ZStack { panes } => {
+                if last_idx < panes.len() {
+                    Some((parent_path, last_idx))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Phase 4 carry-forward: `PaneStackCycle`. Find the
+    /// focused pane's parent ZStack + member index, then
+    /// advance `self.focus` to the next member in
+    /// declaration order, wrapping from the last member
+    /// back to the first. No-op if the focused pane is
+    /// not a ZStack member.
+    fn handle_stack_cycle(&mut self) {
+        if self.runners.is_empty() {
+            return;
+        }
+        if self.focus >= self.runners.len() {
+            self.focus = self.runners.len() - 1;
+        }
+        let focused_id = self.runners[self.focus].computed().id;
+        let seed_path = focused_id.path();
+        let tree_path: &[u16] = if seed_path.len() >= 1 {
+            &seed_path[1..]
+        } else {
+            &[]
+        };
+        let Some((parent_path, member_idx)) =
+            Self::focused_zstack_context(&self.layout_root, tree_path)
+        else {
+            return;
+        };
+        let Some(LayoutNode::ZStack { panes }) =
+            Self::walk_to_layout_node(&self.layout_root, &parent_path)
+        else {
+            return;
+        };
+        let next_idx = (member_idx + 1) % panes.len();
+        let mut next_path = parent_path.clone();
+        next_path.push(next_idx as u16);
+        if let Some(idx) = self.runners.iter().position(|r| {
+            let rp = r.computed().id.path();
+            let tp: &[u16] = if rp.len() >= 1 { &rp[1..] } else { &[] };
+            tp == next_path.as_slice()
+        }) {
+            self.focus = idx;
+            let new_id = self.runners[idx].computed().id;
+            self.stack_focus.insert(new_id, next_idx);
+        }
+    }
+
+    /// Phase 4 carry-forward: `PaneStackDown`. Find the
+    /// focused pane's parent ZStack + member index. If
+    /// the focused member is the LAST (top by z-order /
+    /// pre_order) member of the ZStack, delegate to
+    /// `focus_by_direction(Direction::Down)` so the rect-
+    /// proximity adjacency handoff resolves to the topmost
+    /// pane geometrically below the ZStack. Otherwise
+    /// advance to the next member in declaration order (no
+    /// wrap -- `PaneStackCycle` is the wrap-around
+    /// primitive). No-op if the focused pane is not a
+    /// ZStack member.
+    fn handle_stack_down(&mut self) {
+        if self.runners.is_empty() {
+            return;
+        }
+        if self.focus >= self.runners.len() {
+            self.focus = self.runners.len() - 1;
+        }
+        let focused_id = self.runners[self.focus].computed().id;
+        let seed_path = focused_id.path();
+        let tree_path: &[u16] = if seed_path.len() >= 1 {
+            &seed_path[1..]
+        } else {
+            &[]
+        };
+        let Some((parent_path, member_idx)) =
+            Self::focused_zstack_context(&self.layout_root, tree_path)
+        else {
+            return;
+        };
+        let Some(LayoutNode::ZStack { panes }) =
+            Self::walk_to_layout_node(&self.layout_root, &parent_path)
+        else {
+            return;
+        };
+        if member_idx + 1 == panes.len() {
+            // Bottom-of-stack: hand off to the geometric
+            // neighbour below. `adjacent_pane` skips panes
+            // that share the ZStack's rect (zero
+            // perpendicular gap distance=0), so the
+            // resolution lands on a sibling Split member
+            // outside the ZStack.
+            self.focus_by_direction(Direction::Down);
+            return;
+        }
+        let next_idx = member_idx + 1;
+        let mut next_path = parent_path.clone();
+        next_path.push(next_idx as u16);
+        if let Some(idx) = self.runners.iter().position(|r| {
+            let rp = r.computed().id.path();
+            let tp: &[u16] = if rp.len() >= 1 { &rp[1..] } else { &[] };
+            tp == next_path.as_slice()
+        }) {
+            self.focus = idx;
+            let new_id = self.runners[idx].computed().id;
+            self.stack_focus.insert(new_id, next_idx);
         }
     }
 
@@ -943,6 +1130,15 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         match mode {
             ReconcileMode::Wholesale => {
                 to_drop = old_runners;
+                // Phase 4 carry-forward: a preset reload
+                // wholesale-swaps the layout tree so every
+                // resolved PaneId rotates. The per-ZStack
+                // focus map's old entries reference pane
+                // instances that no longer exist; drop them
+                // so the next `PaneStackCycle` /
+                // `PaneStackDown` rebuilds the map against
+                // the fresh tree.
+                self.stack_focus.clear();
             }
             ReconcileMode::InPlace => {
                 for r in old_runners {
@@ -1976,6 +2172,7 @@ mod input_tests {
             None,
             LayoutRect { x: 0, y: 0, w: 80, h: 24 },
             BTreeMap::new(),
+            BTreeMap::new(),
             ShellSpec::LoginShell,
         );
         ctx.apply_action_full(KeyAction::AppNewPane);
@@ -2060,6 +2257,7 @@ mod input_tests {
             layout_root,
             None,
             LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
         );
@@ -2148,6 +2346,7 @@ mod input_tests {
                 w: 80,
                 h: 24,
             },
+            BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
         );
@@ -2239,6 +2438,7 @@ mod input_tests {
                 h: 24,
             },
             presets,
+            BTreeMap::new(),
             ShellSpec::LoginShell,
         );
         ctx.apply_action_full(KeyAction::PanePreset("beta".to_string()));
@@ -2260,6 +2460,271 @@ mod input_tests {
             ctx.runners[0].layer_id(),
             ctx.runners[1].layer_id(),
             "PanePreset: distinct fresh LayerIds per pane"
+        );
+    }
+
+    /// Phase 4 carry-forward: `PaneStackCycle` rotates
+    /// focus through a focused ZStack's members with
+    /// wrap-around (last member -> first member). The
+    /// focused pane is the LAST member (top by z-order /
+    /// pre_order) of a 3-member ZStack; cycling once
+    /// must wrap it to the FIRST member. Pins the
+    /// "within-ZStack rotatation" half of the Phase 4
+    /// contract.
+    fn pane_stack_cycle_wraps_around_zstack_focus() {
+        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout {
+            zstack {
+                pane kind=shell label="a"
+                pane kind=shell label="b"
+                pane kind=shell label="c"
+            }
+        }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+        )
+        .expect("compute");
+        assert_eq!(initial.panes.len(), 3);
+        let runners: Vec<PaneRunner> = initial
+            .panes
+            .iter()
+            .map(|p| {
+                PaneRunner::spawn_with_graphics(
+                    p.clone(),
+                    cmdash::derive_layer_id(&p.id),
+                    shell.clone(),
+                    Some(close_tx.clone()),
+                )
+                .expect("spawn")
+            })
+            .collect();
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            runners,
+            bindings,
+            // Start focused on the LAST member ("c") so
+            // cycling once must wrap to the first ("a").
+            2,
+            true,
+            close_tx,
+            _close_rx_unused,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            BTreeMap::new(),
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        ctx.apply_action_full(KeyAction::PaneStackCycle);
+        // After cycling from last -> first: focus moves to
+        // the runner for "a" (path [0, 0]).
+        let focused_id = ctx.runners[ctx.focus].computed().id;
+        assert_eq!(focused_id.path(), &[0, 0][..]);
+        assert_eq!(
+            ctx.runners[ctx.focus].computed().label,
+            Some("a".to_string()),
+            "PaneStackCycle: last -> first wraps to the first member"
+        );
+        assert_eq!(ctx.stack_focus.get(&focused_id).copied(), Some(0));
+    }
+
+    /// Phase 4 carry-forward: `PaneStackDown` when the
+    /// focused member is NOT the last of the ZStack
+    /// advances to the next member in declaration order
+    /// (no wrap; no geometric handoff). The handoff case
+    /// is covered separately by
+    /// `pane_stack_down_at_top_hands_off_to_pane_below`.
+    fn pane_stack_down_within_stack_advances_to_next_member() {
+        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout {
+            zstack {
+                pane kind=shell label="a"
+                pane kind=shell label="b"
+            }
+        }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+        )
+        .expect("compute");
+        assert_eq!(initial.panes.len(), 2);
+        let runners: Vec<PaneRunner> = initial
+            .panes
+            .iter()
+            .map(|p| {
+                PaneRunner::spawn_with_graphics(
+                    p.clone(),
+                    cmdash::derive_layer_id(&p.id),
+                    shell.clone(),
+                    Some(close_tx.clone()),
+                )
+                .expect("spawn")
+            })
+            .collect();
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            runners,
+            bindings,
+            // Start focused on the FIRST member ("a"). Down
+            // should advance to "b" (the next-in-declaration-
+            // order member, NOT a wrap to "a" itself; that
+            // is PaneStackCycle's job).
+            0,
+            true,
+            close_tx,
+            _close_rx_unused,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            BTreeMap::new(),
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        ctx.apply_action_full(KeyAction::PaneStackDown);
+        let focused_id = ctx.runners[ctx.focus].computed().id;
+        assert_eq!(focused_id.path(), &[0, 1][..]);
+        assert_eq!(
+            ctx.runners[ctx.focus].computed().label,
+            Some("b".to_string()),
+            "PaneStackDown within-ZStack: advance to next member in declaration order"
+        );
+        assert_eq!(ctx.stack_focus.get(&focused_id).copied(), Some(1));
+    }
+
+    /// Phase 4 carry-forward: `PaneStackDown` at the
+    /// ZStack's last (top by z-order / pre_order) member
+    /// hands focus off to the topmost pane geometrically
+    /// below the ZStack via [`adjacent_pane`]. The
+    /// fixture's outer horizontal split places one
+    /// default-configured pane ("below") under the
+    /// ZStack so the geometry is unambiguous; the ZStack
+    /// occupies the top half (y=0..12), the below-pane
+    /// occupies the bottom half (y=12..24). Focus the
+    /// LAST member of the ZStack ("top") and press
+    /// PaneStackDown; focus must hand off to "below"
+    /// (path [0, 1]).
+    fn pane_stack_down_at_top_hands_off_to_pane_below() {
+        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout {
+            split axis=horizontal ratio=0.5 {
+                zstack {
+                    pane kind=shell label="bottom"
+                    pane kind=shell label="top"
+                }
+                pane kind=shell label="below"
+            }
+        }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+        )
+        .expect("compute");
+        // 3 panes total: zstack[bottom], zstack[top],
+        // below. Order of resolution: pre_order 0 = bottom,
+        // 1 = top (the LAST ZStack member = top in z-order
+        // + last in declaration order). pre_order 2 =
+        // below.
+        assert_eq!(initial.panes.len(), 3);
+        let runners: Vec<PaneRunner> = initial
+            .panes
+            .iter()
+            .map(|p| {
+                PaneRunner::spawn_with_graphics(
+                    p.clone(),
+                    cmdash::derive_layer_id(&p.id),
+                    shell.clone(),
+                    Some(close_tx.clone()),
+                )
+                .expect("spawn")
+            })
+            .collect();
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            runners,
+            bindings,
+            // Start focused on the LAST ZStack member
+            // ("top") -- pre_order 1, path [0, 0, 1] inside
+            // the tree.
+            1,
+            true,
+            close_tx,
+            _close_rx_unused,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            BTreeMap::new(),
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        // Sanity: focused runner is the LAST ZStack member.
+        let pre_focus_id = ctx.runners[ctx.focus].computed().id;
+        assert_eq!(pre_focus_id.path(), &[0, 0, 1][..]);
+        assert_eq!(
+            ctx.runners[ctx.focus].computed().label,
+            Some("top".to_string())
+        );
+        ctx.apply_action_full(KeyAction::PaneStackDown);
+        // After the handoff: focus moved to the geometric
+        // neighbour below the ZStack -- which is the
+        // "below" pane at path [0, 1].
+        assert_ne!(
+            ctx.focus, 1,
+            "PaneStackDown at last member must hand focus off (NOT stay at the same index)"
+        );
+        let post_focus_id = ctx.runners[ctx.focus].computed().id;
+        assert_eq!(post_focus_id.path(), &[0, 1][..]);
+        assert_eq!(
+            ctx.runners[ctx.focus].computed().label,
+            Some("below".to_string()),
+            "PaneStackDown at last ZStack member must hand focus off to the pane below"
+        );
+        // The handoff path also doesn't add to stack_focus:
+        // the new focus is OUTSIDE the ZStack, so the
+        // focused_pane's `focused_zstack_context` lookup
+        // returns None, the helper is a no-op for the
+        // stack_focus map. The map should be empty after
+        // the handoff (no entries from this test's
+        // run-through).
+        assert!(
+            ctx.stack_focus.is_empty(),
+            "PaneStackDown handoff target is outside the ZStack; stack_focus should stay empty"
         );
     }
 }

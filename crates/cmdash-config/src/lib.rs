@@ -186,6 +186,20 @@ pub enum KeyAction {
     PaneFocusDown,
     PaneFocusLeft,
     PaneFocusRight,
+    /// `pane.stack.cycle` - cycle focus through members of the
+    /// currently-focused ZStack (wrap-around from last → first).
+    /// No-op if the focused pane is not a member of a ZStack.
+    /// Phase 4 carry-forward.
+    PaneStackCycle,
+    /// `pane.stack.down` - directional within-ZStack Down:
+    /// focus the next member of the focused ZStack in
+    /// declaration order; if the focused pane is the last (top)
+    /// member, hand focus off to the topmost pane geometrically
+    /// below the ZStack via [`adjacent_pane`]. No-op if the
+    /// focused pane is not a ZStack member, or if the focused
+    /// ZStack member has no geometrically-below neighbour.
+    /// Phase 4 carry-forward.
+    PaneStackDown,
     /// `pane.preset.<name>` - focus a named preset.
     PanePreset(String),
 }
@@ -538,6 +552,14 @@ fn parse_action(s: &str) -> Option<KeyAction> {
         "pane.focus.down" => Some(KeyAction::PaneFocusDown),
         "pane.focus.left" => Some(KeyAction::PaneFocusLeft),
         "pane.focus.right" => Some(KeyAction::PaneFocusRight),
+        // Phase 4 carry-forward: per-ZStack focus primitives.
+        // `pane.stack.cycle` cycles the focused ZStack's focus
+        // forward with wrap-around; `pane.stack.down` is the
+        // directional within-ZStack Down with a bottom-edge
+        // geometric handoff to the topmost pane below the
+        // ZStack.
+        "pane.stack.cycle" => Some(KeyAction::PaneStackCycle),
+        "pane.stack.down" => Some(KeyAction::PaneStackDown),
         "pane.preset" => Some(KeyAction::PanePreset(String::new())),
         other => other
             .strip_prefix("pane.preset.")
