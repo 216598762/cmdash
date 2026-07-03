@@ -209,6 +209,21 @@ pub enum KeyAction {
     /// if the focused ZStack member has no geometrically-above
     /// neighbour. Phase 4 carry-forward.
     PaneStackUp,
+    /// Phase 4.5/5 carry-forward: `PaneStackLeft`. Cycle
+    /// through ZStack members in declaration order with
+    /// retreat semantics at the FIRST member, then hand off
+    /// geometrically to the pane outside the ZStack via
+    /// `Direction::Left` (column-split trapdoor: a ZStack
+    /// in the right half of a `split axis=horizontal`
+    /// lands on the sibling Split member to its LEFT).
+    PaneStackLeft,
+    /// Phase 4.5/5 carry-forward: `PaneStackRight`. Cycle
+    /// through ZStack members in declaration order with
+    /// advance semantics at the LAST member, then hand off
+    /// geometrically to the pane outside the ZStack via
+    /// `Direction::Right` -- the horizontal-axis mirror of
+    /// `PaneStackDown`/`PaneStackUp` on the geometric axis.
+    PaneStackRight,
     /// `pane.preset.<name>` - focus a named preset.
     PanePreset(String),
 }
@@ -572,6 +587,8 @@ fn parse_action(s: &str) -> Option<KeyAction> {
         "pane.stack.cycle" => Some(KeyAction::PaneStackCycle),
         "pane.stack.down" => Some(KeyAction::PaneStackDown),
         "pane.stack.up" => Some(KeyAction::PaneStackUp),
+        "pane.stack.left" => Some(KeyAction::PaneStackLeft),
+        "pane.stack.right" => Some(KeyAction::PaneStackRight),
         "pane.preset" => Some(KeyAction::PanePreset(String::new())),
         other => other
             .strip_prefix("pane.preset.")

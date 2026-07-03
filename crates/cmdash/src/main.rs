@@ -661,17 +661,24 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             KeyAction::PaneFocusDown => self.focus_by_direction(Direction::Down),
             KeyAction::PaneFocusLeft => self.focus_by_direction(Direction::Left),
             KeyAction::PaneFocusRight => self.focus_by_direction(Direction::Right),
-            // Phase 4 carry-forward: ZStack focus primitives.
-            // `PaneStackCycle` rotates focus within the focused
-            // ZStack with wrap-around; `PaneStackDown` advances
-            // focus within the stack but hands off to a
-            // geometric-below neighbour when the focused pane
-            // is the last (top) member; `PaneStackUp` mirrors
-            // Down with a geometric-above neighbour handoff on
-            // the first (bottom) member.
+            // Phase 4 + 4.5/5 carry-forward: ZStack focus
+            // primitives. `PaneStackCycle` rotates focus
+            // within the focused ZStack with wrap-around;
+            // `PaneStackDown` advances focus within the stack
+            // but hands off to a geometric-below neighbour when
+            // the focused pane is the last (top) member;
+            // `PaneStackUp` mirrors Down with a geometric-above
+            // neighbour handoff on the first (bottom) member;
+            // `PaneStackLeft` and `PaneStackRight` (Phase
+            // 4.5/5) mirror Up/Down on the horizontal axis,
+            // handing off to a geometric-LEFT / -RIGHT
+            // neighbour when the focused member is the first /
+            // last member respectively.
             KeyAction::PaneStackCycle => self.handle_stack_cycle(),
             KeyAction::PaneStackDown => self.handle_stack_down(),
             KeyAction::PaneStackUp => self.handle_stack_up(),
+            KeyAction::PaneStackLeft => self.handle_stack_left(),
+            KeyAction::PaneStackRight => self.handle_stack_right(),
             KeyAction::AppNewPane => self.split_focused_for_new_pane(),
             KeyAction::PaneClose => self.close_focused_and_rebalance(),
             KeyAction::PanePreset(name) => self.swap_to_preset(&name),
@@ -962,6 +969,143 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             self.focus = idx;
             let new_id = self.runners[idx].computed().id;
             self.stack_focus.insert(new_id, prev_idx);
+        }
+    }
+
+    /// Phase 4.5/5 carry-forward: `PaneStackLeft` -- the
+    /// horizontal-axis MIRROR of [`handle_stack_up`]. Find
+    /// the focused pane's parent ZStack + member index. If
+    /// the focused member is the FIRST member of the
+    /// ZStack (in declaration order), delegate to
+    /// `focus_by_direction(Direction::Left)` so the rect-
+    /// proximity adjacency handoff resolves to the left
+    /// pane geometrically to the left of the ZStack.
+    /// Otherwise retreat to the previous member in
+    /// declaration order (no wrap; `PaneStackCycle` is the
+    /// wrap-around primitive). No-op if the focused pane
+    /// is not a ZStack member.
+    ///
+    /// **Trapdoor awareness** -- the fixture axis trapdoor
+    /// documented on `split_rect` in `cmdash-layout`
+    /// applies equally here: cfg `split axis=horizontal` is
+    /// a **column** split (same y range, different x), so a
+    /// `Left` handoff for a ZStack in the RIGHT half of an
+    /// `axis=horizontal` split lands on a sibling Split
+    /// member to its LEFT -- the *opposite* intuition from
+    /// the axis-token's prose name. The 2 boundary-handoff
+    /// tests below use `axis=horizontal ratio=0.5`
+    /// exclusively so the side pane sits in column 0 or
+    /// column 1, NOT a vertical neighbour.
+    fn handle_stack_left(&mut self) {
+        if self.runners.is_empty() {
+            return;
+        }
+        if self.focus >= self.runners.len() {
+            self.focus = self.runners.len() - 1;
+        }
+        let focused_id = self.runners[self.focus].computed().id;
+        let seed_path = focused_id.path();
+        let tree_path: &[u16] = if seed_path.len() >= 1 {
+            &seed_path[1..]
+        } else {
+            &[]
+        };
+        let Some((parent_path, member_idx)) =
+            Self::focused_zstack_context(&self.layout_root, tree_path)
+        else {
+            return;
+        };
+        let Some(LayoutNode::ZStack { panes }) =
+            cmdash_layout::walk_imut(&self.layout_root, &parent_path).ok()
+        else {
+            return;
+        };
+        if member_idx == 0 {
+            // First member: hand off to the geometric
+            // neighbour to the LEFT. `adjacent_pane` skips
+            // panes that share the ZStack's rect (zero
+            // perpendicular gap distance=0), so the
+            // resolution lands on a sibling Split member
+            // to the left of the ZStack.
+            self.focus_by_direction(Direction::Left);
+            return;
+        }
+        let prev_idx = member_idx - 1;
+        let mut next_path = parent_path.clone();
+        next_path.push(prev_idx as u16);
+        if let Some(idx) = self.runners.iter().position(|r| {
+            let rp = r.computed().id.path();
+            let tp: &[u16] = if rp.len() >= 1 { &rp[1..] } else { &[] };
+            tp == next_path.as_slice()
+        }) {
+            self.focus = idx;
+            let new_id = self.runners[idx].computed().id;
+            self.stack_focus.insert(new_id, prev_idx);
+        }
+    }
+
+    /// Phase 4.5/5 carry-forward: `PaneStackRight` -- the
+    /// horizontal-axis MIRROR of [`handle_stack_down`]. Find
+    /// the focused pane's parent ZStack + member index. If
+    /// the focused member is the LAST member of the
+    /// ZStack (in declaration order), delegate to
+    /// `focus_by_direction(Direction::Right)` so the rect-
+    /// proximity adjacency handoff resolves to the right
+    /// pane geometrically to the right of the ZStack.
+    /// Otherwise advance to the next member in declaration
+    /// order (no wrap). No-op if the focused pane is not a
+    /// ZStack member.
+    ///
+    /// **Trapdoor awareness** -- same as
+    /// [`handle_stack_left`] above: `split axis=horizontal`
+    /// is a **column** split, so a `Right` handoff for a
+    /// ZStack in the LEFT half lands on a sibling Split
+    /// member to its RIGHT.
+    fn handle_stack_right(&mut self) {
+        if self.runners.is_empty() {
+            return;
+        }
+        if self.focus >= self.runners.len() {
+            self.focus = self.runners.len() - 1;
+        }
+        let focused_id = self.runners[self.focus].computed().id;
+        let seed_path = focused_id.path();
+        let tree_path: &[u16] = if seed_path.len() >= 1 {
+            &seed_path[1..]
+        } else {
+            &[]
+        };
+        let Some((parent_path, member_idx)) =
+            Self::focused_zstack_context(&self.layout_root, tree_path)
+        else {
+            return;
+        };
+        let Some(LayoutNode::ZStack { panes }) =
+            cmdash_layout::walk_imut(&self.layout_root, &parent_path).ok()
+        else {
+            return;
+        };
+        if member_idx + 1 == panes.len() {
+            // Last member: hand off to the geometric
+            // neighbour to the RIGHT. `adjacent_pane` skips
+            // panes that share the ZStack's rect (zero
+            // perpendicular gap distance=0), so the
+            // resolution lands on a sibling Split member
+            // to the right of the ZStack.
+            self.focus_by_direction(Direction::Right);
+            return;
+        }
+        let next_idx = member_idx + 1;
+        let mut next_path = parent_path.clone();
+        next_path.push(next_idx as u16);
+        if let Some(idx) = self.runners.iter().position(|r| {
+            let rp = r.computed().id.path();
+            let tp: &[u16] = if rp.len() >= 1 { &rp[1..] } else { &[] };
+            tp == next_path.as_slice()
+        }) {
+            self.focus = idx;
+            let new_id = self.runners[idx].computed().id;
+            self.stack_focus.insert(new_id, next_idx);
         }
     }
 
@@ -2943,6 +3087,430 @@ mod input_tests {
         assert!(
             ctx.stack_focus.is_empty(),
             "PaneStackUp handoff target is outside the ZStack; stack_focus should stay empty"
+        );
+    }
+
+    // ============================================================
+    // Phase 4.5/5 carry-forward regression tests for the
+    // horizontal-axis ZStack focus primitives
+    // (`PaneStackLeft`, `PaneStackRight`). Mirror the Phase 4
+    // PaneStackUp / PaneStackDown within-stack + boundary-
+    // handoff tests on the horizontal axis. Two within-stack
+    // tests pin declaration-order retreat / advance (no wrap,
+    // stack_focus records the new member index); two boundary
+    // tests pin the geometric handoff to the LEFT / RIGHT
+    // sibling outside the ZStack.
+    //
+    // **Trapdoor awareness**: `split axis=horizontal` is a
+    // **column** split (same y range, different x), so the
+    // boundary-handoff fixtures place the side pane in
+    // column 0 (LEFT) / column 1 (RIGHT) of an
+    // `axis=horizontal ratio=0.5` split. Path[1] in the
+    // post-handoff PaneId encodes the split-child index;
+    // `post_focus_id.path()[1] == N` is the trapdoor-
+    // validating pin. Path[0] is the resolver seed (always
+    // 0) -- NOT a meaningful trapdoor signal.
+    // ============================================================
+
+    /// Phase 4.5/5 carry-forward: `PaneStackLeft` retreats
+    /// to the **previous** member of the focused ZStack in
+    /// declaration order (no wrap). Mirror the Phase 4
+    /// PaneStackUp within-stack assertion style: focus the
+    /// SECOND member, apply PaneStackLeft, expect focus on
+    /// the FIRST member with `stack_focus` recording the
+    /// new member index (0 for pane "a").
+    #[test]
+    fn pane_stack_left_within_stack_retreats_to_previous_member() {
+        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout {
+            zstack {
+                pane kind=shell label="a"
+                pane kind=shell label="b"
+            }
+        }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+        )
+        .expect("compute");
+        assert_eq!(initial.panes.len(), 2);
+        let pane_a = initial.panes[0].clone();
+        let pane_b = initial.panes[1].clone();
+        let id_a = cmdash::derive_layer_id(&pane_a.id);
+        let id_b = cmdash::derive_layer_id(&pane_b.id);
+        let r0 =
+            PaneRunner::spawn_with_graphics(pane_a, id_a, shell.clone(), Some(close_tx.clone()))
+                .expect("spawn r0");
+        let r1 =
+            PaneRunner::spawn_with_graphics(pane_b, id_b, shell, Some(close_tx.clone()))
+                .expect("spawn r1");
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            vec![r0, r1],
+            bindings,
+            1, // focus on "b" (SECOND member)
+            true,
+            close_tx,
+            _close_rx_unused,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        assert_ne!(
+            ctx.focus, 0,
+            "pre-focus must NOT already be at the FIRST member (otherwise the test proves nothing)"
+        );
+        ctx.apply_action_full(KeyAction::PaneStackLeft);
+        assert_ne!(
+            ctx.focus, 1,
+            "PaneStackLeft from the SECOND member must NOT no-op -- it retreats within the stack"
+        );
+        assert_eq!(
+            ctx.focus, 0,
+            "PaneStackLeft retreats to the previous member in declaration order"
+        );
+        let focused_id = ctx.runners[ctx.focus].computed().id.clone();
+        assert!(
+            ctx.stack_focus.contains_key(&focused_id),
+            "PaneStackLeft within the stack must update stack_focus for the new member index"
+        );
+        assert_eq!(
+            ctx.stack_focus.get(&focused_id).copied(),
+            Some(0),
+            "stack_focus must record the new member's index (0 for pane a)"
+        );
+    }
+
+    /// Phase 4.5/5 carry-forward: `PaneStackLeft` at the
+    /// FIRST member of a ZStack DELEGATES to
+    /// `focus_by_direction(Direction::Left)` for a geometric
+    /// handoff OUTSIDE the ZStack. Fixture: `left_outside`
+    /// pane in the LEFT column of `split axis=horizontal
+    /// ratio=0.5` (column split -- same y, different x),
+    /// ZStack in the RIGHT column. `adjacent_pane` lands on
+    /// the LEFT-of-stack pane OUTSIDE the ZStack via
+    /// rect-proximity. Pin focus moves to the UNATTACHED
+    /// pane (NOT back into the ZStack), `stack_focus` is
+    /// empty (handoff short-circuits BEFORE the mutation
+    /// block).
+    ///
+    /// **Trapdoor awareness**: `split axis=horizontal` is a
+    /// **column** split -- L handoff lands on SIBLING at
+    /// column 0 (left_outside), NOT a vertical neighbour.
+    /// `post_focus_id.path()[1] == 0` is the trapdoor-
+    /// validating pin.
+    #[test]
+    fn pane_stack_left_at_first_member_hands_off_to_pane_left() {
+        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout {
+            split axis=horizontal ratio=0.5 {
+                pane kind=shell label="left_outside"
+                zstack {
+                    pane kind=shell label="left_inside"
+                    pane kind=shell label="right_inside"
+                }
+            }
+        }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+        )
+        .expect("compute");
+        assert_eq!(initial.panes.len(), 3);
+        let pane_left_outside = initial.panes[0].clone();
+        let pane_left_inside = initial.panes[1].clone();
+        let pane_right_inside = initial.panes[2].clone();
+        let id_left_outside = cmdash::derive_layer_id(&pane_left_outside.id);
+        let id_left_inside = cmdash::derive_layer_id(&pane_left_inside.id);
+        let id_right_inside = cmdash::derive_layer_id(&pane_right_inside.id);
+        let r0 = PaneRunner::spawn_with_graphics(
+            pane_left_outside,
+            id_left_outside,
+            shell.clone(),
+            Some(close_tx.clone()),
+        )
+        .expect("spawn r0");
+        let r1 = PaneRunner::spawn_with_graphics(
+            pane_left_inside,
+            id_left_inside,
+            shell.clone(),
+            Some(close_tx.clone()),
+        )
+        .expect("spawn r1");
+        let r2 = PaneRunner::spawn_with_graphics(
+            pane_right_inside,
+            id_right_inside,
+            shell,
+            Some(close_tx.clone()),
+        )
+        .expect("spawn r2");
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            vec![r0, r1, r2],
+            bindings,
+            1, // focus on left_inside (FIRST ZStack member)
+            true,
+            close_tx,
+            _close_rx_unused,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        assert_ne!(
+            ctx.focus, 0,
+            "pre-focus must NOT already be at left_outside (otherwise the test proves nothing)"
+        );
+        ctx.apply_action_full(KeyAction::PaneStackLeft);
+        assert_ne!(
+            ctx.focus, 1,
+            "PaneStackLeft at FIRST member must NOT advance within the stack -- must handoff OUTSIDE"
+        );
+        assert_eq!(
+            ctx.focus, 0,
+            "PaneStackLeft at first member hands off via Direction::Left to left_outside"
+        );
+        let post_focus_id = ctx.runners[ctx.focus].computed().id.clone();
+        assert_eq!(
+            post_focus_id.path(),
+            &[0, 0][..],
+            "post-focus PaneId must point at left_outside at column 0"
+        );
+        assert_eq!(
+            post_focus_id.path()[1], 0,
+            "post-focus SPLIT child index 0 validates the column-split trapdoor"
+        );
+        assert!(
+            ctx.stack_focus.is_empty(),
+            "handoff path must NOT mutate stack_focus (short-circuit before the mutation block)"
+        );
+    }
+
+    /// Phase 4.5/5 carry-forward: `PaneStackRight` advances
+    /// to the **next** member of the focused ZStack in
+    /// declaration order (no wrap). Mirror the Phase 4
+    /// PaneStackDown within-stack assertion style: focus
+    /// the FIRST member, apply PaneStackRight, expect focus
+    /// on the SECOND member with `stack_focus` recording
+    /// the new member index (1 for pane "b").
+    #[test]
+    fn pane_stack_right_within_stack_advances_to_next_member() {
+        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout {
+            zstack {
+                pane kind=shell label="a"
+                pane kind=shell label="b"
+            }
+        }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+        )
+        .expect("compute");
+        assert_eq!(initial.panes.len(), 2);
+        let pane_a = initial.panes[0].clone();
+        let pane_b = initial.panes[1].clone();
+        let id_a = cmdash::derive_layer_id(&pane_a.id);
+        let id_b = cmdash::derive_layer_id(&pane_b.id);
+        let r0 =
+            PaneRunner::spawn_with_graphics(pane_a, id_a, shell.clone(), Some(close_tx.clone()))
+                .expect("spawn r0");
+        let r1 =
+            PaneRunner::spawn_with_graphics(pane_b, id_b, shell, Some(close_tx.clone()))
+                .expect("spawn r1");
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            vec![r0, r1],
+            bindings,
+            0, // focus on "a" (FIRST member)
+            true,
+            close_tx,
+            _close_rx_unused,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        ctx.apply_action_full(KeyAction::PaneStackRight);
+        assert_ne!(
+            ctx.focus, 0,
+            "PaneStackRight from FIRST member must NOT no-op -- it advances within the stack"
+        );
+        assert_eq!(
+            ctx.focus, 1,
+            "PaneStackRight advances to the next member in declaration order"
+        );
+        let focused_id = ctx.runners[ctx.focus].computed().id.clone();
+        assert!(
+            ctx.stack_focus.contains_key(&focused_id),
+            "PaneStackRight within the stack must update stack_focus for the new member index"
+        );
+        assert_eq!(
+            ctx.stack_focus.get(&focused_id).copied(),
+            Some(1),
+            "stack_focus must record the new member's index (1 for pane b)"
+        );
+    }
+
+    /// Phase 4.5/5 carry-forward: `PaneStackRight` at the
+    /// LAST member of a ZStack DELEGATES to
+    /// `focus_by_direction(Direction::Right)` for a
+    /// geometric handoff OUTSIDE the ZStack. Fixture:
+    /// `right_outside` pane in the RIGHT column of `split
+    /// axis=horizontal ratio=0.5` (column split), ZStack in
+    /// the LEFT column. `adjacent_pane` lands on the
+    /// RIGHT-of-stack pane OUTSIDE the ZStack via
+    /// rect-proximity. Pin focus moves to the UNATTACHED
+    /// pane (NOT back into the ZStack), `stack_focus` is
+    /// empty (handoff short-circuits BEFORE the mutation
+    /// block).
+    ///
+    /// **Trapdoor awareness**: `split axis=horizontal` is a
+    /// **column** split -- R handoff lands on SIBLING at
+    /// column 1 (right_outside), NOT a vertical neighbour.
+    /// `post_focus_id.path()[1] == 1` is the trapdoor-
+    /// validating pin.
+    #[test]
+    fn pane_stack_right_at_last_member_hands_off_to_pane_right() {
+        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout {
+            split axis=horizontal ratio=0.5 {
+                zstack {
+                    pane kind=shell label="left_inside"
+                    pane kind=shell label="right_inside"
+                }
+                pane kind=shell label="right_outside"
+            }
+        }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+        )
+        .expect("compute");
+        assert_eq!(initial.panes.len(), 3);
+        let pane_left_inside = initial.panes[0].clone();
+        let pane_right_inside = initial.panes[1].clone();
+        let pane_right_outside = initial.panes[2].clone();
+        let id_left_inside = cmdash::derive_layer_id(&pane_left_inside.id);
+        let id_right_inside = cmdash::derive_layer_id(&pane_right_inside.id);
+        let id_right_outside = cmdash::derive_layer_id(&pane_right_outside.id);
+        let r0 = PaneRunner::spawn_with_graphics(
+            pane_left_inside,
+            id_left_inside,
+            shell.clone(),
+            Some(close_tx.clone()),
+        )
+        .expect("spawn r0");
+        let r1 = PaneRunner::spawn_with_graphics(
+            pane_right_inside,
+            id_right_inside,
+            shell.clone(),
+            Some(close_tx.clone()),
+        )
+        .expect("spawn r1");
+        let r2 = PaneRunner::spawn_with_graphics(
+            pane_right_outside,
+            id_right_outside,
+            shell,
+            Some(close_tx.clone()),
+        )
+        .expect("spawn r2");
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            vec![r0, r1, r2],
+            bindings,
+            1, // focus on right_inside (LAST ZStack member)
+            true,
+            close_tx,
+            _close_rx_unused,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        assert_ne!(
+            ctx.focus, 2,
+            "pre-focus must NOT already be at right_outside (otherwise the test proves nothing)"
+        );
+        ctx.apply_action_full(KeyAction::PaneStackRight);
+        assert_ne!(
+            ctx.focus, 1,
+            "PaneStackRight at LAST member must NOT advance within the stack -- must handoff OUTSIDE"
+        );
+        assert_eq!(
+            ctx.focus, 2,
+            "PaneStackRight at last member hands off via Direction::Right to right_outside"
+        );
+        let post_focus_id = ctx.runners[ctx.focus].computed().id.clone();
+        assert_eq!(
+            post_focus_id.path(),
+            &[0, 1][..],
+            "post-focus PaneId must point at right_outside at column 1"
+        );
+        assert_eq!(
+            post_focus_id.path()[1], 1,
+            "post-focus SPLIT child index 1 validates the column-split trapdoor"
+        );
+        assert!(
+            ctx.stack_focus.is_empty(),
+            "handoff path must NOT mutate stack_focus (short-circuit before the mutation block)"
         );
     }
 }
