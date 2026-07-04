@@ -9,22 +9,63 @@
 use std::io::Read;
 use std::time::{Duration, Instant};
 
-use cmdash_pty::{Color, KittyGraphicCmd, PaneEvent, PaneLayerId, PanePty, PtyError, ShellSpec};
+use cmdash_pty::{
+    Color, KittyGraphicCmd, PaneEvent, PaneLayerId, PanePty, PaneReader, PtyError, ShellSpec,
+};
 
-/// Drain whatever bytes the child emits within `budget`. Returns
-/// the concatenated bytes read so far.
-fn drain(reader: &mut impl Read, budget: Duration) -> Vec<u8> {
+/// Drain whatever bytes the child emits within `budget`, returning
+/// the concatenated bytes read so far WITHOUT blocking past the
+/// deadline. Spawns a worker thread that drives `read()` on a
+/// shared `PaneReader` (wrapped in `Arc<Mutex<>>`) and forwards
+/// each chunk through an `mpsc::sync_channel`; the worker
+/// terminates naturally when the reader sees EOF or an error,
+/// or when the main thread drops the receiver. The main thread
+/// enforces the deadline via `recv_timeout` rather than the
+/// prior post-hoc deadline check — without this, the helper
+/// would block forever on a `read()` whose deadline fires
+/// only after it returns, which happens when a child (e.g.
+/// `/bin/cat` spawned in a non-TTY CI environment where the
+/// PTY master never produces data after the child hangs on
+/// its stdin) keeps cat's stdin open indefinitely.
+///
+/// Without this thread-based deadline, `cargo test -p cmdash-pty`
+/// stalls for the per-test 60-second cargo timeout on
+/// `pty_write_to_child_round_trips_via_cat`, surfacing a
+/// confusing "stall" instead of a deterministic failure to
+/// debug in this non-TTY CI env.
+fn drain(
+    reader: &std::sync::Arc<std::sync::Mutex<PaneReader>>,
+    budget: Duration,
+) -> Vec<u8> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+    let reader_for_thread = std::sync::Arc::clone(reader);
+    let _handle = std::thread::spawn(move || {
+        let mut guard = match reader_for_thread.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut buf = [0u8; 4096];
+        loop {
+            match guard.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
     let deadline = Instant::now() + budget;
     let mut out = Vec::new();
     loop {
-        let mut buf = [0u8; 4096];
-        let n = match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        out.extend_from_slice(&buf[..n]);
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(chunk) => out.extend_from_slice(&chunk),
+            Err(_) => break,
         }
     }
     out
@@ -41,7 +82,10 @@ fn pty_printf_pipes_bytes_into_grid() {
         PaneLayerId(1),
     )
     .expect("spawn pty");
-    let bytes = drain(&mut reader, Duration::from_secs(2));
+    let bytes = drain(
+        &std::sync::Arc::new(std::sync::Mutex::new(reader)),
+        Duration::from_secs(2),
+    );
     pty.advance(&bytes).expect("advance");
     let snap = pty.snapshot();
     assert_eq!(snap.grid.cell(0, 0).ch, 'A');
@@ -302,7 +346,10 @@ fn pty_write_to_child_round_trips_via_cat() {
     .expect("spawn cat pty");
     let n = pty.write(b"hi\n").expect("write");
     assert_eq!(n, 3);
-    let echoed = drain(&mut reader, Duration::from_secs(2));
+    let echoed = drain(
+        &std::sync::Arc::new(std::sync::Mutex::new(reader)),
+        Duration::from_secs(2),
+    );
     pty.advance(&echoed).expect("advance");
     let snap = pty.snapshot();
     assert_eq!(snap.grid.cell(0, 0).ch, 'h');
