@@ -225,6 +225,11 @@ in audit cycle 0.
 7. Land with `--no-gpg-sign` if the host's GPG agent lacks a TTY
    (workaround via `git -c commit.gpgsign=false commit ...`).
 
+**Cycle-numbering convention.** `### Audit cycle N` subscripts are
+sequential audit batches across a defined atom range; collisions
+resolved by appending a dash + range qualifier (e.g.
+`### Audit cycle 1 - 75b20a6..1e44a44`).
+
 A guiding invariant: the commit body stays untouched. The ledger is
 the authority. Future audit reads override divergent commit-body
 claims via the authoritative measured value captured here.
