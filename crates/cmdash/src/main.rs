@@ -70,6 +70,17 @@ use tracing::{debug, info, warn};
 /// re-adding a parser crate; the `Cargo.toml` constraint at
 /// v1.0.0 is "minimize the workspace's external-dep churn
 /// between minor versions".
+///
+/// `Debug` is derived (not just `Clone` / `PartialEq` / `Eq`)
+/// so the cli_args_tests' `.expect()` / `.expect_err()` calls
+/// can format the inner value when an assertion fails — the
+/// `Result::expect` family's `Debug` bound is on the
+/// `Result`'s inner type, so a missing derive propagates as
+/// a compile-time error here. The `Eq` derive avoids an
+/// unnecessary clone in the test that asserts
+/// `log_level.as_deref() == Some(level)` for the
+/// `log_level_all_six_valid_levels_parse_ok` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CliArgs {
     /// `Some(level)` iff `--log-level=<level>` was passed (the
     /// value is already validated against
