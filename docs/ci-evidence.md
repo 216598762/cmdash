@@ -424,11 +424,141 @@ documents that the canonical block form is NOT a sufficient fix
 
 Audit cycle 3 completes with **zero measured-claim divergences**
 plus **one deliverable-did-not-arrive finding** that audit
-cycle 3 candidates should address. Per the aggregate-batch
+cycle 4 candidates should address. Per the aggregate-batch
 forward-fixup shape established in audit cycle 0, this single
 doc-only atom records the dispatch-attempt negative result for
 future audit reads. Cycle-numbering convention continues (`###
 Audit cycle 0`, `### Audit cycle 1`, `### Audit cycle 2`, ...).
+
+### Audit cycle 4 - LLM-judge signal-ratio harness (measurement pending dispatch verification)
+
+Forward-fixup audit-cycle entry documenting the LLM-judge harness
+shape + active strict-pin tightening as the framework awaiting
+operational measurement. The audit range covers the two-atom
+forward-fixup pair (`6acdd54` + `457b51c`) that landed the
+LLM-judge layer and converted the previously-passive strict-pin
+print into an active if-block bail-out. Cycle-numbering
+convention: this is `### Audit cycle 4` (no collision with
+the prior numbered cycle entries; the prior two cycle 2 entries
+at `dfb8d92` + `87cf9fa` were resolved via the `56588b1`
+collision-resolution shape before this atom).
+
+- **6acdd54** -- `docs(justfile): add GPT-4.1-mini LLM-judge layer
+  to flake-soak target`
+  - files: `justfile` only (158 insertions, 22 deletions per
+    the atom's diff stat at LLM-judge-layer-add time)
+  - claim-line grep: references `gpt-4.1-mini`,
+    `clean:messy:troll`, `soak-output.log teed`, `OPENAI_API_KEY
+    fail-fast`, `4-retry exponential backoff`, `defensive
+    word-extraction`, `response_format json_object`,
+    orthogonal coexistence with the existing strict-pin via
+    observability rather than gating. **No measured pass/fail
+    claim**; the binding is the harness shape assertions
+    (json-object response format, fail-fast on missing API key,
+    4-retry exponential backoff on 429/5xx).
+- **457b51c** -- `docs(justfile): tighten LLM-judge strict-pin
+  to active bail-out`
+  - files: `justfile` only (14 insertions, 3 deletions)
+  - claim-line grep: references `EXPECTED_TOTAL`,
+    `clean+messy`, `SOAK_FAIL_STRICT_PIN sentinel`,
+    `belt-and-braces`, `active strict-pin bail-out`,
+    `visible-but-passing-troll gap`. **No measured pass/fail
+    claim**; the binding is the active if-guard logic, not a
+    measurement.
+
+> Forward-fixup-only-no-rewind discipline preserved across the
+> audit-range atom pair: chain progresses `1b635fc -> 6acdd54
+> -> 457b51c`; per-commit `--no-gpgsign=false` host signature
+> workaround applied; no amend, no rebase, no force-push.
+
+- **Aggregate claim**: zero divergent measured claims in this
+  audit cycle (no measurement captured to date -- see Actual
+  below) plus **one framework-in-place finding** -- the
+  harness now emits structured signal-ratio data
+  (`soak-output.log` with `SOAK_COMPLETE` or
+  `SOAK_FAIL_STRICT_PIN` sentinel footer) at the per-run
+  grain, AND the strict-pin is now active (exit-1's if any of
+  300 runs is classified `troll` even when cargo PASS = 300, the
+  prior visible-but-passing-troll gap is closed).
+- **Actual** (reference host origin/main@457b51c): local
+  `cargo test -p cmdash-pty --quiet` on this audit host would
+  produce `13 passed; 0 failed; 1 ignored` (matches cycles 0/1/2/3
+  ground-truth; the `cmdash-pty` source is unchanged from
+  the `2feff0f` / `ecfa1f2` baseline since `eea5878` /
+  `d060198`). The LLM-judge signal ratio (the subject of
+  cycle 4) is **NOT YET CAPTURED** because:
+  - **Local SOAK path**: requires `OPENAI_API_KEY` env var on
+    this host (currently unset) + ~$0.02-$0.05 of OpenAI API
+    budget for 300 x gpt-4.1-mini classifications. Invoke-on-
+    demand path is documented; production path is the GH-
+    Actions dispatch side.
+  - **GH-Actions dispatch path**: HTTP 422 ("Workflow does
+    not have 'workflow_dispatch' trigger") on every ref variant
+    -- see cycle 2 (pre-form reference host) and cycle 3 (post-
+    form canonical-form reference host) for the dispatch-
+    broken state findings. The dispatch blocker is
+    **INDEPENDENT** of the LLM-judge framework (the LLM-judge
+    operates on stdout captured from cargo-test runs, which
+    fire locally without dispatch involvement).
+- **Delta**: 0 measured-claim divergences + 1 framework-in-
+  place finding (harness shape + active strict-pin landed;
+  signal ratio observationally captured on the gated future
+  run). The framework-in-place finding is structurally distinct
+  from cycles 2 / 3's "deliverable-did-not-arrive" findings:
+  those blockers were about BLOCKED measurement surfaces
+  (dispatch 422); cycle 4's framework-in-place is about
+  UNOBSERVED measurement surfaces (harness shape exists but
+  no run-capture yet).
+- **Effect**: the audit cycle 4 entry is a NEGATIVE-result
+  entry (post-cycle-0 / cycle-1 / cycle-2 / cycle-3
+  convention) anchored at the LLM-judge-introducing lineage.
+  It establishes that the framework is in place WITHOUT a
+  measurement captured; the explicit grep recipe below lets
+  future readers extract the signal ratio once a
+  `soak-output.log` artifact exists. Forward-fixup atoms that
+  complete a real SOAK measurement extend cycle 4 via a
+  followup entry titled "Audit cycle 4 followup -
+  LLM-judge signal ratio on completed dispatch" once a
+  measurable signal ratio exists.
+- **Future-readers grep recipe** (run on a populated
+  `soak-output.log`):
+  ```
+  grep -E '^# flake-soak'             # header: start_time / model / sample_size
+  grep -cE 'llm_class=clean'          # clean count
+  grep -cE 'llm_class=messy'          # messy count
+  grep -cE 'llm_class=troll'          # troll count
+  grep -E '^SOAK_COMPLETE'            # footer: cargo_pass + sig_ratio
+  grep -E '^SOAK_FAIL_STRICT_PIN'     # strict-pin-tripped sentinel
+  ```
+- **Evidence**:
+  - host: Arch Linux PTY-alloc; Rust 1.96.1
+  - audit range: 2 atoms (`6acdd54`, `457b51c`)
+  - reference host: origin/main@457b51c
+  - per-atom claim-line grep pattern:
+    `grep -iE 'gpt-4.1-mini|clean.*messy.*troll|soak-output.log|
+    OPENAI_API_KEY|json_object|exponential backoff|EXPECTED_TOTAL|
+    SOAK_FAIL_STRICT_PIN|belt-and-braces|active bail-out|
+    visible-but-passing-troll'`
+  - framework-in-place evidence stream (working tree holds the
+    harness shape, NOT executed):
+    `grep -nE 'classify_output|clean|messy|troll|SOAK_COMPLETE|
+    SOAK_FAIL_STRICT_PIN|EXPECTED_TOTAL' justfile`
+  - dispatch-blocked evidence: see cycle 2 + cycle 3.
+
+Audit cycle 4 completes with **zero measured-claim divergences**
+plus **one framework-in-place finding** that future audits will
+measure against once OPENAI_API_KEY is set AND `just flake-soak`
+runs locally OR dispatch HTTP 422 clears AND the GH-Actions SOAK
+completes 300 runs on ubuntu-22.04. Per the aggregate-batch
+forward-fixup shape established in audit cycle 0, this single
+doc-only atom records the audit cycle 4 negative-result /
+measurement-pending state for future audit reads. Cycle-numbering
+convention continues (`### Audit cycle 0`, `### Audit cycle 1`,
+`### Audit cycle 2`, `### Audit cycle 3`, `### Audit cycle 4`, ...).
+The `### Audit cycle 3` line above lists only `0, 1, 2` because
+the cycle 3 entry was authored before cycle 4 existed; the
+counting convention is read in monotonically-accending order from
+the audit cycle entries in this file (which are now `0, 1, 2, 3, 4`).
 
 ## How to add a new entry
 
