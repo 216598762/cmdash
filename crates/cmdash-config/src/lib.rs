@@ -307,9 +307,7 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
                 if !cfg.presets.is_empty() {
                     return Err(ConfigError::DuplicatePresets);
                 }
-                let c = n
-                    .children()
-                    .ok_or_else(|| ConfigError::EmptyChildren("presets"))?;
+                let c = n.children().ok_or(ConfigError::EmptyChildren("presets"))?;
                 for k in c.nodes() {
                     if k.name().value() != "preset" {
                         return Err(ConfigError::UnexpectedPresetsChild(
