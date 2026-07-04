@@ -44,17 +44,17 @@ use std::time::Duration;
 
 use cmdash::graphics::{GraphicsState, Metrics};
 use cmdash::pane::{PaneCloseTx, PaneRunner};
-use cmdash_pty::PaneLayerId;
 use cmdash::render::{blit_cursor, blit_grid};
 use cmdash_config::{
-    parse as parse_config, KeyAction, LayoutNode, Pane as CfgPane, PaneKind,
-    Ratio as CfgRatio, SplitAxis as CfgSplitAxis,
+    parse as parse_config, KeyAction, LayoutNode, Pane as CfgPane, PaneKind, Ratio as CfgRatio,
+    SplitAxis as CfgSplitAxis,
 };
 use cmdash_keybinds::Router;
 use cmdash_layout::{
     adjacent_pane, remove_leaf, replace_leaf_with_split, walk_imut, ComputedLayout, Direction,
     PaneId, Rect as LayoutRect,
 };
+use cmdash_pty::PaneLayerId;
 use cmdash_pty::{PaneEvent, ShellSpec};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::Terminal;
@@ -353,8 +353,8 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// don't linger in the map.
     stack_focus: BTreeMap<PaneId, usize>,
     /// Default shell for runtime-spawned panes. v1 single shell
-/// (`LoginShell`) — `cmdash::run` wires the constant. A future
-/// per-pane shell override slots in here.
+    /// (`LoginShell`) — `cmdash::run` wires the constant. A future
+    /// per-pane shell override slots in here.
     shell: ShellSpec,
 }
 
@@ -653,8 +653,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             }
             KeyAction::PaneFocusPrev => {
                 if !self.runners.is_empty() {
-                    self.focus = (self.focus + self.runners.len() - 1)
-                        % self.runners.len();
+                    self.focus = (self.focus + self.runners.len() - 1) % self.runners.len();
                 }
             }
             KeyAction::PaneFocusUp => self.focus_by_direction(Direction::Up),
@@ -693,9 +692,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// bounded by `event::poll(0)`. The free [`input_phase`]
     /// helper is a parallel impl retained for v1 input_tests
     /// signature compatibility.
-    pub fn input_phase_full(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn input_phase_full(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         while event::poll(Duration::from_millis(0))? {
             let evt = event::read()?;
             self.handle_event_full(&evt);
@@ -888,7 +885,6 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         }
     }
 
-
     /// Phase 4 + 4.5/5 carry-forward consolidation: directed
     /// ZStack focus primitive. Replaces the 4
     /// near-byte-identical `handle_stack_down`/`up`/`left`/`right`
@@ -943,7 +939,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     ///   Folding these into one fn would tangle two
     ///   different post-conditions behind a single
     ///   conditional branch -- an anti-pattern. They are
-    ///   intentionally separate./// - **Trapdoor precedent** -- the [`cmdash_layout::split_rect`] 
+    ///   intentionally separate./// - **Trapdoor precedent** -- the [`cmdash_layout::split_rect`]
     ///   rustdoc on `cmdash_layout` warns that the cfg
     ///   `axis=horizontal` is a *column* split (same y
     ///   range, different x columns), the OPPOSITE of the
@@ -1029,7 +1025,6 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             }
         }
     }
-
 
     /// Carry-forward: `AppNewPane`. Locate the focused leaf
     /// in `self.layout_root` and replace it with a
@@ -1275,18 +1270,16 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         // the survivor's LayerId stays stable per Hard rule),
         // spawn fresh LayerIds for genuinely new panes / for
         // Wholesale slots.
-        let mut new_runners: Vec<PaneRunner> =
-            Vec::with_capacity(post_layout.panes.len());
+        let mut new_runners: Vec<PaneRunner> = Vec::with_capacity(post_layout.panes.len());
         for pane in &post_layout.panes {
-            let survivor_opt: Option<PaneRunner> =
-                if matches!(mode, ReconcileMode::InPlace) {
-                    pane.label
-                        .as_deref()
-                        .map(str::to_string)
-                        .and_then(|l| survivors.remove(&l))
-                } else {
-                    None
-                };
+            let survivor_opt: Option<PaneRunner> = if matches!(mode, ReconcileMode::InPlace) {
+                pane.label
+                    .as_deref()
+                    .map(str::to_string)
+                    .and_then(|l| survivors.remove(&l))
+            } else {
+                None
+            };
             if let Some(mut r) = survivor_opt {
                 // InPlace survivor: rebind `PaneId` (its
                 // `pre_order` may have shifted) + resize PTY.
@@ -2257,17 +2250,12 @@ mod input_tests {
         .expect("compute initial-layout");
         let pane = initial_layout.panes[0].clone();
         let original_layer = cmdash::derive_layer_id(&pane.id);
-        let runner = PaneRunner::spawn_with_graphics(
-            pane,
-            original_layer,
-            shell,
-            Some(close_tx.clone()),
-        )
-        .expect("spawn single-pane runner");
+        let runner =
+            PaneRunner::spawn_with_graphics(pane, original_layer, shell, Some(close_tx.clone()))
+                .expect("spawn single-pane runner");
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             vec![runner],
@@ -2281,7 +2269,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -2296,8 +2289,8 @@ mod input_tests {
             2,
             "AppNewPane on a single-leaf root must yield 2 PaneRunners"
         );
-        let post_layout = ComputedLayout::compute(&ctx.layout_root, ctx.last_area)
-            .expect("post-Split compute");
+        let post_layout =
+            ComputedLayout::compute(&ctx.layout_root, ctx.last_area).expect("post-Split compute");
         assert_eq!(post_layout.panes.len(), 2);
         assert_eq!(
             ctx.runners[0].layer_id(),
@@ -2340,20 +2333,14 @@ mod input_tests {
         let pane_b = initial_layout.panes[1].clone();
         let id_a = cmdash::derive_layer_id(&pane_a.id);
         let id_b = cmdash::derive_layer_id(&pane_b.id);
-        let r0 = PaneRunner::spawn_with_graphics(
-            pane_a,
-            id_a,
-            shell.clone(),
-            Some(close_tx.clone()),
-        )
-        .expect("spawn r0");
-        let r1 =
-            PaneRunner::spawn_with_graphics(pane_b, id_b, shell, Some(close_tx.clone()))
-                .expect("spawn r1");
+        let r0 =
+            PaneRunner::spawn_with_graphics(pane_a, id_a, shell.clone(), Some(close_tx.clone()))
+                .expect("spawn r0");
+        let r1 = PaneRunner::spawn_with_graphics(pane_b, id_b, shell, Some(close_tx.clone()))
+            .expect("spawn r1");
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             vec![r0, r1],
@@ -2367,7 +2354,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -2423,21 +2415,15 @@ mod input_tests {
         let pane_b = initial_layout.panes[1].clone();
         let id_a = cmdash::derive_layer_id(&pane_a.id);
         let id_b = cmdash::derive_layer_id(&pane_b.id);
-        let r0 = PaneRunner::spawn_with_graphics(
-            pane_a,
-            id_a,
-            shell.clone(),
-            Some(close_tx.clone()),
-        )
-        .expect("spawn r0");
-        let r1 =
-            PaneRunner::spawn_with_graphics(pane_b, id_b, shell, Some(close_tx.clone()))
-                .expect("spawn r1");
+        let r0 =
+            PaneRunner::spawn_with_graphics(pane_a, id_a, shell.clone(), Some(close_tx.clone()))
+                .expect("spawn r0");
+        let r1 = PaneRunner::spawn_with_graphics(pane_b, id_b, shell, Some(close_tx.clone()))
+            .expect("spawn r1");
         let survivor_layer = r1.layer_id();
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             vec![r0, r1],
@@ -2525,8 +2511,7 @@ mod input_tests {
         let beta_layout_root = beta_cfg.layout.expect("beta layout block");
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut presets = BTreeMap::new();
         presets.insert("beta".to_string(), beta_layout_root);
@@ -2559,8 +2544,8 @@ mod input_tests {
         // for the AGENTS.md Hard rule; the binary's tick-loop
         // would drain it on the next phase 1, no echo here).
         assert_eq!(ctx.runners.len(), 2);
-        let post_layout = ComputedLayout::compute(&ctx.layout_root, ctx.last_area)
-            .expect("post-swap compute");
+        let post_layout =
+            ComputedLayout::compute(&ctx.layout_root, ctx.last_area).expect("post-swap compute");
         assert_eq!(post_layout.panes.len(), 2);
         assert_ne!(
             ctx.runners[0].layer_id(),
@@ -2599,7 +2584,12 @@ mod input_tests {
         let layout_root = cfg.layout.expect("layout block");
         let initial = ComputedLayout::compute(
             &layout_root,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute");
         assert_eq!(initial.panes.len(), 3);
@@ -2618,8 +2608,7 @@ mod input_tests {
             .collect();
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             runners,
@@ -2635,7 +2624,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -2675,7 +2669,12 @@ mod input_tests {
         let layout_root = cfg.layout.expect("layout block");
         let initial = ComputedLayout::compute(
             &layout_root,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute");
         assert_eq!(initial.panes.len(), 2);
@@ -2694,8 +2693,7 @@ mod input_tests {
             .collect();
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             runners,
@@ -2713,7 +2711,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -2760,7 +2763,12 @@ mod input_tests {
         let layout_root = cfg.layout.expect("layout block");
         let initial = ComputedLayout::compute(
             &layout_root,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute");
         // 3 panes total: zstack[bottom], zstack[top],
@@ -2784,8 +2792,7 @@ mod input_tests {
             .collect();
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             runners,
@@ -2802,7 +2809,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -2858,7 +2870,12 @@ mod input_tests {
         let layout_root = cfg.layout.expect("layout block");
         let initial = ComputedLayout::compute(
             &layout_root,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute");
         assert_eq!(initial.panes.len(), 2);
@@ -2877,8 +2894,7 @@ mod input_tests {
             .collect();
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             runners,
@@ -2896,7 +2912,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -2931,7 +2952,12 @@ mod input_tests {
         let layout_root = cfg.layout.expect("layout block");
         let initial = ComputedLayout::compute(
             &layout_root,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute");
         // 3 panes total: above, zstack[bottom], zstack[top].
@@ -2956,8 +2982,7 @@ mod input_tests {
             .collect();
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             runners,
@@ -2974,7 +2999,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -3032,7 +3062,12 @@ mod input_tests {
         let layout_root = cfg.layout.expect("layout block");
         let initial = ComputedLayout::compute(
             &layout_root,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute");
         assert_eq!(initial.panes.len(), 2);
@@ -3051,8 +3086,7 @@ mod input_tests {
             .collect();
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             runners,
@@ -3068,7 +3102,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -3114,7 +3153,12 @@ mod input_tests {
         let layout_root = cfg.layout.expect("layout block");
         let initial = ComputedLayout::compute(
             &layout_root,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute");
         assert_eq!(initial.panes.len(), 2);
@@ -3133,8 +3177,7 @@ mod input_tests {
             .collect();
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             runners,
@@ -3150,7 +3193,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -3207,7 +3255,12 @@ mod input_tests {
         let layout_root = cfg.layout.expect("layout block");
         let initial = ComputedLayout::compute(
             &layout_root,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute");
         // 3 panes total: zstack[left_inside] at pre_order 0
@@ -3231,8 +3284,7 @@ mod input_tests {
             .collect();
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             runners,
@@ -3249,7 +3301,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -3313,7 +3370,12 @@ mod input_tests {
         let layout_root = cfg.layout.expect("layout block");
         let initial = ComputedLayout::compute(
             &layout_root,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute");
         // 3 panes total: left_outside at pre_order 0
@@ -3338,8 +3400,7 @@ mod input_tests {
             .collect();
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             runners,
@@ -3356,7 +3417,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -3422,7 +3488,12 @@ mod input_tests {
         let layout_root = cfg.layout.expect("layout block");
         let initial = ComputedLayout::compute(
             &layout_root,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute");
         // 2 panes total: zstack[only_inside] at pre_order 0
@@ -3444,8 +3515,7 @@ mod input_tests {
             .collect();
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             runners,
@@ -3462,7 +3532,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -3523,7 +3598,12 @@ mod input_tests {
         let layout_root = cfg.layout.expect("layout block");
         let initial = ComputedLayout::compute(
             &layout_root,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute");
         // 2 panes total: left_outside at pre_order 0
@@ -3546,8 +3626,7 @@ mod input_tests {
             .collect();
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             runners,
@@ -3564,7 +3643,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -3598,7 +3682,6 @@ mod input_tests {
             "PaneStackLeft handoff target is outside the ZStack; stack_focus should stay empty"
         );
     }
-
 
     // ============================================================
     // Phase 6 carry-forward regression tests for the
@@ -3647,23 +3730,22 @@ mod input_tests {
         let layout_root = cfg.layout.expect("layout block");
         let initial = ComputedLayout::compute(
             &layout_root,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute");
         assert_eq!(initial.panes.len(), 1);
         let pane_only = initial.panes[0].clone();
         let id_only = cmdash::derive_layer_id(&pane_only.id);
-        let r0 = PaneRunner::spawn_with_graphics(
-            pane_only,
-            id_only,
-            shell,
-            Some(close_tx.clone()),
-        )
-        .expect("spawn r0");
+        let r0 = PaneRunner::spawn_with_graphics(pane_only, id_only, shell, Some(close_tx.clone()))
+            .expect("spawn r0");
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             vec![r0],
@@ -3677,7 +3759,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             std::collections::BTreeMap::new(),
             std::collections::BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -3742,7 +3829,12 @@ mod input_tests {
         let layout_root = cfg.layout.expect("layout block");
         let initial = ComputedLayout::compute(
             &layout_root,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute");
         assert_eq!(initial.panes.len(), 3);
@@ -3752,31 +3844,17 @@ mod input_tests {
         let id_a = cmdash::derive_layer_id(&pane_a.id);
         let id_b = cmdash::derive_layer_id(&pane_b.id);
         let id_c = cmdash::derive_layer_id(&pane_c.id);
-        let r0 = PaneRunner::spawn_with_graphics(
-            pane_a,
-            id_a,
-            shell.clone(),
-            Some(close_tx.clone()),
-        )
-        .expect("spawn r0");
-        let r1 = PaneRunner::spawn_with_graphics(
-            pane_b,
-            id_b,
-            shell.clone(),
-            Some(close_tx.clone()),
-        )
-        .expect("spawn r1");
-        let r2 = PaneRunner::spawn_with_graphics(
-            pane_c,
-            id_c,
-            shell,
-            Some(close_tx.clone()),
-        )
-        .expect("spawn r2");
+        let r0 =
+            PaneRunner::spawn_with_graphics(pane_a, id_a, shell.clone(), Some(close_tx.clone()))
+                .expect("spawn r0");
+        let r1 =
+            PaneRunner::spawn_with_graphics(pane_b, id_b, shell.clone(), Some(close_tx.clone()))
+                .expect("spawn r1");
+        let r2 = PaneRunner::spawn_with_graphics(pane_c, id_c, shell, Some(close_tx.clone()))
+            .expect("spawn r2");
         let graphics = GraphicsState::new(Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal =
-            ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
         let bindings = Router::new(vec![]);
         let mut ctx = TickContext::new_full(
             vec![r0, r1, r2],
@@ -3790,7 +3868,12 @@ mod input_tests {
             Duration::from_millis(33),
             layout_root,
             None,
-            LayoutRect { x: 0, y: 0, w: 80, h: 24 },
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
             std::collections::BTreeMap::new(),
             std::collections::BTreeMap::new(),
             ShellSpec::LoginShell,
@@ -3813,14 +3896,16 @@ mod input_tests {
         );
         let post_focus_id = ctx.runners[ctx.focus].computed().id.clone();
         assert_eq!(
-            post_focus_id, ctx.runners[0].computed().id,
+            post_focus_id,
+            ctx.runners[0].computed().id,
             "post-focus PaneId must match pane 'a' at pre_order=0 (FIRST member)"
         );
         // Path[1] pin: declaration-order ZStack member index.
         // Path[0] is the resolver seed, always 0 -- NOT a
         // meaningful per-this-test signal.
         assert_eq!(
-            post_focus_id.path()[1], 0,
+            post_focus_id.path()[1],
+            0,
             "post-focus path[1] must read 0 (declaration-order idx of FIRST member)"
         );
         assert!(

@@ -265,68 +265,69 @@ pub enum ConfigError {
 pub fn parse(source: &str) -> Result<Config, ConfigError> {
     let doc: KdlDocument = source
         .parse()
-        .map_err(|e: kdl::KdlError| ConfigError::Kdl(e.to_string()))?;        let mut cfg = Config::default();
-        for n in doc.nodes() {
-            let name = n.name().value();
-            match name {
-                "layout" => {
-                    if cfg.layout.is_some() {
-                        return Err(ConfigError::DuplicateLayout);
-                    }
-                    // The outer `layout { ... }` is a single-node container.
-                    // Descend into its first (and only) child, which is the
-                    // actual root LayoutNode.
-                    let children = n.children().ok_or_else(|| {
-                        ConfigError::UnknownLayoutNode("layout block must contain a LayoutNode".into())
-                    })?;
-                    let kids = children.nodes();
-                    let first = kids.first().ok_or_else(|| {
-                        ConfigError::UnknownLayoutNode("layout block must contain a LayoutNode".into())
-                    })?;
-                    if kids.len() > 1 {
-                        return Err(ConfigError::UnknownLayoutNode(
-                            "layout block may contain exactly one LayoutNode".into(),
-                        ));
-                    }
-                    cfg.layout = Some(read_layout(first)?);
+        .map_err(|e: kdl::KdlError| ConfigError::Kdl(e.to_string()))?;
+    let mut cfg = Config::default();
+    for n in doc.nodes() {
+        let name = n.name().value();
+        match name {
+            "layout" => {
+                if cfg.layout.is_some() {
+                    return Err(ConfigError::DuplicateLayout);
                 }
-                "keybinds" => {
-                    if let Some(c) = n.children() {
-                        for k in c.nodes() {
-                            if k.name().value() != "bind" {
-                                return Err(ConfigError::UnexpectedKindbindChild(
-                                    k.name().value().to_string(),
-                                ));
-                            }
-                            cfg.keybinds.push(read_keybind(k)?);
-                        }
-                    }
+                // The outer `layout { ... }` is a single-node container.
+                // Descend into its first (and only) child, which is the
+                // actual root LayoutNode.
+                let children = n.children().ok_or_else(|| {
+                    ConfigError::UnknownLayoutNode("layout block must contain a LayoutNode".into())
+                })?;
+                let kids = children.nodes();
+                let first = kids.first().ok_or_else(|| {
+                    ConfigError::UnknownLayoutNode("layout block must contain a LayoutNode".into())
+                })?;
+                if kids.len() > 1 {
+                    return Err(ConfigError::UnknownLayoutNode(
+                        "layout block may contain exactly one LayoutNode".into(),
+                    ));
                 }
-                "presets" => {
-                    if !cfg.presets.is_empty() {
-                        return Err(ConfigError::DuplicatePresets);
-                    }
-                    let c = n.children().ok_or_else(|| {
-                        ConfigError::EmptyChildren("presets")
-                    })?;
+                cfg.layout = Some(read_layout(first)?);
+            }
+            "keybinds" => {
+                if let Some(c) = n.children() {
                     for k in c.nodes() {
-                        if k.name().value() != "preset" {
-                            return Err(ConfigError::UnexpectedPresetsChild(
+                        if k.name().value() != "bind" {
+                            return Err(ConfigError::UnexpectedKindbindChild(
                                 k.name().value().to_string(),
                             ));
                         }
-                        let (name, body) = read_named_preset(k)?;
-                        if cfg.presets.contains_key(&name) {
-                            return Err(ConfigError::DuplicatePreset(name));
-                        }
-                        cfg.presets.insert(name, body);
+                        cfg.keybinds.push(read_keybind(k)?);
                     }
                 }
-                other => return Err(ConfigError::UnknownTopLevel(other.into())),
             }
+            "presets" => {
+                if !cfg.presets.is_empty() {
+                    return Err(ConfigError::DuplicatePresets);
+                }
+                let c = n
+                    .children()
+                    .ok_or_else(|| ConfigError::EmptyChildren("presets"))?;
+                for k in c.nodes() {
+                    if k.name().value() != "preset" {
+                        return Err(ConfigError::UnexpectedPresetsChild(
+                            k.name().value().to_string(),
+                        ));
+                    }
+                    let (name, body) = read_named_preset(k)?;
+                    if cfg.presets.contains_key(&name) {
+                        return Err(ConfigError::DuplicatePreset(name));
+                    }
+                    cfg.presets.insert(name, body);
+                }
+            }
+            other => return Err(ConfigError::UnknownTopLevel(other.into())),
         }
-        Ok(cfg)
     }
+    Ok(cfg)
+}
 
 fn read_layout(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
     match n.name().value() {
@@ -466,9 +467,9 @@ fn read_named_preset(n: &KdlNode) -> Result<(String, LayoutNode), ConfigError> {
     }
     let kids = n
         .children()
-        .ok_or_else(|| ConfigError::UnknownLayoutNode(
-            "preset block must contain a LayoutNode body".into(),
-        ))?
+        .ok_or_else(|| {
+            ConfigError::UnknownLayoutNode("preset block must contain a LayoutNode body".into())
+        })?
         .nodes();
     let first = kids.first().ok_or_else(|| {
         ConfigError::UnknownLayoutNode("preset block must contain a LayoutNode body".into())
@@ -719,7 +720,11 @@ mod tests {
         let cfg = parse(src).expect("layout with split parses");
         let layout = cfg.layout.expect("Config.layout populated");
         match layout {
-            LayoutNode::Split { axis, ratio, children } => {
+            LayoutNode::Split {
+                axis,
+                ratio,
+                children,
+            } => {
                 assert_eq!(axis, SplitAxis::default());
                 assert_eq!(ratio, Ratio(60));
                 assert_eq!(children.len(), 2);
@@ -774,14 +779,8 @@ mod tests {
                 match &children[0] {
                     LayoutNode::ZStack { panes } => {
                         assert_eq!(panes.len(), 2);
-                        assert_eq!(
-                            pane_label(&panes[0]),
-                            Some("overlay".to_string())
-                        );
-                        assert_eq!(
-                            pane_label(&panes[1]),
-                            Some("overlay_below".to_string())
-                        );
+                        assert_eq!(pane_label(&panes[0]), Some("overlay".to_string()));
+                        assert_eq!(pane_label(&panes[1]), Some("overlay_below".to_string()));
                     }
                     other => panic!(
                         "expected ZStack child[0], got: {:?}",

@@ -171,7 +171,7 @@ pub enum Direction {
     Right,
 }
 
-    /// Split `area` along `axis` at `ratio` percent of the dimension.
+/// Split `area` along `axis` at `ratio` percent of the dimension.
 /// Child 0 gets `ratio%`; child 1 gets the remainder.
 
 ///
@@ -468,9 +468,7 @@ pub fn remove_leaf(root: &mut LayoutNode, path: &[u16]) -> Result<(), LayoutErro
         None => {
             let parent_node = walk_mut(root, parent_path)?;
             match parent_node {
-                LayoutNode::Split { children, .. } => {
-                    surviving_sibling_of(leaf_idx, children)
-                }
+                LayoutNode::Split { children, .. } => surviving_sibling_of(leaf_idx, children),
                 LayoutNode::Stack { panes } | LayoutNode::ZStack { panes } => {
                     surviving_sibling_of(leaf_idx, panes)
                 }
@@ -482,12 +480,17 @@ pub fn remove_leaf(root: &mut LayoutNode, path: &[u16]) -> Result<(), LayoutErro
     };
     // Step 2: physically remove the leaf from the parent's children.
     {
-        let parent_node: &mut LayoutNode =
-            if parent_path.is_empty() { root } else { walk_mut(root, parent_path)? };
+        let parent_node: &mut LayoutNode = if parent_path.is_empty() {
+            root
+        } else {
+            walk_mut(root, parent_path)?
+        };
         match parent_node {
             LayoutNode::Split { children, .. } => {
                 if leaf_idx >= children.len() {
-                    return Err(LayoutError::SplitChildCount { got: children.len() });
+                    return Err(LayoutError::SplitChildCount {
+                        got: children.len(),
+                    });
                 }
                 children.remove(leaf_idx);
             }
@@ -549,17 +552,12 @@ pub fn remove_leaf(root: &mut LayoutNode, path: &[u16]) -> Result<(), LayoutErro
 /// nested walk through Split-of-Split). Treat those as the
 /// load-bearing ground truth for callers doing layout mutation
 /// on top of [`LayoutNode`].
-pub fn walk_imut<'a>(
-    root: &'a LayoutNode,
-    path: &[u16],
-) -> Result<&'a LayoutNode, LayoutError> {
+pub fn walk_imut<'a>(root: &'a LayoutNode, path: &[u16]) -> Result<&'a LayoutNode, LayoutError> {
     let mut node = root;
     for &idx in path {
         let next = match node {
             LayoutNode::Split { children, .. } => children.get(idx as usize),
-            LayoutNode::Stack { panes } | LayoutNode::ZStack { panes } => {
-                panes.get(idx as usize)
-            }
+            LayoutNode::Stack { panes } | LayoutNode::ZStack { panes } => panes.get(idx as usize),
             LayoutNode::Pane(_) | LayoutNode::Preset { .. } => {
                 return Err(LayoutError::SplitChildCount { got: 1 })
             }
@@ -573,10 +571,7 @@ pub fn walk_imut<'a>(
 /// Walk a mutable `&mut` chain of children at `path` into the
 /// tree, returning the node at `path`. Subject to the same
 /// error conditions as [`walk_imut`].
-fn walk_mut<'a>(
-    root: &'a mut LayoutNode,
-    path: &[u16],
-) -> Result<&'a mut LayoutNode, LayoutError> {
+fn walk_mut<'a>(root: &'a mut LayoutNode, path: &[u16]) -> Result<&'a mut LayoutNode, LayoutError> {
     let mut node = root;
     for &idx in path {
         let next = match node {
@@ -632,7 +627,9 @@ fn replace_child(
     match parent {
         LayoutNode::Split { children, .. } => {
             if idx >= children.len() {
-                return Err(LayoutError::SplitChildCount { got: children.len() });
+                return Err(LayoutError::SplitChildCount {
+                    got: children.len(),
+                });
             }
             children[idx] = new_child;
             Ok(())
@@ -696,13 +693,14 @@ pub fn adjacent_pane(
     focused: PaneId,
     direction: Direction,
 ) -> Option<PaneId> {
-    let focused_pane = layout
-        .panes
-        .iter()
-        .find(|p| p.id == focused)?;
+    let focused_pane = layout.panes.iter().find(|p| p.id == focused)?;
     let f = focused_pane.rect;
-    let mut best: Option<(u32 /* overlap */, u32 /* distance */, u32 /* pre_order */, PaneId)> =
-        None;
+    let mut best: Option<(
+        u32, /* overlap */
+        u32, /* distance */
+        u32, /* pre_order */
+        PaneId,
+    )> = None;
     for pane in &layout.panes {
         if pane.id == focused {
             continue;
@@ -1087,10 +1085,7 @@ mod internal_sanity_tests {
         );
         // Symmetric "no neighbour in opposite direction" returns
         // `None` (no pane is LEFT of the leftmost pane).
-        assert_eq!(
-            adjacent_pane(&layout, left_id, Direction::Left),
-            None
-        );
+        assert_eq!(adjacent_pane(&layout, left_id, Direction::Left), None);
     }
 
     /// 2x2 grid (outer V over inner H pairs): focused pane Right
@@ -1165,7 +1160,12 @@ mod internal_sanity_tests {
         );
         let layout = ComputedLayout::compute(
             &root,
-            Rect { x: 0, y: 0, w: 80, h: 24 },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute ZStack-within-Split");
         // 3 panes total: 2 overlay + 1 tail.
@@ -1181,12 +1181,22 @@ mod internal_sanity_tests {
         assert_eq!(ovl_a.rect, ovl_b.rect);
         assert_eq!(
             ovl_a.rect,
-            Rect { x: 0, y: 0, w: 80, h: 12 }
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 12
+            }
         );
         // Tail got the bottom half.
         assert_eq!(
             tail.rect,
-            Rect { x: 0, y: 12, w: 80, h: 12 }
+            Rect {
+                x: 0,
+                y: 12,
+                w: 80,
+                h: 12
+            }
         );
         // Overlay peers still have distinct PaneIds.
         assert_ne!(ovl_a.id, ovl_b.id);
@@ -1200,15 +1210,16 @@ mod internal_sanity_tests {
     #[test]
     fn resolve_zstack_three_members_ordered_pre_orders() {
         let root = LayoutNode::ZStack {
-            panes: vec![
-                p(Some("bottom")),
-                p(Some("middle")),
-                p(Some("top")),
-            ],
+            panes: vec![p(Some("bottom")), p(Some("middle")), p(Some("top"))],
         };
         let layout = ComputedLayout::compute(
             &root,
-            Rect { x: 0, y: 0, w: 80, h: 24 },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
         )
         .expect("compute 3-member zstack");
         assert_eq!(layout.panes.len(), 3);

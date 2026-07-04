@@ -201,7 +201,7 @@ impl PaneRunner {
     /// Pair with [`Self::resize`] if the underlying PTY child
     /// also needs to match the new rect (e.g. after a tree
     /// mutation has shifted proportions). The orchestrator in
-    ///`TickContext::reconcile_runners` 
+    ///`TickContext::reconcile_runners`
     /// pairs the two so a survivor's PTY child AND cached
     /// computed reflect the new layout at the end of one tick.
     ///
