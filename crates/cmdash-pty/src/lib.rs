@@ -404,9 +404,9 @@ impl KittyAccumulator {
 /// input bytes for `ESC _` APC (kitty graphics) sequences.
 /// Drives the routing between `KittyAccumulator` (for APC
 /// payloads) and `vte::Parser::advance` (for everything else).
-/// Four states cover the four contexts an `ESC` byte can appear
-/// in: outside an APC, just saw one outside an APC, inside an
-/// APC, and just saw one inside an APC.
+/// Five states cover the contexts an `ESC` byte can appear
+/// in: outside an APC, just saw one outside an APC, saw `ESC _`,
+/// inside an APC, and just saw one inside an APC.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum ApcScannerState {
     /// Default. Outside any APC. Bare `ESC` transitions to
@@ -416,11 +416,25 @@ enum ApcScannerState {
     #[default]
     Idle,
     /// Outside APC; an unconsumed `ESC` is waiting for the next
-    /// byte. `_` -> start APC; `[`/`]` / `P` / else -> flush
-    /// the prior `ESC` to `vte` and resume normal flow; another
-    /// `ESC` -> flush prior (it wasn't APC), stay `SeenEsc` for
-    /// the new one.
+    /// byte. `_` -> start APC by transitioning to
+    /// [`SeenEscUnderscore`](ApcScannerState::SeenEscUnderscore);
+    /// `[`/`]` / `P` / else -> flush the prior `ESC` to `vte`
+    /// and resume normal flow; another `ESC` -> flush prior
+    /// (it wasn't APC), stay `SeenEsc` for the new one.
     SeenEsc,
+    /// Outside APC; consumed `ESC _` and now waiting for the
+    /// kitty-graphics command-introducer `G` (`0x47`). Bare `G`
+    /// -> transition to [`InApc`](ApcScannerState::InApc) and
+    /// call `KittyAccumulator::begin()` WITHOUT pushing `G`
+    /// into the kitty buffer (the `G` is framing, not payload
+    /// data, so it must not become part of `parse_kitty_chunk`'s
+    /// metadata key=value stream). Any other byte -> this was
+    /// not a kitty-graphics APC after all; push `ESC _ <byte>`
+    /// to `vte` and resume normal flow. This state was the
+    /// load-bearing fix for the `a=d`, `a=p`, `a=t` etc. action
+    /// resolutions being mis-routed to the load/place default
+    /// path because `G` was previously leaked into the meta.
+    SeenEscUnderscore,
     /// Inside an APC. Payload bytes accumulate into
     /// `KittyAccumulator.raw`. `BEL` (`0x07`) terminates; a lone
     /// `ESC` defers the terminate-decision to the next byte via
@@ -791,7 +805,7 @@ pub struct PanePty {
     kitty: KittyAccumulator,
     /// Pre-scan state machine: routes APC (kitty `ESC _`) bytes
     /// to `KittyAccumulator` instead of `vte::Parser::advance`.
-    /// See [`ApcScannerState`] for the four states.
+    /// See [`ApcScannerState`] for the five states.
     apc: ApcScanner,
     fg: Color,
     bg: Color,
@@ -934,7 +948,7 @@ impl PanePty {
         // DCS strings through `hook`/`put`/`unhook`. Without
         // this pre-scan, `PaneEvent::KittyGraphic`s never fire
         // and the cmdash binary silently loses kitty graphics
-        // emission. The below four-state machine is the
+        // emission. The below five-state machine is the
         // architectural fix.
         let mut vte_bytes = Vec::with_capacity(bytes.len());
         for &b in bytes {
@@ -948,9 +962,15 @@ impl PanePty {
                 }
                 ApcScannerState::SeenEsc => {
                     if b == b'_' {
-                        // ESC _ starts an APC.
-                        self.apc.state = ApcScannerState::InApc;
-                        self.kitty.begin();
+                        // ESC _ was consumed; the next byte
+                        // decides whether this is a kitty
+                        // graphics APC (introducer `G`) or some
+                        // other non-APC sequence (`ESC _ X` is
+                        // rare in practice but valid escape
+                        // framing per VT100). Defer the
+                        // `KittyAccumulator::begin()` until we
+                        // confirm via `SeenEscUnderscore`.
+                        self.apc.state = ApcScannerState::SeenEscUnderscore;
                     } else if b == 0x1B {
                         // Emit the prior ESC; the new ESC could
                         // still be the start of APC. Stay SeenEsc.
@@ -961,6 +981,41 @@ impl PanePty {
                         // (CSI), ESC ] (OSC), ESC P (DCS). Hand
                         // ESC + this byte back to vte.
                         vte_bytes.push(0x1B);
+                        vte_bytes.push(b);
+                        self.apc.state = ApcScannerState::Idle;
+                    }
+                }
+                ApcScannerState::SeenEscUnderscore => {
+                    if b == b'G' {
+                        // ESC _ G is the canonical kitty
+                        // graphics opener per the kitty
+                        // graphics protocol. The `G` byte is
+                        // FRAMING, not data: it must NOT be
+                        // pushed into `KittyAccumulator::raw`
+                        // because `parse_kitty_chunk` would
+                        // otherwise see meta like `Ga=d,i=5`
+                        // (with `Ga` as a key) instead of
+                        // `a=d,i=5`, and the action lookup
+                        // `kv.get("a").unwrap_or("p")` would
+                        // fall back to the load/place default
+                        // for a `Delete` command. Stripping
+                        // the `G` here restores the spec-
+                        // correct metadata stream.
+                        self.apc.state = ApcScannerState::InApc;
+                        self.kitty.begin();
+                    } else {
+                        // The byte after `ESC _` was not `G`,
+                        // so this is NOT a kitty graphics APC.
+                        // Flush the entire `ESC _ <byte>` triple
+                        // to `vte` for normal VT100 handling
+                        // (vte's Paul Williams state machine
+                        // will see it as a no-op or standard
+                        // escape; the exact behavior is
+                        // immaterial because no shell in
+                        // practice emits `ESC _ X` for non-`G`
+                        // `X` outside of kitty graphics).
+                        vte_bytes.push(0x1B);
+                        vte_bytes.push(b'_');
                         vte_bytes.push(b);
                         self.apc.state = ApcScannerState::Idle;
                     }

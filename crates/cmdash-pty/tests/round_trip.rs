@@ -292,7 +292,6 @@ fn pty_kitty_split_chunk_across_advances() {
 }
 
 #[test]
-#[ignore = "Kitty `a=d` Delete mis-parsed as Place: the 4-state APC pre-scan in `PanePty::advance` consumes `ESC _` as the APC opener but does NOT strip the kitty-command introducer `G` (0x47) from the payload. For input `\\x1b_Ga=d,i=5\\x1b\\\\`, `KittyAccumulator.raw` lands as the 7-byte string `Ga=d,i=5` (the `G` is pushed as APC data), and `parse_kitty_chunk`'s split-on-`,` then `splitn('=')` parser inserts kv `{ \"Ga\": \"d\", \"i\": \"5\" }`. The action lookup `kv.get(\"a\")` is `None` (no `a` key, only `Ga`), so `unwrap_or(\"p\")` falls back to `Place` with `id=5` — exactly what the failure dump shows: `KittyGraphic { cmd: Place { id: 5, placement_id: 0, x: 0, y: 0, ... } }`. To re-enable: drop the leading `G` byte on APC entry in the pre-scan (treat `ESC _ G` as a 3-byte opener), or change `parse_kitty_chunk` to reject keys prefixed by ASCII letters that aren't valid kitty kv keys (only `a, i, p, f, s, v, x, y, c, r, z, q, o, t, T` are valid per the kitty spec). See atom `chore(cmdash-pty/tests): restore 3 + file 2 PTY-alloc tests` for the file-up; pair with a `fix: strip kitty-G introducer in ApcScanner pre-scan` followup atom that flips this test back to `#[test]`."]
 fn pty_kitty_delete_emits_event() {
     let (mut pty, _reader) = PanePty::spawn(
         ShellSpec::Command {
