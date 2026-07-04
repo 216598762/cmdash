@@ -23,8 +23,14 @@ the cumulative audit-protocol ledger at `docs/ci-evidence.md`.
 - `cmdash-layout` -- the layer layout primitives.
 - `cmdash-pty` -- the KITTY-protocol PTY front end (backed by
   `portable-pty 0.9`) with event hooks.
-- `cmdash-renderer` -- the layer rendering primitives.
-- `cmdash-tests` -- the integration test surface.
+- `cmdash-widget-sdk` -- the c-ABI `CmdashWidget` trait for
+  dynamic Rust widget `cdylib`s (the layer rendering glue that
+  every dashboard widget plugs into).
+- Integration tests for the binary live inside the `cmdash`
+  crate itself (no separate workspace member); the v1.0.0
+  inventory is 13 plain `#[test]` fns + 1 `#[ignore]` fn
+  (the cat-echo test gated on upstream `portable-pty` upgrade;
+  see checklist line item B2).
 
 ### Added
 
@@ -34,8 +40,13 @@ the cumulative audit-protocol ledger at `docs/ci-evidence.md`.
 - **Workspace layout surface** (`cmdash-config` + `cmdash-keybinds` +
   `cmdash-layout`): the layer-based config surface that drives the
   front end.
-- **Renderer** (`cmdash-renderer`) + **integration tests**
-  (`cmdash-tests`).
+- **Widget SDK** (`cmdash-widget-sdk`) -- the c-ABI
+  `CmdashWidget` trait that external native widget crates
+  implement (e.g. an `examples/widget-clock` `cdylib`).
+- **In-crate integration tests** (inside the `cmdash`
+  binary crate) -- the v1.0.0 test surface; see
+  checklist line item B2 for the 1 `#[ignore]`'d cat-echo
+  test carried forward.
 - **Local-CI gate** (post workflow-removal at `7b8eee0`):
   - `just flake-soak` -- 300-run flake-soak target extended at
     `6acdd54` with the GPT-4.1-mini LLM-judge layer + tightened at
