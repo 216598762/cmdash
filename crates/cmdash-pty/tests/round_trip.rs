@@ -210,7 +210,6 @@ fn pty_invalid_size_spawn_rejected() {
 }
 
 #[test]
-#[ignore = "non-TTY CI: kitty APC forwarding depends on PTY-framed data flow; this test is fragile in environments where the PTY pair behaves differently from a real terminal. See ba2f741 (APC bypass) for the architectural fix that makes this test pass locally; this annotation is a defensive forward-only measure against environmental flakes."]
 fn pty_kitty_load_emits_event_via_vte_hook() {
     let (mut pty, _reader) = PanePty::spawn(
         ShellSpec::Command {
@@ -266,7 +265,6 @@ fn pty_kitty_partial_chunk_does_not_emit() {
 }
 
 #[test]
-#[ignore = "non-TTY CI: kitty APC chunked-across-call boundary depends on data-flow framing across multiple read() calls; fragile in non-TTY environments. See ba2f741."]
 fn pty_kitty_split_chunk_across_advances() {
     let (mut pty, _reader) = PanePty::spawn(
         ShellSpec::Command {
@@ -294,7 +292,7 @@ fn pty_kitty_split_chunk_across_advances() {
 }
 
 #[test]
-#[ignore = "non-TTY CI: kitty Delete command payload format depends on PTY-framed data flow. See ba2f741."]
+#[ignore = "Kitty `a=d` Delete mis-parsed as Place: the 4-state APC pre-scan in `PanePty::advance` consumes `ESC _` as the APC opener but does NOT strip the kitty-command introducer `G` (0x47) from the payload. For input `\\x1b_Ga=d,i=5\\x1b\\\\`, `KittyAccumulator.raw` lands as the 7-byte string `Ga=d,i=5` (the `G` is pushed as APC data), and `parse_kitty_chunk`'s split-on-`,` then `splitn('=')` parser inserts kv `{ \"Ga\": \"d\", \"i\": \"5\" }`. The action lookup `kv.get(\"a\")` is `None` (no `a` key, only `Ga`), so `unwrap_or(\"p\")` falls back to `Place` with `id=5` — exactly what the failure dump shows: `KittyGraphic { cmd: Place { id: 5, placement_id: 0, x: 0, y: 0, ... } }`. To re-enable: drop the leading `G` byte on APC entry in the pre-scan (treat `ESC _ G` as a 3-byte opener), or change `parse_kitty_chunk` to reject keys prefixed by ASCII letters that aren't valid kitty kv keys (only `a, i, p, f, s, v, x, y, c, r, z, q, o, t, T` are valid per the kitty spec). See atom `chore(cmdash-pty/tests): restore 3 + file 2 PTY-alloc tests` for the file-up; pair with a `fix: strip kitty-G introducer in ApcScanner pre-scan` followup atom that flips this test back to `#[test]`."]
 fn pty_kitty_delete_emits_event() {
     let (mut pty, _reader) = PanePty::spawn(
         ShellSpec::Command {
@@ -319,7 +317,6 @@ fn pty_kitty_delete_emits_event() {
 }
 
 #[test]
-#[ignore = "non-TTY CI: kitty Place command payload format depends on PTY-framed data flow. See ba2f741."]
 fn pty_kitty_place_command_emits_event() {
     let (mut pty, _reader) = PanePty::spawn(
         ShellSpec::Command {
@@ -368,7 +365,7 @@ fn pty_osc_title_changes_event_stream() {
 }
 
 #[test]
-#[ignore = "non-TTY CI: cat-PTY round-trip depends on PTY-master buffer drain semantics; in this non-TTY env cat does not echo back through the master (cat hangs on stdin where /dev/tty is not writable). The drain-deadline atom `85355ff` ensures the test exits cleanly under its `2s` deadline (env-overridable via `CMDASH_TEST_DRAIN_SECS`) rather than stalling `>60s`; the underlying assertion still fails here. Re-enable on a host CI with a real TTY harness."]
+#[ignore = "`/bin/cat` PTY echo race: after `PanePty::write(b\"hi\\n\")`, the test drains the master under `drain_deadline_default()` (now `secs.clamp(1, 30)` via atom `f158ea0`) then asserts grid(0,0).ch == `h`. The drain returns 0 bytes here because (a) `/bin/cat` has NOT been scheduled between `PanePty::spawn` returning and `PanePty::write` being called — `portable_pty` does not synchronize `Child::ready_read` with the spawner's return — and (b) the `portable_pty` PTY line discipline does NOT enable echo by default, so there is no synchronous echo back to the master on `pty.write`. The master buffer therefore stays empty for the entire drain deadline and grid(0,0).ch stays at the default `' '` — hence the failure `left: ' ', right: 'h'`. To re-enable: either set the PTY termios `ECHO` flag in `PanePty::spawn` (synchronous echo on master write), or add a `PanePty::wait_child_ready` poll (gate `Child::try_wait`-style readiness on the master returning at least 1 byte) before `pty.write` is observable to tests. See atom `chore(cmdash-pty/tests): restore 3 + file 2 PTY-alloc tests` for the file-up; pair with a `fix(cmdash-pty): enable PTY termios ECHO in spawn` followup atom that flips this test back to `#[test]`."]
 fn pty_write_to_child_round_trips_via_cat() {
     let (mut pty, reader) = PanePty::spawn(
         ShellSpec::Command {
