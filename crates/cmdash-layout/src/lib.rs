@@ -173,8 +173,6 @@ pub enum Direction {
 
 /// Split `area` along `axis` at `ratio` percent of the dimension.
 /// Child 0 gets `ratio%`; child 1 gets the remainder.
-
-///
 /// # Axis semantics
 ///
 /// Naming is a frequently-stepped trapdoor. This crate's
