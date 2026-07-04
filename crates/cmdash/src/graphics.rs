@@ -8,10 +8,10 @@
 //!   in a flat `HashMap` keyed by a stable
 //!   [`cmdash_pty::PaneLayerId`] (1:1 with the pane — AGENTS.md
 //!   §"Hard rule: one layer per instance").
-//! - [`GraphicsState::on_kitty`] dispatches each
+//! - `GraphicsState::on_kitty` dispatches each
 //!   [`KittyGraphicCmd`] variant:
 //!   - `Load`: decode the RGBA payload via [`image::load_from_memory`]
-//!     and call [`Self::push_image`] to register the freshly-pushed
+//!     and call `Self::push_image` to register the freshly-pushed
 //!     [`dashcompositor::ImageLayer`].
 //!   - `Place`: re-create the layer at the new pixel position
 //!     while preserving the cached RGBA. (dashcompositor's
@@ -61,7 +61,7 @@ impl Metrics {
     /// phrase `"cell_w and cell_h must be non-zero"` is
     /// consumed by the `metrics_new_panics_on_zero_*`
     /// regression tests in
-    /// [`internal_sanity_tests`].
+    ///`internal_sanity_tests` .
     ///
     /// Not `const fn` -- no const-eval consumer exists today
     /// (`Default::default()` is `fn`, not `const fn`;
@@ -192,7 +192,7 @@ impl GraphicsState {
     /// Push a fresh [`ImageLayer`] onto the stack from a
     /// pre-decoded RGBA, register it under `(pane, kitty_id)`,
     /// and add the kitty_id to the pane's image list. Used by
-    /// both [`Self::on_kitty`] (production) and unit/integration
+    /// both `Self::on_kitty` (production) and unit/integration
     /// tests (no real PNG decode required).
     pub fn push_image(
         &mut self,
@@ -265,7 +265,7 @@ impl GraphicsState {
         Ok(())
     }
 
-    /// Best-effort wrapper around [`Self::on_kitty`] that logs
+    /// Best-effort wrapper around `Self::on_kitty` that logs
     /// failures via `tracing::warn!` instead of propagating. v1
     /// treats kitty errors as non-fatal because the child's own
     /// shell session must keep running; a failed image must not
