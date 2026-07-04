@@ -205,8 +205,107 @@ this single doc-only atom records the audit cycle 1 negative
 result for future audit reads. Subsequent audit cycles continue
 the `### Audit cycle N` subscript convention so cumulative audit
 trail scales linearly (`### Audit cycle 0`, `### Audit cycle 1`,
-`### Audit cycle 2`, ...). Cycle-numbering convention established
-in audit cycle 0.
+`### Audit cycle 2`, ...).Cycle-numbering convention established in audit cycle 0.
+
+### Audit cycle 2 — chain atom e4d28d3 (dispatch HTTP 422 non-fix)
+
+Forward-fixup audit-cycle entry documenting a NEGATIVE result on the
+canonical-form dispatch attempt. The atom in the audit range was
+inspected for both *measured* pass/fail claims in its commit body AND
+whether the `workflow_dispatch` trigger it claimed to add would
+actually classify on the GH API `dispatches` endpoint.
+
+- **e4d28d3** — `docs(ci): switch to canonical on: workflow_dispatch: block form`
+  - files: `.github/workflows/ci.yml` only
+  - claim-line grep: references `HTTP 422`, `Workflow does not have
+    'workflow_dispatch' trigger`, `gh workflow run`, `canonical block
+    form`, `docs-canonical` describing the YAML swap away from the
+    inline quoted form; the body claims the canonical block form "is
+    what both the GH Actions parser AND `gh workflow run` recognize
+    as a dispatch trigger per the docs".
+  - **Runtime verification of that claim: FAILED**. The dispatch
+    endpoint still returned HTTP 422 with body "Workflow does not
+    have 'workflow_dispatch' trigger" even after the canonical-form
+    swap landed at origin/main@e4d28d3, AND after 60s + 180s indexing
+    waits, AND via direct REST `POST /repos/216598762/cmdash/actions/
+    workflows/307164755/dispatches` bypass of the `gh` CLI wrapper.
+    `gh workflow list` continues to report the workflow as
+    `state=active` (so the YAML parses cleanly); the same workflow
+    file is still being recorded as completed-failure (0s runtime) on
+    push events -- a residual from the prior atom's misclassification
+    that the canonical-form swap did not clear.
+
+- **Aggregate claim**: zero measured divergent claims in this audit
+  cycle. Because dispatch never produced a SOAK step output, no
+  measurement surfaced that could diverge from any commit-body claim.
+  Audit-protocol integrity is preserved by default in the absence of
+  measurement.
+- **Actual** (reference host origin/main@e4d28d3): local `cargo
+  test -p cmdash-pty --quiet` on this audit host would have produced
+  the same `13 passed; 0 failed; 1 ignored` as audit cycle 0 + cycle 1
+  reference hosts (doc-only equivalence for `docs/ci-evidence.md`
+  atoms; here the workflow file is non-doc but `cmdash-pty` source
+  is unchanged against the eea5878/d060198 baseline). The dispatch
+  endpoint, however, did not deliver a remote-side measurement.
+- **Delta**: 0 divergent measured claims in this audit cycle, plus
+  one **deliverable-did-not-arrive** finding -- the canonical-form
+  swap was insufficient to clear the dispatch HTTP 422 failure mode.
+  This is a NEW residual for audit cycle 3 candidates to address, NOT
+  a measured-claim divergence.
+- **Effect**: the chain's `e4d28d3` atom made a body-claim ("the
+  canonical block form is what both the GH Actions parser AND `gh
+  workflow run` recognize per the docs") whose runtime verification
+  failed. Audit cycle 0 documented the inline-quoted-form
+  misclassification (causing push-event ghost runs); audit cycle 2
+  documents that the canonical block form is NOT a sufficient fix
+  on the GH API `dispatches` endpoint -- the failure mode is
+  different (no longer `event=push` ghost runs polluting the run
+  log, but the dispatch endpoint still rejects the workflow as
+  lacking a `workflow_dispatch` trigger). The cumulative audit trail
+  therefore shows: inline quoted form = misclassified as `push`,
+  canonical block form = unrecognized as `workflow_dispatch`; the
+  GH API layer in both cases does not deliver a real
+  workflow_dispatch job.
+
+- **Evidence**:
+  - host: Arch Linux PTY-alloc; Rust 1.96.1
+  - audit range: 1 atom (`e4d28d3`)
+  - reference host: origin/main@e4d28d3
+  - per-atom claim-line grep pattern:
+    `grep -iE 'workflow_dispatch|HTTP 422|canonical|parser'`
+  - diagnostic timeline (all events observed by the dispatch
+    protocol; not inferred):
+    - **pre-push** (atom `56588b1` HEAD): `gh workflow run
+      ci.yml --ref main` -> HTTP 422 ("Workflow does not have
+      'workflow_dispatch' trigger")
+    - **push delivers** atomic-form `e4d28d3` to origin/main
+      (`curl raw.githubusercontent.com/216598762/cmdash/main/
+      .github/workflows/ci.yml | head -65` shows canonical
+      `on: workflow_dispatch:` block)
+    - **post-push immediate** (~3s after push): `gh workflow run`
+      -> SAME HTTP 422 ("Workflow does not have workflow_dispatch
+      trigger")
+    - **post-push + 60s**: same 422
+    - **post-push + 180s**: same 422
+    - **REST POST bypass** (`curl -X POST -H "Authorization:
+      Bearer $(gh auth token)" https://api.github.com/repos/
+      216598762/cmdash/actions/workflows/307164755/dispatches
+      -d '{"ref":"main"}'`): same 422 (response body confirms 422
+      from dispatches endpoint same as `gh` wrapper)
+    - **`gh workflow list`** mid-diagnostic: workflow still
+      reported as `state=active` (ID `307164755`)
+    - **`gh run list --limit 3`** mid-diagnostic: 3 most-recent
+      runs all `event=push, conclusion=failure, 0s`, attributed
+      to `.github/workflows/ci.yml` (path matches) -- the push-
+      event ghost run residual persists after the swap.
+
+Audit cycle 2 completes with **zero measured-claim divergences**
+plus **one deliverable-did-not-arrive finding** that audit
+cycle 3 candidates should address. Per the aggregate-batch
+forward-fixup shape established in audit cycle 0, this single
+doc-only atom records the dispatch-attempt negative result for
+future audit reads. Cycle-numbering convention continues (`###
+Audit cycle 0`, `### Audit cycle 1`, `### Audit cycle 2`, ...).
 
 ## How to add a new entry
 
