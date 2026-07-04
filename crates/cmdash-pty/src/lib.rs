@@ -23,9 +23,15 @@
 //! ## Kitty graphics interception
 //!
 //! The kitty graphics protocol embeds `ESC _ G <key>=<value>;...;<base64> ESC \`
-//! payloads (or `BEL`-terminated). vte 0.15 routes these via
-//! [`vte::Perform::hook`] / [`put`] / [`unhook`] with action char
-//! `'G'`. We accumulate the raw payload and parse it on `unhook`.
+//! payloads (or `BEL`-terminated). At HEAD the [`PanePty::advance`]
+//! byte loop pre-scans for `ESC _` APC sequences and routes their
+//! payload to [`KittyAccumulator`] / [`parse_kitty_chunk`] directly.
+//! This is load-bearing: `vte 0.15` silently DROPS APC strings
+//! (the Paul Williams state machine only routes DCS strings through
+//! `hook`/`put`/`unhook`; APC goes nowhere). See the four-state
+//! pre-scan in `advance` for the byte-routing rules. The
+//! `VtePerf` driver does NOT implement `vte::Perform::hook`/
+//! `put`/`unhook` for kitty (those callbacks never fire for APC).
 
 use base64::Engine;
 use std::collections::HashMap;
@@ -394,6 +400,49 @@ impl KittyAccumulator {
     }
 }
 
+/// State of `PanePty::advance`'s pre-scan loop while walking
+/// input bytes for `ESC _` APC (kitty graphics) sequences.
+/// Drives the routing between `KittyAccumulator` (for APC
+/// payloads) and `vte::Parser::advance` (for everything else).
+/// Four states cover the four contexts an `ESC` byte can appear
+/// in: outside an APC, just saw one outside an APC, inside an
+/// APC, and just saw one inside an APC.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ApcScannerState {
+    /// Default. Outside any APC. Bare `ESC` transitions to
+    /// [`SeenEsc`](ApcScannerState::SeenEsc) so the next byte
+    /// can decide whether this is APC (`_`) or some other escape
+    /// (`[`, `]`, `P`, ...) that should flow to `vte`.
+    #[default]
+    Idle,
+    /// Outside APC; an unconsumed `ESC` is waiting for the next
+    /// byte. `_` -> start APC; `[`/`]` / `P` / else -> flush
+    /// the prior `ESC` to `vte` and resume normal flow; another
+    /// `ESC` -> flush prior (it wasn't APC), stay `SeenEsc` for
+    /// the new one.
+    SeenEsc,
+    /// Inside an APC. Payload bytes accumulate into
+    /// `KittyAccumulator.raw`. `BEL` (`0x07`) terminates; a lone
+    /// `ESC` defers the terminate-decision to the next byte via
+    /// [`InApcSeenEsc`](ApcScannerState::InApcSeenEsc).
+    InApc,
+    /// Inside APC; an `ESC` is waiting for the next byte to
+    /// decide if it's `\` (the second byte of `ST = ESC \`).
+    /// `_` would also imply a new APC, but kitty doesn't nest
+    /// APCs; we treat the prior `ESC` as data in that case.
+    InApcSeenEsc,
+}
+
+/// Drives the APC pre-scan inside `PanePty::advance`. The state
+/// itself is the only field; the byte-routing logic reads
+/// `self.state` and dispatches to `KittyAccumulator` (for APC
+/// payload) or to `vte::Parser::advance` (for everything else)
+/// accordingly.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ApcScanner {
+    state: ApcScannerState,
+}
+
 fn parse_kitty_chunk(raw: &[u8]) -> Option<KittyGraphicCmd> {
     // The kitty escape payload is `<key>=<val>[,<key>=<val>]…[;<base64>]` — a
     // metadata section separated from the base64 payload by a literal `;`
@@ -459,7 +508,6 @@ fn parse_kitty_chunk(raw: &[u8]) -> Option<KittyGraphicCmd> {
 
 struct VtePerf<'a> {
     grid: &'a mut TextGrid,
-    kitty: &'a mut KittyAccumulator,
     events: &'a mut Vec<PaneEvent>,
     title: &'a mut String,
     fg: &'a mut Color,
@@ -685,23 +733,12 @@ impl<'a> vte::Perform for VtePerf<'a> {
         }
     }
 
-    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
-        if action == 'G' {
-            self.kitty.begin();
-        }
-    }
-
-    fn put(&mut self, byte: u8) {
-        self.kitty.push(byte);
-    }
-
-    fn unhook(&mut self) {
-        if let Some(raw) = self.kitty.finish() {
-            if let Some(cmd) = parse_kitty_chunk(&raw) {
-                self.events.push(PaneEvent::KittyGraphic { cmd });
-            }
-        }
-    }
+    // NOTE: `vte::Perform::hook`/`put`/`unhook` are NOT
+    // implemented here. `vte 0.15`'s Paul Williams state
+    // machine only routes DCS strings through these
+    // callbacks; APC (kitty graphics, `ESC _`) is silently
+    // DROPPED. The kitty pre-scan in `PanePty::advance`
+    // owns APC ingestion directly via `KittyAccumulator`.
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         if let Some((first, rest)) = params.split_first() {
@@ -752,6 +789,10 @@ pub struct PanePty {
     parser: Parser,
     grid: TextGrid,
     kitty: KittyAccumulator,
+    /// Pre-scan state machine: routes APC (kitty `ESC _`) bytes
+    /// to `KittyAccumulator` instead of `vte::Parser::advance`.
+    /// See [`ApcScannerState`] for the four states.
+    apc: ApcScanner,
     fg: Color,
     bg: Color,
     attrs: CellAttrs,
@@ -841,6 +882,7 @@ impl PanePty {
                 parser: Parser::new(),
                 grid,
                 kitty: KittyAccumulator::default(),
+                apc: ApcScanner::default(),
                 fg: Color::Default,
                 bg: Color::Default,
                 attrs: CellAttrs::default(),
@@ -884,9 +926,92 @@ impl PanePty {
     /// accumulator; opportunistically emits an Exit event if the
     /// child has already finished.
     pub fn advance(&mut self, bytes: &[u8]) -> Result<(), PtyError> {
+        // Pre-scan input bytes for `ESC _` APC (kitty graphics)
+        // sequences and route the payload to `KittyAccumulator`
+        // BEFORE the remainder goes to `vte::Parser::advance`.
+        // This is load-bearing: `vte 0.15`'s Paul Williams state
+        // machine silently DROPS APC strings — it only routes
+        // DCS strings through `hook`/`put`/`unhook`. Without
+        // this pre-scan, `PaneEvent::KittyGraphic`s never fire
+        // and the cmdash binary silently loses kitty graphics
+        // emission. The below four-state machine is the
+        // architectural fix.
+        let mut vte_bytes = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            match self.apc.state {
+                ApcScannerState::Idle => {
+                    if b == 0x1B {
+                        self.apc.state = ApcScannerState::SeenEsc;
+                    } else {
+                        vte_bytes.push(b);
+                    }
+                }
+                ApcScannerState::SeenEsc => {
+                    if b == b'_' {
+                        // ESC _ starts an APC.
+                        self.apc.state = ApcScannerState::InApc;
+                        self.kitty.begin();
+                    } else if b == 0x1B {
+                        // Emit the prior ESC; the new ESC could
+                        // still be the start of APC. Stay SeenEsc.
+                        vte_bytes.push(0x1B);
+                        self.apc.state = ApcScannerState::SeenEsc;
+                    } else {
+                        // Some other escape sequence: ESC [
+                        // (CSI), ESC ] (OSC), ESC P (DCS). Hand
+                        // ESC + this byte back to vte.
+                        vte_bytes.push(0x1B);
+                        vte_bytes.push(b);
+                        self.apc.state = ApcScannerState::Idle;
+                    }
+                }
+                ApcScannerState::InApc => {
+                    if b == 0x07 {
+                        // BEL terminates the APC. kitty.raw
+                        // already excludes the trailing BEL
+                        // because we transition at the byte
+                        // before pushing it.
+                        self.finish_apc();
+                    } else if b == 0x1B {
+                        // ESC inside APC: defer the
+                        // terminate-decision to the next byte.
+                        self.apc.state = ApcScannerState::InApcSeenEsc;
+                    } else {
+                        self.kitty.push(b);
+                    }
+                }
+                ApcScannerState::InApcSeenEsc => {
+                    if b == b'\\' {
+                        // ST = ESC \\. kitty.raw excludes this
+                        // ESC and the backslash (we transitioned
+                        // at the ESC without pushing it).
+                        self.finish_apc();
+                    } else if b == 0x07 {
+                        // Previous ESC was just data; BEL
+                        // terminates. Push the ESC then finish.
+                        // Degenerate (base64 alphabet has no
+                        // 0x1B so the chunk fails decode and
+                        // parse_kitty_chunk returns None).
+                        self.kitty.push(0x1B);
+                        self.finish_apc();
+                    } else if b == 0x1B {
+                        // ESC ESC: prior ESC is data, new ESC
+                        // could be the start of ST. Stay.
+                        self.kitty.push(0x1B);
+                        self.apc.state = ApcScannerState::InApcSeenEsc;
+                    } else {
+                        // ESC + non-`\` non-BEL byte: prior ESC
+                        // is data, this byte is the next payload
+                        // byte.
+                        self.kitty.push(0x1B);
+                        self.kitty.push(b);
+                        self.apc.state = ApcScannerState::InApc;
+                    }
+                }
+            }
+        }
         let mut driver = VtePerf {
             grid: &mut self.grid,
-            kitty: &mut self.kitty,
             events: &mut self.pending_events,
             title: &mut self.title,
             fg: &mut self.fg,
@@ -895,7 +1020,7 @@ impl PanePty {
             cols: self.cols,
             rows: self.rows,
         };
-        self.parser.advance(&mut driver, bytes);
+        self.parser.advance(&mut driver, &vte_bytes);
         if let Some(child) = self.child.as_mut() {
             if let Ok(Some(status)) = child.try_wait() {
                 self.pending_events.push(PaneEvent::Exit {
@@ -904,6 +1029,20 @@ impl PanePty {
             }
         }
         Ok(())
+    }
+
+    /// End the current APC: reset `apc.state` and complete the
+    /// `KittyAccumulator` cycle, emitting a
+    /// `PaneEvent::KittyGraphic` if the payload parsed into a
+    /// [`KittyGraphicCmd`]. Called from `Self::advance` on
+    /// `BEL` (`0x07`) or `ESC \\` terminator detection.
+    fn finish_apc(&mut self) {
+        self.apc.state = ApcScannerState::Idle;
+        if let Some(raw) = self.kitty.finish() {
+            if let Some(cmd) = parse_kitty_chunk(&raw) {
+                self.pending_events.push(PaneEvent::KittyGraphic { cmd });
+            }
+        }
     }
 
     /// Take all events emitted since the last `drain_events`.
@@ -1154,7 +1293,6 @@ mod internal_sanity_tests {
     fn print_defers_wrap_until_next_character() {
         use vte::Perform;
         let mut g = TextGrid::new(2, 2);
-        let mut kitty = KittyAccumulator::default();
         let mut events: Vec<PaneEvent> = Vec::new();
         let mut title = String::new();
         let mut fg = Color::Default;
@@ -1162,7 +1300,6 @@ mod internal_sanity_tests {
         let mut attrs = CellAttrs::default();
         let mut perf = VtePerf {
             grid: &mut g,
-            kitty: &mut kitty,
             events: &mut events,
             title: &mut title,
             fg: &mut fg,
@@ -1205,7 +1342,6 @@ mod internal_sanity_tests {
     fn lf_consumes_pending_wrap_no_double_advance() {
         use vte::Perform;
         let mut g = TextGrid::new(2, 2);
-        let mut kitty = KittyAccumulator::default();
         let mut events: Vec<PaneEvent> = Vec::new();
         let mut title = String::new();
         let mut fg = Color::Default;
@@ -1213,7 +1349,6 @@ mod internal_sanity_tests {
         let mut attrs = CellAttrs::default();
         let mut perf = VtePerf {
             grid: &mut g,
-            kitty: &mut kitty,
             events: &mut events,
             title: &mut title,
             fg: &mut fg,
@@ -1248,5 +1383,166 @@ mod internal_sanity_tests {
         // Row 1 is the new cursor row, still empty.
         assert_eq!(perf.grid.cell(0, 1).ch, ' ');
         assert_eq!(perf.grid.cell(1, 1).ch, ' ');
+    }
+
+    /// Lone APC chunk with ST terminator emits a `KittyGraphic`
+    /// `Load` event. The simplest happy-path round trip through
+    /// the APC pre-scan.
+    #[test]
+    fn apc_lone_chunk_with_st_emits_load_event() {
+        let (mut pty, _reader) = PanePty::spawn(
+            ShellSpec::Command {
+                argv: vec!["/bin/cat".to_string()],
+            },
+            10,
+            10,
+            PaneLayerId(50),
+        )
+        .expect("spawn pty");
+        pty.advance(b"\x1b_Ga=p,i=1,f=32,s=1,v=1;AAAA\x1b\\")
+            .expect("advance");
+        let events = pty.drain_events();
+        let load_event = events.iter().find_map(|e| match e {
+            PaneEvent::KittyGraphic {
+                cmd:
+                    KittyGraphicCmd::Load {
+                        id,
+                        format,
+                        width,
+                        height,
+                        ..
+                    },
+            } => Some((*id, *format, *width, *height)),
+            _ => None,
+        });
+        assert_eq!(load_event, Some((1u32, 32u8, 1u32, 1u32)));
+        assert_eq!(pty.apc.state, ApcScannerState::Idle);
+    }
+
+    /// Partial APC chunk (no terminator) does NOT emit an
+    /// event yet — the payload is buffered in
+    /// `KittyAccumulator` waiting for terminator bytes. The
+    /// scanner state must stay in `InApc` across the
+    /// `advance()` call so the next call's bytes can finish it.
+    #[test]
+    fn apc_partial_chunk_does_not_emit() {
+        let (mut pty, _reader) = PanePty::spawn(
+            ShellSpec::Command {
+                argv: vec!["/bin/cat".to_string()],
+            },
+            10,
+            10,
+            PaneLayerId(51),
+        )
+        .expect("spawn pty");
+        pty.advance(b"\x1b_Ga=p,i=1,f=32,s=1,v=1;AAAA")
+            .expect("advance partial");
+        let events = pty.drain_events();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PaneEvent::KittyGraphic { .. })),
+            "no event yet, got {:?}",
+            events
+        );
+        assert_eq!(pty.apc.state, ApcScannerState::InApc);
+    }
+
+    /// Split APC across two `advance()` calls: first call
+    /// delivers `ESC _ Ga=p,i=1;AA` (no terminator), second
+    /// delivers `AA\x1b\\` (rest + ST). The scanner threads
+    /// state across the boundary so the chunk parses as a
+    /// single Load event in the second call's event stream.
+    #[test]
+    fn apc_split_across_two_advances_emits() {
+        let (mut pty, _reader) = PanePty::spawn(
+            ShellSpec::Command {
+                argv: vec!["/bin/cat".to_string()],
+            },
+            10,
+            10,
+            PaneLayerId(52),
+        )
+        .expect("spawn pty");
+        pty.advance(b"\x1b_Ga=p,i=1,f=32,s=1,v=1;AA")
+            .expect("advance part 1");
+        assert!(pty.drain_events().is_empty());
+        assert_eq!(pty.apc.state, ApcScannerState::InApc);
+        pty.advance(b"AA\x1b\\").expect("advance part 2");
+        let events = pty.drain_events();
+        let got = events.iter().any(|e| {
+            matches!(
+                e,
+                PaneEvent::KittyGraphic {
+                    cmd: KittyGraphicCmd::Load { id: 1, .. }
+                }
+            )
+        });
+        assert!(got, "expected Load event, got {:?}", events);
+        assert_eq!(pty.apc.state, ApcScannerState::Idle);
+    }
+
+    /// BEL-terminated APC. The kitty protocol uses `BEL`
+    /// (`0x07`) as a fallback terminator in addition to ST
+    /// (`ESC \\`). The scanner detects `BEL` inside
+    /// `ApcScannerState::InApc` and finishes the chunk with
+    /// the same path as for ST.
+    #[test]
+    fn apc_bel_terminated_emits() {
+        let (mut pty, _reader) = PanePty::spawn(
+            ShellSpec::Command {
+                argv: vec!["/bin/cat".to_string()],
+            },
+            10,
+            10,
+            PaneLayerId(53),
+        )
+        .expect("spawn pty");
+        pty.advance(b"\x1b_Ga=p,i=1,f=32,s=1,v=1;AAAA\x07")
+            .expect("advance");
+        let events = pty.drain_events();
+        let got = events.iter().any(|e| {
+            matches!(
+                e,
+                PaneEvent::KittyGraphic {
+                    cmd: KittyGraphicCmd::Load { id: 1, .. }
+                }
+            )
+        });
+        assert!(
+            got,
+            "BEL-terminated kitty Load: expected event, got {:?}",
+            events
+        );
+        assert_eq!(pty.apc.state, ApcScannerState::Idle);
+    }
+
+    /// Non-APC escape sequences are unaffected by the
+    /// pre-scan: `ESC [` (CSI), `ESC ]` (OSC), and plain
+    /// bytes all reach `vte::Parser::advance`. This pins
+    /// the "we only intercept `ESC _`" rule — a future
+    /// maintainer who accidentally widened the trigger
+    /// (e.g., to `ESC P` for DCS) would break this test.
+    #[test]
+    fn apc_non_apc_escape_sequences_unaffected() {
+        let (mut pty, _reader) = PanePty::spawn(
+            ShellSpec::Command {
+                argv: vec!["/bin/cat".to_string()],
+            },
+            10,
+            10,
+            PaneLayerId(54),
+        )
+        .expect("spawn pty");
+        // CSI SGR for red fg + 4 printable chars. The `ESC [
+        // (0x1B 0x5B)` pair must NOT be interpreted as the
+        // start of an APC; the `0x5B` is not `0x5F`.
+        pty.advance(b"\x1b[31mTEXT").expect("advance");
+        let snap = pty.snapshot();
+        assert_eq!(snap.grid.cell(0, 0).ch, 'T');
+        assert_eq!(snap.grid.cell(1, 0).ch, 'E');
+        assert_eq!(snap.grid.cell(2, 0).ch, 'X');
+        assert_eq!(snap.grid.cell(3, 0).ch, 'T');
+        assert_eq!(pty.apc.state, ApcScannerState::Idle);
     }
 }
