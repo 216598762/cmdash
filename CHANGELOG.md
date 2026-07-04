@@ -134,7 +134,7 @@ Major beats (chronological, HEAD-relative at the time of `v1.0.0`):
 - `2b20700` CHANGELOG add at `/CHANGELOG.md` (this file).
 - `657d28b` C2 CHANGELOG status-tick (`DONE`).
 - `4a403dd` C1 tagged-release status-tick (`DONE-v1.0.0`) +
-  `git tag v1.0.0 <final-SHA>` + `git push --tags`.
+  `git tag v1.0.0 4a403dd` + `git push --tags`.
 
 The `v1.0.0` tag is the stable point for downstream consumers
 (cargo install, package managers, etc.). Future v1.0.X patches +
