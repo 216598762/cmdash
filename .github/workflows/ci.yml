@@ -45,8 +45,17 @@
 
 name: ci
 
-on:
-  workflow_dispatch:
+# IMPORTANT: the `on:` key is quoted as `"on":` to escape the YAML 1.1
+# boolean-coercion trap. Bare `on:` parses as `true:` under YAML 1.1
+# (Go yaml.v3's default which GitHub's Actions parser inherits) and
+# GH Actions' downstream trigger-detector then does not find any
+# `workflow_dispatch` trigger — leading to HTTP 422 on `gh workflow
+# run` AND a parallel ghost `event=push` run with `jobs=[]` that
+# surfaces as `conclusion: failure` for the actual `git push` itself.
+# The combined `"on": [workflow_dispatch]` form (quoted key +
+# inline flow-sequence value) is the most-robust shape across the
+# parser versions users have reported in the wild.
+"on": [workflow_dispatch]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -117,17 +126,48 @@ jobs:
               if echo "$OUT" | grep -q 'test result: ok'; then
                 PASS=$((PASS+1))
               elif echo "$OUT" | grep -q 'test result: FAILED'; then
-                echo "::error::CI FLAKE: iter=$n test=$T"
-                echo "::error::--- failing-output-begin ---"
-                echo "$OUT" | tail -60
-                echo "::error::--- failing-output-end ---"
-                echo "::error::Forward-fixup reason text: see commit body."
+                {
+                  echo "::error::CI FLAKE: iter=$n test=$T (assertion failure)"
+                  echo "::error::--- failing-output-begin ---"
+                  echo "$OUT" | tail -60
+                  echo "::error::--- failing-output-end ---"
+                  echo "::error::Forward-fixup reason text: see commit body."
+                } | tee /tmp/cmdash-soak-failures.log
+                exit 1
+              else
+                # cargo test produced neither `test result: ok` nor
+                # `test result: FAILED` — could be runner OOM kill,
+                # SIGSEGV, infra harness timeout, stdin EOF before
+                # runner starts. Preserve the user's forward-fixup
+                # fidelity by treating this as a flake too instead
+                # of silently incrementing iter (which would let
+                # PASS=300 vouch for a partial-soak).
+                {
+                  echo "::error::CI FLAKE: iter=$n test=$T (cargo test produced neither ok nor FAILED — infra-class kill possible)"
+                  echo "::error::--- unexpected-output-begin ---"
+                  echo "$OUT" | tail -60
+                  echo "::error::--- unexpected-output-end ---"
+                  echo "::error::Forward-fixup reason text: see infra-class flake shape and commit body."
+                } | tee /tmp/cmdash-soak-failures.log
                 exit 1
               fi
             done
             [ $((n % 10)) -eq 0 ] && echo "SOAK progress: iter=$n PASS=$PASS"
           done
           echo "SOAK 100 iter x 3 tests = 300 runs: PASS=$PASS"
+
+      # Upload the SOAK fail-path $OUT (written by the SOAK step on
+      # any failure branch via `tee /tmp/cmdash-soak-failures.log`)
+      # as a GH artifact so post-mortem has the FULL output rather
+      # than only the inline `::error::` annotations' tail -60.
+      # Gated by `if: failure()` so green runs pay zero cost.
+      - name: Upload SOAK fail-path $OUT (post-mortem)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-soak-failure-logs
+          path: /tmp/cmdash-soak-failures.log
+          if-no-files-found: warn
 
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
