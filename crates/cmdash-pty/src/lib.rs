@@ -106,6 +106,15 @@ pub struct TextGrid {
     cells: Vec<Cell>,
     cursor_x: u16,
     cursor_y: u16,
+    /// True when the last printable filled the rightmost
+    /// column. The row advance lands on the NEXT `print`, not
+    /// the current one (xterm/VT100 wrap semantics). Cleared by
+    /// line feeds (`LF`/`VT`/`FF`), explicit CSI cursor moves
+    /// (`H`/`f`/`A`/`B`/`C`/`D`), and `consume` from `print`
+    /// itself. `CR` (`0x0D`) does NOT consume the promise
+    /// (a `CR` alone prints nothing, so the pending advance
+    /// survives until the next printable).
+    pending_wrap: bool,
     dirty_rows: Vec<u16>,
 }
 
@@ -118,6 +127,7 @@ impl TextGrid {
             cells: vec![Cell::default(); total],
             cursor_x: 0,
             cursor_y: 0,
+            pending_wrap: false,
             dirty_rows: Vec::new(),
         }
     }
@@ -129,6 +139,22 @@ impl TextGrid {
     }
     pub fn cursor(&self) -> (u16, u16) {
         (self.cursor_x, self.cursor_y)
+    }
+    /// Consume the wrap-pending promise once. Called from
+    /// `VtePerf::print` on entry, from row-advance control
+    /// bytes (`LF`/`VT`/`FF`), and from explicit CSI cursor
+    /// moves (`H`/`f`/`A`/`B`/`C`/`D`). Returns the prior
+    /// flag value so callers can branch on whether the promise
+    /// was active. `pub(crate)` because external consumers
+    /// only ever see cloned snapshots via `PanePty::snapshot`,
+    /// so the method must not be reachable as public API.
+    pub(crate) fn consume_pending_wrap(&mut self) -> bool {
+        if self.pending_wrap {
+            self.pending_wrap = false;
+            true
+        } else {
+            false
+        }
     }
     pub fn cells(&self) -> &[Cell] {
         &self.cells
@@ -538,24 +564,33 @@ impl<'a> VtePerf<'a> {
         };
         match action {
             'H' | 'f' => {
+                // Explicit absolute cursor positioning clears
+                // any pending wrap: the cursor now has an
+                // authoritative (col, row) so the deferred
+                // advance can no longer fire.
+                self.grid.consume_pending_wrap();
                 let row = p0().saturating_sub(1);
                 let col = p1().saturating_sub(1);
                 self.grid.cursor_y = row.min(self.rows.saturating_sub(1));
                 self.grid.cursor_x = col.min(self.cols.saturating_sub(1));
             }
             'A' => {
+                self.grid.consume_pending_wrap();
                 let n = p0().max(1);
                 self.grid.cursor_y = self.grid.cursor_y.saturating_sub(n);
             }
             'B' => {
+                self.grid.consume_pending_wrap();
                 let n = p0().max(1);
                 self.grid.cursor_y = (self.grid.cursor_y + n).min(self.rows - 1);
             }
             'C' => {
+                self.grid.consume_pending_wrap();
                 let n = p0().max(1);
                 self.grid.cursor_x = (self.grid.cursor_x + n).min(self.cols - 1);
             }
             'D' => {
+                self.grid.consume_pending_wrap();
                 let n = p0().max(1);
                 self.grid.cursor_x = self.grid.cursor_x.saturating_sub(n);
             }
@@ -584,13 +619,27 @@ impl<'a> VtePerf<'a> {
 
 impl<'a> vte::Perform for VtePerf<'a> {
     fn print(&mut self, c: char) {
+        // Consume the deferred row advance first: if the prior
+        // printable filled the rightmost column, the cursor
+        // logically sits at column 0 of the NEXT row, but the
+        // advance didn't happen yet. Take the promise here so
+        // `c` lands on the next row, not back at column 0 of
+        // the current row.
+        if self.grid.consume_pending_wrap() {
+            self.grid.cursor_x = 0;
+            self.advance_line();
+        }
         let x = self.grid.cursor_x;
         let y = self.grid.cursor_y;
         self.grid.put(x, y, *self.fg, *self.bg, *self.attrs, c);
         let nx = x.saturating_add(1);
         if nx >= self.cols {
-            self.grid.cursor_x = 0;
-            self.advance_line();
+            // Filled the rightmost column. Defer the row
+            // advance until the next printable arrives so an
+            // immediately-following `\x1b[2K` targets THIS row,
+            // not the next. See `consume_pending_wrap` for the
+            // surrounding rules.
+            self.grid.pending_wrap = true;
         } else {
             self.grid.cursor_x = nx;
         }
@@ -600,6 +649,11 @@ impl<'a> vte::Perform for VtePerf<'a> {
         match byte {
             0x07 => {}
             0x08 => {
+                // CR-free backspace: if pending_wrap is set we
+                // are at the right margin (logically off-screen
+                // on the current row); a lone BS does not move
+                // backward across the wrap boundary, so leave
+                // `pending_wrap` untouched.
                 if self.grid.cursor_x > 0 {
                     self.grid.cursor_x -= 1;
                 }
@@ -609,10 +663,24 @@ impl<'a> vte::Perform for VtePerf<'a> {
                 let next = ((cur / 8) + 1).saturating_mul(8);
                 self.grid.cursor_x = next.min(self.cols - 1);
             }
-            0x0A => self.advance_line(),
-            0x0B => self.advance_line(),
-            0x0C => self.advance_line(),
-            0x0D => self.grid.cursor_x = 0,
+            0x0A..=0x0C => {
+                // LF / VT / FF explicitly request a row advance,
+                // so any pending-wrap promise is consumed (the
+                // row advance this control byte requested IS the
+                // advance that was deferred — no double-advance).
+                // Range pattern satisfies `clippy::manual-range-patterns`;
+                // the resulting semantics is identical to a
+                // three-arm `|` match but fewer characters and
+                // not in scope for the lint.
+                self.grid.consume_pending_wrap();
+                self.advance_line();
+            }
+            0x0D => {
+                // CR alone does not print; per VT100 semantics a
+                // subsequent printable on the wrapped-to row is
+                // expected, so we leave `pending_wrap` set.
+                self.grid.cursor_x = 0;
+            }
             _ => {}
         }
     }
@@ -1073,5 +1141,112 @@ mod internal_sanity_tests {
     fn invalid_size_spawn_rejected() {
         let err = PanePty::spawn(ShellSpec::LoginShell, 0, 0, PaneLayerId(0)).unwrap_err();
         assert!(matches!(err, PtyError::InvalidSize(0, 0)));
+    }
+
+    /// Pending-wrap deferral: a printable that fills the
+    /// rightmost column sets `pending_wrap = true`; the row
+    /// advance lands on the NEXT `print`, not the current
+    /// one (xterm/VT100 wrap semantics). Pins the state
+    /// machine introduced by the
+    /// `fix: defer cursor_y advance in Print until next printable`
+    /// atom.
+    #[test]
+    fn print_defers_wrap_until_next_character() {
+        use vte::Perform;
+        let mut g = TextGrid::new(2, 2);
+        let mut kitty = KittyAccumulator::default();
+        let mut events: Vec<PaneEvent> = Vec::new();
+        let mut title = String::new();
+        let mut fg = Color::Default;
+        let mut bg = Color::Default;
+        let mut attrs = CellAttrs::default();
+        let mut perf = VtePerf {
+            grid: &mut g,
+            kitty: &mut kitty,
+            events: &mut events,
+            title: &mut title,
+            fg: &mut fg,
+            bg: &mut bg,
+            attrs: &mut attrs,
+            cols: 2,
+            rows: 2,
+        };
+        // First printable: cursor at (1, 0); no wrap pending.
+        perf.print('A');
+        assert_eq!(perf.grid.cursor(), (1, 0));
+        assert!(!perf.grid.pending_wrap);
+        assert_eq!(perf.grid.cell(0, 0).ch, 'A');
+        // Second printable: fills the right margin so the row
+        // advance is deferred. Cursor stays at (1, 0) so an
+        // immediately-following `\x1b[2K` would target THIS
+        // row, not the next. This is the root fix for the
+        // `pty_csi_erase_in_line_clears_to_eol` test failure.
+        perf.print('B');
+        assert_eq!(perf.grid.cursor(), (1, 0));
+        assert!(perf.grid.pending_wrap);
+        assert_eq!(perf.grid.cell(1, 0).ch, 'B');
+        // Third printable: consumes the promise, advances to
+        // (0, 1) before placing the char, then lands at (1, 1).
+        perf.print('C');
+        assert!(!perf.grid.pending_wrap);
+        assert_eq!(perf.grid.cursor(), (1, 1));
+        assert_eq!(perf.grid.cell(0, 1).ch, 'C');
+    }
+
+    /// LF consumes the pending-wrap promise AND advances
+    /// exactly ONE row, NOT two (which would scroll). Without
+    /// this guard a future maintainer who "tidies up"
+    /// `execute(0x0A..=0x0C)` back to `self.advance_line()`
+    /// would silently double-scroll small grids and silently
+    /// discard row-0 contents. Pins the consume-once promise
+    /// for the row-advance control bytes (the load-bearing
+    /// counterpart to `print_defers_wrap_until_next_character`).
+    #[test]
+    fn lf_consumes_pending_wrap_no_double_advance() {
+        use vte::Perform;
+        let mut g = TextGrid::new(2, 2);
+        let mut kitty = KittyAccumulator::default();
+        let mut events: Vec<PaneEvent> = Vec::new();
+        let mut title = String::new();
+        let mut fg = Color::Default;
+        let mut bg = Color::Default;
+        let mut attrs = CellAttrs::default();
+        let mut perf = VtePerf {
+            grid: &mut g,
+            kitty: &mut kitty,
+            events: &mut events,
+            title: &mut title,
+            fg: &mut fg,
+            bg: &mut bg,
+            attrs: &mut attrs,
+            cols: 2,
+            rows: 2,
+        };
+        perf.print('A');
+        perf.print('B');
+        // After filling row 0: cursor at (1, 0), pending_wrap = true.
+        assert!(perf.grid.pending_wrap);
+        assert_eq!(perf.grid.cursor(), (1, 0));
+        // LF (0x0A): (1) consumes the promise and (2) advances
+        // the row. Per VT100, `LF` preserves `cursor_x` — it
+        // does NOT reset the column — so after this the cursor
+        // sits at (cols - 1, 1). The discriminative failure
+        // mode this test pins is "the impl forgot
+        // `consume_pending_wrap()`": with `pending_wrap` still
+        // set, a subsequent `print` would re-fire the deferred
+        // advance and force a scroll that drops row 0.
+        perf.execute(0x0A);
+        assert!(
+            !perf.grid.pending_wrap,
+            "LF(0x0A) must clear the pending-wrap promise so a \
+             subsequent printable does not re-fire the deferred advance"
+        );
+        assert_eq!(perf.grid.cursor(), (1, 1));
+        // Row 0's contents survived (no scroll triggered).
+        assert_eq!(perf.grid.cell(0, 0).ch, 'A');
+        assert_eq!(perf.grid.cell(1, 0).ch, 'B');
+        // Row 1 is the new cursor row, still empty.
+        assert_eq!(perf.grid.cell(0, 1).ch, ' ');
+        assert_eq!(perf.grid.cell(1, 1).ch, ' ');
     }
 }
