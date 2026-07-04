@@ -14,10 +14,21 @@
 #   failing shape (cargo test panic / `left == right`).
 # - Assertions print EXPECTED and ACTUAL on every tripwire so the
 #   drift is obvious from the stdout alone.
+## Run `just --list` to enumerate all recipes.
 #
-# Run `just --list` to enumerate all recipes.
+# Requirements:
+# - `just` (https://github.com/casey/just). Install once via
+#   `cargo install just --locked` if not already present (verify with
+#   `command -v just`). Not a build-dep -- only used at invocation time.
+# - Bash 3.2+ (macOS /bin/bash 3.2 supported). The recipes use indexed
+#   arrays instead of `declare -A` associative arrays to preserve
+#   cross-platform portability; the indexed-array variant was added
+#   in the `forward-fixup atom atop d93b7a7` so the recipe runs on
+#   heredity / non-GNU-bash runner hosts too.
+# - `cargo` + `rustc` (via the existing rustup toolchain on this host).
 
-set shell := ["bash", "-cu"]
+set shell := ["bash", "-u"]
+
 
 # ------------------------------------------------------------------------------
 # flake-soak: 100-iteration SOAK on the 3 newly-un-ignored kitty tests.
@@ -48,27 +59,65 @@ flake-soak:
     #!/usr/bin/env bash
     set -euo pipefail
     PASS=0
-    declare -A PASS_PER_TEST=()
-    declare -A MS_PER_TEST_TOTAL=()
+    # Indexed arrays (Bash 3.2+ portable) instead of `declare -A`
+    # associative arrays (Bash 4+) so the recipe runs on macOS
+    # /bin/bash 3.2 too.
     TESTS=(
         pty_kitty_load_emits_event_via_vte_hook
         pty_kitty_split_chunk_across_advances
         pty_kitty_place_command_emits_event
     )
-    for T in "${TESTS[@]}"; do
-        PASS_PER_TEST[$T]=0
-        MS_PER_TEST_TOTAL[$T]=0
+    declare -a PASS_PER_TEST=()
+    declare -a MS_PER_TEST_TOTAL=()
+    for i in "${!TESTS[@]}"; do
+        PASS_PER_TEST+=(0)
+        MS_PER_TEST_TOTAL+=(0)
     done
+    # Portable nanosecond timestamp helper. The detection probes
+    # OUTPUT content, not exit code: GNU `date` emits seconds.ns
+    # like `1717514400.123456789` (contains a `.`); macOS BSD
+    # `date` does NOT recognize `%N` and emits the literal `%N`
+    # suffix with exit code 0 -- so an `> /dev/null 2>&1` exit-check
+    # would mis-detect BSD as GNU and silently corrupt runtime
+    # numbers when the literal `%N` token enters arithmetic. We probe
+    # `[[ $(date +%s%N) == *.* ]]` instead, which is reliable
+    # across both implementations.
+    #
+    # Note: the BSD fallback drops to 1-second grain. Any test
+    # finishing in <1s on macOS reports `avg_runtime=0ms` -- this is
+    # a documented limitation (the bash 3.2+ requirement blocks
+    # using `${EPOCHREALTIME}`, which is bash 5+ only). Downstream
+    # arithmetic `(end - start) / 1000000` still yields ms uniformly
+    # (0 when both timestamps fall in the same second).
+    if [[ $(date +%s%N) == *.* ]]; then
+        nano_time() { date +%s%N; }
+    else
+        nano_time() { echo $(( $(date +%s) * 1000000000 )); }
+    fi
     for n in $(seq 1 100); do
-        for T in "${TESTS[@]}"; do
-            START_NS=$(date +%s%N)
+        for i in "${!TESTS[@]}"; do
+            T="${TESTS[$i]}"
+            START_NS=$(nano_time)
             OUT=$(cargo test -p cmdash-pty --test round_trip --quiet -- "$T" 2>&1) || true
-            END_NS=$(date +%s%N)
+            END_NS=$(nano_time)
             ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
-            MS_PER_TEST_TOTAL[$T]=$(( ${MS_PER_TEST_TOTAL[$T]} + ELAPSED_MS ))
+            # `(( arr[i] += x ))` is portable for arithmetic on
+            # indexed-array elements across bash 3.2/4.x. We append
+            # `|| true` because `(( expr ))` under `set -e` will exit
+            # the script when the post-evaluation result is 0 (a known
+            # bash idiom trap): for our fast-running tests, the
+            # per-test runtime measured in milliseconds is often 0ms,
+            # so MS_PER_TEST_TOTAL[$i] += 0 leaves the element at 0
+            # which trips `(( ... ))` exit code 1 if not neutralized.
+            (( MS_PER_TEST_TOTAL[$i] += ELAPSED_MS )) || true
             if echo "$OUT" | grep -q 'test result: ok'; then
                 PASS=$((PASS+1))
-                PASS_PER_TEST[$T]=$(( ${PASS_PER_TEST[$T]} + 1 ))
+                # `PASS_PER_TEST[$i]++` post-increments from 0 -> 1,
+                # 1 -> 2, ..., 99 -> 100, all of which are truthy in
+                # `(( expr ))` arithmetic context. Safe under `set -e`
+                # without the `|| true` shield that the
+                # `MS_PER_TEST_TOTAL += ELAPSED_MS` line above needs.
+                (( PASS_PER_TEST[$i]++ ))
             else
                 echo "::FLAKE:: iter=$n test=$T elapsed=${ELAPSED_MS}ms"
                 echo "::FLAKE:: FAIL-OUTPUT-BEGIN"
@@ -84,11 +133,11 @@ flake-soak:
     echo ""
     echo "== flake-soak SUMMARY =="
     echo "iterations=100 tests=3 total_runs=$((100 * ${#TESTS[@]})) PASS=$PASS"
-    for T in "${TESTS[@]}"; do
-        AVG_MS=$(( MS_PER_TEST_TOTAL[$T] / 100 ))
-        PASS_PCT=$(( PASS_PER_TEST[$T] * 100 / 100 ))
-        printf '  %-50s pass=%3d/100 (%3d%%)  avg_runtime=%5dms\n' \
-               "$T" "${PASS_PER_TEST[$T]}" "$PASS_PCT" "$AVG_MS"
+    for i in "${!TESTS[@]}"; do
+        T="${TESTS[$i]}"
+        AVG_MS=$(( MS_PER_TEST_TOTAL[$i] / 100 ))
+        printf '  %-50s pass=%3d/100  avg_runtime=%5dms\n' \
+               "$T" "${PASS_PER_TEST[$i]}" "$AVG_MS"
     done
     echo ""
     echo "== flake-soak PASS at the strict-pin: 300/300 green =="
