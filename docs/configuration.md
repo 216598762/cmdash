@@ -316,10 +316,18 @@ Exactly one non-modifier token must close the chord. Valid
 > this is correct (PTYs auto-repeat typed characters internally);
 > use a `bind` if you want a Repeat-disabled behaviour.
 
-### 5.2. Action grammar — the 17 mappable `KeyAction`s
+### 5.2. Action grammar — the 17 wire-form action strings
 
 Every `bind "<chord>" action="<verb>"` line must map to one of the
-following 17 `KeyAction` enum variants. The full list:
+17 wire-form action strings below. **Counting detail:** the
+`KeyAction` enum in `crates/cmdash-config/src/lib.rs` has 15
+variants; the table enumerates 17 wire-form strings because
+`app.new-pane` / `app.new_pane` are aliases for the SAME variant
+and `pane.preset.<name>` accepts any prefix-match against the
+`pane.preset.` literal. So the **parser surface** is 17 strings
+mapping onto **15 enum variants** — keep this distinction in
+mind when reading the `parse_action` match arms. The full
+mapping:
 
 | Action string | Behaviour |
 |---------------|-----------|
@@ -331,7 +339,7 @@ following 17 `KeyAction` enum variants. The full list:
 | `pane.stack.cycle` | Within the focused member's parent `zstack`, advance to the **next** member with wrap-around. No-op outside a `zstack`. |
 | `pane.stack.down` / `pane.stack.up` | Within the focused `zstack` member, advance/retreat in declaration order; **at the boundary** (last for `down`, first for `up`), hand off to the geometrically nearest pane outside the `zstack` via the rect-proximity algorithm. |
 | `pane.stack.left` / `pane.stack.right` | Horizontal-axis mirror of `down`/`up`: cycle through `zstack` members in declaration order; at the boundary, hand off geometrically to the sibling cell of the enclosing `split axis=horizontal`. |
-| `pane.preset` | Wholesale-swap to **the empty-name** preset (rarely meaningful). |
+| `pane.preset` | Wholesale-swap to the **empty-name** preset — i.e. `KeyAction::PanePreset(String::new())`. In practice this never resolves to a real preset body (preset names are non-empty by construction); in v1 you should always use the `pane.preset.<name>` form below. |
 | `pane.preset.<name>` | Wholesale-swap the entire layout tree for the named preset body. Every pane gets a **fresh** `LayerId` (the swap is a different topology, not a rebalance). |
 
 > **Pitfall #4 — Unknown action strings are silently rejected.**
@@ -411,7 +419,6 @@ keybinds {
     bind "ctrl-j"  action="pane.focus.down"
     bind "ctrl-k"  action="pane.focus.up"
     bind "ctrl-l"  action="pane.focus.right"
-    bind "ctrl-w"  action="pane.close"
     bind "tab"     action="pane.focus.next"
 }
 ```
