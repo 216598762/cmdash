@@ -73,7 +73,7 @@ pub enum RunnerError {
 /// thread + mpsc receiver. v1 uses [`cmdash_pty::PanePty`] as
 /// the production impl behind the trait (boxed at the call site
 /// in [`PaneRunner::spawn_with_graphics`]); tests substitute a
-/// [`StubPty`] (see `internal_sanity_tests` below) to pin
+///`StubPty` (see internal_sanity_tests` below) to pin
 /// invariants like the resize Err path that real-PTY tests
 /// can't reach deterministically.
 pub struct PaneRunner {
