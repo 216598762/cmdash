@@ -232,6 +232,18 @@ cargo doc --workspace --no-deps
   Written forward-only as forward-fixup atoms (no amend, no
   rebase, no force-push; per-commit `--no-gpgsign=false`
   host-signature workaround; per-tag `--no-sign` workaround).
+- [`docs/configuration.md`](docs/configuration.md) — the
+  **user-facing configuration and usage guide**. The canonical
+  reference for the KDL config schema (the three top-level
+  blocks `layout` / `keybinds` / `presets` and the five-variant
+  `LayoutNode` grammar), the chord + action grammar (all 17
+  wire-form `KeyAction` strings on 15 enum variants), the
+  `axis=horizontal` column-split TRAPDOOR, and six progressively
+  complex worked examples. Read this to author or audit a
+  `crates/cmdash/config.kdl`. **Pitfall:** the config is
+  **embedded at compile time** via `include_str!` — to change
+  your config, edit the file and rebuild (no
+  `~/.config/cmdash/config.kdl` runtime override in v1).
 
 ## Contributing
 
