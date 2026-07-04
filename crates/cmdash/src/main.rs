@@ -51,7 +51,7 @@ use cmdash_config::{
 };
 use cmdash_keybinds::Router;
 use cmdash_layout::{
-    adjacent_pane, remove_leaf, replace_leaf_with_split, walk_imut, ComputedLayout, Direction,
+    adjacent_pane, remove_leaf, replace_leaf_with_split, ComputedLayout, Direction,
     PaneId, Rect as LayoutRect,
 };
 use cmdash_pty::PaneLayerId;
@@ -856,7 +856,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         }
         let focused_id = self.runners[self.focus].computed().id;
         let seed_path = focused_id.path();
-        let tree_path: &[u16] = if seed_path.len() >= 1 {
+        let tree_path: &[u16] = if !seed_path.is_empty() {
             &seed_path[1..]
         } else {
             &[]
@@ -876,7 +876,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         next_path.push(next_idx as u16);
         if let Some(idx) = self.runners.iter().position(|r| {
             let rp = r.computed().id.path();
-            let tp: &[u16] = if rp.len() >= 1 { &rp[1..] } else { &[] };
+            let tp: &[u16] = if !rp.is_empty() { &rp[1..] } else { &[] };
             tp == next_path.as_slice()
         }) {
             self.focus = idx;
@@ -959,7 +959,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         }
         let focused_id = self.runners[self.focus].computed().id;
         let seed_path = focused_id.path();
-        let tree_path: &[u16] = if seed_path.len() >= 1 {
+        let tree_path: &[u16] = if !seed_path.is_empty() {
             &seed_path[1..]
         } else {
             &[]
@@ -993,7 +993,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             next_path.push(next_idx as u16);
             if let Some(idx) = self.runners.iter().position(|r| {
                 let rp = r.computed().id.path();
-                let tp: &[u16] = if rp.len() >= 1 { &rp[1..] } else { &[] };
+                let tp: &[u16] = if !rp.is_empty() { &rp[1..] } else { &[] };
                 tp == next_path.as_slice()
             }) {
                 self.focus = idx;
@@ -1016,7 +1016,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             next_path.push(prev_idx as u16);
             if let Some(idx) = self.runners.iter().position(|r| {
                 let rp = r.computed().id.path();
-                let tp: &[u16] = if rp.len() >= 1 { &rp[1..] } else { &[] };
+                let tp: &[u16] = if !rp.is_empty() { &rp[1..] } else { &[] };
                 tp == next_path.as_slice()
             }) {
                 self.focus = idx;
@@ -1050,7 +1050,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         // `LayoutNode` tree, so we strip the seed before
         // passing.
         let seed_path = focused_id.path();
-        let tree_path: &[u16] = if seed_path.len() >= 1 {
+        let tree_path: &[u16] = if !seed_path.is_empty() {
             &seed_path[1..]
         } else {
             &[]
@@ -3769,7 +3769,7 @@ mod input_tests {
             std::collections::BTreeMap::new(),
             ShellSpec::LoginShell,
         );
-        let pre_focus_id = ctx.runners[ctx.focus].computed().id.clone();
+        let pre_focus_id = ctx.runners[ctx.focus].computed().id;
         ctx.apply_action_full(KeyAction::PaneStackCycle);
         // Phase 6 cycle boundary pin: (0+1) % 1 == 0 -- focus
         // identity UNCHANGED, but stack_focus is updated.
@@ -3777,7 +3777,7 @@ mod input_tests {
             ctx.focus, 0,
             "PaneStackCycle on a 1-member ZStack wraps ((0+1)%1==0) -- focus STAYS at 0"
         );
-        let post_focus_id = ctx.runners[ctx.focus].computed().id.clone();
+        let post_focus_id = ctx.runners[ctx.focus].computed().id;
         assert_eq!(
             post_focus_id, pre_focus_id,
             "PaneStackCycle on a 1-member ZStack must NOT change focus identity"
@@ -3878,7 +3878,7 @@ mod input_tests {
             std::collections::BTreeMap::new(),
             ShellSpec::LoginShell,
         );
-        let pre_focus_id = ctx.runners[ctx.focus].computed().id.clone();
+        let pre_focus_id = ctx.runners[ctx.focus].computed().id;
         assert_ne!(
             pre_focus_id, ctx.runners[0].computed().id,
             "pre-focus sanity: must NOT already be at the FIRST member (otherwise the wrap assertion proves nothing)"
@@ -3894,7 +3894,7 @@ mod input_tests {
             ctx.focus, 0,
             "PaneStackCycle wraps last (idx 2) -> first (idx 0) via (2+1) % 3"
         );
-        let post_focus_id = ctx.runners[ctx.focus].computed().id.clone();
+        let post_focus_id = ctx.runners[ctx.focus].computed().id;
         assert_eq!(
             post_focus_id,
             ctx.runners[0].computed().id,
