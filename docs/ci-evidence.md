@@ -231,7 +231,7 @@ ed8d849 + 7b65b7a` chain):
 
 This entry exists so future audit readers do not re-derive the
 two convergent failure modes from scratch. Cross-reference: the
-subsequent cycle 2 entry at `87cf9fa` (chain atom `e4d28d3`)
+subsequent cycle 3 entry at `87cf9fa` (chain atom `e4d28d3`)
 documents that the canonical `on: workflow_dispatch:` block-form
 swap ALSO fails on the dispatches endpoint, so the dispatch
 rejection is orthogonal to the YAML form, not resolved by it.
@@ -286,7 +286,7 @@ rejection is orthogonal to the YAML form, not resolved by it.
   audit trail can be reconstructed without re-deriving the
   diagnostic findings from scratch. Combined with the prior
   audit cycle 0 finding (`event=push` misclassifications) and
-  the subsequent cycle 2 entry at `87cf9fa` (canonical-form
+  the subsequent cycle 3 entry at `87cf9fa` (canonical-form
   also fails), the cumulative trail shows:
   - inline-form authoring = `event=push` ghost runs + missing-
     trigger HTTP 422 on branch refs + SHA-ref HTTP 422 on SHA refs
@@ -330,7 +330,7 @@ dispatches endpoint), and the two entries together form the
 full dispatch-failure handoff to audit cycle 3 candidates.
 Cycle-numbering convention: collision-resolution via
 descriptive qualifier (per the `56588b1` convention note).
-### Audit cycle 2 — chain atom e4d28d3 (dispatch HTTP 422 non-fix)
+### Audit cycle 3 — chain atom e4d28d3 (dispatch HTTP 422 non-fix)
 
 Forward-fixup audit-cycle entry documenting a NEGATIVE result on the
 canonical-form dispatch attempt. The atom in the audit range was
