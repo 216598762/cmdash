@@ -23,9 +23,7 @@ Each entry documents:
 - `actual` — measured ground-truth from `cargo test -p <crate> --quiet`
 - `delta` — claim vs actual: discrepancy + reasoning where known
 - `evidence` — the exact `cargo test` invocation + host context
-  (OS, Rust version, time)
-- `forward-fix` — the corrective atom shape (always a new forward-fixup
-  with doc-only ledger entry, per the discipline above)
+  (OS, Rust version, invocation pattern)
 
 ## Entries
 
@@ -58,31 +56,26 @@ preserve history (no amend / no rebase).
   - invocation: `cargo test -p cmdash-pty --quiet`
   - raw output (last 4 lines):
     ```
-    test result: ok. 13 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in <X>s
+    test result: ok. 13 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in (varies per run; not load-bearing)
     ```
-- **Forward-fix**: this atom (`docs/ci-evidence: <subject>`) is the
-  forward-only-no-rewind corrective. Per discipline, no `git commit
-  --amend` or `git rebase -i` is invoked; the `ecfa1f2` commit body is
-  left unaltered; future audit reads override via this ledger entry.
 
 ## How to add a new entry
 
 1. Forward-fixup atom atop the current `origin/main`.
-2. Append an entry under `## Entries` in this file.
-3. Run the measurement cargo command fresh against the new HEAD.
-4. Cite host + Rust version + the exact invocation.
-5. Per cite-style above, document `claim / actual / delta / evidence
-   / forward-fix`.
-6. Commit with message subject prefix matching the atom's scope (e.g.
+2. Run `cargo test -p <crate> --quiet` against the new HEAD.
+3. If the actual diverges from the commit body claim, append an entry
+   under `## Entries` in this file.
+4. Cite host + Rust version + the exact invocation in the entry's
+   `evidence` field.
+5. Per the entry format spec above, document `commit / claim /
+   actual / delta / evidence`. The `forward-fix` field is intentionally
+   absent from the spec (the forward-fixup-no-amend-atom disclaimer
+   lives in `## Audit principles`).
+6. Commit with a subject prefix matching the atom's scope (e.g.
    `chore(ci):`, `fix(cmdash-pty):`, `docs(ci-evidence):`).
-7. Land with `--no-gpg-sign` if the host's GPG agent lacks a TTY (as
-   is the case here; per-commit workaround via
-   `git -c commit.gpgsign=false commit ...`).
+7. Land with `--no-gpg-sign` if the host's GPG agent lacks a TTY
+   (workaround via `git -c commit.gpgsign=false commit ...`).
 
-## Future workflow
-
-When any future commit's body makes a pass/fail claim:
-
-1. Run `cargo test -p <crate> --quiet` against the current `origin/main`.
-2. If the actual diverges from the claim, append a ledger entry.
-3. The commit body stays untouched. The ledger is the authority.
+A guiding invariant: the commit body stays untouched. The ledger is
+the authority. Future audit reads override divergent commit-body
+claims via the authoritative measured value captured here.
