@@ -157,7 +157,7 @@ impl PaneRunner {
     /// v2 contract: the `(x, y)` from the layout engine is
     /// preserved across resize. A `Split`'s second child sits at
     /// `x = layout_w * ratio` (or a similar non-zero origin);
-    /// the blit path in [`crate::main::TickContext::run`] reads
+    /// the blit path in `TickContext::run` reads
     /// `runner.computed().rect.x/.y` straight into a
     /// `ratatui::layout::Rect`, so a resize that zeroed the
     /// origin would silently misplace the pane in a Split
@@ -201,7 +201,7 @@ impl PaneRunner {
     /// Pair with [`Self::resize`] if the underlying PTY child
     /// also needs to match the new rect (e.g. after a tree
     /// mutation has shifted proportions). The orchestrator in
-    /// [`crate::main::TickContext::reconcile_runners`]
+    ///`TickContext::reconcile_runners` 
     /// pairs the two so a survivor's PTY child AND cached
     /// computed reflect the new layout at the end of one tick.
     ///
