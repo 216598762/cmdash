@@ -252,9 +252,20 @@ PAYLOAD_EOF
     echo "== flake-soak SUMMARY (with LLM-judge layer) =="
     echo "iterations=100 tests=3 total_runs_cargo=$((100 * ${#TESTS[@]})) cargo_pass=$PASS clean=$CLEAN messy=$MESSY troll=$TROLL"
     echo "SIG_RATIO: clean=$CLEAN/300 messy=$MESSY/300 troll=$TROLL/300"
-    echo "== flake-soak STRICT-PIN: cargo_pass=$((100 * ${#TESTS[@]})) AND clean+messy=$((CLEAN + MESSY))/300 =="
-    echo "== flake-soak PASS at the strict-pin: 300/300 green (cargo) AND clean/messy/troll signal ratio recorded at soak-output.log =="
-    # Tee final summary line to soak-output.log.
+    EXPECTED_TOTAL=$((100 * ${#TESTS[@]}))
+    # Active strict-pin bail-out (added atop `6acdd54`'s followup): catches
+    # the visible-but-passing-troll gap. The loop's cargo FAIL branch
+    # already exit-1's if cargo_pass < 300, so reaching this point implies
+    # cargo_pass == EXPECTED_TOTAL; the LLM-judge sub-assertion
+    # `clean+messy == EXPECTED_TOTAL` (i.e. NO troll) is what's tightened
+    # here.
+    if [ "$PASS" -ne "$EXPECTED_TOTAL" ] || [ "$((CLEAN + MESSY))" -ne "$EXPECTED_TOTAL" ]; then
+        echo "::FAIL:: flake-soak STRICT-PIN tripped -- cargo_pass=$PASS expected=$EXPECTED_TOTAL; clean+messy=$((CLEAN + MESSY)) expected=$EXPECTED_TOTAL"
+        echo "::FAIL:: forward-fixup candidate: see SIG_RATIO + per-run lines in soak-output.log for which iterations crossed into troll territory."
+        echo "SOAK_FAIL_STRICT_PIN cargo_pass=$PASS clean=$CLEAN messy=$MESSY troll=$TROLL" >> "$SOAK_LOG"
+        exit 1
+    fi
+    echo "== flake-soak PASS at the strict-pin: cargo_pass=$EXPECTED_TOTAL AND clean+messy=$EXPECTED_TOTAL =="
     echo "SOAK_COMPLETE cargo_pass=$PASS clean=$CLEAN messy=$MESSY troll=$TROLL sig_ratio=$CLEAN/300:$MESSY/300:$TROLL/300" >> "$SOAK_LOG"
 
 
