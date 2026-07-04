@@ -776,14 +776,6 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         }
     }
 
-    /// Phase 4 carry-forward: walk a tree-indexed path
-    /// (WITHOUT the resolver `path[0]` seed; callers strip
-    /// the seed before passing) into `root`, returning the
-    /// [`LayoutNode`] at that slot. Returns `None` if any
-    /// intermediate slot is a leaf (a malformed caller
-    /// path). Used by the `handle_stack_cycle` /
-    /// `handle_stack_down` cycle helpers below.
-
     /// Phase 4 carry-forward: locate the focused pane's
     /// parent ZStack + its member index. Returns
     /// `Some((parent_path, member_idx))` if the focused
