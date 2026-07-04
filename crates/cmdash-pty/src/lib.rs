@@ -873,19 +873,27 @@ impl PanePty {
     /// On Windows, this fn is not compiled (the trait method
     /// returns `None`, and ConPTY does not use POSIX termios).
     ///
-    /// **Why `ECHO` matters.** The cat-echo round-trip test
-    /// (`pty_write_to_child_round_trips_via_cat`) historically
-    /// raced because `portable_pty`'s PTY leaves the line
-    /// discipline in raw/semi-cooked mode and the child (e.g.
-    /// `/bin/cat`) had not been scheduled by the time the test
-    /// drained the master. The prior workaround was the
-    /// thread-based `drain(deadline)` helper with a 2 s
-    /// (now `(1, 30)`-clamped, atom `f158ea0`) budget, which
-    /// let cat schedule in time but stayed structurally racy
-    /// on slow CI. enabling `ECHO` makes the kernel itself
-    /// echo master-write bytes back to the master synchronously,
-    /// so the test sees the echo bytes deterministically as
-    /// soon as `pty.write` returns, with no scheduling wait.
+    /// **Why `ECHO | ICANON` matters.** The cat-echo
+    /// round-trip test (`pty_write_to_child_round_trips_via_cat`)
+    /// historically raced because `portable_pty 0.9`'s PTY
+    /// pair is opened in raw / canonical-off mode (effectively
+    /// `cfmakeraw`), so even though `ECHO` is preserved in
+    /// `c_lflag` it has NO effect when `ICANON` is off — the
+    /// line discipline doesn't buffer by line and doesn't fire
+    /// the echo path in raw mode. Adding ONLY `ECHO` (the
+    /// initial forward-fixup in atom `581ddec`) was therefore
+    /// insufficient; the runtime test failure stack-trace from
+    /// my followup commit (post-`581ddec`) showed the same
+    /// `left == right` failure with `left: ' '`. Re-enabling
+    /// `ICANON` alongside `ECHO` makes the kernel itself buffer
+    /// input AND synchronously echo master-write bytes back to
+    /// the master, regardless of the child (/bin/cat)'s
+    /// scheduling state — so the test sees the echo bytes
+    /// deterministically as soon as `pty.write` returns, with
+    /// no scheduling wait. The prior `--(1, 30)`-clamped
+    /// `drain_deadline_default()` (atom `f158ea0`) budget that
+    /// was a workaround FOR this race is still load-bearing and
+    /// is preserved.
     #[cfg(unix)]
     fn enable_pty_echo(fd: std::os::fd::RawFd) -> Result<(), std::io::Error> {
         // SAFETY: `libc::tcgetattr` writes through the
@@ -898,11 +906,22 @@ impl PanePty {
         if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        // OR-in `ECHO` to the line-discipline flags without
-        // disturbing `ICANON` (canonical mode) or `ISIG` (so
-        // ctrl-c still works) — ECHO is the load-bearing bit
-        // for cat-style round trip; the rest stay default.
-        termios.c_lflag |= libc::ECHO;
+        // OR-in `ECHO` AND `ICANON` to the line-discipline
+        // flags. Both bits are load-bearing here: `portable_pty
+        // 0.9` opens its PTY pair in raw / canonical-off mode
+        // (essentially `cfmakeraw`), which makes `ECHO` alone
+        // a no-op — the line discipline does NOT buffer input
+        // by line OR fire the echo path in raw mode. Re-enabling
+        // `ICANON` alongside `ECHO` makes the kernel itself
+        // buffer input AND synchronously echo master-write
+        // bytes back to the master, regardless of the child
+        // (/bin/cat)'s scheduling state. We also zero
+        // `c_cc[libc::VEOF]` so an empty master-write can't
+        // accidentally trigger EOF on the slave's stdin
+        // (default `VEOF` byte is ^D=4; clearing it removes the
+        // EOF-on-NL path which would falsely terminate `cat`).
+        termios.c_lflag |= libc::ECHO | libc::ICANON;
+        termios.c_cc[libc::VEOF] = 0;
         // `TCSANOW` makes the change immediate (vs `TCSADRAIN`
         // which would wait for output to drain; we don't care
         // because cat is going to write next and we want ECHO

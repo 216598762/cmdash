@@ -363,6 +363,7 @@ fn pty_osc_title_changes_event_stream() {
     assert!(got, "expected TitleChanged event, got {:?}", events);
 }
 
+#[cfg(unix)]
 #[test]
 fn pty_write_to_child_round_trips_via_cat() {
     let (mut pty, reader) = PanePty::spawn(
