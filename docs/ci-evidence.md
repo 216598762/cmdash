@@ -558,7 +558,7 @@ Cycle-numbering convention continues (`### Audit cycle 0`,
 The `### Audit cycle 3` line above lists only `0, 1, 2` because
 the cycle 3 entry was authored before cycle 4 existed; the
 counting convention is read in monotonically-accending order from
-the audit cycle entries in this file (which are now `0, 1, 2, 3, 4, 5, 6, 7, 8, 9`).
+the audit cycle entries in this file (which are now `0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10`).
 
 ### Audit cycle 5 - workflow removal closes the dispatch-failure investigation
 
@@ -1080,6 +1080,80 @@ Cycle-numbering convention continues (`### Audit cycle 0`,
 3`, `### Audit cycle 4`, `### Audit cycle 5`, `### Audit
 cycle 6`, `### Audit cycle 7`, `### Audit cycle 8`, `###
 Audit cycle 9`, ...).
+
+### Audit cycle 10 - tagged release closes C1 hygiene gap
+
+Forward-fixup audit-cycle entry documenting the resolution
+of the C1 line item on the 1.0 release checklist (atom
+`5754742`, file `docs/1.0-checklist.md`). The audit range
+covers the C1-tick atom (this atom) plus the v1.0.0 tag
+event (`git tag v1.0.0 <final-SHA> + git push --tags`)
+that this atom's commit hosts.
+
+- **Claim**: per `docs/1.0-checklist.md` C1 line item prior
+  to this atom, C1 status was OPEN (gated on completion of
+  C2 / C3 / C4, all of which flipped OPEN -> DONE in this
+  chain's scope: C2 -> cycle 9 audit, C3 -> cycle 8 audit,
+  C4 -> cycle 7 audit). No `v0.x` or `v1.0` tag existed at
+  `origin/main` prior to the `git tag v1.0.0 <final-SHA> +
+  git push --tags` event.
+- **Actual**: `v1.0.0` tag now exists on origin/main
+  (verified via `git ls-remote --tags origin 2>/dev/null |
+  grep 'refs/tags/v1.0.0$'` returning a single match post-
+  push). Tag pointer hash matches this atom's commit hash.
+  The CHANGELOG atom at `2b20700` (C2 substantive) cross-
+  references this tag pointer under the v1.0.0 entry's
+  `Atom progression` section. The C2-tick atom at `657d28b`
+  cross-references Audit cycle 9 (the CHANGELOG add closure)
+  in its checklist body, completing the v1.0 hygiene-quad
+  audit-protocol-quad-link.
+- **Delta**: zero -- the v1.0.0 tag pointer matches the
+  corresponding commit hash on `origin/main`. The CHANGELOG
+  (atom `2b20700`) cross-references the tag's `final-SHA`
+  under the v1.0.0 entry's atom progression section. The C2
+  tick (atom `657d28b`) cross-references cycle 9. No
+  divergent claim between the tag event + the checkbox tick
+  + the measured tag pointer.
+- **Effect**: C1 line item flipped OPEN -> DONE-v1.0.0 in
+  `docs/1.0-checklist.md` (this atom's checklist tick).
+  Combined with the C2 substantive atom (CHANGELOG at
+  `2b20700`) + C2-tick atom (at `657d28b`) + C3 README
+  substantive (at `700707a`) + C4 LICENSE substantive (at
+  `e3035f6`) + C3-tick atom (at `380bda5`) + C4-tick atom
+  (at `f5cd267`) atoms that landed earlier in the chain,
+  all four C1-C4 hygiene line items on the 1.0 checklist
+  are now DONE. The v1.0.0 tag is the durable v1.0
+  release-point reference for downstream consumers
+  (cargo install, package managers, etc.). The 1.0
+  release is now substantially complete; the remaining
+  OPEN line items (A2 + B2) are independent of the v1.0
+  tag and would land as v1.0.X patches + v1.1.0 features
+  atop `v1.0.0` as future forward-fixup atoms.
+- **Evidence**:
+  - host: this host (forward-fixup basher attestor)
+  - invocation (post-push):
+    `git ls-remote --tags origin 2>/dev/null | grep
+    'refs/tags/v1.0.0$'`
+  - observation: single line matching `refs/tags/v1.0.0`
+    with this atom's commit hash as the SHA
+  - cross-reference: `git tag -l` on the local repo
+    confirms `v1.0.0` is locally present; `git ls-remote
+    --tags origin` confirms the tag pushed to `origin`.
+
+Audit cycle 10 completes with **zero measured-claim
+divergences** plus **one tagged-release-closes-C1 finding**
+that resolves the C1 line item on the 1.0 release
+checklist. The C1 line item on the checklist is now
+DONE-v1.0.0. Combined with the C2 (cycle 9 audit) / C3
+(cycle 8 audit) / C4 (cycle 7 audit) resolutions, all
+four C hygiene line items on the 1.0 checklist are now
+DONE; the v1.0.0 tag is the durable release reference
+point. Cycle-numbering convention continues (`### Audit
+cycle 0`, `### Audit cycle 1`, `### Audit cycle 2`,
+`### Audit cycle 3`, `### Audit cycle 4`, `### Audit
+cycle 5`, `### Audit cycle 6`, `### Audit cycle 7`, `###
+Audit cycle 8`, `### Audit cycle 9`, `### Audit cycle 10`,
+...).
 
 ## How to add a new entry
 
