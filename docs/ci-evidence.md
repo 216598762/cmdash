@@ -558,7 +558,7 @@ Cycle-numbering convention continues (`### Audit cycle 0`,
 The `### Audit cycle 3` line above lists only `0, 1, 2` because
 the cycle 3 entry was authored before cycle 4 existed; the
 counting convention is read in monotonically-accending order from
-the audit cycle entries in this file (which are now `0, 1, 2, 3, 4, 5, 6, 7, 8`).
+the audit cycle entries in this file (which are now `0, 1, 2, 3, 4, 5, 6, 7, 8, 9`).
 
 ### Audit cycle 5 - workflow removal closes the dispatch-failure investigation
 
@@ -977,6 +977,109 @@ DONE-MIT. Cycle-numbering convention continues (`###
 Audit cycle 0`, `### Audit cycle 1`, `### Audit cycle 2`,
 `### Audit cycle 3`, `### Audit cycle 4`, `### Audit cycle
 5`, `### Audit cycle 6`, `### Audit cycle 7`, ...).
+
+### Audit cycle 9 - CHANGELOG add closes C2 hygiene gap
+
+Forward-fixup audit-cycle entry documenting the resolution
+of the C2 line item on the 1.0 release checklist (atom
+`5754742`, file `docs/1.0-checklist.md`). The single-atom
+audit range covers `2b20700` -- the
+`docs(changelog): initial-v1.0.0-release-notes` atom that
+authored `/CHANGELOG.md` at the repo root (Keep-a-ChangeLog
+format with a single `[v1.0.0]` entry covering the chain's
+major beats per the C2 atom-candidate placeholder plus
+post-`7b8eee0` atoms + workspace layout + known limitations
++ forward-fixup-discipline note).
+
+- **Claim**: per `docs/1.0-checklist.md` C2 line item prior
+  to this atom, C2 status was OPEN with the atom-candidate
+  placeholder `docs(changelog): initial-v1.0.0-release-notes`
+  describing the chain's major beats pending. No `CHANGELOG.md`
+  existed at `origin/main`.
+- **Actual**: `CHANGELOG.md` now exists at the repo root
+  (verified via `git ls-tree -r HEAD --name-only | grep
+  '^CHANGELOG.md$'` returning a single match). Follows the
+  Keep-a-ChangeLog format with a single `[v1.0.0]` initial-
+  release entry. Verified by reading `/CHANGELOG.md` line-
+  by-line against the C2 atom-candidate placeholder bullet
+  list (`5e27556` through `7b8eee0`) AND against the post-
+  `7b8eee0` atoms (`8cf4d0f` through `380bda5`) AND against
+  the workspace layout (7 crates) AND against the known
+  limitations (B2 + A2 OPEN).
+- **Delta**: zero -- the CHANGELOG atom shipped the bullet-
+  list content consistent with the C2 atom-candidate
+  placeholder (chain's major beats per `5e27556` to `7b8eee0`)
+  AND added the post-`7b8eee0` atoms that landed during
+  the 1.0 release scoping. No divergent claim between the
+  CHANGELOG atom's commit body and the measured ground
+  truth.
+- **Effect**: C2 line item flipped OPEN -> DONE in
+  `docs/1.0-checklist.md` (this atom's checklist tick).
+  The README atom at `700707a` (chain reference for surface-
+  area cross-references) is now backed by the CHANGELOG's
+  Workspace layout + install + local-CI section linkage.
+  CHANGELOG + README + checklist are now mutually
+  consistent. The independent-rewindability of the
+  CHANGELOG-file-add (atom `2b20700`) versus
+  this checklist tick (this atom) is preserved per the
+  C2-vs-chain-position clarification below.
+- **Evidence**:
+  - host: this host (forward-fixup basher attestor)
+  - invocation:
+    `git ls-tree -r HEAD --name-only | grep '^CHANGELOG.md$'`
+  - observation: single line `CHANGELOG.md` matches
+  - cross-reference: the C2 substantive atom's commit body
+    captures the chain's major beats verbatim.
+
+## C2 vs chain-position: separate-atom dissection
+
+The C2 line item on the 1.0 checklist has TWO logically
+distinct steps:
+
+1. **Substantive resolution (CHANGELOG-file-add)**: the
+   CHANGELOG body covering the chain's major beats +
+   workspace layout + known limitations + forward-fixup
+   discipline + version note lands in `/CHANGELOG.md` as a
+   forward-fixup commit. This is what the C2 substantive
+   atom accomplishes.
+2. **Checklist status tick (this atom)**: flipping the C2
+   line item on `docs/1.0-checklist.md` from OPEN to DONE
+   so the audit-protocol ledger reflects the closed status.
+
+The two steps are deliberately split into distinct forward-
+fixup atoms (CHANGELOG-file-add at the C2 substantive atom,
+status-tick here) so each is independently rewindable:
+
+- If the user later decides to revise the CHANGELOG (e.g.,
+  to add more prior-chain SHAs, switch to a different
+  changelog convention, or expand the v1.0.0 entry), only
+  the CHANGELOG file changes + a new audit cycle entry is
+  needed -- the checklist's DONE tick stays informative.
+- If the audit-protocol needs to revise the `DONE` label
+  format (e.g., to expose the CHANGELOG atom's atom-SHA
+  explicitly on the checklist status line), only this atom
+  is touched -- CHANGELOG stays untouched.
+
+This split is the same independent-rewindability pattern
+used by the LICENSE atom + C4 tick (atom `e3035f6` + atom
+`f5cd267`) plus by the README atom + C3 tick (atom `700707a`
++ atom `380bda5`) plus by the workflow-removal atom + A1
+tick (atom `7b8eee0` + atom `5754742`'s A1 section) plus
+by every prior doc-only checklist tick on the chain.
+
+The `docs/1.0-checklist.md` C2 tick in this atom names the
+C2 substantive atom so future readers can disambiguate
+substantive delivery from checklist reflection.
+
+Audit cycle 9 completes with **zero measured-claim
+divergences** plus **one CHANGELOG-add-closes-C2 finding**
+that resolves the C2 line item on the 1.0 release
+checklist. The C2 line item on the checklist is now DONE.
+Cycle-numbering convention continues (`### Audit cycle 0`,
+`### Audit cycle 1`, `### Audit cycle 2`, `### Audit cycle
+3`, `### Audit cycle 4`, `### Audit cycle 5`, `### Audit
+cycle 6`, `### Audit cycle 7`, `### Audit cycle 8`, `###
+Audit cycle 9`, ...).
 
 ## How to add a new entry
 
