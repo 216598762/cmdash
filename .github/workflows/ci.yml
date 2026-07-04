@@ -57,7 +57,7 @@ permissions:
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
@@ -67,8 +67,8 @@ jobs:
         with:
           lfs: false
 
-      - name: Install Rust 1.96 (matches local toolchain)
-        uses: dtolnay/rust-toolchain@1.96
+      - name: Install Rust 1.96.0 (matches local toolchain; pinned tag avoids drifting onto a future 1.96.x)
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
 
@@ -102,17 +102,24 @@ jobs:
         run: |
           set -euo pipefail
           PASS=0
+          # NOTE: this step intentionally runs WITHOUT --quiet so the
+          # full cargo test assertion shape (panic + `left` / `right`
+          # comparisons) lands verbatim in $OUT for the FAIL path's
+          # `tail -40` capture. The prior `c92da3b` atom used --quiet
+          # and compressed the failure context below the level needed
+          # for a precise `#[ignore = "..."]` reason-text flip on a
+          # forward-fixup atom.
           for n in $(seq 1 100); do
             for T in pty_kitty_load_emits_event_via_vte_hook \
                      pty_kitty_split_chunk_across_advances \
                      pty_kitty_place_command_emits_event; do
-              OUT=$(cargo test -p cmdash-pty --test round_trip --quiet -- "$T" 2>&1) || true
+              OUT=$(cargo test -p cmdash-pty --test round_trip -- "$T" 2>&1) || true
               if echo "$OUT" | grep -q 'test result: ok'; then
                 PASS=$((PASS+1))
               elif echo "$OUT" | grep -q 'test result: FAILED'; then
                 echo "::error::CI FLAKE: iter=$n test=$T"
                 echo "::error::--- failing-output-begin ---"
-                echo "$OUT" | tail -40
+                echo "$OUT" | tail -60
                 echo "::error::--- failing-output-end ---"
                 echo "::error::Forward-fixup reason text: see commit body."
                 exit 1
