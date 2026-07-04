@@ -558,7 +558,7 @@ Cycle-numbering convention continues (`### Audit cycle 0`,
 The `### Audit cycle 3` line above lists only `0, 1, 2` because
 the cycle 3 entry was authored before cycle 4 existed; the
 counting convention is read in monotonically-accending order from
-the audit cycle entries in this file (which are now `0, 1, 2, 3, 4, 5`).
+the audit cycle entries in this file (which are now `0, 1, 2, 3, 4, 5, 6, 7`).
 
 ### Audit cycle 5 - workflow removal closes the dispatch-failure investigation
 
@@ -773,6 +773,105 @@ convention continues (`### Audit cycle 0`, `### Audit
 cycle 1`, `### Audit cycle 2`, `### Audit cycle 3`, `###
 Audit cycle 4`, `### Audit cycle 5`, `### Audit cycle 6`,
 ...).
+
+### Audit cycle 7 - LICENSE add closes C4 hygiene gap
+
+Forward-fixup audit-cycle entry documenting the resolution
+of the C4 line item on the 1.0 release checklist (atom
+`5754742`, file `docs/1.0-checklist.md`). The single-atom
+audit range covers `e3035f6` -- the `chore(license): add
+LICENSE` atom that added `/LICENSE` at the repo root,
+choosing MIT per the user's release-time preference (MIT /
+`The cmdash authors` / 2026, all expressed via the in-flow
+ask_user confirmation before the LICENSE atom landed).
+
+- **Claim**: per `docs/1.0-checklist.md` C4 line item prior
+  to this atom, C4 status was OPEN with the atom-candidate
+  placeholder `chore(license): add <LICENSE-NAME>` pending
+  the user's selection. No LICENSE file existed at
+  `origin/main`.
+- **Actual**: `-- LICENSE` now exists at the repo root
+  (verified via `git ls-tree -r HEAD --name-only | grep
+  '^LICENSE$'` returning a single match). SPDX-format MIT
+  license text with copyright line
+  `Copyright (c) 2026 The cmdash authors`. Verified by
+  reading `/LICENSE` line-by-line; the file content matches
+  the canonical MIT reference text from opensource.org and
+  SPDX-License-Identifier MIT.
+- **Delta**: zero -- the LICENSE atom at `e3035f6` shipped
+  the SPDX-format MIT license verbatim, with the chosen
+  license, copyright holder, and chosen year all matching
+  the user's release-time preference. No divergent claim
+  between the LICENSE atom's commit body and the measured
+  ground truth.
+- **Effect**: C4 line item flipped OPEN -> DONE-MIT in
+  `docs/1.0-checklist.md` (this atom's checklist tick).
+  The README atom at `700707a` (one atom ahead on the
+  chain) cross-references this LICENSE file under its
+  `License` section; LICENSE + README + checklist are now
+  mutually consistent. The independent-rewindability of the
+  LICENSE-file-add (atom `e3035f6`) versus this checklist
+  tick (this atom) is preserved per the C4-vs-chain-position
+  clarification below.
+- **Evidence**:
+  - host: this host (forward-fixup basher attestor)
+  - invocation:
+    `git ls-tree -r HEAD --name-only | grep '^LICENSE$'`
+  - observation: single line `LICENSE` matches
+  - cross-reference: `e3035f6`'s commit body captures the
+    chosen license (MIT), the SPDX-format license text,
+    and the copyright line verbatim.
+
+## C4 vs chain-position: separate-atom dissection
+
+The C4 line item on the 1.0 checklist has TWO logically
+distinct steps:
+
+1. **Substantive resolution (LICENSE-file-add)**: the
+   chosen license + SPDX-format text + copyright holder
+   land in `/LICENSE` as a forward-fixup commit. This is
+   what `e3035f6` accomplishes.
+2. **Checklist status tick (this atom)**: flipping the C4
+   line item on `docs/1.0-checklist.md` from OPEN to
+   DONE-MIT so the audit-protocol ledger reflects the
+   closed status.
+
+The two steps are deliberately split into distinct
+forward-fixup atoms (LICENSE-file-add at `e3035f6`,
+status-tick here) so each is independently rewindable:
+
+- If the user later decides to swap the LICENSE (e.g., to
+  dual-license MIT + Apache-2.0), only the LICENSE file
+  changes + a new audit cycle entry is needed -- the
+  checklist's DONE-MIT tick stays informative.
+- If the audit-protocol needs to revise the `DONE-MIT`
+  label (e.g., to expose the LICENSE atom's atom-SHA
+  explicitly on the checklist status line), only this
+  atom is touched -- LICENSE stays untouched.
+
+This split is the same independent-rewindability pattern
+used by cycle-N audit-protocol entries (each cycle atom is
+independent of the audit-protocol recording of that cycle's
+discoveries, and the recording can be revised without
+mutilating the substantive atom) and by the README atom at
+`700707a` (file-add at `700707a` + status-tick as the
+future C3-tick followup atom -- the
+`e3035f6` LICENSE-add + this C4-tick + future C3-tick
+pattern).
+
+The `docs/1.0-checklist.md` C4 tick in this atom names
+both atoms (`e3035f6` for LICENSE-add + this atom for
+the status tick) so future readers can disambiguate
+substantive delivery from checklist reflection.
+
+Audit cycle 7 completes with **zero measured-claim
+divergences** plus **one LICENSE-add-closes-C4 finding**
+that resolves the C4 line item on the 1.0 release
+checklist. The C4 line item on the checklist is now
+DONE-MIT. Cycle-numbering convention continues (`###
+Audit cycle 0`, `### Audit cycle 1`, `### Audit cycle 2`,
+`### Audit cycle 3`, `### Audit cycle 4`, `### Audit cycle
+5`, `### Audit cycle 6`, `### Audit cycle 7`, ...).
 
 ## How to add a new entry
 
