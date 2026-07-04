@@ -153,6 +153,22 @@ fn parse_cli_args(args: &[String]) -> Result<CliArgs, String> {
             );
         }
         if let Some(val) = arg.strip_prefix("--log-level=") {
+            // Empty-after-`=` (the `--log-level=` form) routes
+            // to the same "requires a value" error as the
+            // bare `--log-level` form above. Without this
+            // special case, `arg.strip_prefix("--log-level=")`
+            // returns `Some("")`, the `match` below has no
+            // whitelist match for the empty string, and the
+            // `_` arm emits "invalid --log-level value \"\""
+            // — which conflates a user-syntax mistake (no
+            // value at all) with a bad-value mistake (real
+            // value but not whitelisted). Two distinct
+            // categories; two distinct error texts.
+            if val.is_empty() {
+                return Err(
+                    "cmdash: --log-level requires a value: --log-level=<level>".to_string(),
+                );
+            }
             match val.to_ascii_lowercase().as_str() {
                 "error" | "warn" | "info" | "debug" | "trace" => {
                     out.log_level = Some(val.to_string());
@@ -1829,6 +1845,37 @@ mod cli_args_tests {
         assert!(
             err.contains("--log-level") && err.contains("requires a value"),
             "error message must name the flag and the missing-value requirement: {err}"
+        );
+    }
+
+    /// Companion to the bare-flag test above: locks the
+    /// empty-after-`=` form (`--log-level=`) into the same
+    /// "requires a value" error path. Without
+    /// `parse_cli_args`' dedicated empty-value check (a
+    /// single `if val.is_empty() { return Err(...) }` arm
+    /// before the whitelist match), the underlying `match`
+    /// falls into the `_` arm and emits
+    /// "invalid --log-level value \"\"" — conflating a
+    /// user-syntax mistake (no value at all) with a wrong-
+    /// value mistake (real value but not whitelisted). The
+    /// two error categories should be visually
+    /// distinguishable in the help text.
+    #[test]
+    fn log_level_empty_after_eq_is_rejected_with_usage_error_message() {
+        let err = parse_cli_args(&argv(&["cmdash", "--log-level="]))
+            .expect_err("--log-level= with empty value must be a parse error");
+        assert!(
+            err.contains("--log-level") && err.contains("requires a value"),
+            "--log-level= must produce the bare-flag error message, \
+             NOT the 'invalid value' error message: {err}"
+        );
+        // Distinguish from the bad-value path: the empty-value
+        // form must NOT contain the whitelist reminder that
+        // the bad-value error uses. Lock the two error
+        // categories as visually-distinguishable.
+        assert!(
+            !err.contains("expected error|warn|info|debug|trace"),
+            "--log-level= must NOT emit the bad-value reminder text: {err}"
         );
     }
 

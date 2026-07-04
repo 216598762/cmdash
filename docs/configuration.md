@@ -130,11 +130,20 @@ start-event (or any event after the binary has cleared the
 alternate screen).
 
 **Pitfall:** Crate-targeted filter expressions like
-`cmdash_layout=debug` are NOT reach-able via `--log-level`
-(it's a single-value override at the binary level). Use
-`RUST_LOG=cmdash_layout=debug` for that. The two knobs are
-mutually exclusive for a single launch: `--log-level` wins,
-the env var is ignored.
+`cmdash_layout=debug` are NOT supported through `--log-level`
+— the cmdash parser itself rejects any value outside the
+five-level whitelist (`error|warn|info|debug|trace`),
+even though `tracing-subscriber`'s `EnvFilter` syntax
+WOULD accept such directives if it were the constraint
+boundary (the subscriber is layered below the parser; the
+parser would never call `EnvFilter::new` with a
+crate-targeted string). Use `RUST_LOG=cmdash_layout=debug`
+for crate-targeted filtering; it is the standard
+`tracing-subscriber` direct-string idiom and is the
+documented escape hatch for crate-level filtering. The two
+knobs are mutually exclusive for a single launch:
+`--log-level` wins if both are set, and the env var is
+silently dropped (no merge, no warning).
 
 ---
 
