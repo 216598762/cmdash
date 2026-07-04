@@ -1,0 +1,17 @@
+// 01-minimal.kdl — verbatim from docs/configuration.md §6.1.
+// Canonical "bare minimum that ships by default" config:
+// a single shell pane and the two bundled keybinds
+// (Ctrl-W = pane.close, Ctrl-Q = app.close).
+//
+// To try it: copy this file on top of `crates/cmdash/config.kdl`
+// (which the binary embeds via `include_str!`) and rebuild.
+// See docs/configuration.md §2 (Pitfall #1) and §6 intro.
+
+layout {
+    pane kind=shell label="default"
+}
+
+keybinds {
+    bind "ctrl-w" action="pane.close"
+    bind "ctrl-q" action="app.close"
+}

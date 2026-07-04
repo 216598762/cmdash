@@ -1,0 +1,26 @@
+// 02-two-pane-split.kdl — verbatim from docs/configuration.md §6.2.
+// A 60/40 horizontal split between an "edit" pane (left) and a "log"
+// pane (right), with vim-style ctrl-h/j/k/l directional focus and
+// ctrl-n = app.new-pane (split the focused leaf; see §2 + §6 intro).
+//
+// Recall Pitfall #2 from docs/configuration.md:
+// `split axis=horizontal` is a COLUMN split (same y, different x),
+// children stack side-by-side (left ↔ right), NOT top/bottom.
+
+layout {
+    split axis=horizontal ratio=0.6 {
+        pane kind=shell label="edit"
+        pane kind=shell label="log"
+    }
+}
+
+keybinds {
+    bind "ctrl-w"  action="pane.close"
+    bind "ctrl-q"  action="app.close"
+    bind "ctrl-n"  action="app.new-pane"
+    bind "ctrl-h"  action="pane.focus.left"
+    bind "ctrl-j"  action="pane.focus.down"
+    bind "ctrl-k"  action="pane.focus.up"
+    bind "ctrl-l"  action="pane.focus.right"
+    bind "tab"     action="pane.focus.next"
+}

@@ -1,0 +1,39 @@
+// 03-stack-and-zstack.kdl — verbatim from docs/configuration.md §6.3.
+// A 70/30 vertical split: top half is a `stack` of 3 equal-height
+// tabs; bottom half is a `zstack` of 2 overlay panes (Phase 3 carry-
+// forward: ZStack members share the parent's rect verbatim).
+//
+// The keybinds include the phase-4 ZStack focus primitives:
+// `pane.stack.cycle` (wrap-around within the focused ZStack) and
+// `pane.stack.{down,up,left,right}` (directional with geometric
+// handoff at the boundary).
+//
+// Recall Pitfall #2 from docs/configuration.md:
+// `split axis=vertical` is a ROW split (same x, different y),
+// children stack top-to-bottom (top ↓ bottom), NOT side-by-side.
+
+layout {
+    split axis=vertical ratio=0.7 {
+        stack {
+            pane kind=shell label="tab-a"
+            pane kind=shell label="tab-b"
+            pane kind=shell label="tab-c"
+        }
+        zstack {
+            pane kind=shell label="overlay-bottom"
+            pane kind=shell label="overlay-top"
+        }
+    }
+}
+
+keybinds {
+    bind "ctrl-w"                               action="pane.close"
+    bind "ctrl-q"                               action="app.close"
+    bind "ctrl-c"                               action="pane.stack.cycle"
+    bind "ctrl-alt-down"                        action="pane.stack.down"
+    bind "ctrl-alt-up"                          action="pane.stack.up"
+    bind "ctrl-alt-left"                        action="pane.stack.left"
+    bind "ctrl-alt-right"                       action="pane.stack.right"
+    bind "alt-1"                                action="pane.focus.next"
+    bind "alt-2"                                action="pane.focus.prev"
+}

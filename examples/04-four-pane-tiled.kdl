@@ -1,0 +1,35 @@
+// 04-four-pane-tiled.kdl — verbatim from docs/configuration.md §6.5.
+// A 4-pane Split-of-Split (2x2 grid): outer `split axis=vertical`
+// at 50% gives the top/bottom halves; each half holds an inner
+// `split axis=horizontal` at 50% that defines the left/right
+// column. Tree depth = 2, well below MAX_TREE_DEPTH = 8.
+//
+// Both `axis` keywords are present here so you can cross-check
+// Pitfall #2 from docs/configuration.md in one file:
+// - `split axis=vertical` (outer): ROW split (children stack
+//   top-to-bottom).
+// - `split axis=horizontal` (inner): COLUMN split (children stack
+//   side-by-side).
+
+layout {
+    split axis=vertical ratio=0.5 {
+        split axis=horizontal ratio=0.5 {
+            pane kind=shell label="top-left"
+            pane kind=shell label="top-right"
+        }
+        split axis=horizontal ratio=0.5 {
+            pane kind=shell label="bot-left"
+            pane kind=shell label="bot-right"
+        }
+    }
+}
+
+keybinds {
+    bind "ctrl-w"  action="pane.close"
+    bind "ctrl-q"  action="app.close"
+    bind "ctrl-n"  action="app.new-pane"
+    bind "ctrl-h"  action="pane.focus.left"
+    bind "ctrl-j"  action="pane.focus.down"
+    bind "ctrl-k"  action="pane.focus.up"
+    bind "ctrl-l"  action="pane.focus.right"
+}

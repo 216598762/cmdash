@@ -380,6 +380,17 @@ The progression below walks from minimal authoring up to a real
 multi-preset layout. Each example past the first is a fork-and-edit
 of the prior — replace `crates/cmdash/config.kdl` and rebuild.
 
+> **Reference copies on disk.** Standing copies of these four
+> canonical configs (extracted verbatim from this doc) live at the
+> project root in [`examples/`](../examples/) as separate `.kdl`
+> files: [`01-minimal.kdl`](../examples/01-minimal.kdl)
+> (§6.1), [`02-two-pane-split.kdl`](../examples/02-two-pane-split.kdl)
+> (§6.2), [`03-stack-and-zstack.kdl`](../examples/03-stack-and-zstack.kdl)
+> (§6.3), and [`04-four-pane-tiled.kdl`](../examples/04-four-pane-tiled.kdl)
+> (§6.5). To try one: copy it on top of `crates/cmdash/config.kdl`
+> and rebuild — see §2 (Pitfall #1). Each header below links to
+> the matching on-disk file.
+
 ### 6.1. Minimal — single shell pane
 
 This is what ships by default:
@@ -399,6 +410,9 @@ Useful for sanity-checking that the binary parsed and rendered one
 pane.
 
 ### 6.2. Two-pane horizontal split + directional focus
+
+*(Reference copy: [`examples/02-two-pane-split.kdl`](../examples/02-two-pane-split.kdl))*
+
 
 A 60/40 left/right split with arrows bound to rect-proximity
 focus:
@@ -429,6 +443,9 @@ translation goes through rect-proximity arithmetic rather than
 literal vim semantics.
 
 ### 6.3. Tabbed stack + ZStack overlay
+
+*(Reference copy: [`examples/03-stack-and-zstack.kdl`](../examples/03-stack-and-zstack.kdl))*
+
 
 A `stack` of three shell panes (= 3 equal-height vertical strips)
 plus a separate `zstack { ... }`, with the phase-4 ZStack focus
@@ -516,6 +533,9 @@ rule) and the new panes spawn with fresh `LayerId`s.
 
 ### 6.5. Advanced — 4-pane Split-of-Split (2×2 grid)
 
+*(Reference copy: [`examples/04-four-pane-tiled.kdl`](../examples/04-four-pane-tiled.kdl))*
+
+
 A `split axis=vertical { split axis=horizontal …, split axis=horizontal … }`
 gives four cells:
 
@@ -592,6 +612,11 @@ regardless of where in the tree that `zstack` sits.
   guide (clippy-baseline-0, flake-soak, the `--no-gpgsign=false`
   per-commit + `--no-sign` per-tag signature workaround on a host
   with a TTY-less GPG agent).
+- [`examples/`](../examples/) — the four canonical configs from §6
+  as standalone `.kdl` files (`01-minimal.kdl`,
+  `02-two-pane-split.kdl`, `03-stack-and-zstack.kdl`,
+  `04-four-pane-tiled.kdl`). Reference-able from §6.2, §6.3,
+  §6.5, and §6.1.
 - [`LICENSE`](../LICENSE) — MIT.
 
 ### Code items referenced by this doc (and how to refer to them)
