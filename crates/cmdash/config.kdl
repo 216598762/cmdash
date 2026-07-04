@@ -10,5 +10,5 @@ layout {
 // dynamic splits, presets, and per-tab navigation.
 keybinds {
     bind "ctrl-w" action="pane.close"
-    bind "ctrl-q" action="app.close"
+    bind "alt-q"  action="app.close"
 }

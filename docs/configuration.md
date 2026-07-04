@@ -64,7 +64,7 @@ When you launch it:
 
 ### 1.3. Exiting
 
-For most cases, use the bundled default **`Ctrl-Q`** (binds to
+For most cases, use the bundled default **`Alt-Q`** (binds to
 `app.close`), which sets `running = false` so the tick loop returns
 and the `TerminalGuard` restores the host terminal (raw-mode +
 alternate-screen + mouse-capture). Closing the **last** pane via
@@ -145,7 +145,7 @@ Each child must be a `bind` line — anything else is
 ```kdl
 keybinds {
     bind "ctrl-w" action="pane.close"
-    bind "ctrl-q" action="app.close"
+    bind "alt-q" action="app.close"
 }
 ```
 
@@ -299,6 +299,20 @@ where each `<modifier>` is one of (case-sensitive):
 | `alt`    / `meta`           | Sets `Modifiers::alt` |
 | `super`  / `cmd` / `win`    | Sets `Modifiers::super_` |
 
+> **Note — `alt` covers both Alt and Option keys in v1.**
+> `cmdash-config`'s `parse_chord` collapses `alt` and `meta` to a
+> single `Modifiers::alt` bit (no L/R distinction in v1). The chord
+> `alt-q` therefore matches **both** Left-Alt+Q and Right-Alt+Q on
+> Linux/Windows keyboards AND Opt+Q (macOS Option+Q) on macOS hosts
+> whose Option key is captured by the same modifier bit. v1 cannot
+> differentiate Left-Alt from Right-Alt; a v2 hook would consume
+> crossterm's `KeyModifiers::LEFT_ALT` / `RIGHT_ALT` flag
+> distinction. **Recall Pitfall #1**: because the default config
+> (`crates/cmdash/config.kdl`) is `include_str!`-embedded at compile
+> time, switching your host's quit keybind to anything other than
+> the bundled `alt-q` requires editing that file + rebuilding the
+> `cmdash` binary.
+
 Exactly one non-modifier token must close the chord. Valid
 **`<key>`** tokens:
 
@@ -402,7 +416,7 @@ layout {
 
 keybinds {
     bind "ctrl-w" action="pane.close"
-    bind "ctrl-q" action="app.close"
+    bind "alt-q" action="app.close"
 }
 ```
 
@@ -427,7 +441,7 @@ layout {
 
 keybinds {
     bind "ctrl-w"  action="pane.close"
-    bind "ctrl-q"  action="app.close"
+    bind "alt-q"  action="app.close"
     bind "ctrl-n"  action="app.new-pane"
     bind "ctrl-h"  action="pane.focus.left"
     bind "ctrl-j"  action="pane.focus.down"
@@ -468,7 +482,7 @@ layout {
 
 keybinds {
     bind "ctrl-w"                               action="pane.close"
-    bind "ctrl-q"                               action="app.close"
+    bind "alt-q"                               action="app.close"
     bind "ctrl-c"                               action="pane.stack.cycle"
     bind "ctrl-alt-down"                        action="pane.stack.down"
     bind "ctrl-alt-up"                          action="pane.stack.up"
@@ -519,7 +533,7 @@ presets {
 
 keybinds {
     bind "ctrl-w"  action="pane.close"
-    bind "ctrl-q"  action="app.close"
+    bind "alt-q"  action="app.close"
     bind "ctrl-1"  action="pane.preset.code"
     bind "ctrl-2"  action="pane.preset.logs"
     bind "alt-1"   action="pane.preset.code"
@@ -555,7 +569,7 @@ layout {
 
 keybinds {
     bind "ctrl-w"  action="pane.close"
-    bind "ctrl-q"  action="app.close"
+    bind "alt-q"  action="app.close"
     bind "ctrl-n"  action="app.new-pane"
     bind "ctrl-h"  action="pane.focus.left"
     bind "ctrl-j"  action="pane.focus.down"

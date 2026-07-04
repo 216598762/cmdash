@@ -28,7 +28,7 @@ layout {
 
 keybinds {
     bind "ctrl-w"                               action="pane.close"
-    bind "ctrl-q"                               action="app.close"
+    bind "alt-q"                                action="app.close"
     bind "ctrl-c"                               action="pane.stack.cycle"
     bind "ctrl-alt-down"                        action="pane.stack.down"
     bind "ctrl-alt-up"                          action="pane.stack.up"
