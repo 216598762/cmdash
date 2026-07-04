@@ -379,8 +379,8 @@ actually classify on the GH API `dispatches` endpoint.
   canonical block form is what both the GH Actions parser AND `gh
   workflow run` recognize per the docs") whose runtime verification
   failed. Audit cycle 0 documented the inline-quoted-form
-  misclassification (causing push-event ghost runs); audit cycle 2
-  documents that the canonical block form is NOT a sufficient fix
+misclassification (causing push-event ghost runs); audit cycle 3
+documents that the canonical block form is NOT a sufficient fix
   on the GH API `dispatches` endpoint -- the failure mode is
   different (no longer `event=push` ghost runs polluting the run
   log, but the dispatch endpoint still rejects the workflow as
@@ -422,7 +422,7 @@ actually classify on the GH API `dispatches` endpoint.
       to `.github/workflows/ci.yml` (path matches) -- the push-
       event ghost run residual persists after the swap.
 
-Audit cycle 2 completes with **zero measured-claim divergences**
+Audit cycle 3 completes with **zero measured-claim divergences**
 plus **one deliverable-did-not-arrive finding** that audit
 cycle 3 candidates should address. Per the aggregate-batch
 forward-fixup shape established in audit cycle 0, this single
