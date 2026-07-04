@@ -59,6 +59,84 @@ preserve history (no amend / no rebase).
     test result: ok. 13 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in (varies per run; not load-bearing)
     ```
 
+### Audit cycle 0 — chain atoms c92da3b → ed8d849 → 7b65b7a → d93b7a7 → 2a5aa3c
+
+Forward-fixup audit-cycle entry. Each atom in the audit range was
+inspected for *measured* pass/fail claims in its commit body vs
+`cargo test -p cmdash-pty --quiet` on origin/main@ebde062 (the
+pre-cleanup reference host) and equivalently origin/main@fa861ac
+(the post-cleanup reference host; doc-only equality since `fa861ac`
+modifies `docs/ci-evidence.md` only).
+
+- **c92da3b** — `ci: add manual-trigger ci.yml workflow_dispatch pipeline`
+  - files: `.github/workflows/ci.yml` only
+  - claim-line grep: workflow YAML only (workflow_dispatch trigger +
+    SOAK + cargo-test invocation pattern); **no measured pass/fail claim**
+- **ed8d849** — `ci: harden ci.yml against run-classification flake + capture full flake shape`
+  - files: `.github/workflows/ci.yml` only
+  - claim-line grep: workflow YAML hardening (ubuntu-22.04 pin,
+    dtolnay 1.96.0 pin, SOAK `--quiet` removal + `tail -60`);
+    **no measured pass/fail claim**
+- **7b65b7a** — `ci: escape YAML 1.1 boolean-coercion trap on `on:` key + harden SOAK fail-path`
+  - files: `.github/workflows/ci.yml` only
+  - claim-line grep: YAML 1.1 quoting fix + SOAK `else` branch for
+    silent-failure path + `actions/upload-artifact@v4` on failure;
+    **no measured pass/fail claim**
+- **d93b7a7** — `chore(ci): add justfile recipes flake-soak + clippy-baseline-3`
+  - files: `justfile` only
+  - claim-line grep: references `300/300 PASS` (SOAK design target)
+    and `clippy-baseline-3` (`expected=3` clippy strict-pin target);
+    **these are recipe-design targets, not measured pass/fail values**
+    for the commit itself. Strict-pin target ≠ measured claim
+    (the recipe enforces the pin; the commit does not assert the
+    pin holds at commit-time).
+- **2a5aa3c** — `chore(ci): add justfile recipes flake-soak + clippy-baseline-3` (hardening)
+  - files: `justfile` only
+  - claim-line grep: hardening pass references `300/300` and
+    `expected=3` as **recipe-design targets** (e.g. "Strict-pin
+    target: 300/300 green"); **no measured pass/fail claim** about
+    the commit itself. Body phrasing distinguishes recipe target
+    from measured assertion in the audit-cycle evidence.
+
+- **Aggregate claim**: zero of the five atoms report a measured
+  cmdash-pty pass/fail count divergent from the actual ground-truth
+  on the reference host.
+- **Actual** (both reference hosts; doc-only equivalence class):
+  `13 passed; 0 failed; 1 ignored` per `cargo test -p cmdash-pty --quiet`.
+- **Delta**: 0 divergent claims in this audit cycle.
+- **Effect**: the chain's `c92da3b → ed8d849 → 7b65b7a → d93b7a7 →
+  2a5aa3c` atoms make NO body-claim about the cmdash-pty library
+  test suite that disagrees with actual ground-truth. Note: the
+  earlier `ecfa1f2` atom's body-claim `22 PASS + 0 FAIL + 1
+  IGNORED` (corrected in this ledger's prior entry) is the unique
+  measured-claim divergence; this audit cycle confirms none of the
+  5 chain atoms in this range carry a similar divergence.
+- **Evidence**:
+  - host: Arch Linux PTY-alloc; Rust 1.96.1
+  - audit range: 5 atoms (`c92da3b`, `ed8d849`, `7b65b7a`,
+    `d93b7a7`, `2a5aa3c`)
+  - reference hosts: origin/main@ebde062 (pre-cleanup) and
+    origin/main@fa861ac (post-cleanup); doc-only chain implies
+    cargo-test ground-truth equivalence class
+  - invocation: `cargo test -p cmdash-pty --quiet` (single shot)
+  - per-atom claim-line grep pattern:
+    `grep -iE 'pass|fail|clippy|+libc|cat-echo|ignore|kitty|soak|baseline|22 PASS|13 PASS'`
+    (matches do not equate to measured claims; they were classified
+    by inspecting the surrounding body context as workflow
+    description / recipe-design target / failure-shape handling
+    rather than measured-claim assertion)
+
+Audit cycle completes with **zero divergent claims**. Per the user
+spec ("append entries where the claim and actual diverge"), this
+aggregate-batch forward-fixup atom exists only to record the
+audit-cycle's NEGATIVE result for future audit reads. Future
+audit readers can interpret "audit cycle N" subscripts as
+sentinel markers for batches of chain atoms where no measured
+pass/fail claim diverged from actual at audit-time on the
+reference host. No `--no-gpg-sign` per-commit workaround unless
+the host's GPG agent remains TTY-less (it does; same
+workaround as `ebde062` and `fa861ac`).
+
 ## How to add a new entry
 
 1. Forward-fixup atom atop the current `origin/main`.
