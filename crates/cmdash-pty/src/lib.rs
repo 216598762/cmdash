@@ -865,6 +865,54 @@ impl PanePty {
 
     /// Spawn a child PTY. Returns the pane state machine + a
     /// reader half that yields bytes from the master.
+    /// Enable the PTY line-discipline `ECHO` flag via the
+    /// master fd's raw termios. On Unix, `portable_pty 0.9`'s
+    /// `MasterPty` trait exposes `as_raw_fd() -> Option<RawFd>`,
+    /// so we can manipulate the underlying termios without
+    /// dropping down to the lower-level `UnixPtySystem` API.
+    /// On Windows, this fn is not compiled (the trait method
+    /// returns `None`, and ConPTY does not use POSIX termios).
+    ///
+    /// **Why `ECHO` matters.** The cat-echo round-trip test
+    /// (`pty_write_to_child_round_trips_via_cat`) historically
+    /// raced because `portable_pty`'s PTY leaves the line
+    /// discipline in raw/semi-cooked mode and the child (e.g.
+    /// `/bin/cat`) had not been scheduled by the time the test
+    /// drained the master. The prior workaround was the
+    /// thread-based `drain(deadline)` helper with a 2 s
+    /// (now `(1, 30)`-clamped, atom `f158ea0`) budget, which
+    /// let cat schedule in time but stayed structurally racy
+    /// on slow CI. enabling `ECHO` makes the kernel itself
+    /// echo master-write bytes back to the master synchronously,
+    /// so the test sees the echo bytes deterministically as
+    /// soon as `pty.write` returns, with no scheduling wait.
+    #[cfg(unix)]
+    fn enable_pty_echo(fd: std::os::fd::RawFd) -> Result<(), std::io::Error> {
+        // SAFETY: `libc::tcgetattr` writes through the
+        // borrowed `&mut termios` pointer; the termios is a
+        // POD struct initialized to zero before the call.
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+        // SAFETY: `fd` is owned by `portable_pty`'s master
+        // pty; `tcgetattr` and `tcsetattr` are `extern "C"`
+        // syscalls that take a raw fd and a `termios` pointer.
+        if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // OR-in `ECHO` to the line-discipline flags without
+        // disturbing `ICANON` (canonical mode) or `ISIG` (so
+        // ctrl-c still works) — ECHO is the load-bearing bit
+        // for cat-style round trip; the rest stay default.
+        termios.c_lflag |= libc::ECHO;
+        // `TCSANOW` makes the change immediate (vs `TCSADRAIN`
+        // which would wait for output to drain; we don't care
+        // because cat is going to write next and we want ECHO
+        // active before that).
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub fn spawn(
         shell: ShellSpec,
         cols: u16,
@@ -882,6 +930,21 @@ impl PanePty {
             pixel_height: 0,
         };
         let pair = pty_system.openpty(size).map_err(PtyError::Spawn)?;
+        // Enable PTY line-discipline `ECHO` so that bytes
+        // written to the master fd by `PanePty::write` are
+        // echoed back to the master synchronously, providing
+        // a deterministic return path for child-input round
+        // trip tests. See `enable_pty_echo` for the rationale.
+        // The call must happen AFTER `openpty` (so the master
+        // fd exists) and BEFORE `pair.slave.spawn_command`
+        // (so the child's first stdin read sees an already
+        // echo-enabled line discipline). On non-Unix the
+        // branch is cfg-gated out entirely; on Unix the trait
+        // method `as_raw_fd` returns `Some(master_fd)`.
+        #[cfg(unix)]
+        if let Some(fd) = pair.master.as_raw_fd() {
+            Self::enable_pty_echo(fd).map_err(|e| PtyError::Spawn(e.into()))?;
+        }
         let cmd = build_command(shell);
         let child = pair.slave.spawn_command(cmd).map_err(PtyError::Spawn)?;
         let reader = pair.master.try_clone_reader().map_err(PtyError::Spawn)?;
