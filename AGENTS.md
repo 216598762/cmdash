@@ -423,7 +423,9 @@ through real `PaneRunner::spawn_with_graphics` children.
 ## Development workflow
 
 - Commit often. Multi-line commit messages, conventional prefix:
-  `feat:`, `fix:`, `refactor:`, `docs:`, `test:`.
+  `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `style:`
+  (formatter-only; commit `14ad9a0` is the chain's establishing
+  precedent), `chore:` (build tooling and dependency maintenance).
 - Push major changes. (No remote configured yet — add one when the user
   provides a URL, then push.)
 - Feature branches: `feat/<short-name>`. Squash into `main`.
