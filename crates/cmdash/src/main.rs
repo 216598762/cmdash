@@ -51,8 +51,8 @@ use cmdash_config::{
 };
 use cmdash_keybinds::Router;
 use cmdash_layout::{
-    adjacent_pane, remove_leaf, replace_leaf_with_split, ComputedLayout, Direction,
-    PaneId, Rect as LayoutRect,
+    adjacent_pane, remove_leaf, replace_leaf_with_split, ComputedLayout, Direction, PaneId,
+    Rect as LayoutRect,
 };
 use cmdash_pty::PaneLayerId;
 use cmdash_pty::{PaneEvent, ShellSpec};
@@ -429,6 +429,10 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     // The 10-arg ctor is the most central tenant of the AGENTS.md
     // "minimal API surface" rule -- it mirrors the ten
     // user-provided struct fields one-to-one.
+    #[allow(
+        dead_code,
+        reason = "v1 free-fn fallback for input_tests signature stability; superseded by TickContext::new_full in production use"
+    )]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         runners: Vec<PaneRunner>,
@@ -890,7 +894,6 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// near-byte-identical `handle_stack_down`/`up`/`left`/`right`
     /// fns from prior phases; folds their boundary condition
     /// + boundary-handoff shape into a single 2-argument
-    /// helper.
     ///
     /// Arguments:
     /// - `handoff_direction`: the [`Direction`] the helper
@@ -936,10 +939,13 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     ///     `stack_focus`** -- even on the wrap-around, the
     ///     keyed member-index entry tracks the post-wrap
     ///     focus.
+    ///
     ///   Folding these into one fn would tangle two
     ///   different post-conditions behind a single
     ///   conditional branch -- an anti-pattern. They are
-    ///   intentionally separate./// - **Trapdoor precedent** -- the [`cmdash_layout::split_rect`]
+    ///   intentionally separate.
+    ///
+    /// - **Trapdoor precedent** -- the [`cmdash_layout::split_rect`]
     ///   rustdoc on `cmdash_layout` warns that the cfg
     ///   `axis=horizontal` is a *column* split (same y
     ///   range, different x columns), the OPPOSITE of the
@@ -1451,6 +1457,10 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
 /// pane's PTY, OR schedule a host SIGWINCH relayout. Non-blocking;
 /// bounded by the caller's tick. Returns `Err` on crossterm I/O
 /// failures so the binary can stop cleanly.
+#[allow(
+    dead_code,
+    reason = "v1 free-fn fallback for input_tests signature stability; superseded by TickContext::input_phase_full in production use"
+)]
 fn input_phase(
     runners: &mut Vec<PaneRunner>,
     bindings: &Router,
@@ -1465,6 +1475,10 @@ fn input_phase(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "v1 free-fn fallback for input_tests signature stability; superseded by TickContext::handle_event_full in production use"
+)]
 fn handle_event(
     evt: &Event,
     bindings: &Router,
@@ -1515,6 +1529,10 @@ fn handle_event(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "v1 free-fn fallback for input_tests signature stability; superseded by TickContext::apply_action_full in production use"
+)]
 fn apply_action(
     action: KeyAction,
     focus: &mut usize,
