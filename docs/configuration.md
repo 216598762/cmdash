@@ -72,6 +72,72 @@ alternate-screen + mouse-capture). Closing the **last** pane via
 
 ---
 
+### 1.4. Logging
+
+cmdash is built on [`tracing`] + [`tracing-subscriber`]; every
+`info!` / `warn!` / `debug!` / `trace!` macro call across the
+binary's source routes through one global subscriber wired at
+startup. v1.0.0 controls the subscriber's `EnvFilter` with three
+layered knobs, applied in this precise order:
+
+1. `--log-level=<level>` (CLI launch argument) — sets the
+   filter directly. Accepted values: `error`, `warn`, `info`,
+   `debug`, `trace` (case-insensitive). When present, it
+   overrides both the env var and the fallback default.
+2. The `RUST_LOG` environment variable — the standard
+   `tracing-subscriber::EnvFilter` direct-string format
+   (e.g. `RUST_LOG=cmdash_layout=debug,info`). Honoured when
+   `--log-level` is NOT passed.
+3. Default — when neither is set, the filter falls back to
+   `info` (the v1.0.0 release default).
+
+**Precedence, highest first:** `--log-level` > `RUST_LOG` > `info`.
+The flag is strictly pre-tracing_subscriber init: `--log-level`
+drives the `EnvFilter` for the binary's events from the FIRST
+tracing macro call forward (no log-window missed during
+startup).
+
+#### Examples
+
+```bash
+# Show every tracing event the binary emits (loud).
+cmdash --log-level=trace
+
+# Show only warnings + errors (quiet; everything-at-or-above warn).
+cmdash --log-level=warn
+
+# Mix-and-match the crate-targeted form via the env var (the
+# CLI flag is single-value and does NOT take a module=level
+# pair). Filter the layout engine to debug, keep everything
+# else at info.
+RUST_LOG=cmdash_layout=debug,info cmdash
+
+# Unknown value or unknown flag → binary refuses to start
+# (exit 2), no debug spew; the parse-error message names
+# both the offending token and the valid values.
+cmdash --log-level=BOGUS   # ERR: invalid --log-level value "BOGUS"
+cmdash -v                  # ERR: unknown flag: "-v"
+cmdash --help              # prints Usage, exits 0
+```
+
+**Pitfall:** Because the binary defaults to `info`, every
+startup normally emits one `info!` event ("cmdash starting…").
+If you set `--log-level=error` you will see NO startup banner
+— silent launch is by design at that level, not a hang. To
+confirm the flag actually took effect, re-run with
+`--log-level=info` and look for the `log_level=` field on the
+start-event (or any event after the binary has cleared the
+alternate screen).
+
+**Pitfall:** Crate-targeted filter expressions like
+`cmdash_layout=debug` are NOT reach-able via `--log-level`
+(it's a single-value override at the binary level). Use
+`RUST_LOG=cmdash_layout=debug` for that. The two knobs are
+mutually exclusive for a single launch: `--log-level` wins,
+the env var is ignored.
+
+---
+
 ## 2. The v1.0.0 config model — embedded at compile time
 
 > **Pitfall #1 — Recompile to edit the config.**

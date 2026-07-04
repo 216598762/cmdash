@@ -105,6 +105,33 @@ Build requirements:
   See the audit-protocol ledger entry for the current PTY-alloc
   status.
 
+## Running cmdash
+
+Build per [Installation & Build](#installation--build), then:
+
+```bash
+# Default launch — no flags. Tracing filter is $RUST_LOG
+# (if set), else 'info'.
+./target/release/cmdash
+
+# Verbose: every tracing event the binary emits lands.
+./target/release/cmdash --log-level=trace
+
+# Quiet: only warnings + errors above.
+./target/release/cmdash --log-level=warn
+
+# Help / unknown value → exit 0 / exit 2 with a usage message.
+./target/release/cmdash --help
+```
+
+The `--log-level=<level>` flag (one of `error` / `warn` /
+`info` / `debug` / `trace`, case-insensitive) overrides the
+`RUST_LOG` env var and the `info` fallback when set. See
+[`docs/configuration.md` §1.4](./docs/configuration.md) for
+the full precedence rules and the two Pitfall notes (silent
+launch at `--log-level=error`; crate-targeted filtering
+required to go through `$RUST_LOG`).
+
 ## Architecture (one frame)
 
 The `cmdash::main::TickContext::run` loop iterates `self.runners`

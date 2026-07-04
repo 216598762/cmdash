@@ -60,15 +60,157 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::Terminal;
 use tracing::{debug, info, warn};
 
+/// Parsed CLI arguments. The v1 binary's launch surface is
+/// deliberately minimal — exactly one override
+/// (`--log-level=<level>`) plus `--help` / `-h` — so a
+/// hand-rolled [`parse_cli_args`] function keeps the dep
+/// graph free of `clap` / `pico-args`. Future surface-area
+/// growth (config-override flags, alternate-config paths,
+/// …) should still re-evaluate dep-free hand-rolling before
+/// re-adding a parser crate; the `Cargo.toml` constraint at
+/// v1.0.0 is "minimize the workspace's external-dep churn
+/// between minor versions".
+struct CliArgs {
+    /// `Some(level)` iff `--log-level=<level>` was passed (the
+    /// value is already validated against
+    /// `error|warn|info|debug|trace`). `None` means the
+    /// subscriber falls back to `RUST_LOG` env var, then
+    /// `info` default.
+    log_level: Option<String>,
+    /// `true` iff `--help` or `-h` was passed.
+    help: bool,
+}
+
+/// Usage text printed on `--help` / `-h` and after a parse
+/// error. Held in a `&'static str` constant so `print!` /
+/// `eprint!` can take a borrow without re-allocating on each
+/// invocation. Multi-line string with `\` line-continuations
+/// keeps the embedded indentation readable in source.
+const USAGE: &str = "\
+Usage: cmdash [--log-level=<level>]
+
+Options:
+  --log-level=<level>   tracing-subscriber filter level: one of
+                        error, warn, info, debug, trace
+                        (case-insensitive). When set, overrides
+                        both the $RUST_LOG env var and the
+                        fallback 'info' default.
+  -h, --help            print this help message and exit.
+
+Notes:
+  The flag is strictly pre-tracing_subscriber init: --log-level
+  drives the EnvFilter for the binary's INFO/WARN/DEBUG/TRACE
+  events from the FIRST tracing macro call forward. Crate-
+  targeted filtering (e.g. cmdash_layout=debug) still routes
+  through $RUST_LOG in the standard EnvFilter direct-string
+  form, and is mutually exclusive with --log-level for a
+  single launch.
+";
+
+/// Hand-rolled argv parser for the v1 launch surface (see
+/// [`CliArgs`]). The full intended surface area is exactly:
+///
+/// - `--log-level=<level>` (mandatory value)
+/// - `--log-level` bare ⇒ parse error (no implicit fallback)
+/// - `--help` / `-h` ⇒ terminate-after-print
+/// - any `--foo` / `-x` flag ⇒ parse error
+/// - any positional arg ⇒ parse error
+///
+/// The bare `--log-level` case is rejected (rather than
+/// silently falling through to "$RUST_LOG or info") so a
+/// typo like `cmdash --log-level` does not quietly behave
+/// differently from `cmdash` — a `warn!` event late in the
+/// tick loop would mask a CLI mistake in the user's
+/// mental model.
+///
+/// Takes an explicit `&[String]` rather than calling
+/// `std::env::args()` directly so unit tests can drive it
+/// without monkey-patching the process environment.
+fn parse_cli_args(args: &[String]) -> Result<CliArgs, String> {
+    let mut out = CliArgs {
+        log_level: None,
+        help: false,
+    };
+    for arg in args.iter().skip(1) {
+        if arg == "--help" || arg == "-h" {
+            out.help = true;
+            continue;
+        }
+        if arg == "--log-level" {
+            return Err(
+                "cmdash: --log-level requires a value: --log-level=<level>".to_string(),
+            );
+        }
+        if let Some(val) = arg.strip_prefix("--log-level=") {
+            match val.to_ascii_lowercase().as_str() {
+                "error" | "warn" | "info" | "debug" | "trace" => {
+                    out.log_level = Some(val.to_string());
+                }
+                _ => {
+                    return Err(format!(
+                        "cmdash: invalid --log-level value {val:?} \
+                         (expected error|warn|info|debug|trace)"
+                    ));
+                }
+            }
+            continue;
+        }
+        if arg.starts_with('-') {
+            return Err(format!("cmdash: unknown flag: {arg:?}"));
+        }
+        return Err(format!(
+            "cmdash: unexpected positional argument: {arg:?}"
+        ));
+    }
+    Ok(out)
+}
+
 fn main() {
+    // Parse args BEFORE tracing_subscriber::init() so the CLI
+    // override can drive the EnvFilter before any subscriber
+    // state is set globally. We exit 2 (standard Unix
+    // usage-error) on bad arg syntax rather than forwarding
+    // to `run()` so a typo never sneaks a wrong log level
+    // through to the binary's first tracing macro call.
+    let cli = match parse_cli_args(&std::env::args().collect::<Vec<_>>()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!();
+            eprint!("{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    if cli.help {
+        print!("{USAGE}");
+        return;
+    }
+
+    // Filter precedence, highest first:
+    //   1. `--log-level=<level>` (CLI override)
+    //   2. `RUST_LOG` env var (tracing-subscriber default)
+    //   3. `info` (v1.0.0 release default)
+    let env_filter = if let Some(level) = cli.log_level.as_deref() {
+        tracing_subscriber::EnvFilter::new(level)
+    } else if let Ok(env_filter) =
+        tracing_subscriber::EnvFilter::try_from_default_env()
+    {
+        env_filter
+    } else {
+        tracing_subscriber::EnvFilter::new("info")
+    };
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(env_filter)
         .with_target(false)
         .init();
-    info!("cmdash starting (ratatui text body + dashcompositor kitty graphics)");
+    if let Some(level) = &cli.log_level {
+        info!(
+            log_level = %level,
+            "cmdash starting (cli log-level override); ratatui text body + dashcompositor kitty graphics"
+        );
+    } else {
+        info!("cmdash starting (ratatui text body + dashcompositor kitty graphics)");
+    }
     if let Err(e) = run() {
         eprintln!("cmdash: fatal: {e}");
         std::process::exit(1);
@@ -1622,6 +1764,148 @@ fn event_to_bytes(code: KeyCode) -> Option<Vec<u8>> {
     Some(bytes.to_vec())
 }
 
+#[cfg(test)]
+mod cli_args_tests {
+    //! Unit tests for [`parse_cli_args`]. The function is
+    //! intentionally hand-rolled to keep the v1 binary's
+    //! dep graph free of `clap` / `pico-args`, so the test
+    //! surface here pins the language-level behavior
+    //! (validation, error messages, set/clear of the override
+    //! field) rather than deferring to a third-party parser
+    //! crate's table-driven self-tests. The
+    //! `log_level_verbose_shorthand_is_still_rejected` test
+    //! in particular is a deliberate "design choice" lock so
+    //! a future contributor adding `-v` shorthand has to
+    //! address the ask_user choice behind the v1 launch
+    //! surface first.
+    use super::{parse_cli_args, CliArgs};
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn log_level_all_six_valid_levels_parse_ok() {
+        for level in ["error", "warn", "info", "debug", "trace"] {
+            let raw = format!("--log-level={level}");
+            let parsed = parse_cli_args(&argv(&["cmdash", &raw]))
+                .unwrap_or_else(|e| panic!("{level} must parse: {e}"));
+            assert_eq!(
+                parsed.log_level.as_deref(),
+                Some(level),
+                "validator must echo the canonical lowercase form"
+            );
+            assert!(!parsed.help);
+        }
+    }
+
+    #[test]
+    fn log_level_upper_case_is_accepted_with_canonical_lowercase_casing() {
+        let parsed = parse_cli_args(&argv(&["cmdash", "--log-level=DEBUG"]))
+            .expect("--log-level=DEBUG must parse (case-insensitive)");
+        assert_eq!(
+            parsed.log_level.as_deref(),
+            Some("DEBUG"),
+            "parser preserves original casing in the stored value; \
+             EnvFilter normalizes it downstream"
+        );
+    }
+
+    #[test]
+    fn log_level_bare_flag_is_rejected_with_usage_error_message() {
+        let err = parse_cli_args(&argv(&["cmdash", "--log-level"]))
+            .expect_err("--log-level with no =value must be a parse error");
+        assert!(
+            err.contains("--log-level") && err.contains("requires a value"),
+            "error message must name the flag and the missing-value requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn log_level_unknown_value_is_rejected_with_the_offending_value_quoted() {
+        let err = parse_cli_args(&argv(&["cmdash", "--log-level=BOGUS"]))
+            .expect_err("--log-level=BOGUS must be a parse error");
+        assert!(
+            err.contains("BOGUS") && err.contains("error"),
+            "error message must quote the offending value and list valid levels: {err}"
+        );
+    }
+
+    #[test]
+    fn log_level_verbose_shorthand_is_still_rejected_in_v1() {
+        // Deliberate: the user explicitly chose --log-level=<level>
+        // over -v / --verbose via ask_user. Lock that decision
+        // so a future contributor adding `-v` shorthand has to
+        // address the ask_user precedent before merging.
+        assert!(
+            parse_cli_args(&argv(&["cmdash", "-v"])).is_err(),
+            "-v must remain rejected; --log-level=<level> is the v1 binary's only verbosity dial"
+        );
+        assert!(
+            parse_cli_args(&argv(&["cmdash", "--verbose"])).is_err(),
+            "--verbose must remain rejected; --log-level=<level> is the v1 binary's only verbosity dial"
+        );
+    }
+
+    #[test]
+    fn help_flag_short_and_long_set_help_true_and_leave_level_none() {
+        for flag in ["--help", "-h"] {
+            let parsed = parse_cli_args(&argv(&["cmdash", flag]))
+                .unwrap_or_else(|e| panic!("{flag} must parse, not error: {e}"));
+            assert!(parsed.help, "{flag} must turn help=true");
+            assert!(
+                parsed.log_level.is_none(),
+                "{flag} must not affect log_level"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_long_flag_is_rejected() {
+        let err = parse_cli_args(&argv(&["cmdash", "--unknown-flag"]))
+            .expect_err("--unknown-flag must be a parse error");
+        assert!(
+            err.contains("unknown") && err.contains("--unknown-flag"),
+            "error message must name the unknown flag: {err}"
+        );
+    }
+
+    #[test]
+    fn positional_argument_is_rejected() {
+        let err = parse_cli_args(&argv(&["cmdash", "extra"]))
+            .expect_err("positional arg must be a parse error");
+        assert!(
+            err.contains("positional") && err.contains("\"extra\""),
+            "error message must name the offending token: {err}"
+        );
+    }
+
+    #[test]
+    fn no_args_returns_empty_with_help_false_and_level_none() {
+        let parsed = parse_cli_args(&argv(&["cmdash"]))
+            .expect("argv = [\"cmdash\"] is the no-args case and must parse");
+        assert_eq!(parsed.log_level, None);
+        assert!(!parsed.help);
+    }
+
+    #[test]
+    fn cli_args_struct_can_be_constructed_with_default_field_set() {
+        // A future revision that adds a new field to CliArgs
+        // will break this test site as a "remember to update the
+        // tests" reminder rather than silently absorbing the new
+        // field.
+        let _ = CliArgs {
+            log_level: None,
+            help: false,
+        };
+    }
+}
+
+// Existing `input_tests` module: tick-loop regression tests that
+// drive `cmdash::run` end-to-end via the test backend. Adding
+// `cli_args_tests` ABOVE rather than BELOW this module keeps
+// related test modules grouped together and the new tests visible
+// immediately when a future reader opens the bottom of the file.
 #[cfg(test)]
 mod input_tests {
     //! Regression tests for the binary's `cmdash::run` tick-loop
