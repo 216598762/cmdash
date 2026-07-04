@@ -45,17 +45,20 @@
 
 name: ci
 
-# IMPORTANT: the `on:` key is quoted as `"on":` to escape the YAML 1.1
-# boolean-coercion trap. Bare `on:` parses as `true:` under YAML 1.1
-# (Go yaml.v3's default which GitHub's Actions parser inherits) and
-# GH Actions' downstream trigger-detector then does not find any
-# `workflow_dispatch` trigger — leading to HTTP 422 on `gh workflow
-# run` AND a parallel ghost `event=push` run with `jobs=[]` that
-# surfaces as `conclusion: failure` for the actual `git push` itself.
-# The combined `"on": [workflow_dispatch]` form (quoted key +
-# inline flow-sequence value) is the most-robust shape across the
-# parser versions users have reported in the wild.
-"on": [workflow_dispatch]
+# `on: workflow_dispatch:` (canonical block form) is what both the
+# GH Actions parser AND `gh workflow run` recognize as a dispatch
+# trigger. The prior atom (the `c92da3b + ed8d849 + 7b65b7a` chain
+# right after the 5e27556 clippy baseline) tried the inline quoted
+# form `"on": [workflow_dispatch]` (claimed-most-robust per a YAML
+# 1.1 quoting-trap narrative that turns out NOT to apply to the GH
+# Actions parser); `gh workflow run ci.yml --ref main` consistently
+# returned HTTP 422 with body "Workflow does not have
+# 'workflow_dispatch' trigger" -- even though `gh workflow list`
+# reported the workflow as active (registering the YAML cleanly but
+# not recognizing the inline form as a dispatch trigger). Canonical
+# block form is the docs-canonical shape that resolves this.
+on:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
