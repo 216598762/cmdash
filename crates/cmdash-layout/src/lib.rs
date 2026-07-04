@@ -540,7 +540,7 @@ pub fn remove_leaf(root: &mut LayoutNode, path: &[u16]) -> Result<(), LayoutErro
 /// `.ok()?` if they already short-circuit on `None`); the
 /// `cmdash` binary uses this pattern at its 4 inline callsites
 /// (`focused_zstack_context` / `handle_stack_cycle` /
-/// `handle_stack_down` / `handle_stack_up`).
+/// `crosstack_member(Direction::Down|Up|Left|Right, advance)`).
 ///
 /// The path-traversal contract is pinned by the unit tests
 /// `replace_leaf_with_split_preserves_original_pre_order` (asserts
