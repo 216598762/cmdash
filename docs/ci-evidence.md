@@ -145,6 +145,69 @@ reference host. No `--no-gpg-sign` per-commit workaround unless
 the host's GPG agent remains TTY-less (it does; same
 workaround as `ebde062` and `fa861ac`).
 
+### Audit cycle 1 — chain atoms 75b20a6 → 1e44a44
+
+Forward-fixup audit-cycle entry. Each atom in the audit range was
+inspected for *measured* pass/fail claims in its commit body vs
+`cargo test -p cmdash-pty --quiet` on origin/main@1e44a44 (this
+audit cycle's reference host; post-cycle-0 ledger chain).
+
+- **75b20a6** — `docs(ci-evidence): audit cycle 0 thin-boundary edge-case clarification`
+  - files: `docs/ci-evidence.md` only
+  - claim-line grep: references `AT INVOCATION TIME`, `AT COMMIT
+    TIME`, `expected=3`, `300/300 green`, `audit-protocol note`
+    describing the audit-protocol boundary CLARIFICATION shape
+    (not measured pass/fail values); **no measured pass/fail
+    claim**. The semantic references to pass/fail concepts in the
+    body ARE the very subject of the audit-protocol boundary
+    clarification that the atom adds — they describe RECIPE
+    DESIGN vs MEASURED ASSERTION, not measured values.
+- **1e44a44** — `docs(ci-evidence): condense audit cycle 0 edge-case note to one sentence`
+  - files: `docs/ci-evidence.md` only
+  - claim-line grep: references `one sentence`, `user-specified`,
+    `(audit-protocol note)` describing the form-iteration;
+    **no measured pass/fail claim**. The atom's body reports the
+    diff (multi-sentence → single-sentence) but does not assert
+    any cargo-test ground-truth.
+
+- **Aggregate claim**: zero of the two atoms report a measured
+  cmdash-pty pass/fail count divergent from the actual ground-truth
+  on the reference host.
+- **Actual** (reference host origin/main@1e44a44):
+  `13 passed; 0 failed; 1 ignored` per `cargo test -p cmdash-pty --quiet`.
+- **Delta**: 0 divergent claims in this audit cycle.
+- **Effect**: the chain's `75b20a6 → 1e44a44` atoms are doc-only
+  ledger edits to a CI evidence ledger; they make NO measured
+  pass/fail claim about the cmdash-pty library test suite that
+  could diverge from actual ground-truth. Audit-cycle-1 confirms
+  that the post-cycle-0 ledger chain's doc-only forward-fixups
+  preserve audit-protocol integrity without introducing
+  measurable drift. The earlier `ecfa1f2` atom's body-claim
+  `22 PASS + 0 FAIL + 1 IGNORED` (corrected in this ledger's
+  prior entry) remains the unique measured-claim divergence in
+  the cumulative chain.
+- **Evidence**:
+  - host: Arch Linux PTY-alloc; Rust 1.96.1
+  - audit range: 2 atoms (`75b20a6`, `1e44a44`)
+  - reference host: origin/main@1e44a44 (post-condensation
+    ledger state)
+  - invocation: `cargo test -p cmdash-pty --quiet` (single shot)
+  - per-atom claim-line grep pattern:
+    `grep -iE 'pass|fail|clippy|+libc|cat-echo|ignore|kitty|soak|baseline|22 PASS|13 PASS|\b300\b|expected='`
+    (matches were classified manually by inspecting body context
+    as audit-protocol boundary discussion / form-iteration note /
+    recipe-target semantic reference; none are measured pass/fail
+    claims).
+
+Audit cycle 1 completes with **zero divergent claims**. Per the
+aggregate-batch forward-fixup shape established in audit cycle 0,
+this single doc-only atom records the audit cycle 1 negative
+result for future audit reads. Subsequent audit cycles continue
+the `### Audit cycle N` subscript convention so cumulative audit
+trail scales linearly (`### Audit cycle 0`, `### Audit cycle 1`,
+`### Audit cycle 2`, ... -- cycle-numbering convention per
+code-reviewer item-1 on the prior `53e1b13` review pass).
+
 ## How to add a new entry
 
 1. Forward-fixup atom atop the current `origin/main`.
