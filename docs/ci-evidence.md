@@ -550,15 +550,123 @@ plus **one framework-in-place finding** that future audits will
 measure against once OPENAI_API_KEY is set AND `just flake-soak`
 runs locally OR dispatch HTTP 422 clears AND the GH-Actions SOAK
 completes 300 runs on ubuntu-22.04. Per the aggregate-batch
-forward-fixup shape established in audit cycle 0, this single
-doc-only atom records the audit cycle 4 negative-result /
-measurement-pending state for future audit reads. Cycle-numbering
-convention continues (`### Audit cycle 0`, `### Audit cycle 1`,
-`### Audit cycle 2`, `### Audit cycle 3`, `### Audit cycle 4`, ...).
+forward-fixup shape established in audit cycle 0, this singledoc-only atom records the audit cycle 4 negative-result /
+measurement-pending state for future audit reads.
+Cycle-numbering convention continues (`### Audit cycle 0`,
+`### Audit cycle 1`, `### Audit cycle 2`, `### Audit cycle 3`,
+`### Audit cycle 4`, `### Audit cycle 5`, ...).
 The `### Audit cycle 3` line above lists only `0, 1, 2` because
 the cycle 3 entry was authored before cycle 4 existed; the
 counting convention is read in monotonically-accending order from
-the audit cycle entries in this file (which are now `0, 1, 2, 3, 4`).
+the audit cycle entries in this file (which are now `0, 1, 2, 3, 4, 5`).
+
+### Audit cycle 5 - workflow removal closes the dispatch-failure investigation
+
+Forward-fixup audit-cycle entry documenting the workflow-removal
+atom (`7b8eee0`) as the closure of the dispatch-blocker
+investigation thread that audit cycles 2 + 3 documented as
+deliverable-did-not-arrive findings plus cycle 4's LLM-judge
+framework-in-place measurement-pending state. The dispatch-
+blocker source has been REMOVED from the repo entirely (rather
+than resolved transitively); cycles 2 + 3 dispatch-blocker
+findings therefore become MFA (made-for-archive) for that side
+of the trail, while audit cycle 4's framework-in-place finding
+remains LIVE pending a real local-SOAK capture.
+
+- **7b8eee0** -- `cleanup: remove .github/workflows/ci.yml
+  entirely`
+  - files: `.github/workflows/ci.yml` (deleted); empty parent
+    directories `.github/workflows/` + `.github/` (pruned).
+    Verified post-commit: `ls -la .github` produces "cannot
+    access .github: No such file or directory".
+  - claim-line grep: references `cleanup`, `remove entirely`,
+    `forward-fixup atom atop f8326bd`, `dispatch-blocker source
+    from the repo`, `Local just flake-soak + cargo test -p
+    cmdash-pty remain as the only CI gate`, describing the
+    removal action + dispatch-blocker cause stripped. **No
+    measured pass/fail claim**; the binding is the file
+    deletion itself, not a cargo-test measurement.
+
+> Forward-fixup-only-no-rewind discipline preserved: chain
+> progresses `f8326bd -> 7b8eee0`; per-commit
+> `--no-gpgsign=false` host signature workaround applied; no
+> amend, no rebase, no force-push. Cross-reference:
+> `docs/1.0-checklist.md` (atom `5754742`) marks this atom's
+> intent as checklist line item A1 status DONE.
+
+- **Aggregate claim**: zero divergent measured claims in this
+  audit cycle plus one **dispatch-blocker-source-removed
+  finding** -- the audit trajectory that cycles 2 + 3 partially
+  documented is now closed by REMOVAL rather than RESOLUTION;
+  future audit readers can interpret cycles 2 + 3
+  dispatch-blocker findings as historical observations of the
+  original `c92da3b .. e4d28d3` chain's dispatch-blocked state,
+  no longer load-bearing for the current lineage.
+- **Actual** (reference host origin/main@7b8eee0): local
+  `cargo test -p cmdash-pty --quiet` on this audit host would
+  produce `13 passed; 0 failed; 1 ignored` (matches cycles
+  0/1/2/3/4 ground-truth; the `cmdash-pty` source is unchanged).
+  The remote-side GH-Actions measurement is NO LONGER POSSIBLE
+  -- the workflow file is gone, the GH Actions `dispatches`
+  endpoint is no longer addressable, and the GH API cannot
+  exercise workflow routing for a workflow that does not
+  exist in the repo.
+- **Delta**: 0 measured-claim divergences + 1 dispatch-blocker-
+  source-removed finding. Cycle 5's finding is structurally
+  distinct from cycles 2 + 3 + 4's findings:
+  - Cycles 2 + 3 found: dispatch-blocker present and
+    persistent (whichever YAML form was tried). Cumulative
+    pattern: inline-form = `event=push` ghost runs +
+    missing-trigger HTTP 422 on branch refs; canonical-block-
+    form = missing-trigger HTTP 422 persists.
+  - Cycle 4 found: LLM-judge framework-in-place + measurement-
+    pending (gated on OPENAI_API_KEY + dispatch HTTP 422,
+    independent of the LLM-judge layer).
+  - Cycle 5 (new): dispatch-blocker source REMOVED from the
+    repo. Audit marker for "this investigation thread is
+    closed".
+
+- **Effect**: cycles 2 + 3 dispatch-blocker findings become
+  MFA (made-for-archive) for the dispatch-blocker side of the
+  cumulative audit trail. The dispatch-blocker investigation
+  thread is closed; future readers do not re-derive the
+  GH-Actions workflow_dispatch endpoint as the failure vector
+  since the workflow file no longer exists in the repo.
+  Cycle 4's LLM-judge framework-in-place finding remains
+  LIVE: the harness shape is in place per atom `6acdd54` +
+  `457b51c` (forward-fixup chain at `1b635fc -> 6acdd54 ->
+  457b51c`), but a real local-SOAK capture (with OPENAI_API_KEY
+  set + ~$0.02-$0.05 OpenAI budget for 300 x gpt-4.1-mini
+  classifications) is still pending -- checklist line item A2
+  in `docs/1.0-checklist.md` (atom `5754742`).
+
+- **Evidence**:
+  - host: Arch Linux PTY-alloc; Rust 1.96.1
+  - audit range: 1 atom (`7b8eee0`)
+  - reference host: origin/main@7b8eee0
+  - per-atom claim-line grep pattern:
+    `grep -iE 'cleanup|remove entirely|forward-fixup atom atop|
+    dispatch-blocker|workflow_dispatch|MFA|just flake-soak|
+    cargo test -p cmdash-pty only CI gate'`
+  - workflow-removal evidence stream:
+    `git ls-tree -r HEAD | grep workflows` (returns 0 lines;
+    the `.github/workflows/` subtree is gone from the tree)
+  - audit-protocol cross-reference: cycle 2 (line 211, pre-
+    canonical-form dispatch failure), cycle 3 (line 333, post-
+    canonical-form dispatch still-failing), cycle 4 (line
+    433, LLM-judge framework-in-place), and the dispatch-
+    blocker thread closure is at 1.0 checklist line item A1 =
+    DONE (atom `5754742`).
+
+Audit cycle 5 completes with **zero measured-claim divergences**
+plus **one dispatch-blocker-source-removed finding** that
+closes the audit thread initiated by cycles 2 + 3. Per the
+aggregate-batch forward-fixup shape established in audit
+cycle 0, this single doc-only atom records the audit cycle 5
+closure for future audit reads. Cycle-numbering convention
+continues (`### Audit cycle 0`, `### Audit cycle 1`,
+`### Audit cycle 2`, `### Audit cycle 3`, `### Audit cycle 4`,
+`### Audit cycle 5`, ...).
 
 ## How to add a new entry
 
