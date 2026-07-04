@@ -207,6 +207,129 @@ the `### Audit cycle N` subscript convention so cumulative audit
 trail scales linearly (`### Audit cycle 0`, `### Audit cycle 1`,
 `### Audit cycle 2`, ...).Cycle-numbering convention established in audit cycle 0.
 
+
+### Audit cycle 2 - dispatch failure (HTTP 422) - pre-canonical-form reference host
+
+Forward-fixup audit-cycle entry documenting the dispatch-broken
+state at the pre-canonical-form reference host (origin/main@56588b1).
+The pre-fix dispatch attempt tripped two convergent HTTP 422 failure
+modes on the inline-quoted-form `"on": [workflow_dispatch]` workflow
+authoring (the same authoring preserved from the `c92da3b +
+ed8d849 + 7b65b7a` chain):
+
+1. **SHA-ref rejection**: `gh workflow run ci.yml --ref <SHA>`
+   (targeting a specific historical commit by SHA) returns HTTP 422
+   with body "No ref found for: <SHA>". `gh workflow run` does not
+   accept commit SHAs as `--ref` values; only branch / tag /
+   `refs/heads/<x>` formats resolve.
+2. **Missing-trigger rejection**: `gh workflow run ci.yml --ref main`
+   (or `--ref refs/heads/main`) returns HTTP 422 with body "Workflow
+   does not have 'workflow_dispatch' trigger". The inline-quoted-form
+   was not recognized by the GH Actions parser as registering a
+   workflow_dispatch trigger despite `gh workflow list` reporting
+   the workflow as `state=active`.
+
+This entry exists so future audit readers do not re-derive the
+two convergent failure modes from scratch. Cross-reference: the
+subsequent cycle 2 entry at `87cf9fa` (chain atom `e4d28d3`)
+documents that the canonical `on: workflow_dispatch:` block-form
+swap ALSO fails on the dispatches endpoint, so the dispatch
+rejection is orthogonal to the YAML form, not resolved by it.
+
+- **56588b1** (inline-form on-disc; pre-canonical-form):
+  - files: `.github/workflows/ci.yml` (the workflow file at this
+    host state carried the inline-quoted-form authoring
+    unchanged from the `c92da3b + ed8d849 + 7b65b7a` chain);
+    8 doc-only ledger atoms had accumulated on top of the
+    workflow chain by this lineage position (ebde062 + fa861ac
+    + 53e1b13 + 75b20a6 + 1e44a44 + d593549 + f9bd266 + 56588b1)
+  - diagnostic dispatches (verbatim from basher transcripts):
+    - `gh workflow run ci.yml --ref 56588b1` -> HTTP 422
+      with body "No ref found for: 56588b1" (SHA-ref class)
+    - `gh workflow run ci.yml --ref HEAD` -> HTTP 422
+      (SHA-ref class)
+    - `gh workflow run ci.yml --ref main` -> HTTP 422 with
+      body "Workflow does not have 'workflow_dispatch' trigger"
+      (missing-trigger class)
+    - `gh workflow run ci.yml --ref refs/heads/main` -> HTTP
+      422 (missing-trigger class)
+
+- **Aggregate claim**: zero measured divergent claims in this
+  audit cycle (no measurement surfaced because no SOAK step ran;
+  audit-protocol integrity preserved by default in the absence
+  of measurement).
+- **Actual** (reference host origin/main@56588b1): local
+  `cargo test -p cmdash-pty --quiet` on this audit host
+  produces `13 passed; 0 failed; 1 ignored` (matches cycle 0 +
+  cycle 1 ground-truth; the doc-only equivalence class is in
+  scope at `56588b1`'s lineage position because the changes
+  between cycles 0/1 and `56588b1` are all doc-only). Remote-side
+  measurement: NOT AVAILABLE (dispatch failed with HTTP 422 on
+  every ref variant).
+- **Delta**: 0 measured-claim divergences + 2 dispatch-broken
+  findings captured here for the historical reader:
+  - **SHA-ref rejection** (HTTP 422 on `--ref <SHA>`): a
+    `gh workflow run` CLI constraint, not a workflow YAML
+    issue; future readers target branches or tags instead of
+    SHAs.
+  - **Missing-trigger rejection** (HTTP 422 on `--ref main`):
+    a workflow YAML form issue at this lineage position;
+    subsequently shown (by audit cycle 2 at `87cf9fa`) to
+    persist even after the canonical-form swap, so the rejection
+    is NOT a YAML form issue but a deeper GH API
+    dispatches-endpoint gating layer (likely workflow-level
+    permissions or run-event-arbitration cache, NOT the
+    YAML form).
+
+- **Effect**: this entry anchors the dispatch-broken state at
+  the pre-canonical-form lineage position so the cumulative
+  audit trail can be reconstructed without re-deriving the
+  diagnostic findings from scratch. Combined with the prior
+  audit cycle 0 finding (`event=push` misclassifications) and
+  the subsequent cycle 2 entry at `87cf9fa` (canonical-form
+  also fails), the cumulative trail shows:
+  - inline-form authoring = `event=push` ghost runs + missing-
+    trigger HTTP 422 on branch refs + SHA-ref HTTP 422 on SHA refs
+  - canonical-form swap = missing-trigger HTTP 422 on branch
+    refs persists (ghost runs go away because the swap is real
+    but the trigger is still unrecognized on the dispatches
+    endpoint)
+  The two findings (this entry + the post-fix cycle 2 entry
+  at `87cf9fa`) collectively handoff the dispatch-failure
+  residual to audit cycle 3 candidates, who will need to
+  investigate the deeper GH API layer (workflow permissions /
+  run-event-arbitration caching / branch-protection rules)
+  rather than the YAML form.
+
+- **Evidence**:
+  - host: Arch Linux PTY-alloc; Rust 1.96.1
+  - audit range: 0 chain atoms (this entry documents a host-
+    state finding at the pre-canonical-form lineage, not a
+    per-atom body-claim audit; SHA-ref + missing-trigger 422s
+    are properties of the host state, not any specific atom's
+    body claim)
+  - reference host: origin/main@56588b1
+  - diagnostic dispatches (verbatim, all observed live):
+    - SHA-ref class: `gh workflow run ci.yml --ref 56588b1`
+      -> HTTP 422 (body "No ref found for: 56588b1");
+      `gh workflow run ci.yml --ref HEAD` -> HTTP 422
+    - missing-trigger class: `gh workflow run ci.yml --ref
+      main` -> HTTP 422 (body "Workflow does not have
+      'workflow_dispatch' trigger"); `gh workflow run ci.yml
+      --ref refs/heads/main` -> HTTP 422
+  - per-finding grep pattern:
+    `grep -iE 'workflow_dispatch|HTTP 422|ref resolution|
+    no ref found|trigger'`
+
+This entry anchors at the pre-canonical-form lineage so the
+cumulative audit trail can be reconstructed without re-deriving
+the SHA-ref or missing-trigger findings. The post-canonical-form
+cycle 2 entry at `87cf9fa` (chain atom `e4d28d3`) documents the
+second leg of this trail (canonical-form also failing on the
+dispatches endpoint), and the two entries together form the
+full dispatch-failure handoff to audit cycle 3 candidates.
+Cycle-numbering convention: collision-resolution via
+descriptive qualifier (per the `56588b1` convention note).
 ### Audit cycle 2 — chain atom e4d28d3 (dispatch HTTP 422 non-fix)
 
 Forward-fixup audit-cycle entry documenting a NEGATIVE result on the
