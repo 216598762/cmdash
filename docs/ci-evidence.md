@@ -101,7 +101,7 @@ modifies `docs/ci-evidence.md` only).
 > **Edge-case clarification** (audit-protocol note): strict-pin
 > targets such as `expected=3` (from `clippy-baseline-3`) and
 > `300/300 green` (from `flake-soak`) are enforced AT INVOCATION
-> TIME by the recipe - not asserted AT COMMIT TIME by the body - so
+> TIME by the recipe — not asserted AT COMMIT TIME by the body — so
 > audit readers should not classify them as measured claims even
 > though the phrases semantic-reference pass/fail concepts upstream
 > of the recipe-enforcement boundary.
@@ -205,8 +205,8 @@ this single doc-only atom records the audit cycle 1 negative
 result for future audit reads. Subsequent audit cycles continue
 the `### Audit cycle N` subscript convention so cumulative audit
 trail scales linearly (`### Audit cycle 0`, `### Audit cycle 1`,
-`### Audit cycle 2`, ... -- cycle-numbering convention per
-code-reviewer item-1 on the prior `53e1b13` review pass).
+`### Audit cycle 2`, ...). Cycle-numbering convention established
+in audit cycle 0.
 
 ## How to add a new entry
 
