@@ -68,7 +68,7 @@ For most cases, use the bundled default **`Alt-Q`** (binds to
 `app.close`), which sets `running = false` so the tick loop returns
 and the `TerminalGuard` restores the host terminal (raw-mode +
 alternate-screen + mouse-capture). Closing the **last** pane via
-`pane.close` (default **`Ctrl-W`**) also quits.
+`pane.close` (default **`Alt-W`**) also quits.
 
 ---
 
@@ -144,8 +144,8 @@ Each child must be a `bind` line — anything else is
 
 ```kdl
 keybinds {
-    bind "ctrl-w" action="pane.close"
-    bind "alt-q" action="app.close"
+    bind "alt-w"  action="pane.close"
+    bind "alt-q"   action="app.close"
 }
 ```
 
@@ -415,8 +415,8 @@ layout {
 }
 
 keybinds {
-    bind "ctrl-w" action="pane.close"
-    bind "alt-q" action="app.close"
+    bind "alt-w"  action="pane.close"
+    bind "alt-q"   action="app.close"
 }
 ```
 
@@ -440,8 +440,8 @@ layout {
 }
 
 keybinds {
-    bind "ctrl-w"  action="pane.close"
-    bind "alt-q"  action="app.close"
+    bind "alt-w"   action="pane.close"
+    bind "alt-q"   action="app.close"
     bind "ctrl-n"  action="app.new-pane"
     bind "ctrl-h"  action="pane.focus.left"
     bind "ctrl-j"  action="pane.focus.down"
@@ -481,8 +481,8 @@ layout {
 }
 
 keybinds {
-    bind "ctrl-w"                               action="pane.close"
-    bind "alt-q"                               action="app.close"
+    bind "alt-w"                                action="pane.close"
+    bind "alt-q"                                action="app.close"
     bind "ctrl-c"                               action="pane.stack.cycle"
     bind "ctrl-alt-down"                        action="pane.stack.down"
     bind "ctrl-alt-up"                          action="pane.stack.up"
@@ -532,8 +532,8 @@ presets {
 }
 
 keybinds {
-    bind "ctrl-w"  action="pane.close"
-    bind "alt-q"  action="app.close"
+    bind "alt-w"   action="pane.close"
+    bind "alt-q"   action="app.close"
     bind "ctrl-1"  action="pane.preset.code"
     bind "ctrl-2"  action="pane.preset.logs"
     bind "alt-1"   action="pane.preset.code"
@@ -568,8 +568,8 @@ layout {
 }
 
 keybinds {
-    bind "ctrl-w"  action="pane.close"
-    bind "alt-q"  action="app.close"
+    bind "alt-w"   action="pane.close"
+    bind "alt-q"   action="app.close"
     bind "ctrl-n"  action="app.new-pane"
     bind "ctrl-h"  action="pane.focus.left"
     bind "ctrl-j"  action="pane.focus.down"

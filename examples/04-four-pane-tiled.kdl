@@ -25,7 +25,7 @@ layout {
 }
 
 keybinds {
-    bind "ctrl-w"  action="pane.close"
+    bind "alt-w"   action="pane.close"
     bind "alt-q"   action="app.close"
     bind "ctrl-n"  action="app.new-pane"
     bind "ctrl-h"  action="pane.focus.left"
