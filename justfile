@@ -270,39 +270,51 @@ PAYLOAD_EOF
 
 
 # ------------------------------------------------------------------------------
-# clippy-baseline-3: pin cargo clippy residual count to EXACTLY 3.
+# clippy-baseline-0: pin cargo clippy residual count to EXACTLY 0.
 # ------------------------------------------------------------------------------
 #
-# Per user authorization (strict-pin option), this recipe FAILS
-# IMMEDIATELY if the count is not exactly 3. The current actual count
-# is 0 (per `cargo clippy --workspace --all-targets -- -D warnings` on
-# `origin/main@7b65b7a`), so the recipe WILL FAIL on first run -- that
-# is the deliberate tripwire alerting to the stale `5e27556`
-# "3-residual" claim carried in earlier commit bodies. Future drift in
-# either direction (someone fixes a residual and the count drops, OR
-# someone regresses clippy and the count rises) trips this alert and
-# surfaces as a forward-fixup candidate.
+# Per the B1 forward-fixup atop `5754742` (the 1.0 checklist B1 line
+# item), the `clippy-baseline-3` recipe (which hard-coded
+# `EXPECTED=3` as a deliberate tripwire against the `5e27556`
+# "3-residual" claim carried in earlier commit bodies) was renamed +
+# retargeted to `clippy-baseline-0` with `EXPECTED=0` to match the
+# current actual residual count on origin/main (which has been 0
+# since the cleanup-era atoms resolved the 5e27556 residuals).
 #
-# The expected count is hard-coded to 3 (per user spec). If the actual
-# count drifts, the recipe's stdout shows:
-#   EXPECTED count: 3
+# The strict-pin intent is preserved: this recipe exits-1 if `cargo
+# clippy` produces ANY residual `^error` line, so a future regression
+# that introduces (or re-introduces) clippy warnings-as-errors still
+# surfaces as a forward-fixup candidate. The tripwire no longer
+# fires on first run (actual = expected = 0); it now fires only on
+# regression.
+#
+# Baseline transition: `clippy-baseline-3` (tripwire at EXPECTED=3
+# vs actual=0, deliberately failing) -> `clippy-baseline-0`
+# (strict-pin at EXPECTED=0 vs actual=0, green on first run; will
+# exit-1 only on regression to actual>0).
+#
+# The expected count is hard-coded to 0 (per the recipe's
+# strict-pin option + the user's B1 release-time preference for
+# `clippy-baseline-0` over documenting the tripwire shape in
+# release notes). If the actual count drifts, the recipe's stdout
+# shows:
+#   EXPECTED count: 0
 #   ACTUAL   count: <N>
-#   ::FAIL:: clippy-baseline-3 strict-pin tripped
+#   ::FAIL:: clippy-baseline-0 strict-pin tripped
 #   ::FAIL:: first-10-error-snippets-begin
 #   ... (verbatim clippy error snippets) ...
 #   ::FAIL:: first-10-error-snippets-end
 #
 # Forward-fixup candidates when this recipe fails:
-#   - If ACTUAL=0 (current): re-baseline with `clippy-baseline-0`
-#     recipe and rename this one OR raise the expected to 3 and
-#     intentionally re-introduce the 5e27556 residuals.
-#   - If ACTUAL>3: forward-fixup `clippy-residual-sweep` atom.
+#   - If ACTUAL>0: forward-fixup `clippy-residual-sweep` atom to
+#     resolve the new residual(s); raise this recipe's EXPECTED
+#     only if the residual is documented as a known limitation.
 [group('lint')]
-clippy-baseline-3:
+clippy-baseline-0:
     #!/usr/bin/env bash
     set -euo pipefail
-    EXPECTED=3
-    echo "== clippy-baseline-3 =="
+    EXPECTED=0
+    echo "== clippy-baseline-0 =="
     echo "command: cargo clippy --workspace --all-targets -- -D warnings"
     OUT=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1) || true
     COUNT=$(echo "$OUT" | grep -c '^error' || true)
@@ -310,7 +322,7 @@ clippy-baseline-3:
     echo "ACTUAL   count: $COUNT"
     if [ "$COUNT" -ne "$EXPECTED" ]; then
         echo ""
-        echo "::FAIL:: clippy-baseline-3 strict-pin tripped"
+        echo "::FAIL:: clippy-baseline-0 strict-pin tripped"
         echo "::FAIL:: expected=$EXPECTED actual=$COUNT"
         echo "::FAIL:: first-10-error-snippets-begin"
         echo "$OUT" | grep '^error' | head -10 || true
@@ -321,4 +333,4 @@ clippy-baseline-3:
         exit 1
     fi
     echo ""
-    echo "== PASS: clippy-baseline-3 strict-pin holds at EXPECTED=ACTUAL=$COUNT =="
+    echo "== PASS: clippy-baseline-0 strict-pin holds at EXPECTED=ACTUAL=$COUNT =="
