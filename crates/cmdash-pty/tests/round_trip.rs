@@ -13,6 +13,19 @@ use cmdash_pty::{
     Color, KittyGraphicCmd, PaneEvent, PaneLayerId, PanePty, PaneReader, PtyError, ShellSpec,
 };
 
+/// Compute the drain deadline default, honoring the env-overridable
+/// `CMDASH_TEST_DRAIN_SECS` so devs debugging locally can extend the
+/// window without touching the helper or its call sites. Defaults to
+/// 2 seconds (matches the cat-stall threshold that was set when the
+/// drain-deadline atom landed in `85355ff`).
+fn drain_deadline_default() -> Duration {
+    let secs = std::env::var("CMDASH_TEST_DRAIN_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(2);
+    Duration::from_secs(secs)
+}
+
 /// Drain whatever bytes the child emits within `budget`, returning
 /// the concatenated bytes read so far WITHOUT blocking past the
 /// deadline. Spawns a worker thread that drives `read()` on a
@@ -33,10 +46,7 @@ use cmdash_pty::{
 /// `pty_write_to_child_round_trips_via_cat`, surfacing a
 /// confusing "stall" instead of a deterministic failure to
 /// debug in this non-TTY CI env.
-fn drain(
-    reader: &std::sync::Arc<std::sync::Mutex<PaneReader>>,
-    budget: Duration,
-) -> Vec<u8> {
+fn drain(reader: &std::sync::Arc<std::sync::Mutex<PaneReader>>, budget: Duration) -> Vec<u8> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
     let reader_for_thread = std::sync::Arc::clone(reader);
     let _handle = std::thread::spawn(move || {
@@ -73,7 +83,7 @@ fn drain(
 
 #[test]
 fn pty_printf_pipes_bytes_into_grid() {
-    let (mut pty, mut reader) = PanePty::spawn(
+    let (mut pty, reader) = PanePty::spawn(
         ShellSpec::Command {
             argv: vec!["/usr/bin/printf".to_string(), "AB\nCD".to_string()],
         },
@@ -84,7 +94,7 @@ fn pty_printf_pipes_bytes_into_grid() {
     .expect("spawn pty");
     let bytes = drain(
         &std::sync::Arc::new(std::sync::Mutex::new(reader)),
-        Duration::from_secs(2),
+        drain_deadline_default(),
     );
     pty.advance(&bytes).expect("advance");
     let snap = pty.snapshot();
@@ -338,9 +348,9 @@ fn pty_osc_title_changes_event_stream() {
 }
 
 #[test]
-#[ignore = "non-TTY CI: cat-PTY round-trip depends on PTY-master buffer drain semantics; this env's cat does not echo \"hi\\n\" back through the master (cat hangs on stdin where /dev/tty is not writable). The drain-deadline atom above ensures the test exits cleanly under its 2s deadline rather than stalling >60s; the underlying assertion still fails here. Re-enable when a host CI has a real TTY harness."]
+#[ignore = "non-TTY CI: cat-PTY round-trip depends on PTY-master buffer drain semantics; in this non-TTY env cat does not echo back through the master (cat hangs on stdin where /dev/tty is not writable). Drain-deadline atom 85355ff ensures the test exits cleanly under its 2s deadline (env-overridable via CMDASH_TEST_DRAIN_SECS) rather than stalling >60s; the underlying assertion still fails here. Re-enable on a host CI with a real TTY harness."]
 fn pty_write_to_child_round_trips_via_cat() {
-    let (mut pty, mut reader) = PanePty::spawn(
+    let (mut pty, reader) = PanePty::spawn(
         ShellSpec::Command {
             argv: vec!["/bin/cat".to_string()],
         },
@@ -353,7 +363,7 @@ fn pty_write_to_child_round_trips_via_cat() {
     assert_eq!(n, 3);
     let echoed = drain(
         &std::sync::Arc::new(std::sync::Mutex::new(reader)),
-        Duration::from_secs(2),
+        drain_deadline_default(),
     );
     pty.advance(&echoed).expect("advance");
     let snap = pty.snapshot();
