@@ -131,9 +131,9 @@ Major beats (chronological, HEAD-relative at the time of `v1.0.0`):
 - `700707a` README add at `/README.md` (repo root).
 - `f5cd267` C4 LICENSE status-tick (`DONE-MIT`).
 - `380bda5` C3 README status-tick (`DONE`).
-- `<C2-substantive-SHA>` CHANGELOG add at `/CHANGELOG.md` (this file).
-- `<C2-tick-SHA>` C2 CHANGELOG status-tick (`DONE`).
-- `<C1-tick-SHA>` C1 tagged-release status-tick (`DONE-v1.0.0`) +
+- `2b20700` CHANGELOG add at `/CHANGELOG.md` (this file).
+- `657d28b` C2 CHANGELOG status-tick (`DONE`).
+- `4a403dd` C1 tagged-release status-tick (`DONE-v1.0.0`) +
   `git tag v1.0.0 <final-SHA>` + `git push --tags`.
 
 The `v1.0.0` tag is the stable point for downstream consumers

@@ -1171,6 +1171,11 @@ Audit cycle 8`, `### Audit cycle 9`, `### Audit cycle 10`,
    `chore(ci):`, `fix(cmdash-pty):`, `docs(ci-evidence):`).
 7. Land with `--no-gpg-sign` if the host's GPG agent lacks a TTY
    (workaround via `git -c commit.gpgsign=false commit ...`).
+8. Tag events likewise use `--no-sign` on `git tag -a` when the host's
+   GPG agent lacks a TTY (workaround via
+   `git tag -a <tag-name> --no-sign -m '<message>' HEAD`); the tag
+   pointer is metadata pointing at a commit so no commit history
+   is mutated.
 
 **Cycle-numbering convention.** `### Audit cycle N` subscripts are
 sequential audit batches across a defined atom range; collisions
