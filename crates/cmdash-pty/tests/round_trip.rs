@@ -364,7 +364,7 @@ fn pty_osc_title_changes_event_stream() {
 }
 
 #[test]
-#[ignore = "`/bin/cat` PTY echo race: after `PanePty::write(b\"hi\\n\")`, the test drains the master under `drain_deadline_default()` (now `secs.clamp(1, 30)` via atom `f158ea0`) then asserts grid(0,0).ch == `h`. The drain returns 0 bytes here because (a) `/bin/cat` has NOT been scheduled between `PanePty::spawn` returning and `PanePty::write` being called — `portable_pty` does not synchronize `Child::ready_read` with the spawner's return — and (b) the `portable_pty` PTY line discipline does NOT enable echo by default, so there is no synchronous echo back to the master on `pty.write`. The master buffer therefore stays empty for the entire drain deadline and grid(0,0).ch stays at the default `' '` — hence the failure `left: ' ', right: 'h'`. To re-enable: either set the PTY termios `ECHO` flag in `PanePty::spawn` (synchronous echo on master write), or add a `PanePty::wait_child_ready` poll (gate `Child::try_wait`-style readiness on the master returning at least 1 byte) before `pty.write` is observable to tests. fn pty_write_to_child_round_trips_via_cat() {
+fn pty_write_to_child_round_trips_via_cat() {
     let (mut pty, reader) = PanePty::spawn(
         ShellSpec::Command {
             argv: vec!["/bin/cat".to_string()],
