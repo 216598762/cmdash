@@ -98,17 +98,11 @@ modifies `docs/ci-evidence.md` only).
     the commit itself. Body phrasing distinguishes recipe target
     from measured assertion in the audit-cycle evidence.
 
-> **Edge-case clarification** (audit-protocol note, added in a
-> follow-up forward-fixup atop `53e1b13` per code-reviewer item-2):
-> strict-pin targets such as `expected=3` (from `clippy-baseline-3`)
-> and `300/300 green` (from `flake-soak`) are **enforced AT
-> INVOCATION TIME by the recipe**, not asserted AT COMMIT TIME by
-> the body. Even when phrased as "Strict-pin" / "Strict-pin
-> target" / "expected=N", these phrases describe recipe design —
-> `just clippy-baseline-3` enforces `expected=3` against the live
-> clippy count; `just flake-soak` enforces `300/300` against the
-> live soak output — NOT measured commit-time pass/fail state.
-> Audit readers should not classify them as measured claims even
+> **Edge-case clarification** (audit-protocol note): strict-pin
+> targets such as `expected=3` (from `clippy-baseline-3`) and
+> `300/300 green` (from `flake-soak`) are enforced AT INVOCATION
+> TIME by the recipe - not asserted AT COMMIT TIME by the body - so
+> audit readers should not classify them as measured claims even
 > though the phrases semantic-reference pass/fail concepts upstream
 > of the recipe-enforcement boundary.
 
