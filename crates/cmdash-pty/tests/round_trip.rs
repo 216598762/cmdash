@@ -18,12 +18,32 @@ use cmdash_pty::{
 /// window without touching the helper or its call sites. Defaults to
 /// 2 seconds (matches the cat-stall threshold that was set when the
 /// drain-deadline atom landed in `85355ff`).
+///
+/// **Bounds.** The parsed value is clamped to `[1, 30]` seconds to
+/// defend against `CMDASH_TEST_DRAIN_SECS=0` (silent empty-drain that
+/// turns test failures into type-swap diffs) and
+/// `CMDASH_TEST_DRAIN_SECS=1000000` (elevent-day drain that wedges
+/// the test runner). The bounds are deliberately generous — devs
+/// debugging locally can step up to 30s, but a typo cannot wedge
+/// CI.
+///
+/// **Caching.** The result is cached in a `OnceLock` because each
+/// `std::env::var` is a libc `getenv` syscall. Not material at the
+/// current 2 call sites, but defensive if the helper ever grows
+/// into a per-byte deadline.
 fn drain_deadline_default() -> Duration {
-    let secs = std::env::var("CMDASH_TEST_DRAIN_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(2);
-    Duration::from_secs(secs)
+    use std::sync::OnceLock;
+    /// Cached `Duration` from the first `CMDASH_TEST_DRAIN_SECS` read.
+    /// Single-thread test context; `OnceLock` is the right tool.
+    static CACHE: OnceLock<Duration> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let raw = std::env::var("CMDASH_TEST_DRAIN_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(2);
+        let clamped = raw.clamp(1, 30);
+        Duration::from_secs(clamped)
+    })
 }
 
 /// Drain whatever bytes the child emits within `budget`, returning
@@ -348,7 +368,7 @@ fn pty_osc_title_changes_event_stream() {
 }
 
 #[test]
-#[ignore = "non-TTY CI: cat-PTY round-trip depends on PTY-master buffer drain semantics; in this non-TTY env cat does not echo back through the master (cat hangs on stdin where /dev/tty is not writable). Drain-deadline atom 85355ff ensures the test exits cleanly under its 2s deadline (env-overridable via CMDASH_TEST_DRAIN_SECS) rather than stalling >60s; the underlying assertion still fails here. Re-enable on a host CI with a real TTY harness."]
+#[ignore = "non-TTY CI: cat-PTY round-trip depends on PTY-master buffer drain semantics; in this non-TTY env cat does not echo back through the master (cat hangs on stdin where /dev/tty is not writable). The drain-deadline atom `85355ff` ensures the test exits cleanly under its `2s` deadline (env-overridable via `CMDASH_TEST_DRAIN_SECS`) rather than stalling `>60s`; the underlying assertion still fails here. Re-enable on a host CI with a real TTY harness."]
 fn pty_write_to_child_round_trips_via_cat() {
     let (mut pty, reader) = PanePty::spawn(
         ShellSpec::Command {
