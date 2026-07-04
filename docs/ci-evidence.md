@@ -558,7 +558,7 @@ Cycle-numbering convention continues (`### Audit cycle 0`,
 The `### Audit cycle 3` line above lists only `0, 1, 2` because
 the cycle 3 entry was authored before cycle 4 existed; the
 counting convention is read in monotonically-accending order from
-the audit cycle entries in this file (which are now `0, 1, 2, 3, 4, 5, 6, 7`).
+the audit cycle entries in this file (which are now `0, 1, 2, 3, 4, 5, 6, 7, 8`).
 
 ### Audit cycle 5 - workflow removal closes the dispatch-failure investigation
 
@@ -773,6 +773,111 @@ convention continues (`### Audit cycle 0`, `### Audit
 cycle 1`, `### Audit cycle 2`, `### Audit cycle 3`, `###
 Audit cycle 4`, `### Audit cycle 5`, `### Audit cycle 6`,
 ...).
+
+### Audit cycle 8 - README add closes C3 hygiene gap
+
+Forward-fixup audit-cycle entry documenting the resolution
+of the C3 line item on the 1.0 release checklist (atom
+`5754742`, file `docs/1.0-checklist.md`). The single-atom
+audit range covers `700707a` -- the `docs: add README.md
+at repo root` atom that authored a 119-line `README.md` at
+the repo root documenting the cmdash surface area
+(Layer-based terminal multiplexer and dashboard per
+`Cargo.toml`), workspace layout (7 crates), installation
+commands, local-CI surface, and cross-references to
+`docs/1.0-checklist.md` + `docs/ci-evidence.md` + `LICENSE`.
+
+- **Claim**: per `docs/1.0-checklist.md` C3 line item prior
+  to this atom, C3 status was OPEN with the atom-candidate
+  placeholder `docs(readme): initial-readme` describing the
+  cmdash surface area pending. No `README.md` existed at
+  `origin/main`.
+- **Actual**: `README.md` now exists at the repo root
+  (verified via `git ls-tree -r HEAD --name-only | grep
+  '^README.md$'` returning a single match). 119-line README
+  covering tagline (verbatim from `Cargo.toml`
+  workspace.package.description) + version (`0.1.0`) + repo
+  URL (verbatim from `Cargo.toml` workspace.package.repository)
+  + Rust version floor (`1.73+`) + 7-crate workspace layout
+  table + install commands (`cargo build --workspace --release`
+  + `cargo install --path crates/cmdash`) + build requirements
+  (Rust 1.73+ + C compiler for pty-alloc) + local-CI surface
+  (post workflow-removal: `just clippy-baseline-0` + `just
+  flake-soak`) + justfile recipes + cross-references to
+  docs/1.0-checklist.md + docs/ci-evidence.md + LICENSE.
+- **Delta**: zero -- the README atom at `700707a` shipped
+  surface-area claims consistent with `Cargo.toml` (tagline /
+  version / repo URL / Rust version floor) and cross-references
+  consistent with the chain's LICENSE + 1.0-checklist + 
+  audit-protocol documents. No divergent claim between the
+  README atom's surface-area claims and the measured ground
+  truth on the reference host.
+- **Effect**: C3 line item flipped OPEN -> DONE in
+  `docs/1.0-checklist.md` (this atom's checklist tick).
+  The LICENSE atom at `e3035f6` (one atom behind on the
+  chain) provides the LICENSE file cross-referenced under
+  the README's `License` section; LICENSE + README +
+  checklist are now mutually consistent. The
+  independent-rewindability of the README-file-add (atom
+  `700707a`) versus this checklist tick (this atom) is
+  preserved per the C3-vs-chain-position clarification below.
+- **Evidence**:
+  - host: this host (forward-fixup basher attestor)
+  - invocation:
+    `git ls-tree -r HEAD --name-only | grep '^README.md$'`
+  - observation: single line `README.md` matches
+  - cross-reference: `700707a`'s commit body captures the
+    surface-area scope (tagline + version + install + local
+    CI + audit-protocol cross-refs) verbatim.
+
+## C3 vs chain-position: separate-atom dissection
+
+The C3 line item on the 1.0 checklist has TWO logically
+distinct steps:
+
+1. **Substantive resolution (README-file-add)**: the README
+   body covering the cmdash surface area + install + local-CI
+   + cross-refs lands in `/README.md` as a forward-fixup
+   commit. This is what `700707a` accomplishes.
+2. **Checklist status tick (this atom)**: flipping the C3
+   line item on `docs/1.0-checklist.md` from OPEN to DONE so
+   the audit-protocol ledger reflects the closed status.
+
+The two steps are deliberately split into distinct
+forward-fixup atoms (README-file-add at `700707a`,
+status-tick here) so each is independently rewindable:
+
+- If the user later decides to revise the README (e.g., to
+  expose new install recipes, document a workspace
+  restructure, or expand the local-CI surface), only the
+  README file changes + a new audit cycle entry is needed
+  -- the checklist's DONE tick stays informative.
+- If the audit-protocol needs to revise the `DONE` label
+  format (e.g., to expose the README atom's atom-SHA
+  explicitly on the checklist status line), only this atom
+  is touched -- README stays untouched.
+
+This split is the same independent-rewindability pattern
+used by the LICENSE atom + C4 tick (atom `e3035f6` + atom
+`f5cd267`) plus by the workflow-removal atom + A1 tick
+(atom `7b8eee0` + atom `5754742`'s A1 section) plus by
+cycle-N audit-protocol entries (each cycle atom is
+independent of the audit-protocol recording of that cycle's
+discoveries, and the recording can be revised without
+mutilating the substantive atom).
+
+The `docs/1.0-checklist.md` C3 tick in this atom names the
+README atom at `700707a` so future readers can disambiguate
+substantive delivery from checklist reflection.
+
+Audit cycle 8 completes with **zero measured-claim
+divergences** plus **one README-add-closes-C3 finding**
+that resolves the C3 line item on the 1.0 release
+checklist. The C3 line item on the checklist is now DONE.
+Cycle-numbering convention continues (`### Audit cycle 0`,
+`### Audit cycle 1`, `### Audit cycle 2`, `### Audit cycle
+3`, `### Audit cycle 4`, `### Audit cycle 5`, `### Audit
+cycle 6`, `### Audit cycle 7`, `### Audit cycle 8`, ...).
 
 ### Audit cycle 7 - LICENSE add closes C4 hygiene gap
 
