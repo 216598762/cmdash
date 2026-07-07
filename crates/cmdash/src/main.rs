@@ -574,93 +574,16 @@ pub(crate) enum ReconcileMode {
 }
 
 impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
-    /// Construct a [`TickContext`] from the ten per-frame
-    /// building blocks (runners + bindings + focus-and-running +
-    /// close_rx + graphics + borrowed terminal + tick +
-    /// layout_root + pending_resize). Enforces `focus <
-    /// runners.len()` so the `runners.get_mut(*focus)`
-    /// write-input path inside [`Self::run`] cannot index out
-    /// of bounds; the `apply_action::PaneClose` arm restores
-    /// this invariant after a tail-remove by clamping focus to
-    /// `len() - 1`.
-    ///
-    /// This 10-arg ctor delegates to [`Self::new_full`] with
-    /// default `close_tx` (an unused fresh channel whose Sender
-    /// is dropped on ctx drop), default `last_area` (80x24),
-    /// empty `presets` map, and `ShellSpec::LoginShell`. Tests
-    /// that don't exercise the runtime mutation paths
-    /// (`AppNewPane` / `PaneFocus{Direction}` / `PanePreset`)
-    /// should keep using this; production's `cmdash::run` goes
-    /// through [`Self::new_full`] directly so the
-    /// runtime-spawn paths share the ctx's `close_tx` Sender.
-    // The 10-arg ctor is the most central tenant of the AGENTS.md
-    // "minimal API surface" rule -- it mirrors the ten
-    // user-provided struct fields one-to-one.
-    #[allow(
-        dead_code,
-        reason = "v1 free-fn fallback for input_tests signature stability; superseded by TickContext::new_full in production use"
-    )]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        runners: Vec<PaneRunner>,
-        bindings: Router,
-        focus: usize,
-        running: bool,
-        close_rx: Receiver<cmdash_pty::PaneLayerId>,
-        graphics: GraphicsState,
-        terminal: &'a mut Terminal<B>,
-        tick: Duration,
-        layout_root: LayoutNode,
-        pending_resize: Option<(u16, u16)>,
-    ) -> Self {
-        assert!(
-            focus < runners.len(),
-            "TickContext::new: focus ({focus}) is out of bounds for {} runners",
-            runners.len(),
-        );
-        // Default close_tx whose Receiver is never read; v1 tests
-        // that build ctx via `new()` don't exercise runtime
-        // mutations, so the dead Sender never sends.
-        let (close_tx, _close_rx_default): (Sender<cmdash_pty::PaneLayerId>, _) =
-            std::sync::mpsc::channel();
-        let last_area = LayoutRect {
-            x: 0,
-            y: 0,
-            w: 80,
-            h: 24,
-        };
-        Self::new_full(
-            runners,
-            bindings,
-            focus,
-            running,
-            close_tx,
-            close_rx,
-            graphics,
-            terminal,
-            tick,
-            layout_root,
-            pending_resize,
-            last_area,
-            BTreeMap::new(),
-            // Phase 4 carry-forward: `new()` (10-arg, used by
-            // legacy test fixtures that don't exercise the
-            // runtime mutation paths) initializes the
-            // per-ZStack focus map empty. Tests that drive
-            // ZStack focus actions build via `new_full`
-            // directly and can pre-seed `stack_focus` if
-            // they want a non-empty starting state.
-            BTreeMap::new(),
-            ShellSpec::LoginShell,
-        )
-    }
-
     /// Construct a [`TickContext`] from all 14 per-frame
     /// building blocks, including the runtime-mutation hooks
     /// (`close_tx: PaneCloseTx`, `last_area: LayoutRect`,
     /// `presets: BTreeMap<String, LayoutNode>`,
-    /// `shell: ShellSpec`). Enforces the same `focus <
-    /// runners.len()` invariant as [`Self::new`].
+    /// `shell: ShellSpec`). Enforces `focus < runners.len()`
+    /// so the `runners.get_mut(*focus)` write-input path
+    /// inside [`Self::run`] cannot index out of bounds;
+    /// `Self::apply_action_full::PaneClose` restores this
+    /// invariant after a tail-remove by clamping focus to
+    /// `len() - 1`.
     ///
     // Production's `cmdash::run` calls this. Buffered into a
     // sub-struct would just duplicate the schema-history
@@ -806,12 +729,14 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
 
     /// Apply a [`KeyAction`] to the full [`TickContext`] —
     /// both the v1 arms (AppClose, PaneFocusNext,
-    /// PaneFocusPrev) and the new carry-forward arms
-    /// (`AppNewPane`, `PaneFocus{Up,Down,Left,Right}`,
-    /// `PaneClose` rebalance, `PanePreset(name)`). The free
-    /// [`apply_action`] fn is a parallel impl kept for the
-    /// v1 input_tests' signature stability; the binary's tick
-    /// loop drives THIS method through [`Self::handle_event_full`].
+    /// PaneFocusPrev, `PaneClose` rebalance) and the
+    /// carry-forward arms (`AppNewPane`,
+    /// `PaneFocus{Up,Down,Left,Right}`, `PanePreset(name)`).
+    /// The binary's tick loop drives this method through
+    /// [`Self::handle_event_full`]; the prior v1 free-fn
+    /// `apply_action` (atom `b315047`-predecessor) was removed
+    /// in this atom so test + production share the same
+    /// reconcile path end-to-end.
     pub fn apply_action_full(&mut self, action: KeyAction) {
         match action {
             KeyAction::AppClose => {
@@ -860,9 +785,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// Phase 0 of the AGENTS.md rendering pipeline, full
     /// version. Drains crossterm events and routes each one
     /// through [`Self::handle_event_full`]. Non-blocking;
-    /// bounded by `event::poll(0)`. The free [`input_phase`]
-    /// helper is a parallel impl retained for v1 input_tests
-    /// signature compatibility.
+    /// bounded by `event::poll(0)`.
     pub fn input_phase_full(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         while event::poll(Duration::from_millis(0))? {
             let evt = event::read()?;
@@ -876,10 +799,18 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             self.apply_action_full(action);
             return;
         }
-        // Host SIGWINCH coalescer — same arm the free
-        // [`handle_event`] had under v1. Phase 0.5 drains the
-        // slot (`pending_resize.take()`) at the top of the
-        // next tick to drive [`Self::relayout`].
+        // Host SIGWINCH coalescer — Phase 0.5 drains the slot
+        // (`pending_resize.take()`) at the top of the next
+        // tick to drive [`Self::relayout`]. Coalesce-on-
+        // overwrite so a rapid resize burst collapses to the
+        // LATEST (cols, rows) by the time the next tick
+        // reaches phase 0.5. This arm deliberately does NOT
+        // mutate `runners`; relayout happens at the top of the
+        // tick after this input drain so the cross-key
+        // close-channel invariant
+        // (`Drop::drop enqueues onto a live receiver`) is
+        // preserved for any pane drops that share the same
+        // tick.
         if let Event::Resize(w, h) = evt {
             self.pending_resize = Some((*w, *h));
             return;
@@ -1610,152 +1541,6 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         }
     }
 }
-
-/// Phase 0: drain any pending crossterm events and dispatch them
-/// — either to a keybind action or straight into the focused
-/// pane's PTY, OR schedule a host SIGWINCH relayout. Non-blocking;
-/// bounded by the caller's tick. Returns `Err` on crossterm I/O
-/// failures so the binary can stop cleanly.
-#[allow(
-    dead_code,
-    reason = "v1 free-fn fallback for input_tests signature stability; superseded by TickContext::input_phase_full in production use"
-)]
-fn input_phase(
-    runners: &mut Vec<PaneRunner>,
-    bindings: &Router,
-    focus: &mut usize,
-    running: &mut bool,
-    pending_resize: &mut Option<(u16, u16)>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    while event::poll(Duration::from_millis(0))? {
-        let evt = event::read()?;
-        handle_event(&evt, bindings, focus, runners, running, pending_resize);
-    }
-    Ok(())
-}
-
-#[allow(
-    dead_code,
-    reason = "v1 free-fn fallback for input_tests signature stability; superseded by TickContext::handle_event_full in production use"
-)]
-fn handle_event(
-    evt: &Event,
-    bindings: &Router,
-    focus: &mut usize,
-    runners: &mut Vec<PaneRunner>,
-    running: &mut bool,
-    pending_resize: &mut Option<(u16, u16)>,
-) {
-    if let Some(action) = bindings.dispatch_crossterm(evt) {
-        apply_action(action, focus, runners, running);
-        return;
-    }
-    // Host SIGWINCH (crossterm `Event::Resize`) — coalesce-on-
-    // overwrite so a rapid resize burst collapses to the LATEST
-    // (cols, rows) by the time the next tick reaches phase 0.5.
-    // This arm deliberately does NOT mutate `runners`; relayout
-    // happens at the top of the tick after this input drain so
-    // the cross-key close-channel invariant
-    // (`Drop::drop enqueues onto a live receiver`) is preserved
-    // for any pane drops that share the same tick.
-    if let Event::Resize(w, h) = evt {
-        *pending_resize = Some((*w, *h));
-        return;
-    }
-    let Event::Key(KeyEvent {
-        code,
-        kind,
-        modifiers,
-        ..
-    }) = evt
-    else {
-        return;
-    };
-    if !matches!(kind, KeyEventKind::Press) {
-        return;
-    }
-    // The `modifiers` field is intentionally ignored for v1
-    // forwarding: a shift modifier in the focus pane is just
-    // whatever the PTY (<input>) further decodes from the bytes.
-    let _ = modifiers;
-    let Some(bytes) = event_to_bytes(*code) else {
-        return;
-    };
-    if let Some(runner) = runners.get_mut(*focus) {
-        if let Err(e) = runner.write_input(&bytes) {
-            debug!(error = ?e, layer_id = ?runner.layer_id(), "write_input failed");
-        }
-    }
-}
-
-#[allow(
-    dead_code,
-    reason = "v1 free-fn fallback for input_tests signature stability; superseded by TickContext::apply_action_full in production use"
-)]
-fn apply_action(
-    action: KeyAction,
-    focus: &mut usize,
-    runners: &mut Vec<PaneRunner>,
-    running: &mut bool,
-) {
-    match action {
-        KeyAction::AppClose => {
-            *running = false;
-        }
-        KeyAction::PaneFocusNext => {
-            if !runners.is_empty() {
-                *focus = (*focus + 1) % runners.len();
-            }
-        }
-        KeyAction::PaneFocusPrev => {
-            if !runners.is_empty() {
-                *focus = (*focus + runners.len() - 1) % runners.len();
-            }
-        }
-        // v1 implements PaneClose here: remove the focused
-        // runner from the Vec, which fires `PaneRunner::Drop`
-        // and routes the pane's `PaneLayerId` into the close
-        // channel. TickContext::run drains that channel in
-        // phase 1 and calls `GraphicsState::close_pane`,
-        // satisfying AGENTS.md §"Hard rule: one layer per
-        // instance". Closing the last pane quits the binary
-        // (`*running = false`); the focus index is clamped to
-        // the new last entry when the tail was removed so the
-        // next PTY-write-input path can't index out of bounds.
-        KeyAction::PaneClose => {
-            if runners.is_empty() {
-                return;
-            }
-            // Sanitize focus before indexing (defensive — should
-            // already be in-bounds from new-tab spawn and the
-            // focus clamp below; cheap).
-            if *focus >= runners.len() {
-                *focus = runners.len() - 1;
-            }
-            let closing_layer_id = runners[*focus].layer_id();
-            debug!(
-                layer_id = ?closing_layer_id,
-                focus = *focus,
-                "pane-close: drop focused runner (Drop -> close_tx -> graphics.close_pane)"
-            );
-            runners.remove(*focus);
-            if runners.is_empty() {
-                *running = false;
-                return;
-            }
-            if *focus >= runners.len() {
-                *focus = runners.len() - 1;
-            }
-        }
-        // v1: AppNewPane, PanePreset, PaneFocus{Up,Down,Left,
-        // Right} are no-ops. v2 will hook them into the layout
-        // engine.
-        _ => {
-            debug!(?action, "key action not yet implemented in v1");
-        }
-    }
-}
-
 /// Encode an unmatched key press as PTY-friendly bytes for the
 /// focused pane. Returns `None` for variants that should NOT
 /// leak to the PTY (Insert, F-keys above 4, media keys,
@@ -2092,24 +1877,67 @@ mod input_tests {
         })
     }
 
-    /// Ctrl-W on a 2-pane Vec: Vec shrinks by one, the
-    /// survivor is unmoved, the close-channel receives the
-    /// dropped pane's `PaneLayerId`, and `graphics.close_pane`
-    /// drains the matching image registration. Exercises the
-    /// live binary's full Ctrl-W -> close-channel ->
-    /// dashcompositor revoke pipeline.
+    /// Ctrl-W on a 2-pane Vec, routed through the production
+    /// `TickContext::handle_event_full` -> `apply_action_full`
+    /// pipeline. Vec shrinks by one, the survivor is unmoved,
+    /// the close-channel receives the dropped pane's
+    /// `PaneLayerId`, and `graphics.close_pane` drains the
+    /// matching image registration.
+    ///
+    /// The free-fn `handle_event` + `apply_action` pair was
+    /// removed in this atom; test and production now share the
+    /// same dispatch + reconcile surface end-to-end (AGENTS.md
+    /// Phase 2 dual-location contract).
     #[test]
     fn ctrl_w_pane_close_pops_focused_runner_and_routes_close_message() {
-        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
-        let r0 = make_runner("a", close_tx.clone());
-        let r1 = make_runner("b", close_tx.clone());
-        let dropped_layer_id = r0.layer_id();
-        let survivor_layer_id = r1.layer_id();
-        let mut runners: Vec<PaneRunner> = vec![r0, r1];
+        // Split layout_root with 2 leaves so the focused
+        // pane's resolver path_len >= 2 (closing a direct
+        // child of `layout_root` triggers the v2
+        // `close_focused_and_rebalance` "binary quits"
+        // short-circuit). The runners are spawned FROM this
+        // layout_root so their `pane.id`s align with the ctx
+        // `layout_root`'s panes for reconcile-by-label.
+        let source = r#"layout {
+            split axis=horizontal ratio=0.5 {
+                pane kind=shell label="a"
+                pane kind=shell label="b"
+            }
+        }"#;
+        let cfg = cmdash_config::parse(source).expect("parse split config");
+        let layout_root = cfg.layout.expect("layout block");
+        let last_area = LayoutRect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
+        let layout = ComputedLayout::compute(&layout_root, last_area).expect("compute");
+        assert_eq!(layout.panes.len(), 2);
 
-        // Pre-register one image for the focused pane so we can
-        // prove `close_pane` revokes it on drain, matching the
-        // production LayerStack revoking flow.
+        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+        let mut runners: Vec<PaneRunner> = Vec::with_capacity(2);
+        for pane in &layout.panes {
+            let tx_clone = close_tx.clone();
+            let layer_id = cmdash::derive_layer_id(&pane.id);
+            let r = PaneRunner::spawn_with_graphics(
+                pane.clone(),
+                layer_id,
+                ShellSpec::Command {
+                    argv: vec!["true".to_string()],
+                },
+                Some(tx_clone),
+            )
+            .expect("spawn pane");
+            runners.push(r);
+        }
+        // Left leaf (focus 0); its `LayerId` will be the one
+        // routed into close_rx on dispatch.
+        let dropped_layer_id = runners[0].layer_id();
+        let survivor_layer_id = runners[1].layer_id();
+
+        // Pre-register one image for the focused pane so we
+        // can prove `close_pane` revokes it on drain, matching
+        // the production LayerStack revoking flow.
         let mut graphics = GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
         graphics.push_image(dropped_layer_id, 1, image::RgbaImage::new(1, 1));
         assert!(graphics.has_image(dropped_layer_id, 1));
@@ -2123,57 +1951,76 @@ mod input_tests {
             action: KeyAction::PaneClose,
         }]);
 
-        let mut focus: usize = 0;
-        let mut running = true;
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
 
-        handle_event(
-            &key_event(
-                crossterm::event::KeyCode::Char('w'),
-                crossterm::event::KeyModifiers::CONTROL,
-            ),
-            &bindings,
-            &mut focus,
-            &mut runners,
-            &mut running,
-            &mut None,
+        let mut ctx = TickContext::new_full(
+            runners,
+            bindings,
+            0, // focus on the left leaf
+            true,
+            close_tx.clone(),
+            close_rx,
+            graphics,
+            &mut terminal,
+            std::time::Duration::from_millis(33),
+            layout_root,
+            None,
+            last_area,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
         );
 
+        // Dispatch Ctrl-W through the production
+        // `TickContext::handle_event_full` path: Router
+        // dispatch -> KeyAction::PaneClose -> apply_action_full
+        // -> close_focused_and_rebalance -> reconcile_runners.
+        ctx.handle_event_full(&key_event(
+            crossterm::event::KeyCode::Char('w'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+
         // 1) Vec shrank by one, the survivor is the original
-        //    `r1` (its `PaneLayerId` matches), and one open
-        //    pane does not quit the binary.
-        assert_eq!(runners.len(), 1);
-        assert!(running, "closing one pane must not stop the binary");
-        assert_eq!(runners[0].layer_id(), survivor_layer_id);
+        //    r1 (its PaneLayerId matches), and one open pane
+        //    does not quit the binary.
+        assert_eq!(ctx.runners.len(), 1);
+        assert!(ctx.running, "closing one pane must not stop the binary");
+        assert_eq!(ctx.runners[0].layer_id(), survivor_layer_id);
 
         // 2) Focus stays valid (still 0 since 0 < 1).
-        assert_eq!(focus, 0);
+        assert_eq!(ctx.focus(), 0);
 
         // 3) `Drop::drop` enqueued the closing pane's id onto
-        //    the close-channel the binary's main loop drains.
-        let received = close_rx
+        //    the close-channel the binary's main loop drains
+        //    (now exposed via ctx.close_rx).
+        let received = ctx
+            .close_rx
             .try_recv()
             .expect("PaneRunner::Drop must enqueue the closing pane's layer id");
         assert_eq!(received, dropped_layer_id);
 
-        // 4) Simulating phase 1 -- drain + close_pane
-        //    -- revokes the dashcompositor image registration.
-        graphics.close_pane(received);
-        assert!(!graphics.has_image(dropped_layer_id, 1));
-
-        drop(close_tx);
-        drop(runners);
-        drop(graphics);
+        // 4) Simulating phase 1 -- drain + close_pane --
+        //    revokes the dashcompositor image registration.
+        ctx.graphics.close_pane(received);
+        assert!(!ctx.graphics.has_image(dropped_layer_id, 1));
     }
 
-    /// Closing the last surviving pane flips `running` to
-    /// false and quits the binary. Verifies the empty-Vec edge
-    /// case is handled without panicking.
+    /// Closing the last surviving pane routed through the
+    /// production `TickContext::handle_event_full` path flips
+    /// `running` to `false` and quits the binary. Single-leaf
+    /// dummy layout: the focused leaf IS the root (resolver
+    /// path len == 1), so `close_focused_and_rebalance`
+    /// follows the "binary quits" branch (calls
+    /// `self.runners.clear()` and `self.running = false`). The
+    /// free-fn `handle_event` form is gone in v2; the only
+    /// live dispatch site is `TickContext::handle_event_full`.
     #[test]
     fn pane_close_last_pane_quits_binary() {
         let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
         let r0 = make_runner("only", close_tx.clone());
         let dropped_layer_id = r0.layer_id();
-        let mut runners: Vec<PaneRunner> = vec![r0];
+        let runners: Vec<PaneRunner> = vec![r0];
 
         let bindings = Router::new(vec![Keybind {
             mods: CfgModifiers::default(),
@@ -2181,51 +2028,100 @@ mod input_tests {
             action: KeyAction::PaneClose,
         }]);
 
-        let mut focus: usize = 0;
-        let mut running = true;
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let graphics = GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
+        let last_area = LayoutRect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
 
-        handle_event(
-            &key_event(
-                crossterm::event::KeyCode::Char('w'),
-                crossterm::event::KeyModifiers::NONE,
-            ),
-            &bindings,
-            &mut focus,
-            &mut runners,
-            &mut running,
-            &mut None,
+        let mut ctx = TickContext::new_full(
+            runners,
+            bindings,
+            0, // focus on the only leaf
+            true,
+            close_tx.clone(),
+            close_rx,
+            graphics,
+            &mut terminal,
+            std::time::Duration::from_millis(33),
+            dummy_layout_root(),
+            None,
+            last_area,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
         );
 
-        assert!(runners.is_empty());
-        assert!(!running, "closing the final pane must quit the binary");
-        let received = close_rx
+        ctx.handle_event_full(&key_event(
+            crossterm::event::KeyCode::Char('w'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        assert!(ctx.runners.is_empty());
+        assert!(!ctx.running, "closing the final pane must quit the binary");
+        let received = ctx
+            .close_rx
             .try_recv()
             .expect("closing the only pane must enqueue the close message");
         assert_eq!(received, dropped_layer_id);
-
-        drop(close_tx);
-        drop(runners);
     }
 
-    /// Removing the focused pane when it is the TAIL of the
-    /// Vec must clamp `focus` to the new last index so the
+    /// Removing the focused pane when it is the TAIL of a
+    /// Vec drives `close_focused_and_rebalance` ->
+    /// `reconcile_runners(InPlace)`; the post-rebalance focus
+    /// index must clamp to the new last index so the
     /// `runners.get_mut(*focus)` PTY-write path cannot index
-    /// out of bounds in subsequent ticks.
+    /// out of bounds in subsequent ticks. Routed through the
+    /// production `TickContext::handle_event_full` path
+    /// with a 3-pane Split layout (a on top, b+c on the
+    /// bottom nested split), focusing the tail pane (c).
     #[test]
     fn pane_close_clamps_focus_when_tail_removed() {
-        let (close_tx, _close_rx): (PaneCloseTx, _) = mpsc::channel();
-        // Three distinct `PaneLayerId`s by construction -- we
-        // pass them explicitly. v1 stack layouts collapse to a
-        // single tabbed pane so a shared layout can't give us
-        // three distinct ids; independent single-pane layouts
-        // all derive `PaneLayerId(0)` and would collide.
-        let r0 = make_runner_with_id("a", PaneLayerId(1), close_tx.clone());
-        let r1 = make_runner_with_id("b", PaneLayerId(2), close_tx.clone());
-        let r2 = make_runner_with_id("c", PaneLayerId(3), close_tx.clone());
-        let survivor_a = r0.layer_id();
-        let survivor_b = r1.layer_id();
-        let dropped_layer_id = r2.layer_id();
-        let mut runners = vec![r0, r1, r2];
+        let source = r#"layout {
+            split axis=vertical ratio=0.5 {
+                pane kind=shell label="a"
+                split axis=vertical ratio=0.5 {
+                    pane kind=shell label="b"
+                    pane kind=shell label="c"
+                }
+            }
+        }"#;
+        let cfg = cmdash_config::parse(source).expect("parse 3-pane tree");
+        let layout_root = cfg.layout.expect("layout block");
+        let last_area = LayoutRect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
+        let layout = ComputedLayout::compute(&layout_root, last_area).expect("compute");
+        assert_eq!(layout.panes.len(), 3);
+
+        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+        let mut runners: Vec<PaneRunner> = Vec::with_capacity(3);
+        for pane in &layout.panes {
+            let tx_clone = close_tx.clone();
+            let layer_id = cmdash::derive_layer_id(&pane.id);
+            let r = PaneRunner::spawn_with_graphics(
+                pane.clone(),
+                layer_id,
+                ShellSpec::Command {
+                    argv: vec!["true".to_string()],
+                },
+                Some(tx_clone),
+            )
+            .expect("spawn pane");
+            runners.push(r);
+        }
+        // Resolver pre-order: pane_a -> pane_b -> pane_c;
+        // focus on the tail = pane_c (idx 2).
+        let survivor_a = runners[0].layer_id();
+        let survivor_b = runners[1].layer_id();
+        let dropped_layer_id = runners[2].layer_id();
         assert_ne!(runners[0].layer_id(), runners[1].layer_id());
         assert_ne!(runners[1].layer_id(), runners[2].layer_id());
 
@@ -2235,35 +2131,47 @@ mod input_tests {
             action: KeyAction::PaneClose,
         }]);
 
-        // Focus the LAST pane (index 2). Removing it should
-        // clamp focus to len-1 (1) so the next tick gets a
-        // valid index.
-        let mut focus: usize = 2;
-        let mut running = true;
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let graphics = GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
 
-        handle_event(
-            &key_event(
-                crossterm::event::KeyCode::Char('w'),
-                crossterm::event::KeyModifiers::NONE,
-            ),
-            &bindings,
-            &mut focus,
-            &mut runners,
-            &mut running,
-            &mut None,
+        let mut ctx = TickContext::new_full(
+            runners,
+            bindings,
+            2, // focus on the tail pane (c)
+            true,
+            close_tx.clone(),
+            close_rx,
+            graphics,
+            &mut terminal,
+            std::time::Duration::from_millis(33),
+            layout_root,
+            None,
+            last_area,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
         );
 
-        assert_eq!(runners.len(), 2);
-        assert!(running);
-        assert_eq!(focus, 1, "removing the tail must clamp focus");
-        // Survivors must stay at positions 0 and 1 by `PaneLayerId`
-        // (not just by Vec index); the dropped runner was at idx 2.
-        assert_eq!(runners[0].layer_id(), survivor_a);
-        assert_eq!(runners[1].layer_id(), survivor_b);
-        assert_ne!(runners[1].layer_id(), dropped_layer_id);
+        // Drive through the production dispatch path:
+        // handle_event_full -> Router::dispatch -> PaneClose
+        // -> apply_action_full -> close_focused_and_rebalance
+        // -> reconcile_runners(InPlace).
+        ctx.handle_event_full(&key_event(
+            crossterm::event::KeyCode::Char('w'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
 
-        drop(close_tx);
-        drop(runners);
+        assert_eq!(ctx.runners.len(), 2);
+        assert!(ctx.running);
+        // c was removed at idx 2 → focus clamps from 2 -> 1.
+        assert_eq!(ctx.focus(), 1, "removing the tail must clamp focus");
+        // Survivors must stay at positions 0 and 1 by
+        // `PaneLayerId` (not just by Vec index); the dropped
+        // runner was at idx 2.
+        assert_eq!(ctx.runners[0].layer_id(), survivor_a);
+        assert_eq!(ctx.runners[1].layer_id(), survivor_b);
+        assert_ne!(ctx.runners[1].layer_id(), dropped_layer_id);
     }
 
     /// Building a [`TickContext`] with `focus >= runners.len()`
@@ -2274,29 +2182,41 @@ mod input_tests {
     /// regression test" rule for the focus invariant.
     /// Uses a `ratatui::backend::TestBackend` to construct a
     /// real `Terminal` without writing to stdout.
+    /// Migrated to `TickContext::new_full` (was `new`) by the
+    /// atom that deleted the v1 10-arg ctor; the focus-bound
+    /// panic invariant is now enforced at the 14-arg ctor.
     #[test]
     #[should_panic(expected = "focus")]
-    fn tick_context_new_panics_when_focus_out_of_bounds() {
+    fn tick_context_new_full_panics_when_focus_out_of_bounds() {
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
-        let (_close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel::<cmdash_pty::PaneLayerId>();
+        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel::<cmdash_pty::PaneLayerId>();
         let bindings = Router::new(vec![]);
         let graphics =
             cmdash::graphics::GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
         // Empty runners + focus=0 -> 0 < 0 is false -> assert! fires.
-        let _ctx = TickContext::new(
+        let _ctx = TickContext::new_full(
             Vec::<PaneRunner>::new(),
             bindings,
             0,
             true,
+            close_tx,
             close_rx,
             graphics,
             &mut terminal,
             std::time::Duration::from_millis(33),
             dummy_layout_root(),
             None,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            ShellSpec::LoginShell,
         );
-        drop(_close_tx);
     }
 
     /// Companion to the empty-Vec test above: locks the
@@ -2307,10 +2227,12 @@ mod input_tests {
     /// Vec on the next `runners.get_mut(*focus)` call). Uses
     /// `make_runner_with_id` so each pane has a distinct
     /// `PaneLayerId` independent of layout-pre-order numbering.
+    /// Migrated to `TickContext::new_full` for the same reason
+    /// as the empty-Vec companion.
     #[test]
     #[should_panic(expected = "focus")]
-    fn tick_context_new_panics_when_focus_equals_non_zero_len() {
-        let (close_tx, _close_rx) = mpsc::channel::<cmdash_pty::PaneLayerId>();
+    fn tick_context_new_full_panics_when_focus_equals_non_zero_len() {
+        let (close_tx, close_rx) = mpsc::channel::<cmdash_pty::PaneLayerId>();
         let r0 = make_runner_with_id("a", PaneLayerId(1), close_tx.clone());
         let r1 = make_runner_with_id("b", PaneLayerId(2), close_tx.clone());
         let bindings = Router::new(vec![]);
@@ -2318,48 +2240,83 @@ mod input_tests {
             cmdash::graphics::GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
-        let _ctx = TickContext::new(
+        let _ctx = TickContext::new_full(
             vec![r0, r1],
             bindings,
             2, // focus == runners.len()
             true,
-            _close_rx,
+            close_tx,
+            close_rx,
             graphics,
             &mut terminal,
             std::time::Duration::from_millis(33),
             dummy_layout_root(),
             None,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            ShellSpec::LoginShell,
         );
     }
 
     /// Phase 2 v2 wiring regression: a crossterm
-    /// `Event::Resize(w, h)` synthesised at the `handle_event`
-    /// boundary must land in `pending_resize` so the top of
-    /// the next tick drives `relayout(w, h)`. Splits the
-    /// assertion into the two smallest claims the bug
-    /// surface allows: (1) the option transitions from
-    /// `None` -> `Some((w, h))`, (2) subsequent resize
-    /// signals coalesce (overwrite, NOT push) so rapid
-    /// SIGWINCH bursts collapse to the LATEST dims.
+    /// `Event::Resize(w, h)` synthesised at the
+    /// `TickContext::handle_event_full` boundary must land
+    /// in `pending_resize` so the top of the next tick drives
+    /// `relayout(w, h)`. Splits the assertion into the two
+    /// smallest claims the bug surface allows: (1) the
+    /// option transitions from `None` -> `Some((w, h))`, (2)
+    /// subsequent resize signals coalesce (overwrite, NOT
+    /// push) so rapid SIGWINCH bursts collapse to the LATEST
+    /// dims. Migrated from the prior free-fn form so the
+    /// test exercises the same dispatch that production
+    /// drives.
     #[test]
     fn handle_event_resize_event_arms_pending_resize() {
-        let (close_tx, _close_rx): (PaneCloseTx, _) = mpsc::channel();
-        let mut runners: Vec<PaneRunner> = vec![];
-        let bindings = Router::new(vec![]);
-        let mut focus: usize = 0;
-        let mut running = true;
-        let mut pending_resize: Option<(u16, u16)> = None;
+        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+        let r0 = make_runner("resize-anchor", close_tx.clone());
+        let runners: Vec<PaneRunner> = vec![r0];
 
-        handle_event(
-            &Event::Resize(132, 50),
-            &bindings,
-            &mut focus,
-            &mut runners,
-            &mut running,
-            &mut pending_resize,
+        let bindings = Router::new(vec![]);
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let graphics = GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
+        let last_area = LayoutRect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
+
+        let mut ctx = TickContext::new_full(
+            runners,
+            bindings,
+            0, // focus on the only leaf
+            true,
+            close_tx.clone(),
+            close_rx,
+            graphics,
+            &mut terminal,
+            std::time::Duration::from_millis(33),
+            dummy_layout_root(),
+            None,
+            last_area,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
         );
+
+        // Phase 0.5 starts at `pending_resize == None`. After
+        // dispatch the field must transition to Some with the
+        // dispatched dims.
+        ctx.handle_event_full(&Event::Resize(132, 50));
         assert_eq!(
-            pending_resize,
+            ctx.pending_resize,
             Some((132, 50)),
             "Event::Resize must arm pending_resize for phase 0.5 relayout"
         );
@@ -2367,21 +2324,12 @@ mod input_tests {
         // Coalesce-on-overwrite: a second resize arrives
         // BEFORE phase 0.5 has taken the first queued tuple,
         // so the value should simply be replaced, not stacked.
-        handle_event(
-            &Event::Resize(200, 60),
-            &bindings,
-            &mut focus,
-            &mut runners,
-            &mut running,
-            &mut pending_resize,
-        );
+        ctx.handle_event_full(&Event::Resize(200, 60));
         assert_eq!(
-            pending_resize,
+            ctx.pending_resize,
             Some((200, 60)),
             "second Event::Resize must coalesce onto (NOT push past) the first"
         );
-
-        drop(close_tx);
     }
 
     /// Phase 2 v2 wiring regression end-to-end at the tick
@@ -2457,7 +2405,7 @@ mod input_tests {
         let r0 =
             PaneRunner::spawn_with_graphics(pane_a, id_a, shell.clone(), Some(close_tx.clone()))
                 .expect("spawn runner A");
-        let r1 = PaneRunner::spawn_with_graphics(pane_b, id_b, shell, Some(close_tx))
+        let r1 = PaneRunner::spawn_with_graphics(pane_b, id_b, shell, Some(close_tx.clone()))
             .expect("spawn runner B");
         let runners = vec![r0, r1];
         let bindings = Router::new(vec![]);
@@ -2466,17 +2414,27 @@ mod input_tests {
         let backend = ratatui::backend::TestBackend::new(132, 50);
         let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
 
-        let mut ctx = TickContext::new(
+        let mut ctx = TickContext::new_full(
             runners,
             bindings,
             0,
             true,
+            close_tx,
             close_rx,
             graphics,
             &mut terminal,
             std::time::Duration::from_millis(33),
             layout_root.clone(),
             Some((132, 50)),
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            ShellSpec::LoginShell,
         );
 
         // Pairing pin BEFORE relayout: each runner's id must
