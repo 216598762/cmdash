@@ -141,22 +141,29 @@ flake-soak:
     classify_output() {
         local text="$1"
         local attempt=1 max_attempts=4 pause=2
-        local classified="" tmpfile text_json response http_code body
-        # Truncate text and escape as JSON string (bash 3.2+/jq).
-        text_json=$(printf '%s' "$text" | head -c 2000 | jq -Rs .)
+        local classified="" tmpfile text_truncated response http_code body
+        # Truncate the cargo-test stdout to 2000 bytes before
+        # JSON-escaping -- a deliberate API hygiene choice that
+        # keeps the OpenAI request payload bounded. Without
+        # the truncation, long cargo runs would blow up the
+        # payload. Truncation happens before the JSON escape
+        # so the 2000-byte bound is on the RAW text, not on
+        # the escaped output.
+        text_truncated=$(printf '%s' "$text" | head -c 2000)
+        # Build the OpenAI Chat Completions API request payload
+        # via `jq -n --arg` (NOT a `cat > tmpfile <<EOF` heredoc).
+        # `just` 1.55.1 parses recipe bodies token-by-token and
+        # chokes on JSON content in heredocs. The `jq` filter is
+        # a single-quoted argument so `just` sees a single token.
+        # See `tests/justfile-parse.sh` for the regression test
+        # pinning the parse fix.
         tmpfile=$(mktemp)
-        cat > "$tmpfile" << PAYLOAD_EOF
-{
-  "model": "gpt-4.1-mini",
-  "response_format": {"type": "json_object"},
-  "messages": [
-    {"role": "system", "content": $(printf '%s' "$SYSTEM_MSG" | jq -Rs .)},
-    {"role": "user", "content": $text_json}
-  ],
-  "temperature": 0,
-  "max_tokens": 12
-}
-PAYLOAD_EOF
+        jq -nc \
+            --arg model "gpt-4.1-mini" \
+            --arg system "$SYSTEM_MSG" \
+            --arg user "$text_truncated" \
+            '{model: $model, response_format: {type: "json_object"}, messages: [{role: "system", content: $system}, {role: "user", content: $user}], temperature: 0, max_tokens: 12}' \
+            > "$tmpfile"
         while [ $attempt -le $max_attempts ]; do
             response=$(curl -sS --max-time 15 -w "\n__HTTP_STATUS__:%{http_code}\n" \
                 -X POST "https://api.openai.com/v1/chat/completions" \
