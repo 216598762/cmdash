@@ -1793,6 +1793,20 @@ mod input_tests {
     /// Spawn a single `PaneRunner` wired to a close-channel and
     /// using `/bin/true` (fast-exit child) so `Drop::drop`
     /// rejoins the reader thread promptly in tests.
+    ///
+    /// `#[allow(dead_code)]` after the
+    /// `setup_fixture_ctx` extraction atom migrated the
+    /// 2 v1 free-fn tests that used this helper
+    /// (`pane_close_last_pane_quits_binary` +
+    /// `handle_event_resize_event_arms_pending_resize`)
+    /// onto the new fixture. The helper is retained
+    /// (not deleted) because the 2 `should_panic` tests
+    /// use `make_runner_with_id` (the sibling helper
+    /// below) and a future test author may want a
+    /// single-pane `make_runner` shortcut; the AGENTS.md
+    /// forward-only-no-rewind discipline prefers a
+    /// dead-code annotation over a deletion.
+    #[allow(dead_code)]
     fn make_runner(label: &str, close_tx: PaneCloseTx) -> PaneRunner {
         let cfg = cmdash_config::parse(&format!("layout {{ pane kind=shell label=\"{label}\" }}"))
             .expect("parse KDL");
@@ -1877,6 +1891,91 @@ mod input_tests {
         })
     }
 
+    /// Test-side fixture builder for the
+    /// 32+ `apply_action_full`-driven tests in this mod.
+    /// Replaces ~25 lines of repeated boilerplate
+    /// (KDL parse + `ComputedLayout::compute` +
+    /// `for pane in layout.panes { spawn_with_graphics }` +
+    /// `TestBackend` + `Terminal` + `GraphicsState` +
+    /// 14-arg `TickContext::new_full`) with a single 6-arg
+    /// call. Returns `(ctx, layout_root, last_area)` so tests
+    /// can drive post-dispatch layout assertions (e.g.
+    /// `relayout` test re-computes `pre_layout` against the
+    /// pre-dispatch `layout_root` + `last_area`).
+    ///
+    /// The 2 should_panic tests cannot use this helper:
+    /// they need `runners: Vec::new()` to trigger the
+    /// `focus < runners.len()` assert, and this helper
+    /// always spawns at least one runner from the parsed
+    /// KDL. Those tests keep their manual
+    /// `TickContext::new_full` construction.
+    ///
+    /// `pending_resize` is hardcoded to `None`; the relayout
+    /// test, which needs `Some((132, 50))`, mutates
+    /// `ctx.pending_resize` after the call (the field is
+    /// private to `fn main`'s module but accessible to
+    /// `input_tests` via the descendant-mod rule).
+    ///
+    /// Pre-dispatch `PaneLayerId` capture: tests that need
+    /// `dropped_layer_id` / `survivor_layer_id` BEFORE the
+    /// dispatch read `ctx.runners[i].layer_id()` directly
+    /// after the helper returns (the field is private but
+    /// accessible to the descendant `input_tests` mod).
+    /// AGENTS.md "minimal API surface" rule says no
+    /// fixture-side `Opts` struct; the 6-arg flat signature
+    /// is the agreed helper shape.
+    fn setup_fixture_ctx<'a>(
+        kdl: &str,
+        focus: usize,
+        bindings: Router,
+        shell: ShellSpec,
+        last_area: LayoutRect,
+        terminal: &'a mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    ) -> (
+        TickContext<'a, ratatui::backend::TestBackend>,
+        LayoutNode,
+        LayoutRect,
+    ) {
+        let cfg = cmdash_config::parse(kdl).expect("setup_fixture_ctx: parse KDL");
+        let layout_root = cfg.layout.expect("setup_fixture_ctx: layout block");
+        let layout = ComputedLayout::compute(&layout_root, last_area)
+            .expect("setup_fixture_ctx: compute");
+        let (close_tx, close_rx) = mpsc::channel();
+        let mut runners: Vec<PaneRunner> = Vec::with_capacity(layout.panes.len());
+        for pane in &layout.panes {
+            let tx_clone = close_tx.clone();
+            let layer_id = cmdash::derive_layer_id(&pane.id);
+            let r = PaneRunner::spawn_with_graphics(
+                pane.clone(),
+                layer_id,
+                shell.clone(),
+                Some(tx_clone),
+            )
+            .expect("setup_fixture_ctx: spawn pane");
+            runners.push(r);
+        }
+        let graphics =
+            GraphicsState::new(cmdash::graphics::Metrics::default(), (last_area.w, last_area.h));
+        let ctx = TickContext::new_full(
+            runners,
+            bindings,
+            focus,
+            true,
+            close_tx,
+            close_rx,
+            graphics,
+            terminal,
+            std::time::Duration::from_millis(33),
+            layout_root.clone(),
+            None,
+            last_area,
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            shell,
+        );
+        (ctx, layout_root, last_area)
+    }
+
     /// Ctrl-W on a 2-pane Vec, routed through the production
     /// `TickContext::handle_event_full` -> `apply_action_full`
     /// pipeline. Vec shrinks by one, the survivor is unmoved,
@@ -1903,45 +2002,12 @@ mod input_tests {
                 pane kind=shell label="b"
             }
         }"#;
-        let cfg = cmdash_config::parse(source).expect("parse split config");
-        let layout_root = cfg.layout.expect("layout block");
         let last_area = LayoutRect {
             x: 0,
             y: 0,
             w: 80,
             h: 24,
         };
-        let layout = ComputedLayout::compute(&layout_root, last_area).expect("compute");
-        assert_eq!(layout.panes.len(), 2);
-
-        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
-        let mut runners: Vec<PaneRunner> = Vec::with_capacity(2);
-        for pane in &layout.panes {
-            let tx_clone = close_tx.clone();
-            let layer_id = cmdash::derive_layer_id(&pane.id);
-            let r = PaneRunner::spawn_with_graphics(
-                pane.clone(),
-                layer_id,
-                ShellSpec::Command {
-                    argv: vec!["true".to_string()],
-                },
-                Some(tx_clone),
-            )
-            .expect("spawn pane");
-            runners.push(r);
-        }
-        // Left leaf (focus 0); its `LayerId` will be the one
-        // routed into close_rx on dispatch.
-        let dropped_layer_id = runners[0].layer_id();
-        let survivor_layer_id = runners[1].layer_id();
-
-        // Pre-register one image for the focused pane so we
-        // can prove `close_pane` revokes it on drain, matching
-        // the production LayerStack revoking flow.
-        let mut graphics = GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
-        graphics.push_image(dropped_layer_id, 1, image::RgbaImage::new(1, 1));
-        assert!(graphics.has_image(dropped_layer_id, 1));
-
         let bindings = Router::new(vec![Keybind {
             mods: CfgModifiers {
                 ctrl: true,
@@ -1954,23 +2020,29 @@ mod input_tests {
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
 
-        let mut ctx = TickContext::new_full(
-            runners,
-            bindings,
+        let (mut ctx, _layout_root, _last_area) = setup_fixture_ctx(
+            source,
             0, // focus on the left leaf
-            true,
-            close_tx.clone(),
-            close_rx,
-            graphics,
-            &mut terminal,
-            std::time::Duration::from_millis(33),
-            layout_root,
-            None,
+            bindings,
+            ShellSpec::Command {
+                argv: vec!["true".to_string()],
+            },
             last_area,
-            BTreeMap::new(),
-            BTreeMap::new(),
-            ShellSpec::LoginShell,
+            &mut terminal,
         );
+        assert_eq!(ctx.runners.len(), 2, "split must produce 2 panes");
+
+        // Left leaf (focus 0); its `LayerId` will be the one
+        // routed into close_rx on dispatch.
+        let dropped_layer_id = ctx.runners[0].layer_id();
+        let survivor_layer_id = ctx.runners[1].layer_id();
+
+        // Pre-register one image for the focused pane so we
+        // can prove `close_pane` revokes it on drain, matching
+        // the production LayerStack revoking flow.
+        ctx.graphics
+            .push_image(dropped_layer_id, 1, image::RgbaImage::new(1, 1));
+        assert!(ctx.graphics.has_image(dropped_layer_id, 1));
 
         // Dispatch Ctrl-W through the production
         // `TickContext::handle_event_full` path: Router
@@ -2017,11 +2089,13 @@ mod input_tests {
     /// live dispatch site is `TickContext::handle_event_full`.
     #[test]
     fn pane_close_last_pane_quits_binary() {
-        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
-        let r0 = make_runner("only", close_tx.clone());
-        let dropped_layer_id = r0.layer_id();
-        let runners: Vec<PaneRunner> = vec![r0];
-
+        let source = r#"layout { pane kind=shell label="only" }"#;
+        let last_area = LayoutRect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
         let bindings = Router::new(vec![Keybind {
             mods: CfgModifiers::default(),
             key: KeyToken::Char('w'),
@@ -2030,31 +2104,18 @@ mod input_tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
-        let graphics = GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
-        let last_area = LayoutRect {
-            x: 0,
-            y: 0,
-            w: 80,
-            h: 24,
-        };
 
-        let mut ctx = TickContext::new_full(
-            runners,
-            bindings,
+        let (mut ctx, _layout_root, _last_area) = setup_fixture_ctx(
+            source,
             0, // focus on the only leaf
-            true,
-            close_tx.clone(),
-            close_rx,
-            graphics,
-            &mut terminal,
-            std::time::Duration::from_millis(33),
-            dummy_layout_root(),
-            None,
+            bindings,
+            ShellSpec::Command {
+                argv: vec!["true".to_string()],
+            },
             last_area,
-            BTreeMap::new(),
-            BTreeMap::new(),
-            ShellSpec::LoginShell,
+            &mut terminal,
         );
+        let dropped_layer_id = ctx.runners[0].layer_id();
 
         ctx.handle_event_full(&key_event(
             crossterm::event::KeyCode::Char('w'),
@@ -2090,41 +2151,12 @@ mod input_tests {
                 }
             }
         }"#;
-        let cfg = cmdash_config::parse(source).expect("parse 3-pane tree");
-        let layout_root = cfg.layout.expect("layout block");
         let last_area = LayoutRect {
             x: 0,
             y: 0,
             w: 80,
             h: 24,
         };
-        let layout = ComputedLayout::compute(&layout_root, last_area).expect("compute");
-        assert_eq!(layout.panes.len(), 3);
-
-        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
-        let mut runners: Vec<PaneRunner> = Vec::with_capacity(3);
-        for pane in &layout.panes {
-            let tx_clone = close_tx.clone();
-            let layer_id = cmdash::derive_layer_id(&pane.id);
-            let r = PaneRunner::spawn_with_graphics(
-                pane.clone(),
-                layer_id,
-                ShellSpec::Command {
-                    argv: vec!["true".to_string()],
-                },
-                Some(tx_clone),
-            )
-            .expect("spawn pane");
-            runners.push(r);
-        }
-        // Resolver pre-order: pane_a -> pane_b -> pane_c;
-        // focus on the tail = pane_c (idx 2).
-        let survivor_a = runners[0].layer_id();
-        let survivor_b = runners[1].layer_id();
-        let dropped_layer_id = runners[2].layer_id();
-        assert_ne!(runners[0].layer_id(), runners[1].layer_id());
-        assert_ne!(runners[1].layer_id(), runners[2].layer_id());
-
         let bindings = Router::new(vec![Keybind {
             mods: CfgModifiers::default(),
             key: KeyToken::Char('w'),
@@ -2133,25 +2165,25 @@ mod input_tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
-        let graphics = GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
 
-        let mut ctx = TickContext::new_full(
-            runners,
-            bindings,
+        let (mut ctx, _layout_root, _last_area) = setup_fixture_ctx(
+            source,
             2, // focus on the tail pane (c)
-            true,
-            close_tx.clone(),
-            close_rx,
-            graphics,
-            &mut terminal,
-            std::time::Duration::from_millis(33),
-            layout_root,
-            None,
+            bindings,
+            ShellSpec::Command {
+                argv: vec!["true".to_string()],
+            },
             last_area,
-            BTreeMap::new(),
-            BTreeMap::new(),
-            ShellSpec::LoginShell,
+            &mut terminal,
         );
+        assert_eq!(ctx.runners.len(), 3, "3-pane split must produce 3 panes");
+        // Resolver pre-order: pane_a -> pane_b -> pane_c;
+        // focus on the tail = pane_c (idx 2).
+        let survivor_a = ctx.runners[0].layer_id();
+        let survivor_b = ctx.runners[1].layer_id();
+        let dropped_layer_id = ctx.runners[2].layer_id();
+        assert_ne!(ctx.runners[0].layer_id(), ctx.runners[1].layer_id());
+        assert_ne!(ctx.runners[1].layer_id(), ctx.runners[2].layer_id());
 
         // Drive through the production dispatch path:
         // handle_event_full -> Router::dispatch -> PaneClose
@@ -2278,37 +2310,27 @@ mod input_tests {
     /// drives.
     #[test]
     fn handle_event_resize_event_arms_pending_resize() {
-        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
-        let r0 = make_runner("resize-anchor", close_tx.clone());
-        let runners: Vec<PaneRunner> = vec![r0];
-
-        let bindings = Router::new(vec![]);
-        let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
-        let graphics = GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
+        let source = r#"layout { pane kind=shell label="resize-anchor" }"#;
         let last_area = LayoutRect {
             x: 0,
             y: 0,
             w: 80,
             h: 24,
         };
+        let bindings = Router::new(vec![]);
 
-        let mut ctx = TickContext::new_full(
-            runners,
-            bindings,
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+
+        let (mut ctx, _layout_root, _last_area) = setup_fixture_ctx(
+            source,
             0, // focus on the only leaf
-            true,
-            close_tx.clone(),
-            close_rx,
-            graphics,
-            &mut terminal,
-            std::time::Duration::from_millis(33),
-            dummy_layout_root(),
-            None,
+            bindings,
+            ShellSpec::Command {
+                argv: vec!["true".to_string()],
+            },
             last_area,
-            BTreeMap::new(),
-            BTreeMap::new(),
-            ShellSpec::LoginShell,
+            &mut terminal,
         );
 
         // Phase 0.5 starts at `pending_resize == None`. After
