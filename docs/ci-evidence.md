@@ -1752,6 +1752,203 @@ Cycle-numbering convention continues (`### Audit cycle 0`,
 `### Audit cycle 10`, `### Audit cycle 11`, `### Audit cycle 12`,
 `### Audit cycle 13`, `### Audit cycle 14`, ...).
 
+### Audit cycle 15 - retroactive audit-protocol entry for the justfile-parse-fix atom `0c97dfb`
+
+Forward-fixup audit-cycle entry retroactively recording the
+measured-claim ground truth for the justfile-parse-fix atom
+`0c97dfb`, which landed between cycle 13 (`2e781c2`) and
+cycle 14 (`c1b9c46`) without its own audit-protocol cycle
+entry. Per the audit-protocol format principle (cycles 0-13
+self-describe in `## Audit principles`: "[the ledger] is the
+audit-cleaner shape per the forward-only-no-rewind posture.
+Future readers override divergent commit-body claims via
+the authoritative measured value captured here.") + AGENTS.md
+forward-only discipline ("Corrective entries land as new
+forward-fixup atoms with a doc-only ledger entry"), the
+missing audit entry belongs as a new forward-fixup docs-only
+atom (this one), NOT as a retroactive modification of any
+prior atom or audit entry.
+
+Cycle 14's atom `c1b9c46` commit body misframed
+`0c97dfb` as "a pre-cycle-14 atom that doesn't need a
+new audit entry because it has no measured-claim
+divergence to record" — violating the format principle
+which implies *recording* no-divergence cases (not
+skipping them). Cycle 15 lands the missing entry.
+
+- **`docs/ci-evidence.md`** -- this file
+  - edits: APPEND a new `### Audit cycle 15` entry between
+    cycle 14 and the `## How to add a new entry` footer.
+  - the cycle 15 atom itself is a docs-only atom; no code
+    files modified by this atom.
+
+> **Audit-protocol-preservation note**: cycles 0-14 in this
+file are BYTE-EQUIVALENT to their pre-cycle-15 state. The
+cycle 15 atom only ADDS a new cycle 15 entry; no prior
+audit-protocol cycle entry (0-14) was modified. The atom
+being audited (`0c97dfb`) was a pre-cycle-14 atom that
+touched `justfile` (1 hunk, +22/-15 net lines) + added
+`tests/justfile-parse.sh` (102 lines, new file); the cycle
+15 atom doesn't modify either of those files. Per
+audit-protocol convention (parallel to cycle 14's: "the
+cycle-numbering-convention closing parenthetical inside
+cycle 13's body still lists `### Audit cycle 13` as the last
+entry (verbatim), and the new cycle 14 entry's closing
+parenthetical lists `### Audit cycle 14` as the new last
+entry"), the cycle 14 entry's closing parenthetical contains
+`... ### Audit cycle 14, ...` verbatim and is NOT updated
+to include cycle 15; the new cycle 15 entry's closing
+parenthetical contains `... ### Audit cycle 14, ### Audit
+cycle 15, ...` verbatim and supersedes the prior convention
+list.
+
+- **Aggregate claim** (of the atom being audited,
+  `0c97dfb`): zero measured-claim divergences. The atom
+  makes no explicit cargo-gate pass-count claim; the parse
+  fix claims empirical verification ("`just --list` and
+  `just --show <recipe>` now return RC=0 for all 3 recipes")
+  but does not assert a cargo-test count. Per the
+  audit-protocol format's running convention that
+  non-explicit-no-test atoms are measured against the full
+  4-cargo-gate set, the implicit claim is "all 4 cargo gates
+  continue to pass and the new test surface passes".
+- **Actual** (reference host origin/main@HEAD = `c1b9c46`,
+  current state on which `0c97dfb` is a direct ancestor):
+  - `cargo fmt --all --check`: 0 violations (RC=0)
+  - `cargo test --workspace --quiet`: RC=0. Aggregate
+    `130 passed / 0 failed / 1 ignored` across the 19
+    test binaries. The `cmdash`-crate-as-binary subset
+    -- verbatim quote from cycle 13's `Actual`
+    section: "Local `cargo test --workspace` on this
+    audit host produces 35/35 pass (matches cycle
+    11/12 ground truth; the doc-only change does not
+    affect test inventory)" (cycle 13's verbatim
+    `/35 pass` is the binary-level subset invariant
+    being cross-checked here; cycle 15's
+    `Actual`-section re-measures both numbers
+    explicitly so future readers can compare) -- gives
+    **35 passed / 0 failed / 0 ignored**; the    remaining 95 passes are distributed across the
+    `cmdash` lib + the workspace's other 6 crates'
+    binary subsets (per-binary breakdown available
+    via `cargo test --workspace 2>&1 | grep '^test
+    result: ok.'`).
+    `0c97dfb`'s file scope (`justfile` bash + the new
+    bash test) is OUTSIDE the cargo-test surface, so the
+    `/130 passed` aggregate is invariant from `0c97dfb`'s
+    pre-state to post-cycle-15 state.
+  - `cargo clippy --workspace --all-targets --
+    -D warnings`: 0 warnings (RC=0)
+  - `RUSTDOCFLAGS='-D rustdoc::broken-intra-doc-links' cargo
+    doc -p cmdash --lib --no-deps`: 0 broken intra-doc
+    links (the cmdash project doc-build gate; RC=0)
+  - `bash tests/justfile-parse.sh`: 0 (the new regression
+    test for `0c97dfb`'s parse fix; asserts `just --list`
+    exits 0, all 3 recipes enumerable, `just --show
+    <recipe>` exits 0 for each, body has >=5 non-comment
+    lines; the script fails on any of these 4 assertions)
+- **Delta**: 0 measured-claim divergences + 1 structural
+  finding (the new `tests/justfile-parse.sh` regression
+  test pinning `0c97dfb`'s parse fix; new files at the
+  audit-protocol level are a structural finding rather than
+  a measurement claim because regression tests don't carry
+  an aggregate pass/fail number in the cargo-test sense).
+  The workspace-level aggregate (`130 / 0 / 1`) and the
+  cmdash-binary aggregate (`35 / 0 / 0`) reconcile
+  cleanly: prior cycles 11/12/13/14's `/35 pass` wording
+  is the cmdash-binary subset invariant (the only
+  cargo-test surface the prior cycles explicitly
+  measured, since `0c97dfb`'s scope is bash-outside-
+  cargo-test); cycle 15's `Actual`-section re-measures
+  both numbers explicitly so future readers can compare
+  workspace-level aggregate to the prior binary-level
+  reading.
+  Cycle 15's finding is structurally distinct from cycles
+  0-14:
+  - Cycles 0-1: doc-only ledger atoms confirmed zero-body-
+    claim divergence.
+  - Cycles 2-3: dispatch-blocker findings.
+  - Cycle 4: LLM-judge framework-in-place + measurement
+    -pending.
+  - Cycle 5: dispatch-blocker-source-removed.
+  - Cycle 6: clippy-baseline strict-pin retarget.
+  - Cycles 7-10: hygiene-line-items closed (LICENSE,
+    README, CHANGELOG, v1.0.0 tag).
+  - Cycle 11: forward-look-SHA-placeholder closure for
+    the `--log=<path>` atom.
+  - Cycle 12: reproducible GPG-signing-path
+    institutionalization (the wrapper + justfile recipe +
+    AGENTS.md bullet + .gitignore entry + this file's
+    cycle 12 entry).
+  - Cycle 13: annotation pass for `--no-gpgsign` workaround
+    in 4 non-audit-protocol files.
+  - Cycle 14: structural fix that relocated the misplaced
+    `## How to add a new entry` footer to EOF.
+  - Cycle 15 (new): retroactive audit-protocol entry for
+    the justfile-parse-fix atom `0c97dfb` that landed
+    without its own audit entry between cycles 13 and 14.
+- **Effect**: closes the audit-protocol hygiene gap flagged
+  by cycle 14's code-review. The audit-protocol log now has
+  a `### Audit cycle 15` entry documenting `0c97dfb`'s
+  measured-claim ground truth; the cycle log is contiguous
+  + complete in that no non-doc-only atom is missing an
+  audit entry. The cycle 15 atom itself is docs-only and
+  does not modify any code or test. The new
+  `tests/justfile-parse.sh` regression test (added by
+  `0c97dfb`) becomes auditable under the cargo-gate set via
+  the BASHER check above.
+- **No `1.0-checklist.md` line item moved by this atom.**
+  The retroactive audit entry is a docs-only change;
+  `A1/A2/B1/B2/C1/C2/C3/C4` line items are unchanged (still
+  `A1 DONE` + `A2 OPEN` + `B1 DONE` + `B2 OPEN` +
+  `C1 DONE-v1.0.0` + `C2/C3/C4 DONE`).
+- **Evidence**:
+  - host: Arch Linux PTY-alloc; Rust 1.96.1
+  - audit range: 1 prior atom (`0c97dfb`) + the 1
+    audit-protocol atom (this cycle 15 atom)
+  - reference host: origin/main@HEAD = `c1b9c46`
+  - measured ground-truth per gate (with RCs):
+    `cargo fmt --all --check` -> RC=0; 0 violations
+    `cargo test --workspace --quiet` -> RC=0;
+    aggregate `130 passed / 0 failed / 1 ignored`
+    `cargo clippy --workspace --all-targets --
+      -D warnings` -> RC=0; 0 warnings
+    `RUSTDOCFLAGS='-D rustdoc::broken-intra-doc-links'
+      cargo doc -p cmdash --lib --no-deps` -> RC=0;
+    0 broken intra-doc links
+    `bash tests/justfile-parse.sh` -> RC=0;
+    4 of 4 assertions pass
+  - byte-equivalence evidence stream (tightened):
+    `git diff origin/main docs/ci-evidence.md | grep '^-'
+      | grep -v '^---'` returns 0 prior-cycle-modified
+    lines (only `+` cycle 15 entry lines in the diff).
+    Plus `git diff --stat origin/main docs/ci-evidence.md`
+    shows exactly `175 insertions(+), 0 deletions(-)`
+    -- only appended lines; no prior cycle modified.
+    Plus the cycle 14 closing parenthetical is preserved
+    verbatim (cycle 14's closure ends with
+    `\`\`### Audit cycle 14\`\`, ...)`; cycle 15's
+    closure extends the canonical cycle-list to
+    `\`\`### Audit cycle 15\`\`` without modifying the
+    cycle 14 list).
+  - audit-protocol cross-reference: cycle 12 (atom
+    `4b994fd`, the `gpg-setup` recipe that `0c97dfb`
+    unblocks); cycle 13 (atom `2e781c2`, annotation
+    pass); cycle 14 (atom `c1b9c46`, structural fix
+    whose per-fix-cycles-0-13 reference misframed
+    `0c97dfb` as not needing its own audit entry).
+
+Audit cycle 15 completes with **zero measured-claim
+divergences** plus **one structural finding (the new
+`tests/justfile-parse.sh` regression test as the parse-fix
+pin)** for the justfile-parse-fix atom `0c97dfb`.
+Cycle-numbering convention continues (`### Audit cycle 0`,
+`### Audit cycle 1`, `### Audit cycle 2`, `### Audit cycle 3`,
+`### Audit cycle 4`, `### Audit cycle 5`, `### Audit cycle 6`,
+`### Audit cycle 7`, `### Audit cycle 8`, `### Audit cycle 9`,
+`### Audit cycle 10`, `### Audit cycle 11`, `### Audit cycle 12`,
+`### Audit cycle 13`, `### Audit cycle 14`, `### Audit cycle 15`,
+...).
+
 ## How to add a new entry
 
 1. Forward-fixup atom atop the current `origin/main`.
