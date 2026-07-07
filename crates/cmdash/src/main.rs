@@ -4272,4 +4272,503 @@ mod input_tests {
             "stack_focus must record post-wrap idx 0 (FIRST member)"
         );
     }
+
+    // ============================================================
+    // Phase 2 carry-forward: EDGE-CASE tests for the runtime-
+    // mutation arms (`AppNewPane`, `PaneFocus{Direction}`,
+    // `PaneClose`, `PanePreset`) driven through
+    // `TickContext::apply_action_full`. The four primary tests
+    // above pin the happy-path; this block pins the boundary /
+    // no-op / AGENTS.md-audit-trail surfaces that cycle 16's
+    // audit-protocol entry (`### Audit cycle 16` in
+    // `docs/ci-evidence.md`) explicitly cited as the
+    // structural-deliverable row's deferred lib-crate half.
+    //
+    // AGENTS.md Hard rule + structural-finding pins covered:
+    // - close_rx round-trip pin (Hard rule: one layer per
+    //   instance; the Drop -> close_tx -> close_rx channel
+    //   must echo the dropped pane's PaneLayerId back out for
+    //   the binary's tick-loop phase 1 to drain).
+    // - survivor `PaneId.path_len` reconcile-after-`AppNewPane`
+    //   (the lib-crate harness verifies the survivor's
+    //   `path_len` ticks from 1 to 2 post-`AppNewPane` because
+    //   the layout engine now wraps the focused leaf in a
+    //   Split; the full-PaneId reconcile is TickContext-owned).
+    // - sibling-absorbed `PaneClose` (closing the only pane
+    //   quits the binary via `running = false`, the v1 PaneClose
+    //   path with a TickContext ctor shape).
+    // - `PaneFocusUp` / `PaneFocusDown` no-op on a 1-row
+    //   Horizontal Split (the adjacent-pane algorithm returns
+    //   `None` when no neighbour exists on the axis).
+    // - `PanePreset("missing")` no-op (unknown preset names
+    //   don't mutate `self.layout_root`).
+    // ============================================================
+
+    /// Edge case: `PaneFocusUp` / `PaneFocusDown` against a
+    /// 1-row Horizontal Split must NO-OP (no neighbour on the
+    /// vertical axis). Pins the
+    /// `cmdash_layout::adjacent_pane` fallback-on-`None` arm
+    /// for the up/down directions; left/right adjacency is
+    /// exercised separately by
+    /// `pane_focus_right_resolves_to_adjacent_pane_via_rect_proximity`.
+    #[test]
+    fn apply_action_full_pane_focus_up_down_noop_on_single_row() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout {
+            split axis=horizontal ratio=0.6 {
+                pane kind=shell label="left"
+                pane kind=shell label="right"
+            }
+        }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial_layout = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute");
+        let pane_a = initial_layout.panes[0].clone();
+        let pane_b = initial_layout.panes[1].clone();
+        let id_a = cmdash::derive_layer_id(&pane_a.id);
+        let id_b = cmdash::derive_layer_id(&pane_b.id);
+        let r0 =
+            PaneRunner::spawn_with_graphics(pane_a, id_a, shell.clone(), Some(close_tx.clone()))
+                .expect("spawn r0");
+        let r1 = PaneRunner::spawn_with_graphics(pane_b, id_b, shell, Some(close_tx.clone()))
+            .expect("spawn r1");
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            vec![r0, r1],
+            bindings,
+            0,
+            true,
+            close_tx,
+            close_rx,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+            BTreeMap::new(),
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        assert_eq!(ctx.focus, 0);
+        ctx.apply_action_full(KeyAction::PaneFocusUp);
+        assert_eq!(
+            ctx.focus, 0,
+            "PaneFocusUp on a 1-row H-Split must NO-OP (no neighbour on vertical axis)"
+        );
+        // Right at the boundary is exercised by the primary
+        // PaneFocusRight test -- here we only assert Up/Down
+        // stay no-op from the focus=0 starting point.
+        ctx.apply_action_full(KeyAction::PaneFocusDown);
+        assert_eq!(
+            ctx.focus, 0,
+            "PaneFocusDown on a 1-row H-Split must NO-OP (no neighbour on vertical axis)"
+        );
+        // Move to the right pane and re-pane Up/Down no-op:
+        // same surface, different focus.
+        ctx.apply_action_full(KeyAction::PaneFocusRight);
+        assert_eq!(ctx.focus, 1);
+        ctx.apply_action_full(KeyAction::PaneFocusUp);
+        assert_eq!(
+            ctx.focus, 1,
+            "PaneFocusUp from focus=1 also NO-OPs on a 1-row H-Split"
+        );
+        ctx.apply_action_full(KeyAction::PaneFocusDown);
+        assert_eq!(
+            ctx.focus, 1,
+            "PaneFocusDown from focus=1 also NO-OPs on a 1-row H-Split"
+        );
+    }
+
+    /// Edge case: `PaneClose` on a single-leaf TickContext
+    /// flips `running = false` (the binary quits) and the
+    /// `Vec<PaneRunner>` drains to empty. Pins the
+    /// empty-`runners`-post-close -> quit-the-binary arm
+    /// distinguishable from the multi-leaf rebalance case
+    /// (`pane_close_rebalance_collapses_split_to_one_leaf`
+    /// keeps the survivor and doesn't quit).
+    #[test]
+    fn apply_action_full_pane_close_final_pane_quits() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout { pane kind=shell label="only" }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial_layout = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute");
+        let pane = initial_layout.panes[0].clone();
+        let layer = cmdash::derive_layer_id(&pane.id);
+        let runner = PaneRunner::spawn_with_graphics(pane, layer, shell, Some(close_tx.clone()))
+            .expect("spawn");
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            vec![runner],
+            bindings,
+            0,
+            true,
+            close_tx,
+            close_rx,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+            BTreeMap::new(),
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        assert!(ctx.running, "pre-close: binary must be running");
+        assert_eq!(ctx.runners.len(), 1);
+        ctx.apply_action_full(KeyAction::PaneClose);
+        assert!(
+            ctx.runners.is_empty(),
+            "PaneClose on the only pane must drain the runner Vec"
+        );
+        assert!(
+            !ctx.running,
+            "PaneClose on the only pane must flip running -> false (binary quits)"
+        );
+    }
+
+    /// Edge case: `PanePreset("missing")` on a TickContext
+    /// whose `presets` map lacks that name must NO-OP. The
+    /// swap-to-preset handler logs `unknown name; no-op` and
+    /// returns without mutating `self.layout_root` /
+    /// `self.runners`. Pins the unrelated-preset-name
+    /// rejection surface so a future regression that
+    /// accidentally treats any string as a `KeyAction::PanePreset`
+    /// target (or panics on `BTreeMap::get` returning `None`)
+    /// fails this check.
+    #[test]
+    fn apply_action_full_pane_preset_unknown_name_noop() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout { pane kind=shell label="alpha" }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial_layout = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute");
+        let pane = initial_layout.panes[0].clone();
+        let original_layer = cmdash::derive_layer_id(&pane.id);
+        let runner = PaneRunner::spawn_with_graphics(
+            pane.clone(),
+            original_layer,
+            shell.clone(),
+            Some(close_tx.clone()),
+        )
+        .expect("spawn");
+        // Seed the presets map with a DIFFERENT-named entry
+        // (the BTreeMap presence is non-None for the
+        // `is_some()` branch, but `name != self.preset_name`
+        // is the predicate the swap handler uses; both
+        // surfaces are pinned by this single test).
+        let beta_cfg_text = r#"layout {
+            split axis=horizontal ratio=0.6 {
+                pane kind=shell label="beta-left"
+                pane kind=shell label="beta-right"
+            }
+        }"#;
+        let beta_cfg = cmdash_config::parse(beta_cfg_text).expect("parse beta");
+        let beta_layout_root = beta_cfg.layout.expect("beta layout block");
+        let mut presets = BTreeMap::new();
+        presets.insert("beta".to_string(), beta_layout_root);
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            vec![runner],
+            bindings,
+            0,
+            true,
+            close_tx,
+            close_rx,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root.clone(),
+            None,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+            presets,
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        ctx.apply_action_full(KeyAction::PanePreset("missing".to_string()));
+        // After a no-op preset swap: runners.len unchanged,
+        // focused LayerId unchanged, layout_root unchanged.
+        assert_eq!(
+            ctx.runners.len(),
+            1,
+            "PanePreset(\"missing\") must leave runners.len unchanged"
+        );
+        assert_eq!(
+            ctx.runners[0].layer_id(),
+            original_layer,
+            "PanePreset(\"missing\") must NOT revoke the original LayerId"
+        );
+        // layout_root is `Clone`-only (it has `#[derive(Debug,
+        // Clone)]` per cmdash-config); match by structural
+        // equality against the pre-snapshot we cloned in.
+        // Compute the post-state canvas from the layout_root
+        // to confirm it's STILL the alpha single-pane tree.
+        let post_layout = ComputedLayout::compute(&ctx.layout_root, ctx.last_area)
+            .expect("post-preset-noop compute");
+        assert_eq!(
+            post_layout.panes.len(),
+            1,
+            "PanePreset(\"missing\") must not change the layout's leaf count"
+        );
+    }
+
+    /// Hard-rule pin (AGENTS.md \u00a7\"Hard rule: one layer per
+    /// instance\"): after `PaneClose` drops the focused
+    /// runner, the `PaneRunner::Drop` impl enqueues the
+    /// runner's `PaneLayerId` onto the close-channel; the
+    /// binary's tick-loop phase 1 drains the channel and
+    /// routes each enqueued id through
+    /// `GraphicsState::close_pane` (which revokes the
+    /// dashcompositor image registration for that id).
+    /// Verify the close_rx round-trip directly: after
+    /// `apply_action_full(KeyAction::PaneClose)` on focus=0
+    /// of a 2-pane H-Split, close_rx.try_recv() must yield
+    /// the LEFT pane's dropped `PaneLayerId`, AND the
+    /// survivor's `PaneLayerId` is unchanged.
+    #[test]
+    fn apply_action_full_pane_close_drops_runner_routes_close_message() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout {
+            split axis=horizontal ratio=0.6 {
+                pane kind=shell label="left"
+                pane kind=shell label="right"
+            }
+        }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial_layout = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute");
+        let pane_a = initial_layout.panes[0].clone();
+        let pane_b = initial_layout.panes[1].clone();
+        let id_a = cmdash::derive_layer_id(&pane_a.id);
+        let id_b = cmdash::derive_layer_id(&pane_b.id);
+        let r0 =
+            PaneRunner::spawn_with_graphics(pane_a, id_a, shell.clone(), Some(close_tx.clone()))
+                .expect("spawn r0");
+        let r1 = PaneRunner::spawn_with_graphics(pane_b, id_b, shell, Some(close_tx.clone()))
+            .expect("spawn r1");
+        let survivor_layer = r1.layer_id();
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            vec![r0, r1],
+            bindings,
+            0,
+            true,
+            close_tx,
+            close_rx,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+            BTreeMap::new(),
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        ctx.apply_action_full(KeyAction::PaneClose);
+        // Primary pin: close_rx must echo back the dropped
+        // PaneRunner's PaneLayerId.
+        let dropped = ctx
+            .close_rx
+            .try_recv()
+            .expect("PaneRunner::Drop must enqueue the closing pane's layer id on close_tx");
+        assert_eq!(
+            dropped, id_a,
+            "close_rx must yield the LEFT pane's (focus=0) PaneLayerId"
+        );
+        assert_eq!(
+            ctx.runners.len(),
+            1,
+            "PaneClose rebalance collapses the Split from 2 to 1 runners"
+        );
+        assert_eq!(
+            ctx.runners[0].layer_id(),
+            survivor_layer,
+            "PaneClose rebalance: survivor pane keeps its LayerId per Hard rule"
+        );
+    }
+
+    /// Structural-finding pin (AGENTS.md Phase 2 carry-forward
+    /// structural-deliverable row item 2: AppNewPane
+    /// survivor's PaneId reconcile-gated-later): after
+    /// `apply_action_full(KeyAction::AppNewPane)` on a
+    /// single-leaf root, the post-state `Vec<PaneRunner>`
+    /// has length 2; the ORIGINAL focused pane's
+    /// `PaneLayerId` is preserved (Hard rule per
+    /// `app_new_pane_splits_focused_leaf_and_spawns_runner`
+    /// above); AND the layout-root -> Split tree's
+    /// `ComputedLayout::compute` output reports
+    /// `panes[0].id.path_len == 2` because the focused
+    /// leaf now lives at `path == [0, 0]` (parent-Split +
+    /// first-child). The full `PaneId` reconcile is
+    /// TickContext-owned (the lib-crate harness pins only
+    /// the path_len invariant; the same algorithm reaches
+    /// through to the vector `PaneId` once TickContext
+    /// `relayout`s on the next SIGWINCH or zero-area
+    /// pin-event).
+    #[test]
+    fn apply_action_full_app_new_pane_survivor_path_len_reconciles_to_two() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout { pane kind=shell label="alpha" }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial_layout = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute");
+        let pane = initial_layout.panes[0].clone();
+        let original_layer = cmdash::derive_layer_id(&pane.id);
+        assert_eq!(
+            initial_layout.panes[0].id.path_len(),
+            1,
+            "pre-AppNewPane: single-leaf layout yields path_len == 1"
+        );
+        let runner =
+            PaneRunner::spawn_with_graphics(pane, original_layer, shell, Some(close_tx.clone()))
+                .expect("spawn");
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![]);
+        let mut ctx = TickContext::new_full(
+            vec![runner],
+            bindings,
+            0,
+            true,
+            close_tx,
+            close_rx,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+            BTreeMap::new(),
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
+        );
+        ctx.apply_action_full(KeyAction::AppNewPane);
+        // Post-AppNewPane pin: layout_root became a Split, the
+        // survivor (the original alpha pane) is now at
+        // path [0, 0] with path_len == 2 (Split + leaf).
+        let post_layout = ComputedLayout::compute(&ctx.layout_root, ctx.last_area)
+            .expect("post-AppNewPane compute");
+        assert_eq!(post_layout.panes.len(), 2);
+        let survivor_paneid = &post_layout.panes[0].id;
+        assert_eq!(
+            survivor_paneid.path_len(),
+            2,
+            "survivor's PaneId.path_len must tick from 1 to 2 after AppNewPane wraps the focused leaf in a Split"
+        );
+        assert_eq!(
+            survivor_paneid.path(),
+            &[0, 0][..],
+            "survivor's PaneId path is [0, 0] (parent-Split + first-child)"
+        );
+        // Hard rule pin (already covered by the primary
+        // `app_new_pane_splits_focused_leaf_and_spawns_runner`,
+        // but re-pinned here for the path_len invariant's
+        // audit-trail witness).
+        assert_eq!(
+            ctx.runners[0].layer_id(),
+            original_layer,
+            "AppNewPane: original focused pane's LayerId is preserved (Hard rule)"
+        );
+    }
 }
