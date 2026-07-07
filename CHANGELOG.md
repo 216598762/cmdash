@@ -147,6 +147,7 @@ Major beats (chronological, HEAD-relative at the time of `v1.0.0`):
 - `4a403dd` C1 tagged-release status-tick (`DONE-v1.0.0`) +
   `git tag v1.0.0 4a403dd` + `git push --tags`.
 
+  - `d48f9df6` `feat(bin): adopt --log=<path> launch argument, supersede upstream --log-level chain` (post-`v1.0.0`-tag forward-fixup atop origin/main@`0a855c7`; supersedes the upstream `--log-level=<level>` CLI at `4c5ed96 + db9de89 + 0a855c7` via raw-source replacement per the AGENTS.md forward-only-no-rewind discipline; GPG-signed by `8CAF4D685F95A842` (`216598762Agentic <216598762@proton.me>`); cross-reference `docs/ci-evidence.md` `### Audit cycle 11` for the recording).
 The `v1.0.0` tag is the stable point for downstream consumers
 (cargo install, package managers, etc.). Future v1.0.X patches +
 v1.1.0 features land atop the `v1.0.0` tag as new forward-fixup

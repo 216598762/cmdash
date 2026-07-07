@@ -177,8 +177,8 @@ no merge, no warning. If the user wants `--log=<path>` plus
 a non-TRACE filter, that's not in v1.0.0's CLI scope; the
 deliberate choice was to drop the upstream chain's
 `--log-level=<level>` companion (commits `4c5ed96`,
-`db9de89`, `0a855c7` superseded by the parent atom of
-the change adopting `--log=<path>`). A future v2 topic,
+`db9de89`, `0a855c7` superseded by `d48f9df6` (per
+`docs/ci-evidence.md` `### Audit cycle 11`). A future v2 topic,
 NOT a v1.0.X atom, may add `--log-level=<level>` if the
 audit cycles flag it as a recurring need; a v1.0.X atom
 would re-introduce scope-creep without addressing the
