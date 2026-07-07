@@ -581,7 +581,12 @@ fn app_new_pane_splits_focused_leaf_in_real_pty_tree() {
     let source = r#"layout { pane kind=shell label="original" }"#;
     let cfg = cmdash_config::parse(source).expect("parse");
     let original_root = cfg.layout.clone().expect("layout block");
-    let area = LayoutRect { x: 0, y: 0, w: 80, h: 24 };
+    let area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: 80,
+        h: 24,
+    };
 
     let pre_layout = ComputedLayout::compute(&original_root, area).expect("compute pre");
     assert_eq!(pre_layout.panes.len(), 1, "fixture: 1-pane initial tree");
@@ -637,7 +642,8 @@ fn app_new_pane_splits_focused_leaf_in_real_pty_tree() {
     // Hard rule + pre-order invariance (resolve via the public
     // layer_id() / computed() / pre_order() accessors).
     assert_eq!(
-        post_layout.panes[0].id.pre_order(), original_pre_order,
+        post_layout.panes[0].id.pre_order(),
+        original_pre_order,
         "original leaf's pre_order must be unchanged across AppNewPane"
     );
     assert_eq!(
@@ -645,7 +651,8 @@ fn app_new_pane_splits_focused_leaf_in_real_pty_tree() {
         "original leaf's label must be unchanged across AppNewPane"
     );
     assert_eq!(
-        original_runner.layer_id(), original_layer_id,
+        original_runner.layer_id(),
+        original_layer_id,
         "original runner's PaneLayerId must be unchanged (Hard rule: no LayerId rebinding)"
     );
 
@@ -662,16 +669,19 @@ fn app_new_pane_splits_focused_leaf_in_real_pty_tree() {
     // fields that survive across the split without reconcile) and
     // rely on Hard-rule LayerId preservation above.
     assert_eq!(
-        original_runner.computed().id.pre_order(), post_layout.panes[0].id.pre_order(),
+        original_runner.computed().id.pre_order(),
+        post_layout.panes[0].id.pre_order(),
         "original runner's cached pre_order must match post_layout.panes[0] \
          (pre_order is invariant across AppNewPane; full PaneId requires TickContext reconcile)"
     );
     assert_eq!(
-        original_runner.computed().label, post_layout.panes[0].label,
+        original_runner.computed().label,
+        post_layout.panes[0].label,
         "original runner's cached label must match post_layout.panes[0]"
     );
     assert_eq!(
-        new_runner.computed().id, post_layout.panes[1].id,
+        new_runner.computed().id,
+        post_layout.panes[1].id,
         "new runner's cached PaneId must match post_layout.panes[1] \
          (new runner was spawned AFTER the post-layout resolve)"
     );
@@ -737,7 +747,12 @@ fn pane_focus_directional_moves_focus_via_adjacent_pane_in_real_pty_tree() {
     }"#;
     let cfg = cmdash_config::parse(source).expect("parse");
     let layout_root = cfg.layout.clone().expect("layout block");
-    let area = LayoutRect { x: 0, y: 0, w: 80, h: 24 };
+    let area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: 80,
+        h: 24,
+    };
 
     let initial_layout = ComputedLayout::compute(&layout_root, area).expect("compute split");
     assert_eq!(initial_layout.panes.len(), 2);
@@ -747,12 +762,22 @@ fn pane_focus_directional_moves_focus_via_adjacent_pane_in_real_pty_tree() {
     let id_right = pane_right.id;
     assert_eq!(
         pane_left.rect,
-        LayoutRect { x: 0, y: 0, w: 40, h: 24 },
+        LayoutRect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 24
+        },
         "fixture invariant: split child A at (0, 0, 40, 24)"
     );
     assert_eq!(
         pane_right.rect,
-        LayoutRect { x: 40, y: 0, w: 40, h: 24 },
+        LayoutRect {
+            x: 40,
+            y: 0,
+            w: 40,
+            h: 24
+        },
         "fixture invariant: split child B at (40, 0, 40, 24)"
     );
 
@@ -850,7 +875,12 @@ fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
     }"#;
     let cfg = cmdash_config::parse(source).expect("parse");
     let mut layout_root = cfg.layout.clone().expect("layout block");
-    let area = LayoutRect { x: 0, y: 0, w: 80, h: 24 };
+    let area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: 80,
+        h: 24,
+    };
 
     let initial_layout = ComputedLayout::compute(&layout_root, area).expect("compute split");
     let pane_kept = initial_layout.panes[0].clone();
@@ -883,7 +913,7 @@ fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
         .expect("spawn closing"),
     );
     let focus: usize = 1; // focused = closing pane
-    // `focus` is captured at the `runners.remove(focus)` callsite above.
+                          // `focus` is captured at the `runners.remove(focus)` callsite above.
 
     // Drop the focused runner FIRST so its Drop-driven close_tx
     // emit reaches `close_rx` BEFORE `remove_leaf` mutates the
@@ -897,8 +927,7 @@ fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
     // Split root. `remove_leaf` collapses the Split to its
     // survivor (label "kept"). Mirror the production
     // `TickContext::close_focused_and_rebalance`'s path-strip.
-    cmdash_layout::remove_leaf(&mut layout_root, &[1])
-        .expect("remove_leaf (sibling absorption)");
+    cmdash_layout::remove_leaf(&mut layout_root, &[1]).expect("remove_leaf (sibling absorption)");
     assert_eq!(
         layout_root,
         LayoutNode::Pane(CfgPane {
@@ -911,7 +940,11 @@ fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
     // Reconcile InPlace: rebind the survivor's PaneId + resize.
     // LayerId preserved (Hard rule).
     let post_layout = ComputedLayout::compute(&layout_root, area).expect("compute post-close");
-    assert_eq!(post_layout.panes.len(), 1, "PaneClose halves the leaf count");
+    assert_eq!(
+        post_layout.panes.len(),
+        1,
+        "PaneClose halves the leaf count"
+    );
     runners[0].rebind_pane(post_layout.panes[0].clone());
 
     // Hard rule: surviving runner's PaneLayerId is unchanged.
@@ -930,7 +963,8 @@ fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
     );
     // Survivor's cached pane reflects post-mutation resolver.
     assert_eq!(
-        runners[0].computed().id, post_layout.panes[0].id,
+        runners[0].computed().id,
+        post_layout.panes[0].id,
         "survivor's cached PaneId must match post_layout.panes[0]"
     );
     assert_eq!(
@@ -942,7 +976,8 @@ fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
     // the post-mutation resolver (the survivor is now the root,
     // so its resolver path is [0]).
     assert_ne!(
-        runners[0].computed().id, id_kept_pre,
+        runners[0].computed().id,
+        id_kept_pre,
         "survivor's PaneId must rotate to the post-mutation resolver"
     );
     assert_eq!(
@@ -991,7 +1026,12 @@ fn pane_preset_swap_layout_via_real_pty_wholesale_spawn() {
         presets.contains_key("two-pane"),
         "fixture invariant: presets block must contain `two-pane`"
     );
-    let area = LayoutRect { x: 0, y: 0, w: 80, h: 24 };
+    let area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: 80,
+        h: 24,
+    };
 
     let pre_layout = ComputedLayout::compute(&layout_root, area).expect("compute pre-swap");
     assert_eq!(pre_layout.panes.len(), 1, "fixture: 1 leaf pre-swap");

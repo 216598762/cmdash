@@ -1938,8 +1938,8 @@ mod input_tests {
     ) {
         let cfg = cmdash_config::parse(kdl).expect("setup_fixture_ctx: parse KDL");
         let layout_root = cfg.layout.expect("setup_fixture_ctx: layout block");
-        let layout = ComputedLayout::compute(&layout_root, last_area)
-            .expect("setup_fixture_ctx: compute");
+        let layout =
+            ComputedLayout::compute(&layout_root, last_area).expect("setup_fixture_ctx: compute");
         let (close_tx, close_rx) = mpsc::channel();
         let mut runners: Vec<PaneRunner> = Vec::with_capacity(layout.panes.len());
         for pane in &layout.panes {
@@ -1954,8 +1954,10 @@ mod input_tests {
             .expect("setup_fixture_ctx: spawn pane");
             runners.push(r);
         }
-        let graphics =
-            GraphicsState::new(cmdash::graphics::Metrics::default(), (last_area.w, last_area.h));
+        let graphics = GraphicsState::new(
+            cmdash::graphics::Metrics::default(),
+            (last_area.w, last_area.h),
+        );
         let ctx = TickContext::new_full(
             runners,
             bindings,

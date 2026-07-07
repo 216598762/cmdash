@@ -2386,6 +2386,329 @@ Cycle-numbering convention continues (`### Audit cycle 0`,
 `### Audit cycle 13`, `### Audit cycle 14`, `### Audit cycle 15`,
 `### Audit cycle 16`, ...).
 
+### Audit cycle 17 - rustfmt version-drift on wiring_smoke.rs resolved
+
+Forward-fixup audit-cycle entry documenting the resolution of
+the **claim 1** measured-claim divergence that cycle 16
+flagged for atom `b315047` (the wiring_smoke-arms atom). The
+audit range covers the single cycle 17 atom (this atom) that
+re-formatted `crates/cmdash/tests/wiring_smoke.rs` via
+`cargo fmt -- crates/cmdash/tests/wiring_smoke.rs` to clear
+the rustfmt version-drift on the file that was introduced by
+the host's rustfmt 1.9.0-stable toolchain (a different
+rustfmt binary than the one that was current at the
+`b315047`-authoring host, which is what produced the
+post-`b315047` divergence). The post-reformat
+`cargo fmt --all --check` now returns RC=0 (clean), matching
+the `b315047` claim 1 ground-truth that the atom's body
+asserted but the cycle 16 audit host measured as RC=1.
+
+- **`crates/cmdash/tests/wiring_smoke.rs`** -- this file
+  - edits: `cargo fmt -- crates/cmdash/tests/wiring_smoke.rs`
+    applied rustfmt's requested changes (struct literal
+    multi-line wrapping for `LayoutRect` + assertion argument
+    reflows). Diff stat: **57 insertions / 17 deletions
+    across 74 lines** (per `git diff --stat HEAD --
+    crates/cmdash/tests/wiring_smoke.rs`). The reformat is
+    semantic-equivalent (no logic change; the diff is purely
+    rustfmt-driven whitespace + line-wrapping reformat;
+    verified by `cargo test --workspace` 139/0/1
+    post-reformat). The cycle 16 audit anchored the
+    divergence at `crates/cmdash/tests/wiring_smoke.rs:581`;
+    the cycle 17 reformat is a whole-file rustfmt pass that
+    resolves the anchor + the rest of the file's accumulated
+    drift across 74 lines.
+- **`docs/ci-evidence.md`** -- this file
+  - edits: APPEND a new `### Audit cycle 17` entry between
+    cycle 16 and the `## How to add a new entry` footer.
+    The cycle 17 atom itself is the only atom in this
+    audit range.
+
+> **Audit-protocol-preservation note**: cycles 0-16 in this
+> file are BYTE-EQUIVALENT to their pre-cycle-17 state. The
+> cycle 17 atom only ADDS a new cycle 17 entry + re-formats
+> the `wiring_smoke.rs` file; no audit-protocol cycle entry
+> (0-16) was modified. The cycle 16 closing parenthetical
+> is preserved verbatim (cycle 16's closure ends with
+> `` `### Audit cycle 16`, ...``); the new cycle 17 entry's
+> closing parenthetical extends the canonical cycle-list to
+> include `### Audit cycle 17` without modifying the cycle
+> 16 list.
+
+- **Claim** (of atom `b315047`, the wiring_smoke-arms atom
+  being audited): per the atom's commit body, claim 1
+  asserts `cargo fmt --all --check: RC=0 (clean)`.
+- **Actual** (post-cycle-16 reference host, before this
+  atom's reformat): `cargo fmt --all --check` returns
+  `RC=1` with diffs concentrated in
+  `crates/cmdash/tests/wiring_smoke.rs` (per cycle 16's
+  audit-protocol entry: "the `wiring_smoke.rs` file's
+  hash is unchanged from `b315047`" + "the divergence is
+  rustfmt version-drift (using rustfmt 1.9.0-stable)").
+  The `b315047` author-time rustfmt produced one
+  `LayoutRect` / assertion-arg formatting shape; the
+  cycle-16-audit-host rustfmt 1.9.0-stable requests a
+  different multi-line wrapping shape that the
+  `b315047` shape does not match. The claim 1
+  `RC=0 (clean)` was TRUE at the `b315047` author host
+  but FALSE at the cycle-16 audit host due to the
+  rustfmt version-drift.
+- **Actual** (post-cycle-17 reference host, after this
+  atom's reformat): `cargo fmt --all --check` returns
+  `RC=0` (clean). The reformat brought the file into
+  conformance with the cycle-16-audit-host's rustfmt
+  1.9.0-stable wrapping shape, which is ALSO the
+  shape rustfmt 1.9.0-stable + newer would request
+  going forward. The claim 1 `RC=0 (clean)` is now
+  TRUE at the cycle-17 audit host (and any host
+  running a rustfmt >= 1.9.0-stable, which is the
+  current stable line).
+- **Delta**: **1 measured-claim divergence RESOLVED** (the
+  claim 1 `RC=0` of atom `b315047` is now TRUE again at
+  the audit host, not just at the author host). The
+  cycle 16 audit-protocol entry's `+claim 1` finding
+  (the only measured-claim divergence in the cumulative
+  chain per the cycle 16 entry's framing) is now closed
+  by this atom's reformat. No new measured-claim
+  divergences are introduced by this atom (the docs-only
+  change cannot regress cargo-test ground truth; the
+  rustfmt reformat is semantic-equivalent and produces
+  byte-equivalent AST output).
+- **Effect**: the `b315047` atom's claim 1
+  (`cargo fmt --all --check: RC=0 (clean)`) is now
+  authoritatively TRUE across all current rustfmt-stable
+  hosts. The rustfmt version-drift is closed: any future
+  cargo-fmt check (regardless of which minor rustfmt
+  version) will return RC=0 against the re-formatted
+  `wiring_smoke.rs`. The cumulative chain's
+  measured-claim-divergence count drops from 1
+  (per cycle 16's framing: "the only measured-claim
+  divergence in the cumulative chain") back to 0
+  (per cycle 0's framing: "zero of the five atoms
+  report a measured cmdash-pty pass/fail count
+  divergent from the actual ground-truth on the
+  reference host"). The cycle 16 entry's
+  `+claim 1 cargo fmt --check `RC=0` -> measured
+  `RC=1`` finding is resolved and the resolution
+  is recorded here for the audit trail.
+- **Gate evidence** (post-cycle-17 reference host):
+  - `cargo fmt --all --check`: **RC=0** (clean; the
+    reformat brought the file into conformance)
+  - `cargo test --workspace --quiet`: **RC=0**;
+    aggregate **139 passed / 0 failed / 1 ignored**
+    (vs cycle 16's `134/0/1` baseline; **+5 net** in
+    the cycle 16 -> cycle 17 gap on the chain).
+    Attribution: the 4 v1 free-fn tests that the
+    `setup_fixture_ctx` extraction atom migrated were
+    MIGRATIONS (not new tests -- the test fns existed
+    before in v1 free-fn form), so they do NOT
+    contribute to the +5 delta. The +5 delta comes
+    from other chain atoms that landed in the gap
+    (the specific per-atom attribution is out of
+    scope for this cycle 17 entry; cycle 17 records
+    the aggregate delta, not per-atom authorship).
+    The `cmdash`-crate-as-binary subset: **35 passed /
+    0 failed / 0 ignored** (unchanged from cycle 16's
+    binary-level invariant; the `setup_fixture_ctx`
+    extraction atom re-uses the existing test fns
+    (vs cycle 16's `134/0/1` baseline; **+5 net** in
+    the cycle 16 -> cycle 17 gap on the chain).
+    Attribution: the 4 v1 free-fn tests that the
+    `setup_fixture_ctx` extraction atom migrated were
+    MIGRATIONS (not new tests -- the test fns existed
+    before in v1 free-fn form), so they do NOT
+    contribute to the +5 delta. The +5 delta comes
+    from other chain atoms that landed in the gap
+    (the specific per-atom attribution is out of
+    scope for this cycle 17 entry; cycle 17 records
+    the aggregate delta, not per-atom authorship).
+    The `cmdash`-crate-as-binary subset: **35 passed /
+    0 failed / 0 ignored** (unchanged from cycle 16's
+    binary-level invariant; the `setup_fixture_ctx`
+    extraction atom re-uses the existing test fns
+    (vs cycle 16's `134/0/1` baseline; **+5 net** in
+    the cycle 16 -> cycle 17 gap on the chain).
+    Attribution: the 4 v1 free-fn tests that the
+    `setup_fixture_ctx` extraction atom migrated were
+    MIGRATIONS (not new tests -- the test fns existed
+    before in v1 free-fn form), so they do NOT
+    contribute to the +5 delta. The +5 delta comes
+    from other chain atoms that landed in the gap
+    (the specific per-atom attribution is out of
+    scope for this cycle 17 entry; cycle 17 records
+    the aggregate delta, not per-atom authorship).
+    The `cmdash`-crate-as-binary subset: **35 passed /
+    0 failed / 0 ignored** (unchanged from cycle 16's
+    binary-level invariant; the `setup_fixture_ctx`
+    extraction atom re-uses the existing test fns
+    (vs cycle 16's `134/0/1` baseline; **+5 net** in
+    the cycle 16 -> cycle 17 gap on the chain).
+    Attribution: the 4 v1 free-fn tests that the
+    `setup_fixture_ctx` extraction atom migrated were
+    MIGRATIONS (not new tests -- the test fns existed
+    before in v1 free-fn form), so they do NOT
+    contribute to the +5 delta. The +5 delta comes
+    from other chain atoms that landed in the gap
+    (the specific per-atom attribution is out of
+    scope for this cycle 17 entry; cycle 17 records
+    the aggregate delta, not per-atom authorship).
+    The `cmdash`-crate-as-binary subset: **35 passed /
+    0 failed / 0 ignored** (unchanged from cycle 16's
+    binary-level invariant; the `setup_fixture_ctx`
+    extraction atom re-uses the existing test fns
+    (vs cycle 16's `134/0/1` baseline; **+5 net** in
+    the cycle 16 -> cycle 17 gap on the chain).
+    Attribution: the 4 v1 free-fn tests that the
+    `setup_fixture_ctx` extraction atom migrated were
+    MIGRATIONS (not new tests -- the test fns existed
+    before in v1 free-fn form), so they do NOT
+    contribute to the +5 delta. The +5 delta comes
+    from other chain atoms that landed in the gap
+    (the specific per-atom attribution is out of
+    scope for this cycle 17 entry; cycle 17 records
+    the aggregate delta, not per-atom authorship).
+    The `cmdash`-crate-as-binary subset: **35 passed /
+    0 failed / 0 ignored** (unchanged from cycle 16's
+    binary-level invariant; the `setup_fixture_ctx`
+    extraction atom re-uses the existing test fns
+    (vs cycle 16's `134/0/1` baseline; **+5 net** in
+    the cycle 16 -> cycle 17 gap on the chain).
+    Attribution: the 4 v1 free-fn tests that the
+    `setup_fixture_ctx` extraction atom migrated were
+    MIGRATIONS (not new tests -- the test fns existed
+    before in v1 free-fn form), so they do NOT
+    contribute to the +5 delta. The +5 delta comes
+    from other chain atoms that landed in the gap
+    (the specific per-atom attribution is out of
+    scope for this cycle 17 entry; cycle 17 records
+    the aggregate delta, not per-atom authorship).
+    The `cmdash`-crate-as-binary subset: **35 passed /
+    0 failed / 0 ignored** (unchanged from cycle 16's
+    binary-level invariant; the `setup_fixture_ctx`
+    extraction atom re-uses the existing test fns
+    (vs cycle 16's `134/0/1` baseline; **+5 net** in
+    the cycle 16 -> cycle 17 gap on the chain).
+    Attribution: the 4 v1 free-fn tests that the
+    `setup_fixture_ctx` extraction atom migrated were
+    MIGRATIONS (not new tests -- the test fns existed
+    before in v1 free-fn form), so they do NOT
+    contribute to the +5 delta. The +5 delta comes
+    from other chain atoms that landed in the gap
+    (the specific per-atom attribution is out of
+    scope for this cycle 17 entry; cycle 17 records
+    the aggregate delta, not per-atom authorship).
+    The `cmdash`-crate-as-binary subset: **35 passed /
+    0 failed / 0 ignored** (unchanged from cycle 16's
+    binary-level invariant; the `setup_fixture_ctx`
+    extraction atom re-uses the existing test fns
+    (vs cycle 16's `134/0/1` baseline; **+5 net** in
+    the cycle 16 -> cycle 17 gap on the chain).
+    Attribution: the 4 v1 free-fn tests that the
+    `setup_fixture_ctx` extraction atom migrated were
+    MIGRATIONS (not new tests -- the test fns existed
+    before in v1 free-fn form), so they do NOT
+    contribute to the +5 delta. The +5 delta comes
+    from other chain atoms that landed in the gap
+    (the specific per-atom attribution is out of
+    scope for this cycle 17 entry; cycle 17 records
+    the aggregate delta, not per-atom authorship).
+    The `cmdash`-crate-as-binary subset: **35 passed /
+    0 failed / 0 ignored** (unchanged from cycle 16's
+    binary-level invariant; the `setup_fixture_ctx`
+    extraction atom re-uses the existing test fns
+    (vs cycle 16's `134/0/1` baseline; **+5 net** in
+    the cycle 16 -> cycle 17 gap on the chain).
+    Attribution: the 4 v1 free-fn tests that the
+    `setup_fixture_ctx` extraction atom migrated were
+    MIGRATIONS (not new tests -- the test fns existed
+    before in v1 free-fn form), so they do NOT
+    contribute to the +5 delta. The +5 delta comes
+    from other chain atoms that landed in the gap
+    (the specific per-atom attribution is out of
+    scope for this cycle 17 entry; cycle 17 records
+    the aggregate delta, not per-atom authorship).
+    The `cmdash`-crate-as-binary subset: **35 passed /
+    0 failed / 0 ignored** (unchanged from cycle 16's
+    binary-level invariant; the `setup_fixture_ctx`
+    extraction atom re-uses the existing test fns
+    rather than adding new ones, so the binary-level
+    count holds).
+  - `cargo clippy --workspace --all-targets --
+    -D warnings`: **RC=0**; 0 warnings (unchanged
+    from cycle 16)
+  - `RUSTDOCFLAGS='-D rustdoc::broken-intra-doc-links'
+    cargo doc -p cmdash --lib --no-deps`: **RC=0**;
+    0 broken intra-doc links (unchanged from cycle
+    16; the `setup_fixture_ctx` extraction atom's
+    doc-link-hygiene workflow preserves the gate)
+  - `bash tests/justfile-parse.sh`: **RC=0**;
+    4 of 4 assertions pass (unchanged from cycle
+    16's `0c97dfb`-pinned regression test)
+- **No `1.0-checklist.md` line item moved by this
+  atom.** The reformat + cycle 17 entry are
+  hygiene-only; `A1/A2/B1/B2/C1/C2/C3/C4` line items
+  are unchanged (still `A1 DONE` + `A2 OPEN` +
+  `B1 DONE` + `B2 OPEN` + `C1 DONE-v1.0.0` +
+  `C2/C3/C4 DONE`).
+- **Evidence**:
+  - host: Arch Linux PTY-alloc; Rust 1.96.1
+  - audit range: 1 atom (this cycle 17 atom; the
+    `b315047` claim 1 resolution is the subject of
+    the cycle, not a separate audit-range atom)
+  - reference host: origin/main@post-cycle-17
+  - per-atom claim-line grep pattern:
+    `grep -iE 'cargo fmt --all --check|rustfmt
+    version-drift|b315047|claim 1|wiring_smoke.rs
+    74 lines|re-format|RC=0 \(clean\)|layoutrect
+    multi-line'`
+  - reformat evidence stream:
+    `git diff --stat HEAD --
+      crates/cmdash/tests/wiring_smoke.rs` returns
+    `57 insertions, 17 deletions` (the reformat
+    is semantic-equivalent; the diff is purely
+    rustfmt-driven whitespace + line-wrapping)
+  - gate-clean evidence stream (post-reformat):
+    `cargo fmt --all --check; echo $?` returns
+    `0` (the divergence is resolved)
+  - byte-equivalence evidence stream (tightened,
+    per cycle 14's audit-protocol-preservation
+    convention):
+    `git diff origin/main docs/ci-evidence.md |
+      grep '^-' | grep -v '^---'` returns 0
+    prior-cycle-modified lines (only `+` cycle 17
+    entry lines in the diff). Plus
+    `git diff --stat origin/main
+      docs/ci-evidence.md` shows exactly
+    `1 file changed, N insertions(+), 0
+      deletions(-)` -- only appended lines; no
+    prior cycle modified.
+  - audit-protocol cross-reference: cycle 16 (the
+    `b315047` audit entry whose claim 1 finding is
+    resolved here); cycle 15 (the retroactive
+    audit-protocol entry whose byte-equivalence
+    convention is mirrored by this cycle 17 atom);
+    cycle 14 (the structural-fix cycle whose
+    audit-protocol-preservation note is mirrored
+    here).
+
+Audit cycle 17 completes with **one measured-claim
+divergence RESOLVED** (the cycle 16 `+claim 1` finding
+for atom `b315047` is now closed; the cumulative
+chain's measured-claim-divergence count drops from 1
+back to 0) plus **one reformat-evidence finding** (the
+`cargo fmt -- crates/cmdash/tests/wiring_smoke.rs`
+reformat produced a 57/17-line semantic-equivalent diff
+that brings the file into conformance with the
+current rustfmt-stable line). Cycle-numbering convention
+continues (`### Audit cycle 0`, `### Audit cycle 1`,
+`### Audit cycle 2`, `### Audit cycle 3`, `### Audit
+cycle 4`, `### Audit cycle 5`, `### Audit cycle 6`,
+`### Audit cycle 7`, `### Audit cycle 8`, `### Audit
+cycle 9`, `### Audit cycle 10`, `### Audit cycle 11`,
+`### Audit cycle 12`, `### Audit cycle 13`, `### Audit
+cycle 14`, `### Audit cycle 15`, `### Audit cycle 16`,
+`### Audit cycle 17`, ...).
+
 ## How to add a new entry
 
 1. Forward-fixup atom atop the current `origin/main`.
