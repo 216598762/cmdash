@@ -263,7 +263,10 @@ cargo doc --workspace --no-deps
   claims vs measured ground truth across audit cycles 0 → 10.
   Written forward-only as forward-fixup atoms (no amend, no
   rebase, no force-push; per-commit `--no-gpgsign=false`
-  host-signature workaround; per-tag `--no-sign` workaround).
+  host-signature workaround; per-tag `--no-sign` workaround
+  (v1.0.0 era discipline; SUPERSEDED post-v1.0.0 by
+  `scripts/gpg-cmdash-wrapper.sh` per `docs/ci-evidence.md`
+  `### Audit cycle 12`).
 - [`docs/configuration.md`](docs/configuration.md) — the
   **user-facing configuration and usage guide**. The canonical
   reference for the KDL config schema (the three top-level

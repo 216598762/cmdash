@@ -738,8 +738,11 @@ regardless of where in the tree that `zstack` sits.
 - [`docs/1.0-checklist.md`](./1.0-checklist.md) — internal
   release-progress ledger for the v1.0.0 cutoff.
 - [`docs/ci-evidence.md`](./ci-evidence.md) — local-CI recipe
-  guide (clippy-baseline-0, flake-soak, the `--no-gpgsign=false`
-  per-commit + `--no-sign` per-tag signature workaround on a host
+guide (clippy-baseline-0, flake-soak, the `--no-gpgsign=false`
+per-commit + `--no-sign` per-tag signature workaround on a host
+with a TTY-less GPG agent; v1.0.0 era discipline, SUPERSEDED post-v1.0.0
+by `scripts/gpg-cmdash-wrapper.sh` per `docs/ci-evidence.md`
+`### Audit cycle 12`);
   with a TTY-less GPG agent).
 - [`examples/`](../examples/) — the four canonical configs from §6
   as standalone `.kdl` files (`01-minimal.kdl`,

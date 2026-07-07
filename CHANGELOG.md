@@ -115,7 +115,10 @@ the cumulative audit-protocol ledger at `docs/ci-evidence.md`.
 
 This chain follows the `forward-only-no-rewind` discipline: no
 amend, no rebase, no force-push; per-commit `--no-gpgsign=false`
-host signature workaround when the host's GPG agent lacks a TTY.
+host signature workaround when the host's GPG agent lacks a TTY
+(v1.0.0 era discipline; SUPERSEDED post-v1.0.0 by
+`scripts/gpg-cmdash-wrapper.sh` per `docs/ci-evidence.md`
+`### Audit cycle 12`).
 
 Major beats (chronological, HEAD-relative at the time of `v1.0.0`):
 

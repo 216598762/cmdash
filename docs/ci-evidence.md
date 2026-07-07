@@ -1505,3 +1505,158 @@ continues (`### Audit cycle 0`, `### Audit cycle 1`,
 `### Audit cycle 5`, `### Audit cycle 6`, `### Audit cycle 7`,
 `### Audit cycle 8`, `### Audit cycle 9`, `### Audit cycle 10`,
 `### Audit cycle 11`, `### Audit cycle 12`, ...).
+
+### Audit cycle 13 - annotate obsolete `--no-gpgsign` workaround in non-audit-protocol docs (hybrid: annotate non-audit-protocol, leave audit-protocol untouched)
+
+Forward-fixup audit-cycle entry documenting the annotation pass
+that back-pointers stale references to the prior
+`--no-gpgsign=false` per-command workaround and the prior
+`/root/.local/bin/gpg-cmdash-wrapper` host-path wrapper in
+NON-audit-protocol docs (CHANGELOG, README, 1.0-checklist,
+configuration.md). The annotation principle: AUDIT-PROTOCOL
+CYCLE ENTRIES (cycles 0-12 in this file) are HISTORICAL
+record per the audit-protocol format spec; modifying them
+would undermine the format's purpose. NON-AUDIT-PROTOCOL docs
+(CHANGELOG, README, 1.0-checklist, configuration.md) are
+CURRENT-STATE docs; they should reflect the current path. The
+hybrid approach annotates the latter (with a SUPERSEDED
+pointer to `### Audit cycle 12`) and leaves the former
+untouched.
+
+- **CHANGELOG.md** (atom: this cycle 13 atom)
+  - files: `CHANGELOG.md` only (line 117 area; "Atom
+    progression" preamble)
+  - edit: append `(v1.0.0 era discipline; SUPERSEDED
+    post-v1.0.0 by \`scripts/gpg-cmdash-wrapper.sh\` per
+    \`docs/ci-evidence.md\` \`### Audit cycle 12\`)` to the
+    `per-commit \`--no-gpgsign=false\` host signature
+    workaround` phrase
+- **README.md** (atom: this cycle 13 atom)
+  - files: `README.md` only (line 265 area; "Contributing"
+    section's pre-push gate list)
+  - edit: same annotation appended to the same phrase
+- **docs/1.0-checklist.md** (atom: this cycle 13 atom)
+  - files: `docs/1.0-checklist.md` only (lines 164 + 289; the
+    v1.0.0 era discipline statements)
+  - edit: same annotation appended to both occurrences
+- **docs/configuration.md** (atom: this cycle 13 atom)
+  - files: `docs/configuration.md` only (line 741;
+    "Cross-references" section)
+  - edit: same annotation appended to the `--no-gpgsign=false`
+    + `--no-sign` phrase
+
+> **Audit-protocol-preservation note**: cycles 0-12 in this
+> file (the audit-protocol cycle entries themselves) are
+> BYTE-EQUIVALENT to their pre-this-atom state. The
+> annotation pass touches ONLY the 4 non-audit-protocol
+> files (CHANGELOG, README, 1.0-checklist, configuration.md);
+> no audit-protocol cycle entry was modified. This preserves
+> the audit-protocol format's principle that historical cycle
+> entries are immutable record of past-tense decision
+> rationale.
+
+- **Aggregate claim**: zero measured-claim divergences in this
+  audit cycle (this is a doc-only annotation pass; no
+  cargo-test ground truth is asserted or measured). The
+  annotation principle is the finding: AUDIT-PROTOCOL =
+  historical record (untouched); NON-AUDIT-PROTOCOL = current
+  state (annotated to point at cycle 12's wrapper as the
+  canonical current path).
+- **Actual** (reference host origin/main@post-cycle-13): the
+  4 annotated files all carry the SUPERSEDED pointer; the
+  audit-protocol cycle entries (0-12) are byte-equivalent to
+  their pre-this-atom state (no modification). Local `cargo
+  test --workspace` on this audit host produces 35/35 pass
+  (matches cycle 11/12 ground truth; the doc-only change does
+  not affect test inventory). 0 clippy residuals; 0
+  rustdoc-gate residuals.
+- **Delta**: 0 measured-claim divergences + 1 annotation-pass
+  finding. Cycle 13's finding is structurally distinct from
+  cycles 0-12:
+  - Cycles 0-1 found doc-only ledger atoms confirmed
+    zero-body-claim divergence.
+  - Cycles 2-3 found dispatch-blocker findings.
+  - Cycle 4 found LLM-judge framework-in-place +
+    measurement-pending.
+  - Cycle 5 found dispatch-blocker-source-removed.
+  - Cycle 6 found clippy-baseline strict-pin retarget.
+  - Cycle 7 found LICENSE add closes C4 hygiene gap.
+  - Cycle 8 found README add closes C3 hygiene gap.
+  - Cycle 9 found CHANGELOG add closes C2 hygiene gap.
+  - Cycle 10 found v1.0.0 tag closes C1 hygiene gap.
+  - Cycle 11 found forward-look-SHA-placeholder closure
+    for the `--log=<path>` atom.
+  - Cycle 12 found reproducible GPG-signing-path
+    institutionalization (the wrapper + justfile recipe +
+    AGENTS.md bullet + .gitignore + this file's cycle 12
+    entry).
+  - Cycle 13 (new) finds the annotation pass that
+    disambiguates historical vs current state for the
+    `--no-gpgsign` workaround in 4 non-audit-protocol
+    files. The principle: audit-protocol cycle entries are
+    immutable historical record; non-audit-protocol docs
+    are mutable current-state docs that should point at
+    cycle 12's wrapper as the canonical current path.
+- **Effect**: future readers skimming the 4
+  non-audit-protocol files see the SUPERSEDED annotation and
+  follow it to cycle 12. The audit-protocol cycle entries
+  (0-12) remain byte-equivalent to their pre-this-atom
+  state, preserving the historical record. The annotation is
+  a 1-line addition per file (4 files total); it does not
+  delete or rewrite any historical content. The annotation
+  principle is the substantive deliverable.
+- **Structural note (non-blocking)**: this cycle 13 entry
+  lands AFTER the prior cycle 12 entry in the file, which
+  itself landed AFTER the `## How to add a new entry` footer
+  (line 1365) instead of BEFORE it -- a pre-existing
+  structural placement from the cycle 12 atom (atom
+  `4b994fd`). The audit-protocol cycle log (cycles 0-13) is
+  therefore non-contiguous in the file, interrupted by the
+  footer. A future forward-fixup atom could relocate the
+  footer to the end of the file; this cycle 13 atom does NOT
+  bundle the structural fix because per AGENTS.md
+  forward-only discipline, separate atoms are independently
+  rewindable. The annotation principle is the substantive
+  change; the structural fix is a hygiene followup that
+  future authors can land as a `docs(ci-evidence):
+  relocate-footer-to-EOF` atom.
+- **No `1.0-checklist.md` line item moved by this atom.**
+  The annotation is a doc-only change; `A1/A2/B1/B2/C1/C2/
+  C3/C4` line items are unchanged (still `A1 DONE` + `A2
+  OPEN` + `B1 DONE` + `B2 OPEN` + `C1 DONE-v1.0.0` +
+  `C2/C3/C4 DONE`). The annotation does not change any 1.0
+  gating line item's status.
+- **Evidence**:
+  - host: Arch Linux PTY-alloc; Rust 1.96.1
+  - audit range: 1 atom (this cycle 13 atom)
+  - reference host: origin/main@post-cycle-13
+  - per-atom claim-line grep pattern:
+    `grep -nE 'SUPERSEDED post-v1.0.0 by
+    \`scripts/gpg-cmdash-wrapper.sh\`'`
+  - annotation evidence stream:
+    `grep -cE 'SUPERSEDED post-v1.0.0' CHANGELOG.md
+    README.md docs/1.0-checklist.md docs/configuration.md`
+    (returns 1+ per file after this atom lands)
+  - audit-protocol-preservation evidence stream:
+    `git diff <cycle-12-atom-SHA> docs/ci-evidence.md |
+    grep '^[-+]### Audit cycle'` returns 1+ lines (only
+    cycle 13 itself, not modifications to cycles 0-12)
+  - future-readers grep recipe:
+    `grep -iE 'SUPERSEDED.*cycle 12|SUPERSEDED.*
+    gpg-cmdash-wrapper'` returns the annotation + cross-refs
+    in the 4 non-audit-protocol files
+  - audit-protocol cross-reference: cycle 12's
+    `scripts/gpg-cmdash-wrapper.sh` (atom `4b994fd`) is the
+    canonical current path; cycles 0-12 remain
+    byte-equivalent historical record
+
+Audit cycle 13 completes with **zero measured-claim
+divergences** plus **one annotation-pass finding** that
+disambiguates historical vs current state for the
+`--no-gpgsign` workaround in the 4 non-audit-protocol files.
+Cycle-numbering convention continues (`### Audit cycle 0`,
+`### Audit cycle 1`, `### Audit cycle 2`, `### Audit cycle 3`,
+`### Audit cycle 4`, `### Audit cycle 5`, `### Audit cycle 6`,
+`### Audit cycle 7`, `### Audit cycle 8`, `### Audit cycle 9`,
+`### Audit cycle 10`, `### Audit cycle 11`, `### Audit cycle
+12`, `### Audit cycle 13`, ...).
