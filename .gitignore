@@ -5,3 +5,6 @@ Cargo.lock.bak
 
 # Local-only scratch space (per-developer experimentation, not tracked)
 .scratch/
+
+# Security: prevent accidental commits of local GPG passphrases
+*gpg-passphrase*

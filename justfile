@@ -334,3 +334,23 @@ clippy-baseline-0:
     fi
     echo ""
     echo "== PASS: clippy-baseline-0 strict-pin holds at EXPECTED=ACTUAL=$COUNT =="
+
+# ------------------------------------------------------------------------------
+# gpg-setup: wire git's gpg.program to scripts/gpg-cmdash-wrapper.sh and
+# re-enable commit.gpgsign. Run once per host. The wrapper ships in the
+# repo and contains no secrets; the passphrase is held host-local at
+# ~/.config/cmdash/gpg-passphrase (chmod 600). See
+# scripts/gpg-cmdash-wrapper.README.md + docs/ci-evidence.md audit cycle 12.
+# ------------------------------------------------------------------------------
+gpg-setup:
+    @chmod 700 scripts/gpg-cmdash-wrapper.sh
+    @git config --local gpg.program "$(pwd)/scripts/gpg-cmdash-wrapper.sh"
+    @git config --local commit.gpgsign true
+    @echo "== gpg-cmdash-wrapper configured =="
+    @echo "Local git gpg.program:  $(git config --local gpg.program)"
+    @echo "Local git commit.gpgsign: $(git config --local --get commit.gpgsign)"
+    @echo "Next: seed your host-local passphrase file:"
+    @echo "  mkdir -p ~/.config/cmdash"
+    @echo "  printf '%s' 'YOUR_PASSPHRASE' > ~/.config/cmdash/gpg-passphrase"
+    @echo "  chmod 600 ~/.config/cmdash/gpg-passphrase"
+    @echo "  (do NOT commit the passphrase file -- *gpg-passphrase* is in .gitignore)"

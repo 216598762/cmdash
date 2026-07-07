@@ -434,6 +434,18 @@ through real `PaneRunner::spawn_with_graphics` children.
 - Reuse over reinvention: search awesome-rust / awesome-ratatui first.
   If a crate does the job, pull it in.
 - Always run `cargo fmt --all` before committing.
+- **GPG signing (TTY-less hosts).** If the host's `gpg-agent` cannot satisfy
+  passphrase requests through its standard cache path (e.g. `ERR 67108933
+  Not implemented` on the `preset_passphrase` assuan command, or
+  `gpg-preset-passphrase` binary missing on the host's PATH), use the
+  reproducible `scripts/gpg-cmdash-wrapper.sh`. The wrapper is committed
+  to the repo and contains NO secrets; the user's GPG key passphrase
+  lives in `~/.config/cmdash/gpg-passphrase` (chmod 600, host-local,
+  NOT committed; `.gitignore` excludes `*gpg-passphrase*` patterns).
+  Run `just gpg-setup` once per host to wire git's `gpg.program` +
+  re-enable `commit.gpgsign=true`. See
+  `scripts/gpg-cmdash-wrapper.README.md` + `docs/ci-evidence.md` audit
+  cycle 12 for the full diagnostic.
 - **doc-link-hygiene workflow.** When swapping a `[..]` intra-doc-link
   for a bare-backtick form to clear the rustdoc gate, commit TWO
   atoms atomically: the FIX itself uses a `fix:` prefix; the
