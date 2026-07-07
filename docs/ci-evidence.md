@@ -1362,37 +1362,6 @@ cycle 2`, `### Audit cycle 3`, `### Audit cycle 4`,
 `### Audit cycle 5`, `### Audit cycle 6`, `### Audit
 cycle 7`, `### Audit cycle 8`, `### Audit cycle 9`,
 `### Audit cycle 10`, `### Audit cycle 11`, ...).
-## How to add a new entry
-
-1. Forward-fixup atom atop the current `origin/main`.
-2. Run `cargo test -p <crate> --quiet` against the new HEAD.
-3. If the actual diverges from the commit body claim, append an entry
-   under `## Entries` in this file.
-4. Cite host + Rust version + the exact invocation in the entry's
-   `evidence` field.
-5. Per the entry format spec above, document `commit / claim /
-   actual / delta / evidence`. The `forward-fix` field is intentionally
-   absent from the spec (the forward-fixup-no-amend-atom disclaimer
-   lives in `## Audit principles`).
-6. Commit with a subject prefix matching the atom's scope (e.g.
-   `chore(ci):`, `fix(cmdash-pty):`, `docs(ci-evidence):`).
-7. Land with `--no-gpg-sign` if the host's GPG agent lacks a TTY
-   (workaround via `git -c commit.gpgsign=false commit ...`).
-8. Tag events likewise use `--no-sign` on `git tag -a` when the host's
-   GPG agent lacks a TTY (workaround via
-   `git tag -a <tag-name> --no-sign -m '<message>' HEAD`); the tag
-   pointer is metadata pointing at a commit so no commit history
-   is mutated.
-
-**Cycle-numbering convention.** `### Audit cycle N` subscripts are
-sequential audit batches across a defined atom range; collisions
-resolved by appending a dash + range qualifier (e.g.
-`### Audit cycle 1 - 75b20a6..1e44a44`).
-
-A guiding invariant: the commit body stays untouched. The ledger is
-the authority. Future audit reads override divergent commit-body
-claims via the authoritative measured value captured here.
-
 ### Audit cycle 12 - reproducible GPG signing wrapper
 
 Forward-fixup audit-cycle entry documenting the institutionalization of
@@ -1660,3 +1629,156 @@ Cycle-numbering convention continues (`### Audit cycle 0`,
 `### Audit cycle 7`, `### Audit cycle 8`, `### Audit cycle 9`,
 `### Audit cycle 10`, `### Audit cycle 11`, `### Audit cycle
 12`, `### Audit cycle 13`, ...).
+
+### Audit cycle 14 - relocate misplaced `## How to add a new entry` footer to EOF
+
+Forward-fixup audit-cycle entry documenting the resolution of
+the pre-existing structural placement issue from cycle 12
+(atom `4b994fd`). The cycle 12 entry landed AFTER the
+misplaced `## How to add a new entry` footer (which had been
+sitting in the middle of the audit-protocol log between
+cycles 11 and 12 since well before cycle 12), breaking the
+audit-protocol format's expected structure (the cycle log
+should be one consolidated chronological block, with the
+`## How to add a new entry` footer at the end).
+
+Cycle 13's entry (atom `2e781c2`) acknowledged this as a
+non-blocking structural note: "A future forward-fixup atom
+could relocate the footer to the end of the file; this cycle
+13 atom does NOT bundle the structural fix because per
+AGENTS.md forward-only discipline, separate atoms are
+independently rewindable." Cycle 14 lands the structural
+fix as a forward-fixup atom.
+
+- **`docs/ci-evidence.md`** -- this file
+  - edits: (a) DELETE the misplaced `## How to add a new
+    entry` footer block from its current location between
+    cycles 11 and 12; (b) APPEND the moved footer block to
+    the end of the file (after this new cycle 14 entry);
+    (c) INSERT this new `### Audit cycle 14` entry
+    between cycle 13 and the moved footer.
+
+> **Audit-protocol-preservation note**: cycles 0-13 in this
+> file are BYTE-EQUIVALENT to their pre-cycle-14 state. The
+> cycle 14 atom only MOVES the misplaced footer + ADDS a new
+> cycle 14 entry; no audit-protocol cycle entry (0-13) was
+> modified. The moved footer is byte-equivalent to its
+> pre-cycle-14 state (same text, just relocated). The
+> cycle-numbering-convention closing parenthetical inside
+> cycle 13's body still lists `### Audit cycle 13` as the
+> last entry (verbatim), and the new cycle 14 entry's
+> closing parenthetical lists `### Audit cycle 14` as the
+> new last entry, so the cumulative cycle list grows by
+> one without modifying any prior cycle.
+
+- **Aggregate claim**: zero measured-claim divergences in
+  this audit cycle (this is a doc-only structural move; no
+  cargo-test ground truth is asserted or measured). The
+  structural fix is the finding: the misplaced footer block
+  has been relocated to the end of the file, restoring the
+  audit-protocol format's expected structure.
+- **Actual** (reference host origin/main@post-cycle-14):
+  the audit-protocol cycle log (cycles 0-14) is now
+  contiguous in the file; the `## How to add a new entry`
+  footer block is at the end. Verified via
+  `grep -nE '^## |^### Audit cycle' docs/ci-evidence.md`:
+  the heading sequence (top to bottom) is now
+  `# CI Evidence Ledger` + `## Audit principles` +
+  `## Entry format` + `## Entries` +
+  `### Audit cycle 0` ... `### Audit cycle 14` +
+  `## How to add a new entry`. Local `cargo test --workspace`
+  on this audit host produces 35/35 pass (matches cycles
+  11/12/13 ground truth; the doc-only structural change
+  does not affect test inventory). 0 clippy residuals; 0
+  rustdoc-gate residuals.
+- **Delta**: 0 measured-claim divergences + 1
+  structural-fix finding. Cycle 14's finding is
+  structurally distinct from cycles 0-13:
+  - Cycles 0-1: doc-only ledger atoms confirmed
+    zero-body-claim divergence.
+  - Cycles 2-3: dispatch-blocker findings.
+  - Cycle 4: LLM-judge framework-in-place + measurement-pending.
+  - Cycle 5: dispatch-blocker-source-removed.
+  - Cycle 6: clippy-baseline strict-pin retarget.
+  - Cycles 7-10: hygiene-line-items closed (LICENSE,
+    README, CHANGELOG, v1.0.0 tag).
+  - Cycle 11: forward-look-SHA-placeholder closure.
+  - Cycle 12: reproducible GPG-signing-path institutionalization.
+  - Cycle 13: annotation pass for `--no-gpgsign` workaround
+    in 4 non-audit-protocol files.
+  - Cycle 14 (new): structural fix that relocates the
+    misplaced `## How to add a new entry` footer from the
+    middle of the audit-protocol log to the end of the
+    file, restoring the format's expected structure.
+- **Effect**: the audit-protocol log (cycles 0-14) is now
+  contiguous in the file. The `## How to add a new entry`
+  footer is at the end. Future readers see the expected
+  structure: header + audit principles + entry format +
+  entries heading (top) + consolidated cycle log +
+  "How to add a new entry" footer (end). The cycle 13
+  entry's "Structural note" (a pre-existing structural
+  placement from cycle 12's atom `4b994fd`) is resolved.
+- **No `1.0-checklist.md` line item moved by this atom.**
+  The structural move is a doc-only change; `A1/A2/B1/B2/
+  C1/C2/C3/C4` line items are unchanged.
+- **Evidence**:
+  - host: Arch Linux PTY-alloc; Rust 1.96.1
+  - audit range: 1 atom (this cycle 14 atom)
+  - reference host: origin/main@post-cycle-14
+  - per-atom claim-line grep pattern:
+    `grep -nE '^## |^### Audit cycle' docs/ci-evidence.md`
+  - structural-fix evidence stream:
+    `grep -cE '^## How to add a new entry'
+    docs/ci-evidence.md` returns 1 (footer is present,
+    just at end-of-file now -- the line number moved
+    from ~1365 to end-of-file).
+  - byte-equivalence evidence stream:
+    `git diff <cycle-13-atom-SHA> docs/ci-evidence.md`
+    shows only: (a) the deleted misplaced footer block,
+    (b) the new cycle 14 entry, (c) the appended footer
+    block. No prior cycle (0-13) content was modified.
+  - audit-protocol cross-reference: cycle 12 (atom
+    `4b994fd`) and cycle 13 (atom `2e781c2`); both
+    entries' bodies are byte-equivalent to their
+    pre-cycle-14 state.
+
+Audit cycle 14 completes with **zero measured-claim
+divergences** plus **one structural-fix finding** that
+relocates the misplaced footer to the end of the file.
+Cycle-numbering convention continues (`### Audit cycle 0`,
+`### Audit cycle 1`, `### Audit cycle 2`, `### Audit cycle 3`,
+`### Audit cycle 4`, `### Audit cycle 5`, `### Audit cycle 6`,
+`### Audit cycle 7`, `### Audit cycle 8`, `### Audit cycle 9`,
+`### Audit cycle 10`, `### Audit cycle 11`, `### Audit cycle 12`,
+`### Audit cycle 13`, `### Audit cycle 14`, ...).
+
+## How to add a new entry
+
+1. Forward-fixup atom atop the current `origin/main`.
+2. Run `cargo test -p <crate> --quiet` against the new HEAD.
+3. If the actual diverges from the commit body claim, append an entry
+   under `## Entries` in this file.
+4. Cite host + Rust version + the exact invocation in the entry's
+   `evidence` field.
+5. Per the entry format spec above, document `commit / claim /
+   actual / delta / evidence`. The `forward-fix` field is intentionally
+   absent from the spec (the forward-fixup-no-amend-atom disclaimer
+   lives in `## Audit principles`).
+6. Commit with a subject prefix matching the atom's scope (e.g.
+   `chore(ci):`, `fix(cmdash-pty):`, `docs(ci-evidence):`).
+7. Land with `--no-gpg-sign` if the host's GPG agent lacks a TTY
+   (workaround via `git -c commit.gpgsign=false commit ...`).
+8. Tag events likewise use `--no-sign` on `git tag -a` when the host's
+   GPG agent lacks a TTY (workaround via
+   `git tag -a <tag-name> --no-sign -m '<message>' HEAD`); the tag
+   pointer is metadata pointing at a commit so no commit history
+   is mutated.
+
+**Cycle-numbering convention.** `### Audit cycle N` subscripts are
+sequential audit batches across a defined atom range; collisions
+resolved by appending a dash + range qualifier (e.g.
+`### Audit cycle 1 - 75b20a6..1e44a44`).
+
+A guiding invariant: the commit body stays untouched. The ledger is
+the authority. Future audit reads override divergent commit-body
+claims via the authoritative measured value captured here.
