@@ -60,184 +60,182 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::Terminal;
 use tracing::{debug, info, warn};
 
-/// Parsed CLI arguments. The v1 binary's launch surface is
-/// deliberately minimal — exactly one override
-/// (`--log-level=<level>`) plus `--help` / `-h` — so a
-/// hand-rolled [`parse_cli_args`] function keeps the dep
-/// graph free of `clap` / `pico-args`. Future surface-area
-/// growth (config-override flags, alternate-config paths,
-/// …) should still re-evaluate dep-free hand-rolling before
-/// re-adding a parser crate; the `Cargo.toml` constraint at
-/// v1.0.0 is "minimize the workspace's external-dep churn
-/// between minor versions".
+/// Command-line arguments parsed at binary entry. v1 ships
+/// only `--log=<path>`; the upstream chain tip's
+/// `--log-level=<level>` + `--help` + `-h` flags
+/// (commits `4c5ed96`, `db9de89`, `0a855c7`) are
+/// superseded by this atom via forward-fixup (those SHAs
+/// remain on the chain for the audit-protocol lineage;
+/// this atom adds the new CLI surface ATOF `0a855c7`
+/// per AGENTS.md forward-only-no-rewind discipline).
 ///
-/// `Debug` is derived (not just `Clone` / `PartialEq` / `Eq`)
-/// so the cli_args_tests' `.expect()` / `.expect_err()` calls
-/// can format the inner value when an assertion fails — the
-/// `Result::expect` family's `Debug` bound is on the
-/// `Result`'s inner type, so a missing derive propagates as
-/// a compile-time error here. The `Eq` derive avoids an
-/// unnecessary clone in the test that asserts
-/// `log_level.as_deref() == Some(level)` for the
-/// `log_level_all_six_valid_levels_parse_ok` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CliArgs {
-    /// `Some(level)` iff `--log-level=<level>` was passed (the
-    /// value is already validated against
-    /// `error|warn|info|debug|trace`). `None` means the
-    /// subscriber falls back to `RUST_LOG` env var, then
-    /// `info` default.
-    log_level: Option<String>,
-    /// `true` iff `--help` or `-h` was passed.
-    help: bool,
+/// Future v1.0.X CLI additions (`--config=<path>`, `--dry-run`,
+/// `--list-presets`, etc.) extend this struct so the parser
+/// surface stays a one-pass argv scan and each flag earns
+/// its own audit-cycle atom in the forward-fixup chain
+/// (the project's forward-only-no-rewind discipline per
+/// commit `109375e`).
+///
+/// `Debug` is derived so `Result<CliArgs, _>` can be used as an
+/// assertion expectation type, matching the binary's
+/// `cli_args_tests` test infrastructure (the parser is one of
+/// the few pieces of v1 surface area with a hand-rolled
+/// unit-test target); `Debug` also lets `expect_err` assertions
+/// print the parse-error string via `{err:?}`. No other
+/// derives are required: `cli_args_tests` compares
+/// `cli.log.as_deref()` (PathBuf's `PartialEq`, not `CliArgs`'s)
+/// and uses `String::contains(...)` for error-message
+/// assertions, not `PartialEq` on `Result<CliArgs, _>`.
+#[derive(Debug)]
+pub(crate) struct CliArgs {
+    /// `--log=<path>` opens a tracing-subscriber file writer at
+    /// `path` and silences stdout. v1 dumps at TRACE level in
+    /// pretty-printed multi-line indented format (file-only).
+    /// Append-mode; the parent directory must exist; a missing or
+    /// unreadable path is a startup error so the user notices
+    /// immediately rather than chasing phantom debug logs from a
+    /// different working directory later.
+    pub(crate) log: Option<std::path::PathBuf>,
 }
 
-/// Usage text printed on `--help` / `-h` and after a parse
-/// error. Held in a `&'static str` constant so `print!` /
-/// `eprint!` can take a borrow without re-allocating on each
-/// invocation. Multi-line string with `\` line-continuations
-/// keeps the embedded indentation readable in source.
-const USAGE: &str = "\
-Usage: cmdash [--log-level=<level>]
-
-Options:
-  --log-level=<level>   tracing-subscriber filter level: one of
-                        error, warn, info, debug, trace
-                        (case-insensitive). When set, overrides
-                        both the $RUST_LOG env var and the
-                        fallback 'info' default.
-  -h, --help            print this help message and exit.
-
-Notes:
-  The flag is strictly pre-tracing_subscriber init: --log-level
-  drives the EnvFilter for the binary's INFO/WARN/DEBUG/TRACE
-  events from the FIRST tracing macro call forward. Crate-
-  targeted filtering (e.g. cmdash_layout=debug) still routes
-  through $RUST_LOG in the standard EnvFilter direct-string
-  form, and is mutually exclusive with --log-level for a
-  single launch.
-";
-
-/// Hand-rolled argv parser for the v1 launch surface (see
-/// [`CliArgs`]). The full intended surface area is exactly:
-///
-/// - `--log-level=<level>` (mandatory value)
-/// - `--log-level` bare ⇒ parse error (no implicit fallback)
-/// - `--help` / `-h` ⇒ terminate-after-print
-/// - any `--foo` / `-x` flag ⇒ parse error
-/// - any positional arg ⇒ parse error
-///
-/// The bare `--log-level` case is rejected (rather than
-/// silently falling through to "$RUST_LOG or info") so a
-/// typo like `cmdash --log-level` does not quietly behave
-/// differently from `cmdash` — a `warn!` event late in the
-/// tick loop would mask a CLI mistake in the user's
-/// mental model.
-///
-/// Takes an explicit `&[String]` rather than calling
-/// `std::env::args()` directly so unit tests can drive it
-/// without monkey-patching the process environment.
-fn parse_cli_args(args: &[String]) -> Result<CliArgs, String> {
-    let mut out = CliArgs {
-        log_level: None,
-        help: false,
-    };
-    for arg in args.iter().skip(1) {
-        if arg == "--help" || arg == "-h" {
-            out.help = true;
-            continue;
-        }
-        if arg == "--log-level" {
-            return Err(
-                "cmdash: --log-level requires a value: --log-level=<level>".to_string(),
-            );
-        }
-        if let Some(val) = arg.strip_prefix("--log-level=") {
-            // Empty-after-`=` (the `--log-level=` form) routes
-            // to the same "requires a value" error as the
-            // bare `--log-level` form above. Without this
-            // special case, `arg.strip_prefix("--log-level=")`
-            // returns `Some("")`, the `match` below has no
-            // whitelist match for the empty string, and the
-            // `_` arm emits "invalid --log-level value \"\""
-            // — which conflates a user-syntax mistake (no
-            // value at all) with a bad-value mistake (real
-            // value but not whitelisted). Two distinct
-            // categories; two distinct error texts.
-            if val.is_empty() {
+impl CliArgs {
+    /// Hand-rolled argv parser; v1 only knows `--log=<path>`. Scan
+    /// is one-pass over argv (skipping `argv[0]` = program name);
+    /// each recognized flag wins its own slot; the first occurrence of
+    /// `--log=<path>` wins and subsequent ones are noted-but-ignored
+    /// so launch scripts that pass `--log=<x>` more than once don't
+    /// quietly retarget on the user mid-run.
+    ///
+    /// Errors fall into 3 buckets:
+    /// 1. **Bare `--log`** (no `=<path>`) is rejected: ambiguous
+    ///    between "no log" and "missing value"; both look like bugs.
+    /// 2. **`--log=`** (empty value) is rejected: a `PathBuf("")`
+    ///    silently trips Rust's "no such file" error downstream
+    ///    instead of a clear upfront message.
+    /// 3. **Unrecognized flag** is silently accepted as a
+    ///    forward-compat hedge so future flag additions don't break
+    ///    existing launch scripts (given a warn to stderr, not a
+    ///    parse error).
+    pub fn parse(argv: &[String]) -> Result<Self, String> {
+        let mut log: Option<std::path::PathBuf> = None;
+        for token in argv.iter().skip(1) {
+            if let Some(value) = token.strip_prefix("--log=") {
+                if log.is_some() {
+                    eprintln!("cmdash: --log=<path> specified more than once; keeping first");
+                    continue;
+                }
+                if value.is_empty() {
+                    return Err("--log=<path> requires a non-empty <path> argument".into());
+                }
+                log = Some(std::path::PathBuf::from(value));
+                continue;
+            }
+            if token == "--log" {
                 return Err(
-                    "cmdash: --log-level requires a value: --log-level=<level>".to_string(),
+                    "--log=<path> requires an =<path> argument; bare `--log` not accepted".into(),
                 );
             }
-            match val.to_ascii_lowercase().as_str() {
-                "error" | "warn" | "info" | "debug" | "trace" => {
-                    out.log_level = Some(val.to_string());
-                }
-                _ => {
-                    return Err(format!(
-                        "cmdash: invalid --log-level value {val:?} \
-                         (expected error|warn|info|debug|trace)"
-                    ));
-                }
+            // Forward-compat hedge: future flags leak through v1's
+            // parser without aborting. Error-only-not-warn would
+            // force every script to be re-paged against the latest
+            // flag catalog; warn is a softer contract.
+            if token.starts_with("--") {
+                eprintln!("cmdash: warning: ignoring unrecognized flag `{token}` (forward-compat)");
             }
-            continue;
         }
-        if arg.starts_with('-') {
-            return Err(format!("cmdash: unknown flag: {arg:?}"));
-        }
-        return Err(format!(
-            "cmdash: unexpected positional argument: {arg:?}"
-        ));
+        Ok(Self { log })
     }
-    Ok(out)
+}
+
+/// Initialize the tracing subscriber. Two-mode setup:
+///
+/// - **`--log=<path>`** ⇒ file-only, TRACE level, pretty-indented
+///   multi-line events with target + file + line + thread info.
+///   `RUST_LOG` is intentionally IGNORED in this mode because
+///   TRACE is what makes a `--log` launch match the user's
+///   "all information useful for debugging" target (any filter
+///   narrower than TRACE would silently drop event categories the
+///   user is asking to see).
+/// - **no `--log`** ⇒ stdout, INFO default (RUST_LOG env overrides),
+///   single-line compact. Preserves the prior launch behavior.
+///
+/// The dual-mode setup keeps the default launch quiet (stdout stays
+/// on the existing info-only contract) while letting a debugging
+/// session opt into `cmdash --log=/tmp/cmdash-debug.log` without
+/// spamming the host terminal (which is busy with kitty graphics
+/// output).
+///
+/// File-mode error policy: a missing or unreadable `<path>` is a
+/// STARTUP ERROR (exit code 3) so the user notices immediately
+/// rather than capturing zero logs and chasing a phantom failure.
+/// The parent directory is NOT auto-created (verifies the user
+/// actually wanted the log at that location).
+fn init_tracing(log_path: Option<&std::path::Path>) {
+    use tracing_subscriber::{fmt, EnvFilter};
+    match log_path {
+        Some(path) => {
+            let file = match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!(
+                        "cmdash: --log=<{}> could not be opened: {}",
+                        path.display(),
+                        e,
+                    );
+                    std::process::exit(3);
+                }
+            };
+            fmt()
+                .with_env_filter(EnvFilter::new("trace"))
+                .with_writer(file)
+                .pretty()
+                .with_target(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .init();
+        }
+        None => {
+            fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+                )
+                .with_target(false)
+                .init();
+        }
+    }
 }
 
 fn main() {
-    // Parse args BEFORE tracing_subscriber::init() so the CLI
-    // override can drive the EnvFilter before any subscriber
-    // state is set globally. We exit 2 (standard Unix
-    // usage-error) on bad arg syntax rather than forwarding
-    // to `run()` so a typo never sneaks a wrong log level
-    // through to the binary's first tracing macro call.
-    let cli = match parse_cli_args(&std::env::args().collect::<Vec<_>>()) {
+    let argv: Vec<String> = std::env::args().collect();
+    let cli = match CliArgs::parse(&argv) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{e}");
-            eprintln!();
-            eprint!("{USAGE}");
+            eprintln!("cmdash: {e}");
             std::process::exit(2);
         }
     };
-    if cli.help {
-        print!("{USAGE}");
-        return;
-    }
-
-    // Filter precedence, highest first:
-    //   1. `--log-level=<level>` (CLI override)
-    //   2. `RUST_LOG` env var (tracing-subscriber default)
-    //   3. `info` (v1.0.0 release default)
-    let env_filter = if let Some(level) = cli.log_level.as_deref() {
-        tracing_subscriber::EnvFilter::new(level)
-    } else if let Ok(env_filter) =
-        tracing_subscriber::EnvFilter::try_from_default_env()
-    {
-        env_filter
-    } else {
-        tracing_subscriber::EnvFilter::new("info")
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(false)
-        .init();
-    if let Some(level) = &cli.log_level {
-        info!(
-            log_level = %level,
-            "cmdash starting (cli log-level override); ratatui text body + dashcompositor kitty graphics"
+    init_tracing(cli.log.as_deref());
+    // Surface a one-line banner to stderr so a backgrounded
+    // `cmdash --log=/tmp/x.log &` invocation has evidence the
+    // binary is alive BEFORE the file-only subscriber swallows
+    // stdout. Per the user's "File-only (silence stdout)" choice,
+    // the regular `info!("cmdash starting ...")` line below lands
+    // on the file, so without this stderr banner the launch is
+    // silent for as long as the file only fires non-startup events.
+    if let Some(ref p) = cli.log {
+        eprintln!(
+            "cmdash: --log=<{}>, file-only subscriber at TRACE level; \
+             see that file for diagnostics (stdout is silent by design)",
+            p.display(),
         );
-    } else {
-        info!("cmdash starting (ratatui text body + dashcompositor kitty graphics)");
     }
+    info!("cmdash starting (ratatui text body + dashcompositor kitty graphics)");
     if let Err(e) = run() {
         eprintln!("cmdash: fatal: {e}");
         std::process::exit(1);
@@ -1793,169 +1791,173 @@ fn event_to_bytes(code: KeyCode) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod cli_args_tests {
-    //! Unit tests for [`parse_cli_args`]. The function is
-    //! intentionally hand-rolled to keep the v1 binary's
-    //! dep graph free of `clap` / `pico-args`, so the test
-    //! surface here pins the language-level behavior
-    //! (validation, error messages, set/clear of the override
-    //! field) rather than deferring to a third-party parser
-    //! crate's table-driven self-tests. The
-    //! `log_level_verbose_shorthand_is_still_rejected` test
-    //! in particular is a deliberate "design choice" lock so
-    //! a future contributor adding `-v` shorthand has to
-    //! address the ask_user choice behind the v1 launch
-    //! surface first.
-    use super::{parse_cli_args, CliArgs};
+    use super::*;
 
-    fn argv(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
+    /// Helper to lift a `&str` literal into a `String` for the
+    /// `&[String]` parser signature.
+    fn arg(s: &str) -> String {
+        s.to_string()
     }
 
+    /// No `--log` token at all: the field stays `None`. The
+    /// production launch shape (default stdout subscriber at
+    /// INFO level).
     #[test]
-    fn log_level_all_six_valid_levels_parse_ok() {
-        for level in ["error", "warn", "info", "debug", "trace"] {
-            let raw = format!("--log-level={level}");
-            let parsed = parse_cli_args(&argv(&["cmdash", &raw]))
-                .unwrap_or_else(|e| panic!("{level} must parse: {e}"));
-            assert_eq!(
-                parsed.log_level.as_deref(),
-                Some(level),
-                "validator must echo the canonical lowercase form"
-            );
-            assert!(!parsed.help);
-        }
+    fn parse_log_absent_returns_none() {
+        let argv = vec![arg("cmdash")];
+        let cli = CliArgs::parse(&argv).expect("parse");
+        assert!(cli.log.is_none(), "--log absence must yield None");
     }
 
+    /// `--log=/tmp/x.log` is the basic happy path with an
+    /// absolute path; resolves relative vs. absolute via
+    /// standard `PathBuf` semantics (no rewrite).
     #[test]
-    fn log_level_upper_case_is_accepted_with_canonical_lowercase_casing() {
-        let parsed = parse_cli_args(&argv(&["cmdash", "--log-level=DEBUG"]))
-            .expect("--log-level=DEBUG must parse (case-insensitive)");
+    fn parse_log_equals_path_is_some() {
+        let argv = vec![arg("cmdash"), arg("--log=/tmp/x.log")];
+        let cli = CliArgs::parse(&argv).expect("parse");
         assert_eq!(
-            parsed.log_level.as_deref(),
-            Some("DEBUG"),
-            "parser preserves original casing in the stored value; \
-             EnvFilter normalizes it downstream"
+            cli.log.as_deref(),
+            Some(std::path::Path::new("/tmp/x.log")),
+            "--log=/tmp/x.log must yield Some(\"/tmp/x.log\")"
         );
     }
 
+    /// `--log=<relative>` preserves the relative segment
+    /// verbatim; CWD resolution happens at `OpenOptions::open`
+    /// time, not at parse time.
     #[test]
-    fn log_level_bare_flag_is_rejected_with_usage_error_message() {
-        let err = parse_cli_args(&argv(&["cmdash", "--log-level"]))
-            .expect_err("--log-level with no =value must be a parse error");
+    fn parse_log_relative_path_is_some() {
+        let argv = vec![arg("cmdash"), arg("--log=debug.log")];
+        let cli = CliArgs::parse(&argv).expect("parse");
+        assert_eq!(
+            cli.log.as_deref(),
+            Some(std::path::Path::new("debug.log")),
+            "--log=debug.log must yield Some(\"debug.log\")"
+        );
+    }
+
+    /// `--log=` (empty value) is REJECTED: an empty `PathBuf`
+    /// silently trips Rust's "no such file" error downstream
+    /// instead of surfacing a clear upfront message.
+    #[test]
+    fn parse_log_empty_value_errors() {
+        let argv = vec![arg("cmdash"), arg("--log=")];
+        let err = CliArgs::parse(&argv).expect_err("--log= with empty value must error");
         assert!(
-            err.contains("--log-level") && err.contains("requires a value"),
-            "error message must name the flag and the missing-value requirement: {err}"
+            err.contains("--log"),
+            "error message must reference --log: {err:?}"
         );
     }
 
-    /// Companion to the bare-flag test above: locks the
-    /// empty-after-`=` form (`--log-level=`) into the same
-    /// "requires a value" error path. Without
-    /// `parse_cli_args`' dedicated empty-value check (a
-    /// single `if val.is_empty() { return Err(...) }` arm
-    /// before the whitelist match), the underlying `match`
-    /// falls into the `_` arm and emits
-    /// "invalid --log-level value \"\"" — conflating a
-    /// user-syntax mistake (no value at all) with a wrong-
-    /// value mistake (real value but not whitelisted). The
-    /// two error categories should be visually
-    /// distinguishable in the help text.
+    /// Bare `--log` (no `=<path>`) is REJECTED: ambiguous
+    /// between "no log" and "missing value".
     #[test]
-    fn log_level_empty_after_eq_is_rejected_with_usage_error_message() {
-        let err = parse_cli_args(&argv(&["cmdash", "--log-level="]))
-            .expect_err("--log-level= with empty value must be a parse error");
+    fn parse_log_bare_no_equals_errors() {
+        let argv = vec![arg("cmdash"), arg("--log")];
+        let err = CliArgs::parse(&argv).expect_err("bare --log must error");
         assert!(
-            err.contains("--log-level") && err.contains("requires a value"),
-            "--log-level= must produce the bare-flag error message, \
-             NOT the 'invalid value' error message: {err}"
+            err.contains("=path") || err.contains("=<path>"),
+            "error message must point at the =<path> syntax: {err:?}"
         );
-        // Distinguish from the bad-value path: the empty-value
-        // form must NOT contain the whitelist reminder that
-        // the bad-value error uses. Lock the two error
-        // categories as visually-distinguishable.
+    }
+
+    /// First `--log=<path>` wins; subsequent ones warn-and-ignore.
+    /// Pin the "first wins" semantic so launch scripts that
+    /// accidentally pass two `--log=X --log=Y` don't quietly
+    /// retarget the file path mid-run.
+    #[test]
+    fn parse_log_first_wins() {
+        let argv = vec![
+            arg("cmdash"),
+            arg("--log=/tmp/a.log"),
+            arg("--log=/tmp/b.log"),
+        ];
+        let cli = CliArgs::parse(&argv).expect("parse");
+        assert_eq!(
+            cli.log.as_deref(),
+            Some(std::path::Path::new("/tmp/a.log")),
+            "first --log=X must win over subsequent --log=Y"
+        );
+    }
+
+    /// Unknown `--flag` after `--log=...` is silently accepted
+    /// (forward-compat hedge with a warn to stderr) so future
+    /// flag additions don't break existing launch scripts.
+    /// The PARSE SUCCEEDS and the already-set `--log` is
+    /// preserved through the unrecognized token.
+    #[test]
+    fn parse_unknown_flag_after_log_is_ignored() {
+        let argv = vec![
+            arg("cmdash"),
+            arg("--log=/tmp/x"),
+            arg("--future-flag"),
+            arg("--value=42"),
+        ];
+        let cli = CliArgs::parse(&argv).expect("parse must succeed");
+        assert_eq!(
+            cli.log.as_deref(),
+            Some(std::path::Path::new("/tmp/x")),
+            "unknown --future-flag in argv must not invalidate the prior --log=<path>"
+        );
+    }
+
+    /// Unknown `--flag` alone (no --log) still parses
+    /// successfully. Forward-compat hedge: a launcher that adds
+    /// a flag in cmdash v2 must NOT break v1 launch scripts.
+    #[test]
+    fn parse_unknown_flag_alone_is_ignored() {
+        let argv = vec![arg("cmdash"), arg("--future-flag")];
+        let cli = CliArgs::parse(&argv).expect("parse must succeed");
+        assert!(cli.log.is_none());
+    }
+
+    /// Lone `--log` (no `=<path>`) errors BEFORE scanning
+    /// subsequent flags — pin: parser reads left-to-right and
+    /// aborts at the first failing token.
+    #[test]
+    fn parse_log_bare_aborts_before_subsequent_flags() {
+        let argv = vec![arg("cmdash"), arg("--log"), arg("--future-flag")];
+        let err = CliArgs::parse(&argv).expect_err("lone --log must abort");
         assert!(
-            !err.contains("expected error|warn|info|debug|trace"),
-            "--log-level= must NOT emit the bad-value reminder text: {err}"
+            err.contains("--log"),
+            "error message must mention --log: {err:?}"
         );
     }
 
+    /// Empty argv (`vec![]`) — the parser scans with
+    /// `argv.iter().skip(1)` which yields nothing; the result is
+    /// `Ok(Self { log: None })`. Pin this shape in case a future
+    /// refactor accidentally panics on `skip(1)` of an empty slice.
     #[test]
-    fn log_level_unknown_value_is_rejected_with_the_offending_value_quoted() {
-        let err = parse_cli_args(&argv(&["cmdash", "--log-level=BOGUS"]))
-            .expect_err("--log-level=BOGUS must be a parse error");
+    fn parse_empty_argv_returns_none() {
+        let argv: Vec<String> = vec![];
+        let cli = CliArgs::parse(&argv).expect("parse");
         assert!(
-            err.contains("BOGUS") && err.contains("error"),
-            "error message must quote the offending value and list valid levels: {err}"
+            cli.log.is_none(),
+            "empty argv must yield None (skip(1) is a no-op on empty)"
         );
     }
 
+    /// `--log=/foo --log=` (valid first, empty second) — the
+    /// first-wins semantic reaches all the way through invalid
+    /// second tokens; the empty check is short-circuited by the
+    /// "log already set" warn-and-continue. Pin: second invalid
+    /// --log does NOT abort when a valid first exists; only when
+    /// the FIRST --log is itself empty/bare does the parse error
+    /// out.
     #[test]
-    fn log_level_verbose_shorthand_is_still_rejected_in_v1() {
-        // Deliberate: the user explicitly chose --log-level=<level>
-        // over -v / --verbose via ask_user. Lock that decision
-        // so a future contributor adding `-v` shorthand has to
-        // address the ask_user precedent before merging.
-        assert!(
-            parse_cli_args(&argv(&["cmdash", "-v"])).is_err(),
-            "-v must remain rejected; --log-level=<level> is the v1 binary's only verbosity dial"
+    fn parse_log_valid_then_empty_keeps_first() {
+        let argv = vec![arg("cmdash"), arg("--log=/tmp/foo.log"), arg("--log=")];
+        let cli = CliArgs::parse(&argv).expect(
+            "valid --log=/foo then invalid --log= must keep the first \
+             (warn-and-continue, NOT abort)",
         );
-        assert!(
-            parse_cli_args(&argv(&["cmdash", "--verbose"])).is_err(),
-            "--verbose must remain rejected; --log-level=<level> is the v1 binary's only verbosity dial"
+        assert_eq!(
+            cli.log.as_deref(),
+            Some(std::path::Path::new("/tmp/foo.log")),
+            "first valid --log=X must win; --log= after must warn-and-continue"
         );
-    }
-
-    #[test]
-    fn help_flag_short_and_long_set_help_true_and_leave_level_none() {
-        for flag in ["--help", "-h"] {
-            let parsed = parse_cli_args(&argv(&["cmdash", flag]))
-                .unwrap_or_else(|e| panic!("{flag} must parse, not error: {e}"));
-            assert!(parsed.help, "{flag} must turn help=true");
-            assert!(
-                parsed.log_level.is_none(),
-                "{flag} must not affect log_level"
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_long_flag_is_rejected() {
-        let err = parse_cli_args(&argv(&["cmdash", "--unknown-flag"]))
-            .expect_err("--unknown-flag must be a parse error");
-        assert!(
-            err.contains("unknown") && err.contains("--unknown-flag"),
-            "error message must name the unknown flag: {err}"
-        );
-    }
-
-    #[test]
-    fn positional_argument_is_rejected() {
-        let err = parse_cli_args(&argv(&["cmdash", "extra"]))
-            .expect_err("positional arg must be a parse error");
-        assert!(
-            err.contains("positional") && err.contains("\"extra\""),
-            "error message must name the offending token: {err}"
-        );
-    }
-
-    #[test]
-    fn no_args_returns_empty_with_help_false_and_level_none() {
-        let parsed = parse_cli_args(&argv(&["cmdash"]))
-            .expect("argv = [\"cmdash\"] is the no-args case and must parse");
-        assert_eq!(parsed.log_level, None);
-        assert!(!parsed.help);
-    }
-
-    #[test]
-    fn cli_args_struct_can_be_constructed_with_default_field_set() {
-        // A future revision that adds a new field to CliArgs
-        // will break this test site as a "remember to update the
-        // tests" reminder rather than silently absorbing the new
-        // field.
-        let _ = CliArgs {
-            log_level: None,
-            help: false,
-        };
     }
 }
 

@@ -110,27 +110,32 @@ Build requirements:
 Build per [Installation & Build](#installation--build), then:
 
 ```bash
-# Default launch — no flags. Tracing filter is $RUST_LOG
-# (if set), else 'info'.
+# Default launch — no flags. Tracing writes to stdout at
+# info level (or whatever RUST_LOG selects, if set).
 ./target/release/cmdash
 
-# Verbose: every tracing event the binary emits lands.
-./target/release/cmdash --log-level=trace
+# Capture every tracing event to a file. Stdout stays silent
+# in this mode; a stderr banner announces the launch. Trace is
+# FORCED in file mode (RUST_LOG is ignored) so the artifact is
+# the loudest possible picture.
+./target/release/cmdash --log=/tmp/cmdash-debug.log
 
-# Quiet: only warnings + errors above.
-./target/release/cmdash --log-level=warn
-
-# Help / unknown value → exit 0 / exit 2 with a usage message.
-./target/release/cmdash --help
+# Quiet on stdout — warnings + errors only (stdout mode).
+RUST_LOG=warn ./target/release/cmdash
 ```
 
-The `--log-level=<level>` flag (one of `error` / `warn` /
-`info` / `debug` / `trace`, case-insensitive) overrides the
-`RUST_LOG` env var and the `info` fallback when set. See
-[`docs/configuration.md` §1.4](./docs/configuration.md) for
-the full precedence rules and the two Pitfall notes (silent
-launch at `--log-level=error`; crate-targeted filtering
-required to go through `$RUST_LOG`).
+The `--log=<path>` flag (one CLI launch argument) controls
+**WHERE** the binary writes `tracing` events; `RUST_LOG` is
+the env knob controlling **WHAT** filter applies (level, plus
+crate-targeted modifiers like `RUST_LOG=cmdash_layout=debug`).
+They're mutually orthogonal: `--log=<path>` (file mode) ignores
+`RUST_LOG`; without `--log=<path>` (stdout mode), `RUST_LOG`
+is honored. See [`docs/configuration.md` §1.4](./docs/configuration.md)
+for the two-mode behavior: two parser-level error classes
+(bare `--log`, empty `--log=`, exit 2); one file-open-level
+error class (parent dir missing on `OpenOptions::open`, exit 3);
+and the forward-compat warn-and-continue hedge for unrecognized
+flags.
 
 ## Architecture (one frame)
 

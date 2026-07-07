@@ -215,9 +215,9 @@ impl GraphicsState {
 
     /// Apply one kitty event from the supplied pane's PTY. Errors
     /// are surfaced, never swallowed silently: callers decide
-    /// whether to log+continue ([`apply_kitty_event`] is a thin
+    /// whether to log+continue (`apply_kitty_event` is a thin
     /// wrapper that logs via `tracing::warn!` and returns `()`).
-    /// Private -- only [`Self::apply_kitty_event`] (the public
+    /// Private -- only `Self::apply_kitty_event` (the public
     /// surface) and the internal sanity tests in this module
     /// call this; the pub surface is exactly `apply_kitty_event`.
     fn on_kitty(&mut self, pane: PaneLayerId, cmd: &KittyGraphicCmd) -> Result<(), GraphicsError> {

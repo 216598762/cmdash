@@ -77,73 +77,113 @@ alternate-screen + mouse-capture). Closing the **last** pane via
 cmdash is built on [`tracing`] + [`tracing-subscriber`]; every
 `info!` / `warn!` / `debug!` / `trace!` macro call across the
 binary's source routes through one global subscriber wired at
-startup. v1.0.0 controls the subscriber's `EnvFilter` with three
-layered knobs, applied in this precise order:
+startup, just before `run()`. v1.0.0 controls that subscriber
+with **two orthogonal knobs**: the CLI flag controls WHERE the
+events land; the env var controls WHAT filter applies. They do
+not answer the same question, so they do not conflict.
 
-1. `--log-level=<level>` (CLI launch argument) — sets the
-   filter directly. Accepted values: `error`, `warn`, `info`,
-   `debug`, `trace` (case-insensitive). When present, it
-   overrides both the env var and the fallback default.
-2. The `RUST_LOG` environment variable — the standard
-   `tracing-subscriber::EnvFilter` direct-string format
-   (e.g. `RUST_LOG=cmdash_layout=debug,info`). Honoured when
-   `--log-level` is NOT passed.
-3. Default — when neither is set, the filter falls back to
-   `info` (the v1.0.0 release default).
+- `--log=<path>` (CLI launch argument) — redirects the
+  subscriber's writer to a file at `<path>`. The file is
+  opened in append mode; entries at **TRACE level** are
+  pretty-printed with target + file + line-number +
+  thread-id metadata (the loudest possible setting) so a
+  debugger gets the full picture from a single on-host artifact.
+  The parent directory must already exist; a missing or
+  unreadable `<path>` is a STARTUP ERROR (exit 3) so the
+  user notices immediately rather than capturing zero
+  logs and chasing a phantom failure later.
+- `RUST_LOG` environment variable — the standard
+  `tracing-subscriber::EnvFilter` direct-string format
+  (e.g. `RUST_LOG=cmdash_layout=debug,info`). Honoured ONLY
+  when `--log=<path>` is NOT passed (i.e. stdout mode).
+- Stdout default — when neither is set, the subscriber
+  writes to stdout at `info` level, with `RUST_LOG` taking
+  precedence over the `info` fallback.
 
-**Precedence, highest first:** `--log-level` > `RUST_LOG` > `info`.
-The flag is strictly pre-tracing_subscriber init: `--log-level`
-drives the `EnvFilter` for the binary's events from the FIRST
-tracing macro call forward (no log-window missed during
-startup).
+**Two-mode behavior** (orthogonal; both are documented
+honestly):
+
+- `--log=<path>` SET = **file mode**. TRACE is FORCED;
+  `RUST_LOG` is IGNORED (TRACE is what a "capture the
+  full picture" invocation wants; any narrower filter
+  would silently drop event categories the user expects
+  to see). Stdout is silent — the file-only subscriber
+  swallows it by design. The binary emits a one-line
+  `eprintln!` banner to stderr at startup so a backgrounded
+  `cmdash --log=/tmp/x.log &` invocation has evidence the
+  binary is alive BEFORE the file receives events.
+- `--log=<path>` UNSET = **stdout mode**. `RUST_LOG` if
+  set is honored; otherwise falls back to `info`.
 
 #### Examples
 
 ```bash
-# Show every tracing event the binary emits (loud).
-cmdash --log-level=trace
+# Capture every tracing event the binary emits, into a file.
+# Stdout stays silent in this mode; a stderr banner announces
+# the launch. Trace is FORCED in file mode (RUST_LOG ignored).
+cmdash --log=/tmp/cmdash-debug.log
 
-# Show only warnings + errors (quiet; everything-at-or-above warn).
-cmdash --log-level=warn
+# Quiet on stdout: warnings + errors only (stdout mode).
+RUST_LOG=warn cmdash
 
-# Mix-and-match the crate-targeted form via the env var (the
-# CLI flag is single-value and does NOT take a module=level
-# pair). Filter the layout engine to debug, keep everything
-# else at info.
+# Crate-targeted filter via the env var (only honored in
+# stdout mode). Filter the layout engine to debug, keep
+# everything else at info.
 RUST_LOG=cmdash_layout=debug,info cmdash
 
-# Unknown value or unknown flag → binary refuses to start
-# (exit 2), no debug spew; the parse-error message names
-# both the offending token and the valid values.
-cmdash --log-level=BOGUS   # ERR: invalid --log-level value "BOGUS"
-cmdash -v                  # ERR: unknown flag: "-v"
-cmdash --help              # prints Usage, exits 0
+# Append behaviour: a stale log at the same path is EXTENDED,
+# not truncated. Truncate explicitly (mv + restart) if that's
+# the desired behaviour.
+cmdash --log=/var/log/cmdash.log   # append-mode OpenOptions
+
+# Unknown → binary warns-and-continues (forward-compat); a
+# bare `--log` or empty `--log=` is a startup error (exit 2).
+cmdash --log                  # ERR: --log= requires a value
+cmdash --log=                 # ERR: --log=<path> requires a non-empty value
+cmdash --log=/no/such/dir     # ERR: --log=<...> could not be opened (exit 3)
+cmdash --future-flag          # warning to stderr, parse continues
 ```
 
-**Pitfall:** Because the binary defaults to `info`, every
-startup normally emits one `info!` event ("cmdash starting…").
-If you set `--log-level=error` you will see NO startup banner
-— silent launch is by design at that level, not a hang. To
-confirm the flag actually took effect, re-run with
-`--log-level=info` and look for the `log_level=` field on the
-start-event (or any event after the binary has cleared the
-alternate screen).
+**Pitfall — appended not truncated.** `--log=<path>` opens
+with `OpenOptions::create(true).append(true)`, so a stale
+log at the same path is **extended** rather than overwritten.
+Truncate explicitly (`mv` + restart) if that's the desired
+behaviour.
 
-**Pitfall:** Crate-targeted filter expressions like
-`cmdash_layout=debug` are NOT supported through `--log-level`
-— the cmdash parser itself rejects any value outside the
-five-level whitelist (`error|warn|info|debug|trace`),
-even though `tracing-subscriber`'s `EnvFilter` syntax
-WOULD accept such directives if it were the constraint
-boundary (the subscriber is layered below the parser; the
-parser would never call `EnvFilter::new` with a
-crate-targeted string). Use `RUST_LOG=cmdash_layout=debug`
-for crate-targeted filtering; it is the standard
-`tracing-subscriber` direct-string idiom and is the
-documented escape hatch for crate-level filtering. The two
-knobs are mutually exclusive for a single launch:
-`--log-level` wins if both are set, and the env var is
-silently dropped (no merge, no warning).
+**Pitfall — stderr banner is the launch heartbeat.** Because
+the file-mode subscriber swallows stdout, a backgrounded
+`cmdash --log=/tmp/x.log &` invocation looks silent until
+the file actually receives events. The pre-tracing_init
+eprintln line `--log=<...>, file-only subscriber at TRACE
+level ...` is the visibility contract — if you don't see
+it, the file path failed to open and the binary exited 3.
+
+**Pitfall — three parser error classes.** The hand-rolled
+`CliArgs::parse(argv)` distinguishes:
+
+1. **Bare `--log`** (no `=<path>`) → rejected. Ambiguous
+   between "no log" and "missing value"; both look like bugs.
+2. **`--log=`** (empty value) → rejected. An empty `PathBuf`
+   silently trips Rust's "no such file" downstream; we
+   surface the error at parser time instead.
+3. **Empty argv / unknown `--flag` after `--log=...`** →
+   warn-and-continue (forward-compat hedge so future flag
+   additions don't break existing launch scripts) OR
+   `Ok(Self { log: None })` for empty argv. Neither aborts.
+
+**Pitfall — `--log=<path>` does not override an already-set
+`RUST_LOG`.** In file mode `RUST_LOG` is silently dropped;
+no merge, no warning. If the user wants `--log=<path>` plus
+a non-TRACE filter, that's not in v1.0.0's CLI scope; the
+deliberate choice was to drop the upstream chain's
+`--log-level=<level>` companion (commits `4c5ed96`,
+`db9de89`, `0a855c7` superseded by the parent atom of
+the change adopting `--log=<path>`). A future v2 topic,
+NOT a v1.0.X atom, may add `--log-level=<level>` if the
+audit cycles flag it as a recurring need; a v1.0.X atom
+would re-introduce scope-creep without addressing the
+underlying orthogonality question (file destination vs
+filter level are independent knobs).
 
 ---
 
