@@ -187,45 +187,64 @@ pub enum KeyAction {
     PaneFocusLeft,
     PaneFocusRight,
     /// `pane.stack.cycle` - cycle focus through members of the
-    /// currently-focused ZStack (wrap-around from last → first).
-    /// No-op if the focused pane is not a member of a ZStack.
+    /// currently-focused `ZStack` (wrap-around from last → first).
+    /// No-op if the focused pane is not a member of a `ZStack`.
     /// Phase 4 carry-forward.
     PaneStackCycle,
-    /// `pane.stack.down` - directional within-ZStack Down:
-    /// focus the next member of the focused ZStack in
+    /// `pane.stack.down` - directional within-`ZStack` Down:
+    /// focus the next member of the focused `ZStack` in
     /// declaration order; if the focused pane is the last (top)
     /// member, hand focus off to the topmost pane geometrically
-    /// below the ZStack via [`adjacent_pane`]. No-op if the
-    /// focused pane is not a ZStack member, or if the focused
-    /// ZStack member has no geometrically-below neighbour.
+    /// below the `ZStack` via [`adjacent_pane`]. No-op if the
+    /// focused pane is not a `ZStack` member, or if the focused
+    /// `ZStack` member has no geometrically-below neighbour.
     /// Phase 4 carry-forward.
     PaneStackDown,
     /// `pane.stack.up` - mirror of `pane.stack.down`: focus
-    /// the **previous** member of the focused ZStack in
+    /// the **previous** member of the focused `ZStack` in
     /// declaration order; if the focused pane is the first
     /// (bottom) member, hand focus off to the topmost pane
-    /// geometrically above the ZStack via [`adjacent_pane`].
-    /// No-op if the focused pane is not a ZStack member, or
-    /// if the focused ZStack member has no geometrically-above
+    /// geometrically above the `ZStack` via [`adjacent_pane`].
+    /// No-op if the focused pane is not a `ZStack` member, or
+    /// if the focused `ZStack` member has no geometrically-above
     /// neighbour. Phase 4 carry-forward.
     PaneStackUp,
     /// Phase 4.5/5 carry-forward: `PaneStackLeft`. Cycle
-    /// through ZStack members in declaration order with
+    /// through `ZStack` members in declaration order with
     /// retreat semantics at the FIRST member, then hand off
-    /// geometrically to the pane outside the ZStack via
-    /// `Direction::Left` (column-split trapdoor: a ZStack
+    /// geometrically to the pane outside the `ZStack` via
+    /// `Direction::Left` (column-split trapdoor: a `ZStack`
     /// in the right half of a `split axis=horizontal`
-    /// lands on the sibling Split member to its LEFT).
+    /// lands on the sibling `Split` member to its LEFT).
     PaneStackLeft,
     /// Phase 4.5/5 carry-forward: `PaneStackRight`. Cycle
-    /// through ZStack members in declaration order with
+    /// through `ZStack` members in declaration order with
     /// advance semantics at the LAST member, then hand off
-    /// geometrically to the pane outside the ZStack via
+    /// geometrically to the pane outside the `ZStack` via
     /// `Direction::Right` -- the horizontal-axis mirror of
     /// `PaneStackDown`/`PaneStackUp` on the geometric axis.
     PaneStackRight,
     /// `pane.preset.<name>` - focus a named preset.
     PanePreset(String),
+    /// `tab.new` -- create a new empty tab and switch focus to
+    /// it. The new tab holds a single `pane kind=shell leaf at
+    /// the active cell-grid area. AGENTS.md feature #3 "Tabs"
+    /// (M-t default keybind). Cycle-22 atom-1.
+    TabNew,
+    /// `tab.close` -- close the active tab. All its
+    /// `PaneRunner`s are dropped (revoking every dashcompositor
+    /// `LayerId` per AGENTS.md Hard rule); `active_tab` is
+    /// clamped to `tabs.len() - 1`. Closing the last tab
+    /// quits the binary (matches the `PaneClose` last-pane
+    /// semantics). Falling out of scope: a non-active tab's
+    /// close is reserved for a cycle-22 atom-2+ "focus a tab
+    /// before close" extension. AGENTS.md feature #3 "Tabs"
+    /// (M-w default keybind). Cycle-22 atom-1.
+    TabClose,
+    /// `tab.switch.<n>` (n in 1..=9) -- switch focus to the
+    /// nth tab; the M-1..M-9 default keybinds from AGENTS.md
+    /// feature #3 "Tabs". Cycle-22 atom-1.
+    TabSwitch(usize),
 }
 
 /// A cmdash config error.
@@ -507,8 +526,22 @@ fn read_keybind(n: &KdlNode) -> Result<Keybind, ConfigError> {
         action_str.ok_or_else(|| ConfigError::InvalidAction("missing action".into()))?;
     let (mods, key) =
         parse_chord(&chord_str).ok_or_else(|| ConfigError::InvalidChord(chord_str.clone()))?;
-    let action =
-        parse_action(&action_str).ok_or_else(|| ConfigError::InvalidAction(action_str.clone()))?;
+    // Cycle-22 atom-1 hint-augmented reject path: when parse_action
+    // declines a tab.switch.<n> input the user now sees the valid
+    // range (1..=9) instead of just the echo of their own string.
+    // parse_action's contract stays Option<KeyAction>; this is
+    // read-keybind-local UX.
+    let action = match parse_action(&action_str) {
+        Some(a) => a,
+        None => {
+            let hint = action_tab_switch_hint(&action_str);
+            return Err(ConfigError::InvalidAction(if hint.is_empty() {
+                action_str.clone()
+            } else {
+                format!("{action_str}{hint}")
+            }));
+        }
+    };
     Ok(Keybind { mods, key, action })
 }
 
@@ -589,9 +622,32 @@ fn parse_action(s: &str) -> Option<KeyAction> {
         "pane.stack.left" => Some(KeyAction::PaneStackLeft),
         "pane.stack.right" => Some(KeyAction::PaneStackRight),
         "pane.preset" => Some(KeyAction::PanePreset(String::new())),
-        other => other
-            .strip_prefix("pane.preset.")
-            .map(|rest| KeyAction::PanePreset(rest.to_string())),
+        // Cycle-22 atom-1: tab-axis actions. `tab.new`,
+        // `tab.close`, `tab.switch.<n>` (n in 1..=9) wire the
+        // AGENTS.md feature #3 "Tabs" keybinds (M-t / M-w /
+        // M-1..M-9). The `tab.switch` PLANE (no `<n>` suffix)
+        // is rejected so a future typo or partial binding
+        // surfaces as `InvalidAction` at config-parse time
+        // rather than as a runtime no-op.
+        "tab.new" => Some(KeyAction::TabNew),
+        "tab.close" => Some(KeyAction::TabClose),
+        other => {
+            // `tab.switch.<n>` parses before the `pane.preset.<name>`
+            // strip so an ambiguous `tab.switch.1` (which starts
+            // with `tab.` not `pane.`) doesn't fall through to
+            // the preset strip arm.
+            if let Some(n_str) = other.strip_prefix("tab.switch.") {
+                n_str
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=9).contains(n))
+                    .map(KeyAction::TabSwitch)
+            } else {
+                other
+                    .strip_prefix("pane.preset.")
+                    .map(|rest| KeyAction::PanePreset(rest.to_string()))
+            }
+        }
     }
 }
 
@@ -617,6 +673,34 @@ fn entry_to_string(entry: &KdlEntry) -> String {
         return "null".into();
     }
     String::new()
+}
+
+/// Build a hint suffix for parse_action rejection messages
+/// rooted in the `tab.switch.<n>` family. Returns an empty
+/// string for any input that isn't a `tab.switch.*` shape so
+/// the caller emits the original action string verbatim.
+/// Cycle-22 atom-1.
+fn action_tab_switch_hint(s: &str) -> String {
+    if s == "tab.switch" {
+        return "; missing `.<n>` suffix (use `tab.switch.1`..`tab.switch.9`)".into();
+    }
+    if let Some(n_str) = s.strip_prefix("tab.switch.") {
+        if n_str.is_empty() {
+            return "; expected `tab.switch.<n>` with n in 1..=9".into();
+        }
+        match n_str.parse::<usize>() {
+            Ok(n) if (1..=9).contains(&n) => {
+                // In-range input should never reach this code
+                // path; parse_action would have returned Some(_).
+                // Defensive no-op.
+                String::new()
+            }
+            Ok(n) => format!("; valid range for `tab.switch.<n>` is n=1..=9 (got n={n})"),
+            Err(_) => "; expected `tab.switch.<n>` where <n> is a decimal integer 1..=9".into(),
+        }
+    } else {
+        String::new()
+    }
 }
 
 // ===========================================================================
@@ -750,6 +834,99 @@ mod tests {
             "expected UnknownLayoutNode, got: {:?}",
             err
         );
+    }
+
+    // ============================================================
+    // Cycle-22 atom-1: tab-action parsing tests.
+    //
+    // Each new KeyAction variant MUST have a parse_action round-trip test
+    // here. Without these, a typo in parse_action (e.g. a missing digit
+    // arm or a `tab.switch.10` out-of-range bug) silently regresses to
+    // `None` and surfaces to the user as an `InvalidAction` config parse
+    // error at startup — which is correct behavior for a wrong string,
+    // but a misdiagnosed root cause for an arm missing entirely.
+    // Pattern-test mirrors the parse_*_layout_round_trip family above:
+    //   - positive parse test (action string -> KeyAction::TabNew etc.)
+    //   - negative parse test (out-of-range / wrong string -> None)
+    // ============================================================
+
+    /// `tab.new` round-trips into KeyAction::TabNew.
+    #[test]
+    fn parse_tab_new_round_trip() {
+        let act = parse_action("tab.new").expect("tab.new parses");
+        assert_eq!(act, KeyAction::TabNew);
+    }
+
+    /// `tab.close` round-trips into KeyAction::TabClose.
+    #[test]
+    fn parse_tab_close_round_trip() {
+        let act = parse_action("tab.close").expect("tab.close parses");
+        assert_eq!(act, KeyAction::TabClose);
+    }
+
+    /// `tab.switch.<n>` for n in 1..=9 round-trips into
+    /// `KeyAction::TabSwitch(n)`. Parametric over the full
+    /// M-1..M-9 default keybind range from AGENTS.md feature #3.
+    #[test]
+    fn parse_tab_switch_n_round_trip() {
+        for n in 1..=9usize {
+            let s = format!("tab.switch.{n}");
+            let act = parse_action(&s).unwrap_or_else(|| panic!("{s} must parse"));
+            assert_eq!(act, KeyAction::TabSwitch(n), "{s}");
+        }
+    }
+
+    /// `tab.switch.0` and `tab.switch.10` are OUT OF RANGE
+    /// (the AGENTS.md range is M-1..M-9, ON-BOUNDS EXCLUSIVE of
+    /// 0 and 10). Both parse_action inputs return None as a
+    /// forward-fixup candidate signal: at config-parse time,
+    /// a Keybind chord bound to `tab.switch.10` would silently
+    /// no-op at dispatch time without this rejection.
+    #[test]
+    fn parse_tab_switch_out_of_range_returns_none() {
+        assert!(
+            parse_action("tab.switch.0").is_none(),
+            "n=0 is out of range"
+        );
+        assert!(
+            parse_action("tab.switch.10").is_none(),
+            "n=10 is out of range"
+        );
+        assert!(
+            parse_action("tab.switch.99").is_none(),
+            "n=99 is out of range"
+        );
+    }
+
+    /// `tab.switch` (NO digit suffix) is rejected: a config
+    /// that forgets the n-suffix should fail loudly at parse
+    /// time, not silently no-op at dispatch time. Mirrors the
+    /// `pane.preset` (no name) convention.
+    #[test]
+    fn parse_tab_switch_no_n_returns_none() {
+        assert!(
+            parse_action("tab.switch").is_none(),
+            "tab.switch without n is invalid"
+        );
+        assert!(
+            parse_action("tab.switch.").is_none(),
+            "tab.switch. (empty n) is invalid"
+        );
+    }
+
+    /// `tab.foo` (UNRELATED tab-prefix) is rejected: typos
+    /// like `tab.newpane` or `tab.close-tab` should NOT fall
+    /// through to `pane.preset.foo` (which would wire to
+    /// `PanePreset("foo")` — a subtle but real bug shape).
+    /// This pins the parse_action's strip-prefix ordering.
+    #[test]
+    fn parse_tab_unrelated_prefix_returns_none() {
+        assert!(
+            parse_action("tab.foo").is_none(),
+            "tab.foo must not fall through to pane.preset"
+        );
+        assert!(parse_action("tab.newpane").is_none());
+        assert!(parse_action("tab.close-tab").is_none());
     }
 
     /// A `zstack` nested inside a `split` round-trips: the

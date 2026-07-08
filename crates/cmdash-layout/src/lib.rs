@@ -90,7 +90,7 @@ impl Rect {
 /// `pre_order` counts every leaf encountered during a DFS
 /// pre-order traversal starting at zero. `path` mirrors the child
 /// indices from root to the leaf (truncated to [`MAX_TREE_DEPTH`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PaneId {
     pre_order: u32,
     path: [u16; MAX_TREE_DEPTH],

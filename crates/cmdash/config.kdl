@@ -21,8 +21,32 @@ layout {
 // the focused shell's readline buffer (where `^A` means
 // "beginning of line"), never reaching
 // `apply_action_full(KeyAction::AppNewPane)`.
+
+// Cycle-22 atom-1: adds the v2 tab-axis default keybinds
+// `M-1`..`M-9` for tab switch, `M-t` for tab.new, `M-w` for
+// tab.close. The cmdash-config parse_action extension accepts
+// all 9 (`tab.switch.1`..`tab.switch.9`) and the KDL keybind
+// resolver maps `M-<n>` onto `tab.switch.<n>` for `n in 1..=9`.
+// Each M-N press flows through cmdash's tick-loop dispatch
+// surface to the cycle-22 atom-1 placeholder arm and becomes
+// functional across the cycle-22 atom-2 field refactor. Users
+// wanting non-default keybinds can extend the binds in their
+// own `~/.config/cmdash/config.kdl`; cycle-21 atom-3 left
+// `alt-w`/`alt-q`/`ctrl-a` unchanged to preserve the existing
+// surface.
 keybinds {
     bind "alt-w"  action="pane.close"
     bind "alt-q"  action="app.close"
     bind "ctrl-a" action="app.new-pane"
+    bind "M-t"    action="tab.new"
+    bind "M-w"    action="tab.close"
+    bind "M-1"    action="tab.switch.1"
+    bind "M-2"    action="tab.switch.2"
+    bind "M-3"    action="tab.switch.3"
+    bind "M-4"    action="tab.switch.4"
+    bind "M-5"    action="tab.switch.5"
+    bind "M-6"    action="tab.switch.6"
+    bind "M-7"    action="tab.switch.7"
+    bind "M-8"    action="tab.switch.8"
+    bind "M-9"    action="tab.switch.9"
 }

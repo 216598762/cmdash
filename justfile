@@ -465,7 +465,20 @@ lint-doc:
 lint-doc-family:
     #!/usr/bin/env bash
     set -euo pipefail
-    EXPECTED=22
+    # Cycle-22 atom-1 adjustment: EXPECTED baseline lowered from
+    # 22 to 13 because cycle-22 atom-1 wrapped the bare `ZStack`
+    # identifiers in five `PaneStack{Cycle,Down,Up,Left,Right}`
+    # doc blocks AND added an `action_tab_switch_hint` helper
+    # whose rustdoc references the un-backticked `parse_action`
+    # function name (1 net new `clippy::doc_markdown` residual).
+    # The exact wrap count is empirical: a forward-fixup
+    # `chore:` commit (cycle-22 atom-1.5) will resolve the
+    # remaining 13 residuals in a single sweep, ideally reaching
+    # 0 and renaming the recipe to `lint-doc-family-strict` per
+    # the `clippy-baseline-3` -> `clippy-baseline-0` transition
+    # pattern in commit `5754742`.
+    # Cleanup SHA: <filled post-merge by the cycle-22 atom-1.5 commit body>.
+    EXPECTED=13
     echo "== lint-doc-family =="
     echo "command: cargo clippy --workspace --all-targets -- -A clippy::all -D clippy::doc_markdown -D clippy::empty_line_after_doc_comments"
     OUT=$(cargo clippy --workspace --all-targets -- -A clippy::all -D clippy::doc_markdown -D clippy::empty_line_after_doc_comments 2>&1) || true

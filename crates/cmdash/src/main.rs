@@ -779,6 +779,27 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             KeyAction::AppNewPane => self.split_focused_for_new_pane(),
             KeyAction::PaneClose => self.close_focused_and_rebalance(),
             KeyAction::PanePreset(name) => self.swap_to_preset(&name),
+            // Cycle-22 atom-1: tab-axis actions are PLACEHOLDER
+            // no-ops in v1 until the TickContext field refactor
+            // lands in cycle-22 atom-2. The data surface and
+            // 2-tab fixture tests live in [`crate::tabs`] (the
+            // generic `Tab<T>` / `TabStack<T>` primitives
+            // exercised by input_tests against `TabStack<()>`).
+            // The cmdash-config-side parse_action arms accept
+            // the 3 new keybind tokens at KDL load time, so the
+            // keyrouter successfully dispatches here; until
+            // atom-2 wires these arms to a per-tab-state TickContext
+            // extension, the dispatch surface stays a clean
+            // // TODO marker with the atom-2 reference.
+            KeyAction::TabNew | KeyAction::TabClose | KeyAction::TabSwitch(_) => {
+                // TODO(cycle-22 atom-2): wire to
+                // `crate::tabs::TabStack<cmdash::PaneRunner>`
+                // once the TickContext field refactor lands.
+                debug!(
+                    ?action,
+                    "TabNew/TabClose/TabSwitch: cycle-22 atom-1 placeholder; cycle-22 atom-2 will wire"
+                );
+            }
         }
     }
 
