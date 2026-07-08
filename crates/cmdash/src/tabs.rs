@@ -3,7 +3,7 @@
 //!
 //! Cycle-22 atom-1 left the `KeyAction` enum variants, the KDL
 //! `parse_action` arms, and the `cmdash::layer_id`::
-//! [`derive_layer_id_for_tab`] LayerId-namepacks already in place;
+//! `derive_layer_id_for_tab` LayerId-namepacks already in place;
 //! atom-2 wires them through [`TabStack`] bound to a per-tab-state
 //! `TickContext` extension.
 //!
@@ -12,7 +12,7 @@
 //! `Tab<T>` is a single-tab wrapper holding a payload `T` plus a
 //! human-readable `label` (the v1 tab title). `TabStack<T>` is a
 //! linear stack of Tabs plus an `active_idx` cursor; the cursor is
-//! upkept by the [`TabStack::remove`] / `TabStack::switch_to` /
+//! upkept by the `TabStack::remove` / `TabStack::switch_to` /
 //! hot-path accessors so callers don't have to re-clamp `active_idx
 //! < len()` themselves.
 //!
@@ -35,14 +35,11 @@
 //! deliberately preserve the survivor's `PaneLayerId` per AGENTS.md
 //! "Hard rule: one layer per instance".
 //!
-//! Forward-fixup (NOT bundled here): the eventual `Tab<T>::title`
 //! user-facing label (AGENTS.md feature #3 "Tabs" mentions a
 //! tab bar layer); cycle-22 atom-3+ lands it once the keyboard
 //! model settles.
 //!
 //! Cycle-22 atom-2.
-
-use std::fmt;
 
 /// A single tab; holds the per-tab payload `T` plus an optional
 /// human-readable title.
@@ -101,11 +98,11 @@ impl<T> Tab<T> {
 ///    non-empty. The pre-condition is enforced on every entry to
 ///    a mutator; the post-condition is `<self.tabs.len()` for the
 ///    cursor after each operation.
-/// 2. After [`TabStack::remove`], `active_idx` is clamped to
+/// 2. After `TabStack::remove`, `active_idx` is clamped to
 ///    `len() - 1` (matches AGENTS.md / cmdash-config `TabClose`
 ///    rustdoc semantics: "active_tab is clamped to tabs.len() -
 ///    1; closing the last tab quits the binary").
-/// 3. After [`TabStack::switch_to(n)`], `active_idx = n` for any
+/// 3. After `TabStack::switch_to(n)`, `active_idx = n` for any
 ///    in-range `n`; out-of-range `n` is a no-op, leaving the
 ///    cursor unchanged (matches cmdash-config `TabSwitch(n)` M-1..M-9
 ///    keybind range: out-of-range bindings are silently ignored).
