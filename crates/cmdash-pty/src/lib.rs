@@ -39,6 +39,7 @@ use std::io::{Read, Write};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use thiserror::Error;
+use tracing::{debug, trace};
 use vte::{Params, Parser};
 
 // ---------- public constants ----------
@@ -972,11 +973,24 @@ impl PanePty {
             Self::enable_pty_echo(fd).map_err(|e| PtyError::Spawn(e.into()))?;
         }
         let cmd = build_command(shell);
+        debug!(
+            layer_id = layer_id.0,
+            cols,
+            rows,
+            program = ?cmd.get_argv(),
+            "PanePty::spawn: spawning child"
+        );
         let child = pair.slave.spawn_command(cmd).map_err(PtyError::Spawn)?;
         let reader = pair.master.try_clone_reader().map_err(PtyError::Spawn)?;
         let writer = pair.master.take_writer().map_err(PtyError::Spawn)?;
         let grid = TextGrid::new(cols, rows);
         let master = pair.master;
+        debug!(
+            layer_id = layer_id.0,
+            cols,
+            rows,
+            "PanePty::spawn: child spawned successfully"
+        );
         Ok((
             Self {
                 master,
@@ -1029,6 +1043,11 @@ impl PanePty {
     /// accumulator; opportunistically emits an Exit event if the
     /// child has already finished.
     pub fn advance(&mut self, bytes: &[u8]) -> Result<(), PtyError> {
+        trace!(
+            layer_id = self.layer_id.0,
+            byte_count = bytes.len(),
+            "PanePty::advance: feeding bytes"
+        );
         // Pre-scan input bytes for `ESC _` APC (kitty graphics)
         // sequences and route the payload to `KittyAccumulator`
         // BEFORE the remainder goes to `vte::Parser::advance`.
@@ -1197,6 +1216,21 @@ impl PanePty {
     /// Clone the current grid + drain pending events in a single
     /// snapshot.
     pub fn snapshot(&mut self) -> PaneTerminalState {
+        // Gate the O(cols*rows) non_blank_cells count behind
+        // `tracing::enabled!` so it only runs when TRACE is
+        // active. Without the gate, the count runs on every
+        // snapshot (~30 Hz per pane) regardless of log level.
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let non_blank = self.grid.cells().iter().filter(|c| c.ch != ' ').count();
+            trace!(
+                layer_id = self.layer_id.0,
+                cols = self.cols,
+                rows = self.rows,
+                cursor = ?self.grid.cursor(),
+                non_blank_cells = non_blank,
+                "PanePty::snapshot"
+            );
+        }
         let grid = self.grid.clone();
         let pending = std::mem::take(&mut self.pending_events);
         PaneTerminalState {

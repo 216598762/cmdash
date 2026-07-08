@@ -136,4 +136,128 @@ mod tests {
     // into a ratatui `TestBackend`, and asserts the rendered
     // buffer. Unit tests here only cover the static color/attrs
     // mappings because `cmdash_pty::TextGrid::put` is private.
+
+    /// `blit_grid` against a blank `TextGrid` (the initial state
+    /// after `TextGrid::new`) must NOT touch the buffer. The
+    /// skip-blank optimization in `blit_grid` intentionally skips
+    /// cells that are `space + default fg/bg + no attrs` so a
+    /// smaller grid does not erase pre-existing content. This test
+    /// verifies the baseline: a fresh grid produces zero buffer
+    /// mutations against a clean buffer.
+    ///
+    /// Catches: a regression that removes the skip-blank guard
+    /// would cause `blit_grid` to overwrite every cell with a
+    /// space, which is the exact "blank screen" symptom.
+    #[test]
+    fn blit_grid_blank_grid_does_not_touch_buffer() {
+        let grid = cmdash_pty::TextGrid::new(80, 24);
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        // Write a sentinel AND blit the blank grid in a SINGLE
+        // draw call. `Terminal::draw` resets the buffer before
+        // each closure, so combining them in one call is required
+        // to verify that `blit_grid` skips the sentinel cell.
+        terminal
+            .draw(|frame| {
+                let buf = frame.buffer_mut();
+                // Stamp sentinel BEFORE blit.
+                buf.get_mut(0, 0).set_symbol("X");
+                buf.get_mut(5, 3).set_symbol("Y");
+                // Now blit a blank grid on top.
+                let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+                blit_grid(&grid, buf, area);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        assert_eq!(
+            buf.get(0, 0).symbol(),
+            "X",
+            "blit_grid with blank grid must not overwrite pre-existing buffer content; \
+             the skip-blank guard should leave cell (0,0) at its sentinel value"
+        );
+        assert_eq!(
+            buf.get(5, 3).symbol(),
+            "Y",
+            "blit_grid with blank grid must not overwrite pre-existing buffer content; \
+             the skip-blank guard should leave cell (5,3) at its sentinel value"
+        );
+    }
+
+    /// `blit_cursor` with cursor at (0, 0) must add the REVERSED
+    /// modifier to that cell. The cursor cell is the only cell
+    /// that gets the reverse-video treatment; all other cells
+    /// must remain un-reversed.
+    #[test]
+    fn blit_cursor_at_origin_adds_reversed() {
+        let grid = cmdash_pty::TextGrid::new(80, 24);
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+                blit_cursor(&grid, frame.buffer_mut(), area);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        assert!(
+            buf.get(0, 0).style().add_modifier.contains(ratatui::style::Modifier::REVERSED),
+            "cursor at (0,0) must have REVERSED modifier"
+        );
+        // Cell (1, 0) must NOT have REVERSED.
+        assert!(
+            !buf.get(1, 0).style().add_modifier.contains(ratatui::style::Modifier::REVERSED),
+            "non-cursor cell (1,0) must NOT have REVERSED modifier"
+        );
+    }
+
+    /// `blit_cursor` with cursor outside the area must be a
+    /// no-op (no panic, no buffer mutation). The cursor sits at
+    /// (0, 0) by default; when the area starts at (10, 10), the
+    /// cursor is outside the area's local coordinate space.
+    /// `blit_cursor` when the cursor position lies outside the
+    /// area's cell range must be a no-op. The cursor is at (0,0)
+    /// by default in a fresh `TextGrid`; an area starting at
+    /// (40, 10) maps the cursor to buffer cell (40, 10) — which
+    /// IS inside the area (0 < area.width). To truly be outside,
+    /// we need a zero-sized area (width=0 or height=0), but
+    /// `blit_cursor` guards against that via
+    /// `cx >= area.width || cy >= area.height`. With a 1x1 area
+    /// at (40, 10), cursor (0,0) maps to (40,10) which IS inside;
+    /// the cursor IS rendered. Instead, test that cells FAR from
+    /// the area are unaffected by the cursor render.
+    #[test]
+    fn blit_cursor_does_not_affect_cells_outside_area() {
+        let grid = cmdash_pty::TextGrid::new(80, 24);
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let buf = frame.buffer_mut();
+                // Stamp sentinels at cells far from the area.
+                buf.get_mut(0, 0).set_symbol("A");
+                buf.get_mut(1, 0).set_symbol("B");
+                // blit_cursor with area at (40, 10). Cursor (0,0)
+                // maps to buffer cell (40, 10) — cells (0,0) and
+                // (1,0) must be unaffected.
+                let area = ratatui::layout::Rect::new(40, 10, 20, 5);
+                blit_cursor(&grid, buf, area);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        assert_eq!(
+            buf.get(0, 0).symbol(),
+            "A",
+            "cell (0,0) must retain sentinel 'A' after blit_cursor with area at (40,10)"
+        );
+        assert_eq!(
+            buf.get(1, 0).symbol(),
+            "B",
+            "cell (1,0) must retain sentinel 'B' after blit_cursor with area at (40,10)"
+        );
+        // The cursor-reversed cell at (40, 10) must have REVERSED.
+        assert!(
+            buf.get(40, 10).style().add_modifier.contains(ratatui::style::Modifier::REVERSED),
+            "cursor maps to (40,10) and must have REVERSED modifier"
+        );
+    }
 }

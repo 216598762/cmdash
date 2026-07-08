@@ -285,6 +285,15 @@ impl GraphicsState {
     /// `TerminalSize::current()` heuristic, which can drift on
     /// non-TTY CI).
     pub fn render_and_write<W: Write>(&self, writer: &mut W) -> Result<(), GraphicsError> {
+        // Early-out when no images are loaded: composing an
+        // empty LayerStack still produces a full-frame APC-G
+        // block (~1 MiB at 80×24 cells) that overwrites the
+        // text body rendered by ratatui in phase 3a. Skipping
+        // the compose+encode avoids both the stdout corruption
+        // and the per-frame CPU cost.
+        if self.images.is_empty() {
+            return Ok(());
+        }
         let w_px = self.cells.0 as u32 * self.metrics.cell_w;
         let h_px = self.cells.1 as u32 * self.metrics.cell_h;
         let mut fb = FrameBuffer::new(w_px, h_px);
@@ -591,5 +600,45 @@ mod internal_sanity_tests {
         let mut g = GraphicsState::new(Metrics::default(), (80, 24));
         g.set_cells((132, 50));
         assert_eq!(g.cells(), (132, 50));
+    }
+
+    /// Render-and-write with an empty `LayerStack` (no images
+    /// pushed) must succeed and produce ZERO output. Without
+    /// this early-out, `render_and_write` would compose a
+    /// full-frame APC-G block (~1 MiB at 80×24 cells) into
+    /// stdout on EVERY tick, overwriting the text body from
+    /// ratatui's phase 3a `terminal.draw()`. This is the
+    /// root-cause fix for the blank-screen bug: the encoder
+    /// was emitting a full-screen empty kitty frame that
+    /// occluded all text content.
+    #[test]
+    fn render_and_write_empty_stack_succeeds() {
+        let g = GraphicsState::new(Metrics::default(), (80, 24));
+        let mut out = Vec::new();
+        g.render_and_write(&mut out)
+            .expect("render_and_write with empty stack must not error");
+        assert!(
+            out.is_empty(),
+            "empty-stack render must produce ZERO output (early-out); got {} bytes",
+            out.len()
+        );
+    }
+
+    /// Non-empty-stack output must be bounded: the encoder
+    /// should not dump excessive framebuffer data. A 640x384
+    /// pixel framebuffer (80×24 cells at 8×16 px/cell) with
+    /// one 1×1 image should produce a compressed passthrough
+    /// frame well under 4 MiB.
+    #[test]
+    fn render_and_write_nonempty_stack_output_is_bounded() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        g.push_image(PaneLayerId(1), 1, rgba1x1());
+        let mut out = Vec::new();
+        g.render_and_write(&mut out).expect("render");
+        assert!(
+            out.len() < 4 * 1024 * 1024,
+            "non-empty-stack render output must be under 4 MiB; got {} bytes",
+            out.len()
+        );
     }
 }

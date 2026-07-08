@@ -17,6 +17,177 @@ use cmdash_config::{
 use cmdash_layout::{ComputedLayout, Direction, Rect as LayoutRect};
 use cmdash_pty::{PaneLayerId, ShellSpec};
 
+/// Blank-screen detection: a PTY that emits `hello world` via
+/// `printf` must produce visible (non-space) characters in the
+/// ratatui `TestBackend` buffer after `blit_grid` renders the
+/// snapshot. If the PTY→VTE→TextGrid→blit_grid→Buffer chain
+/// breaks at ANY link, the buffer would contain only spaces and
+/// this test fails.
+///
+/// Catches:
+/// - PTY child not producing output (spawn failure, login shell path)
+/// - VTE parser not populating TextGrid (byte routing bug)
+/// - `blit_grid` skipping all cells (blank-cell guard too broad)
+/// - ratatui `Terminal::draw` not flushing buffer to backend
+/// - Snapshot returning an empty/stale grid
+#[test]
+fn blank_screen_detection_pty_echo_must_appear_in_buffer() {
+    let source = r#"layout { pane kind=shell label="blank-test" }"#;
+    let cfg = cmdash_config::parse(source).expect("parse config");
+    let root = cfg.layout.expect("layout block");
+    let area = LayoutRect { x: 0, y: 0, w: 80, h: 24 };
+    let layout = ComputedLayout::compute(&root, area).expect("compute layout");
+    let pane = layout.panes[0].clone();
+    let layer_id = cmdash::derive_layer_id(&pane.id);
+
+    let shell = ShellSpec::Command {
+        argv: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'hello world'; sleep 0.1; exit 0".to_string(),
+        ],
+    };
+    let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
+    std::thread::sleep(Duration::from_millis(250));
+
+    let mut snap = None;
+    for _ in 0..80 {
+        let s = runner.tick().expect("tick");
+        let mut found = false;
+        for y in 0..s.rows {
+            for x in 0..s.cols {
+                if s.grid.cell(x, y).ch != ' ' {
+                    found = true;
+                    break;
+                }
+            }
+            if found { break; }
+        }
+        if found {
+            snap = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let snap = snap.expect("PTY must produce visible content in TextGrid within 2s");
+
+    // Blit to TestBackend and assert non-space content.
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, pane.rect.w, pane.rect.h);
+            cmdash::render::blit_grid(&snap.grid, frame.buffer_mut(), area);
+        })
+        .expect("draw");
+    let buf = terminal.backend().buffer().clone();
+    let mut non_space_count = 0;
+    for y in 0..24 {
+        for x in 0..80 {
+            if buf.get(x, y).symbol() != " " {
+                non_space_count += 1;
+            }
+        }
+    }
+    assert!(
+        non_space_count > 0,
+        "blank-screen detection: ratatui buffer must contain non-space characters after \
+         blit_grid of PTY output; got 0 non-space cells. This means the PTY→VTE→TextGrid→ \
+         blit_grid→Buffer chain is broken somewhere."
+    );
+}
+
+/// Baseline: blit_grid of an empty (all-spaces) TextGrid must
+/// leave the ratatui buffer at its initial state (all spaces).
+/// This verifies the "blank screen" starting condition — before
+/// the PTY child has produced output, the buffer SHOULD be blank.
+/// If this test fails, it means blit_grid is writing spurious
+/// content into the buffer from empty grids.
+#[test]
+fn blank_grid_baseline_buffer_stays_all_spaces() {
+    let grid = cmdash_pty::TextGrid::new(80, 24);
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+            cmdash::render::blit_grid(&grid, frame.buffer_mut(), area);
+        })
+        .expect("draw");
+    let buf = terminal.backend().buffer().clone();
+    for y in 0..24 {
+        for x in 0..80 {
+            let sym = buf.get(x, y).symbol();
+            assert_eq!(
+                sym, " ",
+                "blank grid baseline: cell ({x},{y}) must be space; got {sym:?}"
+            );
+        }
+    }
+}
+
+/// Shell startup: spawn a real login shell (`sh -c 'echo hi; sleep 1'`)
+/// and verify that the PTY produces visible output within a
+/// reasonable timeout. This catches:
+/// - Shell spawn failures (wrong path, permission denied)
+/// - Shell producing only escape sequences that VTE drops
+/// - Shell clearing the screen (ESC[2J) without writing content
+///   afterward
+#[test]
+fn shell_startup_produces_visible_content_in_textgrid() {
+    let source = r#"layout { pane kind=shell label="shell-startup" }"#;
+    let cfg = cmdash_config::parse(source).expect("parse config");
+    let root = cfg.layout.expect("layout block");
+    let area = LayoutRect { x: 0, y: 0, w: 80, h: 24 };
+    let layout = ComputedLayout::compute(&root, area).expect("compute layout");
+    let pane = layout.panes[0].clone();
+    let layer_id = cmdash::derive_layer_id(&pane.id);
+
+    // Spawn a real login shell that echoes a marker.
+    let shell = ShellSpec::Command {
+        argv: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo CMDASH_MARKER; sleep 1; exit 0".to_string(),
+        ],
+    };
+    let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
+    std::thread::sleep(Duration::from_millis(250));
+
+    let mut found_marker = false;
+    for _ in 0..80 {
+        let snap = runner.tick().expect("tick");
+        for y in 0..snap.rows {
+            for x in 0..snap.cols {
+                if snap.grid.cell(x, y).ch == 'C' {
+                    // Check if "CMDASH_MARKER" starts here.
+                    let mut full_match = true;
+                    for (i, ch) in "CMDASH_MARKER".chars().enumerate() {
+                        let cx = x + i as u16;
+                        if cx >= snap.cols || snap.grid.cell(cx, y).ch != ch {
+                            full_match = false;
+                            break;
+                        }
+                    }
+                    if full_match {
+                        found_marker = true;
+                        break;
+                    }
+                }
+            }
+            if found_marker { break; }
+        }
+        if found_marker { break; }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        found_marker,
+        "shell startup: login shell must produce visible 'CMDASH_MARKER' in TextGrid \
+         within 2s. If this fails, the shell either didn't spawn, produced only \
+         escape sequences that VTE dropped, or cleared the screen without content."
+    );
+}
+
 #[test]
 fn wiring_round_trip_renders_echoed_text() {
     let source = r#"layout { pane kind=shell label="wiring" }"#;
@@ -103,6 +274,143 @@ fn wiring_round_trip_renders_echoed_text() {
         }
     }
     assert!(saw_h, "rendered buffer did not contain 'h'");
+}
+
+/// Phase 3a/3b ordering: verify that kitty graphics output
+/// (phase 3b) does NOT overwrite or corrupt the text body
+/// rendered by ratatui (phase 3a). In the live binary,
+/// `TickContext::run` calls `terminal.draw()` (phase 3a) which
+/// writes cursor-positioning CSI sequences + printable characters
+/// to stdout, then calls `GraphicsState::render_and_write()`
+/// (phase 3b) which writes kitty APC-G escapes to the SAME
+/// stdout. If the encoder emits sequences that a terminal
+/// interprets as "clear screen", "cursor home", or otherwise
+/// overwrites the text body, the user sees a blank screen.
+///
+/// Test strategy: capture phase 3a output via
+/// `ratatui::backend::CrosstermBackend<Cursor<Vec<u8>>>`, then
+/// append phase 3b output from `render_and_write` to the same
+/// byte buffer, and verify the text characters from phase 3a
+/// survive in the combined stream. This mirrors the live binary's
+/// exact write ordering (text first, graphics second, same fd).
+#[test]
+fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
+    use cmdash::graphics::{GraphicsState, Metrics};
+    use cmdash_pty::ShellSpec;
+    use std::io::Cursor;
+
+    // Spawn a real PTY that produces visible output.
+    let source = r#"layout { pane kind=shell label="phase-order" }"#;
+    let cfg = cmdash_config::parse(source).expect("parse config");
+    let root = cfg.layout.expect("layout block");
+    let area = LayoutRect { x: 0, y: 0, w: 80, h: 24 };
+    let layout = ComputedLayout::compute(&root, area).expect("compute layout");
+    let pane = layout.panes[0].clone();
+    let layer_id = cmdash::derive_layer_id(&pane.id);
+
+    let shell = ShellSpec::Command {
+        argv: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'VISIBLE_TEXT'; sleep 0.1; exit 0".to_string(),
+        ],
+    };
+    let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
+    std::thread::sleep(Duration::from_millis(250));
+
+    let mut snap = None;
+    for _ in 0..80 {
+        let s = runner.tick().expect("tick");
+        let mut found = false;
+        for y in 0..s.rows {
+            for x in 0..s.cols {
+                if s.grid.cell(x, y).ch == 'V' {
+                    found = true;
+                    break;
+                }
+            }
+            if found { break; }
+        }
+        if found {
+            snap = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let snap = snap.expect("PTY must produce VISIBLE_TEXT within 2s");
+
+    // Phase 3a: render text body via CrosstermBackend to a
+    // byte buffer. This produces raw terminal escape sequences
+    // (cursor moves, SGR, printable chars) — the same output
+    // the live binary's `terminal.draw()` writes to stdout.
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let backend = ratatui::backend::CrosstermBackend::new(&mut buf);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, pane.rect.w, pane.rect.h);
+                cmdash::render::blit_grid(&snap.grid, frame.buffer_mut(), area);
+            })
+            .expect("draw text body");
+    } // Drop the terminal to flush the backend.
+
+    let phase3a_len = buf.get_ref().len();
+    assert!(
+        phase3a_len > 0,
+        "phase 3a must produce non-empty output (cursor moves + text)"
+    );
+
+    // Phase 3b: append kitty graphics output to the SAME byte
+    // buffer. This mirrors the live binary's
+    // `GraphicsState::render_and_write(&mut stdout)` call that
+    // writes to the same fd after `terminal.draw()`.
+    let mut graphics = GraphicsState::new(Metrics::default(), (80, 24));
+    // Push a synthetic 1x1 image so the encoder exercises the
+    // actual image-encoding path (not just the empty-framebuffer
+    // passthrough). This catches regressions where the encoder
+    // corrupts stdout only when real images are present.
+    graphics.push_image(cmdash_pty::PaneLayerId(1), 7, image::RgbaImage::new(1, 1));
+    graphics
+        .render_and_write(buf.get_mut())
+        .expect("phase 3b render_and_write");
+
+    let combined = buf.into_inner();
+    assert!(
+        combined.len() > phase3a_len,
+        "phase 3b must append kitty graphics after phase 3a text"
+    );
+
+    // The combined stream must still contain the text body's
+    // printable characters. If the kitty encoder emitted a
+    // "clear screen" or "cursor home" sequence between the
+    // text and graphics, a terminal would interpret it as
+    // overwriting the text. We verify by scanning for the
+    // ASCII bytes of "VISIBLE_TEXT" in the combined stream.
+    let needle = b"VISIBLE_TEXT";
+    let found = combined
+        .windows(needle.len())
+        .any(|w| w == needle);
+    assert!(
+        found,
+        "phase 3a text 'VISIBLE_TEXT' must survive in the combined \
+         stream after phase 3b kitty graphics. If this fails, the \
+         kitty encoder is overwriting the text body on stdout. \
+         Combined stream length: {} bytes, phase 3a length: {} bytes",
+        combined.len(),
+        phase3a_len,
+    );
+
+    // The combined stream must contain the kitty APC-G escape
+    // header, confirming phase 3b actually wrote graphics data.
+    let kitty_header = b"\x1b_G";
+    let has_kitty = combined
+        .windows(kitty_header.len())
+        .any(|w| w == kitty_header);
+    assert!(
+        has_kitty,
+        "combined stream must contain kitty APC-G escape from phase 3b"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,9 +1701,16 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     // emitting throughout the post-Ctrl-a window. A binary
     // that crashes mid-test would freeze the ring at its
     // crash-time bytes (~sub-second worth, well below 16 KiB).
+    // Threshold: with the empty-LayerStack early-out fix in
+    // `render_and_write`, cmdash no longer emits ~1 MiB of
+    // kitty APC-G data per frame. Only ratatui text escapes
+    // reach the ring buffer (~1–2 KiB over 1.5 s). The
+    // threshold is set to 512 bytes — enough to prove the
+    // binary kept rendering (a crash would freeze the ring
+    // at its pre-Ctrl-a size, typically <200 bytes).
     assert!(
-        final_snapshot.len() >= 16 * 1024,
-        "post-Ctrl-a ring snapshot must be at least 16 KiB (proves the \
+        final_snapshot.len() >= 512,
+        "post-Ctrl-a ring snapshot must be at least 512 bytes (proves the \
          binary kept rendering rather than crashing mid-test); \
          observed pre_snapshot_len={} post_snapshot_len={} \
          poll_budget_ms={}",
@@ -1764,4 +2079,169 @@ fn extract_u16_after(line: &str, field: &str) -> Option<u16> {
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(trimmed.len());
     trimmed[..end].parse::<u16>().ok()
+}
+
+/// Full-pipeline diagnostic: spawn a real PTY with `printf`
+/// and exercise the ENTIRE byte-flow path:
+/// PTY child → master fd → reader thread → mpsc channel →
+/// `PaneRunner::tick()` → `PanePty::advance()` → VTE →
+/// `TextGrid` → `snapshot()` → non-blank cell check.
+///
+/// This is the strongest test for the blank-screen bug
+/// because it exercises the exact code path the live binary
+/// uses (PaneRunner::spawn_with_graphics + the reader thread
+/// in pane.rs). If this test passes but the live binary
+/// still shows blank, the issue is in the render pipeline
+/// (phase 3a/3b) or terminal initialization, NOT the PTY
+/// byte-flow path.
+///
+/// Catches:
+/// - PTY spawn succeeding but child producing no output
+/// - Reader thread exiting immediately (silent EOF)
+/// - mpsc channel disconnecting before bytes arrive
+/// - `PaneRunner::tick()` never calling `advance()`
+/// - VTE parser not populating the TextGrid
+/// - Snapshot returning stale/empty grid
+///
+/// Also verifies that a `sleep 10` shell (long-lived) does
+/// produce content (catches the case where a fast-exit child
+/// like `/bin/true` races the assertion surface, which would
+/// produce a false-positive pass on a broken pipeline).
+#[test]
+fn full_pipeline_pty_reader_tick_snapshot_has_content() {
+    let source = r#"layout { pane kind=shell label="pipeline" }"#;
+    let cfg = cmdash_config::parse(source).expect("parse config");
+    let root = cfg.layout.expect("layout block");
+    let area = LayoutRect { x: 0, y: 0, w: 80, h: 24 };
+    let layout = ComputedLayout::compute(&root, area).expect("compute layout");
+    let pane = layout.panes[0].clone();
+    let layer_id = cmdash::derive_layer_id(&pane.id);
+
+    // Use a long-lived shell so the reader thread has time to
+    // accumulate bytes before the child exits. The marker is
+    // echoed immediately, then the child sleeps.
+    let shell = ShellSpec::Command {
+        argv: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'PIPELINE_MARKER'; sleep 10; exit 0".to_string(),
+        ],
+    };
+    let close_tx: PaneCloseTx = std::sync::mpsc::channel().0;
+    let mut runner = PaneRunner::spawn_with_graphics(
+        pane.clone(),
+        layer_id,
+        shell,
+        Some(close_tx),
+    )
+    .expect("spawn_with_graphics must succeed");
+
+    // Wait for the child to start and produce output.
+    std::thread::sleep(Duration::from_millis(250));
+
+    // Tick the runner repeatedly until we see non-blank cells
+    // in the TextGrid snapshot. Each tick drains bytes_rx and
+    // feeds them through advance() → VTE → TextGrid.
+    let mut found_marker = false;
+    let mut non_blank_count = 0;
+    let mut last_snap = None;
+    for _attempt in 0..80 {
+        let snap = runner.tick().expect("tick must succeed");
+        // Count non-blank cells in the snapshot.
+        let mut count = 0;
+        for y in 0..snap.rows {
+            for x in 0..snap.cols {
+                if snap.grid.cell(x, y).ch != ' ' {
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 && non_blank_count == 0 {
+            non_blank_count = count;
+        }
+        // Check for the marker string.
+        if !found_marker {
+            for y in 0..snap.rows {
+                for x in 0..snap.cols {
+                    if snap.grid.cell(x, y).ch == 'P' {
+                        let mut ok = true;
+                        for (i, ch) in "PIPELINE_MARKER".chars().enumerate() {
+                            let cx = x + i as u16;
+                            if cx >= snap.cols || snap.grid.cell(cx, y).ch != ch {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            found_marker = true;
+                            break;
+                        }
+                    }
+                }
+                if found_marker { break; }
+            }
+        }
+        last_snap = Some(snap);
+        if found_marker { break; }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // The TextGrid MUST have non-blank content. If this
+    // fails, the PTY→reader→advance→TextGrid chain is broken
+    // — this is the exact blank-screen symptom.
+    assert!(
+        non_blank_count > 0,
+        "full pipeline: TextGrid must contain non-blank cells after PTY spawn + tick. \
+         If this fails, the PTY child either exited immediately (bad $SHELL), \
+         the reader thread hit EOF before any bytes were sent, or the VTE parser \
+         didn't populate the grid. Check: $SHELL={:?}",
+        std::env::var("SHELL"),
+    );
+
+    // The marker MUST be found. This proves the full
+    // byte-flow path works end-to-end.
+    assert!(
+        found_marker,
+        "full pipeline: 'PIPELINE_MARKER' must appear in TextGrid. \
+         The grid had {} non-blank cells but the marker was not found — \
+         the PTY may have produced other content (shell prompt, escapes) \
+         but not the expected printf output.",
+        non_blank_count,
+    );
+
+    // Verify the marker survives blit_grid to a ratatui buffer.
+    let snap = last_snap.expect("at least one snapshot");
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, pane.rect.w, pane.rect.h);
+            cmdash::render::blit_grid(&snap.grid, frame.buffer_mut(), area);
+        })
+        .expect("draw");
+    let buf = terminal.backend().buffer().clone();
+    let mut buf_marker = false;
+    'outer: for y in 0..24 {
+        for x in 0..80 {
+            if buf.get(x, y).symbol() == "P" {
+                let mut ok = true;
+                for (i, ch) in "PIPELINE_MARKER".chars().enumerate() {
+                    let cx = x + i as u16;
+                    if cx >= 80 || buf.get(cx, y).symbol() != ch.to_string() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    buf_marker = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    assert!(
+        buf_marker,
+        "full pipeline: 'PIPELINE_MARKER' must survive blit_grid to ratatui buffer. \
+         If the TextGrid had the marker but the buffer doesn't, blit_grid is broken."
+    );
 }

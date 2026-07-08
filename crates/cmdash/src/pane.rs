@@ -443,16 +443,51 @@ impl Drop for PaneRunner {
 
 fn run_reader(mut reader: PaneReader, tx: std::sync::mpsc::Sender<Vec<u8>>) {
     let mut buf = [0u8; 4096];
+    let mut total_bytes: usize = 0;
+    let mut read_count: u64 = 0;
     loop {
         match reader.read(&mut buf) {
-            Ok(0) => break, // EOF; child closed the master.
+            Ok(0) => {
+                // EOF; child closed the master. If zero bytes
+                // were ever read, the child likely exited
+                // immediately (bad $SHELL, missing binary,
+                // startup failure). Log at WARN so it appears
+                // even at INFO subscriber level.
+                if total_bytes == 0 {
+                    warn!(
+                        reads = read_count,
+                        "pane reader: EOF with ZERO bytes read — \
+                         child likely exited immediately (bad \
+                         $SHELL, missing binary, or startup failure)"
+                    );
+                } else {
+                    debug!(
+                        reads = read_count,
+                        total_bytes,
+                        "pane reader: EOF after reading bytes"
+                    );
+                }
+                break;
+            }
             Ok(n) => {
+                total_bytes += n;
+                read_count += 1;
                 if tx.send(buf[..n].to_vec()).is_err() {
+                    debug!(
+                        reads = read_count,
+                        total_bytes,
+                        "pane reader: receiver dropped; stopping"
+                    );
                     break; // Receiver dropped; binary is exiting.
                 }
             }
             Err(e) => {
-                warn!(error = %e, "pane reader error; stopping");
+                warn!(
+                    error = %e,
+                    reads = read_count,
+                    total_bytes,
+                    "pane reader error; stopping"
+                );
                 break;
             }
         }
