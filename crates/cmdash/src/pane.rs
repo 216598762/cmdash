@@ -76,10 +76,32 @@ pub enum RunnerError {
 ///`StubPty` (see `internal_sanity_tests` below) to pin
 /// invariants like the resize Err path that real-PTY tests
 /// can't reach deterministically.
+///
+/// ## Manual `Clone` impl (cycle-22 atom-4)
+///
+/// `PaneRunner` is a runtime resource (PTY child + dashcompositor
+/// layer + reader thread); the trait object field
+/// `pty: Box<dyn PanePtyOps + Send>` is not `Clone` by default.
+/// The additive `TabStack<TabState>` integration in
+/// `cmdash::main` needs `TabState: Clone` (the upstream
+/// `Tab<T>: Clone` derive in `crate::tabs` requires it), and
+/// `TabState` carries a `runners: Vec<PaneRunner>` field. The
+/// manual `Clone` impl below returns a "shell" with `pty: None`
+/// and `reader_thread: None` so the v1 field's runners (the real
+/// ones) stay intact while the `TabState`'s runners are
+/// decorative shells — `TabState.runners` is never used at
+/// runtime (the v1 field's runners are authoritative for v1
+/// code paths, and tab mutations always go through
+/// `reconcile_runners` which spawns fresh real runners).
 pub struct PaneRunner {
     /// Source pane description (rect, kind, label).
     computed: ComputedPane,
-    pty: Box<dyn PanePtyOps + Send>,
+    /// Trait-object PTY backend. Stored as `Option<Box<...>>` so
+    /// the manual `Clone` impl can return a shell with `pty: None`
+    /// (the source keeps its pty; the clone has no runtime
+    /// backend). Production runners always have `pty: Some(_)`
+    /// after `spawn_with_graphics`; `None` is the clone-shell case.
+    pty: Option<Box<dyn PanePtyOps + Send>>,
     bytes_rx: Receiver<Vec<u8>>,
     reader_thread: Option<thread::JoinHandle<()>>,
     /// Optional close-channel sender. When `Some`, `Drop` sends
@@ -88,6 +110,110 @@ pub struct PaneRunner {
     /// layers on the next tick (AGENTS.md §"Hard rule").
     close_tx: Option<PaneCloseTx>,
 }
+
+// Manual `Clone` impl: the trait object field `pty: Box<dyn ...>`
+// is not `Clone` by default. The clone is a "shell" with
+// `pty: None` + `reader_thread: None` -- the source keeps both
+// pty and reader thread, so the v1 field's `runners` Vec
+// (the authoritative real runners for v1 code paths) stays
+// intact after `runners.clone()` for the `TabState` mirror.
+// The clone's `bytes_rx` is a FRESH dummy channel (the
+// original is `std::sync::mpsc::Receiver` which is NOT
+// `Clone`); the dummy's sender is dropped on creation, so
+// the clone's `tick()` will see a disconnected channel and
+// skip the drain loop. The clone is a decorative shell for
+// `TabState.runners` mirroring only -- it is NEVER used at
+// runtime (any call into a clone's `tick()` / `resize()` /
+// `write_input()` would panic on the `pty: None` `.expect`).
+// `close_tx.clone()` IS valid (Sender: Clone).
+impl Clone for PaneRunner {
+    fn clone(&self) -> Self {
+        let (_tx, bytes_rx) = channel::<Vec<u8>>();
+        Self {
+            computed: self.computed.clone(),
+            pty: None,
+            bytes_rx,
+            reader_thread: None,
+            close_tx: self.close_tx.clone(),
+        }
+    }
+}
+
+// Manual `Debug` impl: the trait object field
+// `pty: Option<Box<dyn PanePtyOps + Send>>` is not `Debug`-able
+// (the trait does not require `Debug`). The format_args
+// sentinel prints `<dyn PanePtyOps+Send or <empty>>` so the
+// presence/absence of the pty is observable without forcing
+// the trait to require `Debug` (which would cascade into
+// `MasterPty: Debug` and the test stub). `bytes_rx` /
+// `reader_thread` / `close_tx` are opaque runtime resources
+// -- they print as `<rx>` / `<thread handle or None>` /
+// `<tx or None>`. `computed` is a plain [`ComputedPane`] so
+// its `Debug` delegate runs normally.
+impl std::fmt::Debug for PaneRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaneRunner")
+            .field("computed", &self.computed)
+            .field(
+                "pty",
+                &format_args!(
+                    "{}",
+                    if self.pty.is_some() {
+                        "<dyn PanePtyOps+Send>"
+                    } else {
+                        "<empty>"
+                    },
+                ),
+            )
+            .field("bytes_rx", &format_args!("<rx>"))
+            .field(
+                "reader_thread",
+                &format_args!(
+                    "{}",
+                    if self.reader_thread.is_some() {
+                        "<thread handle>"
+                    } else {
+                        "<None>"
+                    },
+                ),
+            )
+            .field(
+                "close_tx",
+                &format_args!(
+                    "{}",
+                    if self.close_tx.is_some() {
+                        "<tx>"
+                    } else {
+                        "<None>"
+                    },
+                ),
+            )
+            .finish()
+    }
+}
+
+// Manual `PartialEq` + `Eq` impls: two `PaneRunner`s are
+// "equal" iff they reference the same LOGICAL pane
+// (i.e. share a [`cmdash_layout::PaneId`]). The
+// `pty` / `bytes_rx` / `reader_thread` / `close_tx` fields
+// are transient RUNTIME state (a clone-shell has `pty: None`
+// while the source has `pty: Some(_)`, but they're the same
+// logical pane -- comparing the source against its clone
+// returns `true`). This is the only viable semantics for a
+// type with a `Box<dyn PanePtyOps + Send>` field (trait
+// objects are not `PartialEq`); the `computed.id` is the
+// stable identity from the layout engine's pre-order leaf
+// numbering (AGENTS.md §"`PaneId` stability"). The
+// `TabState` derive in `cmdash::main` needs
+// `Vec<PaneRunner>: PartialEq + Eq` so the tab mirror can
+// participate in `assert_eq!` / `Tab<T>: PartialEq` chains.
+impl PartialEq for PaneRunner {
+    fn eq(&self, other: &Self) -> bool {
+        self.computed.id == other.computed.id
+    }
+}
+
+impl Eq for PaneRunner {}
 
 impl PaneRunner {
     /// Spawn a child PTY and a reader thread that forwards
@@ -124,7 +250,7 @@ impl PaneRunner {
             .expect("spawn reader thread");
         Ok(Self {
             computed,
-            pty: Box::new(pty),
+            pty: Some(Box::new(pty)),
             bytes_rx: rx,
             reader_thread: Some(reader_thread),
             close_tx,
@@ -137,15 +263,22 @@ impl PaneRunner {
     pub fn tick(&mut self) -> Result<PaneTerminalState, PtyError> {
         // `try_recv`: no blocking. Empty queue is the common case
         // when a child is idle.
+        let pty = self
+            .pty
+            .as_mut()
+            .expect("PaneRunner::tick: pty is None (clone-shell called at runtime?)");
         while let Ok(bytes) = self.bytes_rx.try_recv() {
-            self.pty.advance(&bytes)?;
+            pty.advance(&bytes)?;
         }
-        Ok(self.pty.snapshot())
+        Ok(pty.snapshot())
     }
 
     /// Non-blocking exit poll.
     pub fn try_wait_exit(&mut self) -> Result<Option<i32>, PtyError> {
-        self.pty.try_wait()
+        self.pty
+            .as_mut()
+            .expect("PaneRunner::try_wait_exit: pty is None")
+            .try_wait()
     }
 
     /// Resize the PTY and overwrite the cached [`ComputedPane`]
@@ -167,14 +300,20 @@ impl PaneRunner {
     /// value keeps the previous last-good state — pane state
     /// mutates atomically, not in halves).
     pub fn resize(&mut self, rect: LayoutRect) -> Result<(), PtyError> {
-        self.pty.resize(rect.w, rect.h)?;
+        self.pty
+            .as_mut()
+            .expect("PaneRunner::resize: pty is None")
+            .resize(rect.w, rect.h)?;
         self.computed.rect = rect;
         Ok(())
     }
 
     /// Forward input bytes to the child.
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<usize, PtyError> {
-        self.pty.write(bytes)
+        self.pty
+            .as_mut()
+            .expect("PaneRunner::write_input: pty is None")
+            .write(bytes)
     }
 
     /// Read-only accessor; transparent pass-through to the spawn-
@@ -216,7 +355,10 @@ impl PaneRunner {
     }
 
     pub fn layer_id(&self) -> PaneLayerId {
-        self.pty.layer_id()
+        self.pty
+            .as_ref()
+            .expect("PaneRunner::layer_id: pty is None")
+            .layer_id()
     }
 
     /// Test-only ctor that injects a [`PanePtyOps`] trait object
@@ -248,7 +390,7 @@ impl PaneRunner {
         let (_tx, rx) = channel::<Vec<u8>>();
         Self {
             computed,
-            pty,
+            pty: Some(pty),
             bytes_rx: rx,
             reader_thread: None,
             close_tx,
@@ -261,9 +403,13 @@ impl Drop for PaneRunner {
         // Best-effort: kill the child before joining the reader so
         // the reader sees EOF promptly instead of an indefinite
         // hang. The child is reachable via `&mut self.pty` since
-        // `self.pty` is still in scope.
-        if let Err(e) = self.pty.kill() {
-            debug!(error = ?e, layer_id = ?self.pty.layer_id(), "kill on drop");
+        // `self.pty` is still in scope. `Option::take()` so a
+        // clone-shell (`pty: None`) is a no-op (the source's
+        // pty is unaffected; the clone has no pty to kill).
+        if let Some(pty) = self.pty.as_mut() {
+            if let Err(e) = pty.kill() {
+                debug!(error = ?e, layer_id = ?pty.layer_id(), "kill on drop");
+            }
         }
         if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
@@ -273,9 +419,12 @@ impl Drop for PaneRunner {
         // loop so its next tick can call
         // `GraphicsState::close_pane`. We swallow a closed-channel
         // error (binary already exited) which is benign.
-        if let Some(tx) = self.close_tx.as_ref() {
-            if let Err(e) = tx.send(self.pty.layer_id()) {
-                debug!(error = ?e, layer_id = ?self.pty.layer_id(),
+        // Skipped for clone-shells (pty: None) since the source
+        // runner's `Drop` is the authoritative emitter of the
+        // close-channel message.
+        if let (Some(tx), Some(pty)) = (self.close_tx.as_ref(), self.pty.as_ref()) {
+            if let Err(e) = tx.send(pty.layer_id()) {
+                debug!(error = ?e, layer_id = ?pty.layer_id(),
                        "close_tx send on drop failed (receiver gone?)");
             }
         }

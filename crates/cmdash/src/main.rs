@@ -45,6 +45,13 @@ use std::time::Duration;
 use cmdash::graphics::{GraphicsState, Metrics};
 use cmdash::pane::{PaneCloseTx, PaneRunner};
 use cmdash::render::{blit_cursor, blit_grid};
+// `TabStack` (and `Tab`) are re-exported from the lib crate's
+// `tabs` module via `cmdash::TabStack`. main.rs is the binary
+// entrypoint; `crate::TabStack` would resolve to the binary
+// crate's flat namespace (which does not define `TabStack`),
+// not the lib. Use the lib-crate path so the `tabs: TabStack<TabState>`
+// field on [`TickContext`] resolves.
+use cmdash::TabStack;
 use cmdash_config::{
     parse as parse_config, KeyAction, LayoutNode, Pane as CfgPane, PaneKind, Ratio as CfgRatio,
     SplitAxis as CfgSplitAxis,
@@ -429,6 +436,62 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Per-tab payload carried by every [`Tab<T>`] in the
+/// `cmdash::main::TickContext::tabs: TabStack<TabState>` stack.
+///
+/// ## Cycle-22 atom-4 ADDITIVE design
+///
+/// The fields here MIRROR the v1 singular fields on
+/// [`TickContext`] (`runners`, `focus`, `layout_root`,
+/// `stack_focus`). The v1 fields stay authoritative for v1 code
+/// paths (the 100+ call sites that read them directly
+/// continue to work); the per-tab payload here is
+/// authoritative ONLY for the tab-axis actions
+/// (`KeyAction::TabNew` / `TabClose` / `TabSwitch(n)`), which
+/// mutate `self.tabs` and then call
+/// [`TickContext::sync_v1_from_active_tab`] +
+/// [`TickContext::reconcile_runners`] to bring the v1 fields
+/// in line with the new active tab.
+///
+/// ## Why the v1 + tabs duplication
+///
+/// The full Option-A rewrite (cycle-22 atom-2 deferred) hit a
+/// cascade of issues with the sentinel-byte sed pipeline
+/// (it only matched `self.X` patterns, missing the 100+ test
+/// fixture bare-name `pane.X` / `ctx.X` accesses). The
+/// additive design avoids the cascade: v1 fields stay
+/// (no test fixture changes), the new `tabs` field is added
+/// alongside, and the tab actions go through a new code path
+/// that syncs the v1 fields from the active tab after every
+/// tab mutation.
+///
+/// ## `Clone` bound for `Tab<T>: Clone`
+///
+/// The `Tab<T>` derive in `crate::tabs` requires `T: Clone`;
+/// in turn, the manual `Clone` impl on [`cmdash::pane::PaneRunner`]
+/// returns a "shell" with `pty: None` (the source keeps its
+/// pty; the clone has no runtime backend). The
+/// `TabState.runners` Vec is therefore a Vec of shells —
+/// decorative only; the authoritative runners for v1 code
+/// paths are the v1 field's `Vec<PaneRunner>` (real pty +
+/// reader thread), reconciled via
+/// [`TickContext::reconcile_runners`] after every tab mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TabState {
+    /// Per-tab pane Vec. Clone-shells (pty-less) per the
+    /// [`cmdash::pane::PaneRunner`] manual `Clone` impl; the
+    /// authoritative real runners are the v1 field's
+    /// `Vec<PaneRunner>` (see the doc above).
+    pub runners: Vec<PaneRunner>,
+    /// Per-tab focused-pane index.
+    pub focus: usize,
+    /// Per-tab KDL layout tree.
+    pub layout_root: LayoutNode,
+    /// Per-tab ZStack focus map (per the v1 `stack_focus`
+    /// semantics).
+    pub stack_focus: BTreeMap<cmdash_layout::PaneId, usize>,
+}
+
 /// Pivot struct for one tick of the AGENTS.md rendering pipeline.
 ///
 /// Bundles the ten per-frame arguments of the prior free
@@ -523,6 +586,21 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// (`LoginShell`) — `cmdash::run` wires the constant. A future
     /// per-pane shell override slots in here.
     shell: ShellSpec,
+    /// Cycle-22 atom-4 ADDITIVE: per-tab payload stack. The
+    /// v1 singular `runners` / `focus` / `layout_root` /
+    /// `stack_focus` fields above are UNAFFECTED by the
+    /// tab-axis actions; the 100+ call sites that read them
+    /// directly continue to work. The `tabs` field is
+    /// authoritative ONLY for the tab-axis actions
+    /// (`KeyAction::TabNew` / `TabClose` / `TabSwitch(n)`),
+    /// which mutate `self.tabs` and then call
+    /// [`Self::sync_v1_from_active_tab`] + [`Self::reconcile_runners`]
+    /// to bring the v1 fields in line with the new active
+    /// tab. Initial-frame state is a 1-tab stack with the
+    /// initial `runners` (cloned shells) / `focus` /
+    /// `layout_root` / `stack_focus` so the v1 + tabs
+    /// surfaces are coherent at construction.
+    tabs: TabStack<TabState>,
 }
 
 /// Monotonic `LayerId` allocator for
@@ -612,6 +690,20 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             "TickContext::new_full: focus ({focus}) is out of bounds for {} runners",
             runners.len(),
         );
+        // Cycle-22 atom-4 ADDITIVE: seed the per-tab stack
+        // with the initial 1-tab payload. The TabState's
+        // `runners` is a CLONE of the input Vec (shells:
+        // `PaneRunner::clone` returns pty-less shells per the
+        // manual `Clone` impl in `pane.rs`); the v1 field's
+        // `runners` keeps the real PaneRunners. The
+        // `TabState.runners` is decorative — `reconcile_runners`
+        // always spawns fresh real runners on tab mutations.
+        let initial_tab = TabState {
+            runners: runners.clone(),
+            focus,
+            layout_root: layout_root.clone(),
+            stack_focus: stack_focus.clone(),
+        };
         Self {
             runners,
             bindings,
@@ -628,6 +720,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             presets,
             stack_focus,
             shell,
+            tabs: TabStack::new(initial_tab),
         }
     }
 
@@ -782,7 +875,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             // Cycle-22 atom-1: tab-axis actions are PLACEHOLDER
             // no-ops in v1 until the TickContext field refactor
             // lands in cycle-22 atom-2. The data surface and
-            // 2-tab fixture tests live in [`crate::tabs`] (the
+            // 2-tab fixture tests live in `crate::tabs` (the
             // generic `Tab<T>` / `TabStack<T>` primitives
             // exercised by input_tests against `TabStack<()>`).
             // The cmdash-config-side parse_action arms accept
@@ -791,15 +884,9 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             // atom-2 wires these arms to a per-tab-state TickContext
             // extension, the dispatch surface stays a clean
             // // TODO marker with the atom-2 reference.
-            KeyAction::TabNew | KeyAction::TabClose | KeyAction::TabSwitch(_) => {
-                // TODO(cycle-22 atom-2): wire to
-                // `crate::tabs::TabStack<cmdash::PaneRunner>`
-                // once the TickContext field refactor lands.
-                debug!(
-                    ?action,
-                    "TabNew/TabClose/TabSwitch: cycle-22 atom-1 placeholder; cycle-22 atom-2 will wire"
-                );
-            }
+            KeyAction::TabNew => self.create_new_tab(),
+            KeyAction::TabClose => self.close_active_tab(),
+            KeyAction::TabSwitch(n) => self.switch_to_tab(n),
         }
     }
 
@@ -1024,7 +1111,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// new focus lands outside the `ZStack`, so any keyed
     /// entry would go stale.
     ///
-    /// **Trapdoor precedent** -- [`cmdash_layout::split_rect`] in
+    /// **Trapdoor precedent** -- `cmdash_layout::split_rect` in
     /// `cmdash_layout` documents that the cfg
     /// `split axis=horizontal` keyword is a *column* split
     /// (same y range, different x columns), the OPPOSITE of
@@ -1104,7 +1191,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// - No-op when no runner is focused, when the focused
     ///   runner's path doesn't fit a ZStack-member slot, or
     ///   when the post-boundary handoff finds no neighbour
-    ///   via [`cmdash_layout::adjacent_pane`].
+    ///   via `cmdash_layout::adjacent_pane`.
     /// - The handoff path does NOT mutate `stack_focus` (the
     ///   new focus is OUTSIDE the `ZStack`, so the keyed
     ///   stack-focus-map entry would never be queried).
@@ -1134,7 +1221,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     ///   conditional branch -- an anti-pattern. They are
     ///   intentionally separate.
     ///
-    /// - **Trapdoor precedent** -- the [`cmdash_layout::split_rect`]
+    /// - **Trapdoor precedent** -- the `cmdash_layout::split_rect`
     ///   rustdoc on `cmdash_layout` warns that the cfg
     ///   `axis=horizontal` is a *column* split (same y
     ///   range, different x columns), the OPPOSITE of the
@@ -1500,7 +1587,14 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                 let layer_id = if matches!(mode, ReconcileMode::Wholesale) {
                     alloc_layer_id()
                 } else {
-                    cmdash::derive_layer_id(&pane.id)
+                    // Cycle-22 atom-4 ADDITIVE: tab-aware
+                    // LayerId so a v2 multi-tab reconcile
+                    // produces collision-free ids across
+                    // tabs. For a single-tab binary
+                    // (`active_tab_idx_u32() == 0 == SINGLE_TAB`)
+                    // this matches the v1 `derive_layer_id`
+                    // call sites byte-for-byte.
+                    cmdash::derive_layer_id_for_tab(&pane.id, self.active_tab_idx_u32())
                 };
                 let tx: PaneCloseTx = self.close_tx.clone();
                 match PaneRunner::spawn_with_graphics(
@@ -1526,6 +1620,85 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         self.runners = new_runners;
         self.graphics
             .set_cells((self.last_area.w, self.last_area.h));
+    }
+
+    /// Cycle-22 atom-4 ADDITIVE: the active tab's index as
+    /// `u32` for `cmdash::derive_layer_id_for_tab`. The
+    /// `reconcile_runners` InPlace path passes this as the
+    /// second arg so multi-tab LayerIds are collision-free.
+    /// For a single-tab binary (`active_tab_idx_u32() == 0 ==
+    /// SINGLE_TAB`) this matches the v1 `derive_layer_id`
+    /// call sites byte-for-byte, so existing tests are
+    /// unaffected. Private (no `pub`) because the only call
+    /// site is `reconcile_runners` in this same `impl` block;
+    /// widening to `pub(crate)` is a single-keyword change
+    /// for a future external test surface that needs the
+    /// active tab index.
+    fn active_tab_idx_u32(&self) -> u32 {
+        self.tabs.active_idx() as u32
+    }
+
+    /// Cycle-22 atom-4 ADDITIVE: copy the active tab's
+    /// `focus` / `layout_root` / `stack_focus` into the v1
+    /// fields so v1 code paths see the post-tab-mutation
+    /// state. The v1 `runners` field is NOT synced here
+    /// (the active tab's `runners` is a Vec of clone-shells;
+    /// the authoritative real runners are written by the
+    /// subsequent [`Self::reconcile_runners`] call). The
+    /// tick loop's `if !self.running { return Ok(()) }` check
+    /// fires BEFORE any access after a `close_active_tab` of
+    /// the last tab empties the stack, so this helper's
+    /// no-op on empty stack is safe.
+    fn sync_v1_from_active_tab(&mut self) {
+        if let Some(active) = self.tabs.active() {
+            self.focus = active.state.focus;
+            self.layout_root = active.state.layout_root.clone();
+            self.stack_focus = active.state.stack_focus.clone();
+        }
+    }
+
+    /// Cycle-22 atom-4 ADDITIVE: create a new tab with a
+    /// single default-shell pane and switch focus to it. The
+    /// active tab's `layout_root` is a 1-leaf `LayoutNode::Pane`
+    /// so the subsequent `reconcile_runners(Wholesale)` spawns
+    /// one fresh runner for the new tab.
+    fn create_new_tab(&mut self) {
+        let new_state = TabState {
+            runners: Vec::new(),
+            focus: 0,
+            layout_root: LayoutNode::Pane(CfgPane {
+                kind: PaneKind::Shell,
+                label: None,
+            }),
+            stack_focus: BTreeMap::new(),
+        };
+        self.tabs.push(new_state);
+        self.sync_v1_from_active_tab();
+        self.reconcile_runners(ReconcileMode::Wholesale);
+    }
+
+    /// Cycle-22 atom-4 ADDITIVE: close the active tab. Empty
+    /// stack quits the binary; otherwise sync the v1 fields
+    /// and reconcile (Wholesale) so the dashcompositor layer
+    /// book-keeping tracks the new active tab's pane geometry.
+    fn close_active_tab(&mut self) {
+        let _removed = self.tabs.remove_active();
+        if self.tabs.is_empty() {
+            self.running = false;
+        } else {
+            self.sync_v1_from_active_tab();
+            self.reconcile_runners(ReconcileMode::Wholesale);
+        }
+    }
+
+    /// Cycle-22 atom-4 ADDITIVE: switch to tab `n`
+    /// (out-of-range is silent no-op per M-1..M-9 keybind
+    /// semantics; mirrors `TabStack::switch_to`).
+    fn switch_to_tab(&mut self, n: usize) {
+        if self.tabs.switch_to(n) {
+            self.sync_v1_from_active_tab();
+            self.reconcile_runners(ReconcileMode::Wholesale);
+        }
     }
 
     /// Drive the AGENTS.md rendering pipeline until `running`
