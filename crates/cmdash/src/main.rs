@@ -64,8 +64,17 @@ use cmdash_layout::{
 use cmdash_pty::PaneLayerId;
 use cmdash_pty::{PaneEvent, ShellSpec};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::Terminal;
 use tracing::{debug, info, warn};
+
+/// Number of terminal rows reserved for the tab bar at the top of
+/// the screen. The layout area's height is reduced by this amount
+/// so panes don't overlap the tab bar. The tab bar is rendered in
+/// phase 3a after pane blits into row 0 of the ratatui buffer.
+/// When only 1 row of terminal height is available, panes are
+/// skipped entirely (the tab bar alone fills the screen).
+const TAB_BAR_HEIGHT: u16 = 1;
 
 /// Command-line arguments parsed at binary entry. v1 ships
 /// `--log=<path>`, `--config=<path>`, and `--help`.
@@ -411,11 +420,18 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
     };
-    let layout = ComputedLayout::compute(&layout_root, total)?;
+    let layout_area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: total.w,
+        h: total.h.saturating_sub(TAB_BAR_HEIGHT),
+    };
+    let layout = ComputedLayout::compute(&layout_root, layout_area)?;
     info!(
         panes = layout.panes.len(),
-        cols = total.w,
-        rows = total.h,
+        cols = layout_area.w,
+        rows = layout_area.h,
+        tab_bar = TAB_BAR_HEIGHT,
         "layout resolved"
     );
 
@@ -479,7 +495,7 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tick,
         layout_root,
         None,
-        total,
+        layout_area,
         cfg.presets,
         BTreeMap::new(),
         ShellSpec::LoginShell,
@@ -894,8 +910,13 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             );
             return;
         }
-        let total = LayoutRect { x: 0, y: 0, w, h };
-        let layout = match ComputedLayout::compute(&self.layout_root, total) {
+        let layout_area = LayoutRect {
+            x: 0,
+            y: 0,
+            w,
+            h: h.saturating_sub(TAB_BAR_HEIGHT),
+        };
+        let layout = match ComputedLayout::compute(&self.layout_root, layout_area) {
             Ok(l) => l,
             Err(e) => {
                 warn!(error = ?e, w, h, "relayout: ComputedLayout::compute failed; skipping");
@@ -925,6 +946,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                 );
             }
         }
+        self.last_area = layout_area;
         self.graphics.set_cells((w, h));
     }
 
@@ -1902,13 +1924,59 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                     );
                     let area = ratatui::layout::Rect::new(
                         runner.computed().rect.x,
-                        runner.computed().rect.y,
+                        runner.computed().rect.y + TAB_BAR_HEIGHT,
                         runner.computed().rect.w,
                         runner.computed().rect.h,
                     );
                     if let Some(snap) = snap {
                         blit_grid(&snap.grid, buf, area);
                         blit_cursor(&snap.grid, buf, area);
+                    }
+                }
+                // Tab bar: render into row 0 of the buffer.
+                // Tab labels show " N:label " or " N:TabN ";
+                // the active tab is highlighted with a blue
+                // background; inactive tabs use a dim style.
+                // At most one row is used regardless of tab
+                // count; tabs that don't fit are silently
+                // truncated.
+                let bar_width = buf.area.width as usize;
+                // Clear the tab bar row.
+                for x in 0..bar_width {
+                    let cell = buf.get_mut(x as u16, 0);
+                    cell.set_symbol(" ");
+                    cell.set_style(
+                        Style::default().bg(Color::DarkGray).fg(Color::Gray),
+                    );
+                }
+                let mut col: usize = 0;
+                for (idx, tab) in self.tabs.iter().enumerate() {
+                    if col >= bar_width { break; }
+                    let is_active = idx == self.tabs.active_idx();
+                    let label = tab.label.as_deref().filter(|l| !l.is_empty());
+                    let tab_text = if let Some(l) = label {
+                        format!(" {}:{} ", idx + 1, l)
+                    } else {
+                        format!(" {} ", idx + 1)
+                    };
+                    let style = if is_active {
+                        Style::default()
+                            .bg(Color::Blue)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().bg(Color::DarkGray).fg(Color::Gray)
+                    };
+                    for ch in tab_text.chars() {
+                        if col >= bar_width { break; }
+                        let cell = buf.get_mut(col as u16, 0);
+                        cell.set_symbol(&ch.to_string());
+                        cell.set_style(style);
+                        col += 1;
+                    }
+                    // Separator space between tabs.
+                    if col < bar_width && idx + 1 < self.tabs.len() {
+                        col += 1;
                     }
                 }
             })?;
@@ -3271,7 +3339,7 @@ mod input_tests {
                 x: 0,
                 y: 0,
                 w: 79,
-                h: 50
+                h: 49
             },
             "child A post-relayout rect must match 132x50 Horizontal-60 split"
         );
@@ -3281,7 +3349,7 @@ mod input_tests {
                 x: 79,
                 y: 0,
                 w: 53,
-                h: 50
+                h: 49
             },
             "child B post-relayout rect must match 132x50 Horizontal-60 split"
         );
@@ -3296,7 +3364,7 @@ mod input_tests {
                 x: 0,
                 y: 0,
                 w: 132,
-                h: 50,
+                h: 49,
             },
         )
         .expect("compute post-layout");
