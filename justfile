@@ -354,12 +354,22 @@ clippy-baseline-0:
 # the time the tripwire tripped, the prose had been re-edited multiple
 # times in ways that compounded the problem.
 #
-# This recipe runs ONLY this single lint at deny-level, so an editor save
-# hook or pre-commit hook can call it and get a fast targeted signal. The
-# full `cargo clippy --workspace --all-targets -- -D warnings` run still
-# runs in `clippy-baseline-0` and at pre-push; `lint-doc` runs faster
-# (single-lint deny, fewer warning categories scanned) and exits early
-# on the doc-lint family WITHOUT widening the tripwire to all warnings.
+# This recipe denies ONLY this single lint, so an editor save hook or
+# pre-commit hook can call it and get a fast targeted signal. The full
+# `cargo clippy --workspace --all-targets -- -D warnings` run still
+# runs in `clippy-baseline-0` and at pre-push. `lint-doc` runs faster
+# (single-lint deny, fewer warning categories scanned) and emits a
+# clippy output where ONLY the targeted lint's `error:` lines appear.
+# Other clippy warnings are silenced via `-A clippy::all`.
+#
+# Editor-friendly arg shape: `-A clippy::all -D clippy::doc_lazy_continuation`
+# silences every other clippy lint (preventing warning noise from
+# crowding the editor's fail-fast signal) while denying JUST this lint.
+# The matching `-A clippy::all -D clippy::<lint-name>` shape is pattern-
+# tested by `tests/lint-doc.sh` (cycle-21 atom-3 polish-tier item (d)).
+# If a future typo flips a character in `-D clippy::doc_lazy_continuation`,
+# the runtime smoke test catches it BEFORE the parse-test regression
+# would silently pass through.
 #
 # Forward-fixup candidates when this recipe fails:
 #   1. Rewrite the rustdoc prose so each paragraph fits on a single line
@@ -383,9 +393,15 @@ clippy-baseline-0:
 lint-doc:
     #!/usr/bin/env bash
     set -euo pipefail
+    EXPECTED=0
     echo "== lint-doc =="
-    echo "command: cargo clippy --workspace --all-targets -- -D clippy::doc_lazy_continuation"
-    OUT=$(cargo clippy --workspace --all-targets -- -D clippy::doc_lazy_continuation 2>&1) || {
+    echo "command: cargo clippy --workspace --all-targets -- -A clippy::all -D clippy::doc_lazy_continuation"
+    OUT=$(cargo clippy --workspace --all-targets -- -A clippy::all -D clippy::doc_lazy_continuation 2>&1) || true
+    COUNT=$(echo "$OUT" | grep -c '^error' || true)
+    echo "EXPECTED count: $EXPECTED"
+    echo "ACTUAL   count: $COUNT"
+    if [ "$COUNT" -ne "$EXPECTED" ]; then
+        echo ""
         echo "::FAIL:: lint-doc tripwire fired; clippy::doc_lazy_continuation residual tripped"
         echo "::FAIL:: first-10-error-snippets-begin"
         echo "$OUT" | head -10
@@ -396,8 +412,92 @@ lint-doc:
         echo "  2. Add a scoped #[allow(clippy::doc_lazy_continuation)] with documented rationale."
         echo "     Precedent: commit 318c6b2 (5-line rationale naming the SHA + AGENTS.md doc-link-hygiene workflow)."
         exit 1
-    }
-    echo "== PASS: lint-doc strict-pin holds at zero doc-lint residuals =="
+    fi
+    echo ""
+    echo "== PASS: lint-doc strict-pin holds at EXPECTED=ACTUAL=$COUNT =="
+
+
+# ------------------------------------------------------------------------------
+# lint-doc-family: deny-only pin against the doc-lint FAMILY.
+# ------------------------------------------------------------------------------
+#
+# Sibling to `lint-doc`. Cycle-21 atom-3 widens the editor-level
+# fail-fast surface from a single lint (`doc_lazy_continuation`) to the
+# doc-lint family that typically trips together in real rustdoc-prose
+# edit cycles: `clippy::doc_markdown` ("item in documentation is missing
+# backticks") + `clippy::empty_line_after_doc_comments`. Editors save-
+# format-hooking `lint-doc-family` get a broader-side fail-fast.
+#
+# Known-baseline (pre-cleanup) strict-pin: current ACTUAL count of
+# `clippy::doc_markdown` + `clippy::empty_line_after_doc_comments`
+# errors in the workspace is 22 (verified empirically at cycle-21
+# atom-3; all 22 are pre-existing `item in documentation is missing
+# backticks` residuals on uninstrumented doc-comments). The recipe
+# mirrors `clippy-baseline-0`'s strict-pin pattern: it exit-1's on
+# ANY drift in either direction (growth = new regression; reduction
+# = accidental cleanup that didn't update the baseline).
+#
+# Forward-fixup candidates when ACTUAL > EXPECTED=22 (regression):
+#   1. Run `cargo clippy --workspace --all-targets -- -A clippy::all -D clippy::doc_markdown`
+#      and inspect the new `error:` lines for the offending file:line.
+#   2. Wrap the offending identifier in backticks (the canonical
+#      `clippy::doc_markdown` "item in documentation is missing backticks"
+#      fix pattern).
+#   3. Add a scoped `#[allow(clippy::doc_markdown)]` for legitimately
+#      informal doc comments with a documented rationale (precedent:
+#      commit `318c6b2` for the `doc_lazy_continuation` precedent).
+#
+# Forward-fixup candidates when ACTUAL < EXPECTED=22 (cleanup that
+# didn't update baseline): the recipe's strict-pin stays future-proof
+# against silent baseline drift. Run the cleanup atom that resolved
+# the residuals, then update EXPECTED to the new count. When the count
+# reaches 0, rename the recipe to `lint-doc-family-strict` (mirrors
+# the `clippy-baseline-3` -> `clippy-baseline-0` transition in commit
+# `5754742` after the cleanup era).
+#
+# Cycle provenance: build on cycle-21 atom-2 (`7a7e4a2`) which shipped
+# `lint-doc`, on cycle-21 atom-1 (`318c6b2`) which formally scoped the
+# `#![allow(clippy::doc_lazy_continuation)]` rationale, and on cycle-20
+# atom-2 (`f92a135`) whose fixup escalation (13 -> 18 -> 26
+# `doc_lazy_continuation` errors) is the original motivation for the
+# doc-lint fail-fast surface.
+[group('lint')]
+lint-doc-family:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    EXPECTED=22
+    echo "== lint-doc-family =="
+    echo "command: cargo clippy --workspace --all-targets -- -A clippy::all -D clippy::doc_markdown -D clippy::empty_line_after_doc_comments"
+    OUT=$(cargo clippy --workspace --all-targets -- -A clippy::all -D clippy::doc_markdown -D clippy::empty_line_after_doc_comments 2>&1) || true
+    COUNT=$(echo "$OUT" | grep -c '^error' || true)
+    echo "EXPECTED count: $EXPECTED"
+    echo "ACTUAL   count: $COUNT"
+    if [ "$COUNT" -ne "$EXPECTED" ]; then
+        echo ""
+        echo "::FAIL:: lint-doc-family strict-pin tripped"
+        echo "::FAIL:: expected=$EXPECTED actual=$COUNT"
+        echo "::FAIL:: first-10-error-snippets-begin"
+        echo "$OUT" | grep '^error' | head -10 || true
+        echo "::FAIL:: first-10-error-snippets-end"
+        echo ""
+        echo "Forward-fixup candidates:"
+        if [ "$COUNT" -gt "$EXPECTED" ]; then
+            echo "  REGRESSION (actual > expected): new clippy::doc_markdown residual(s) introduced."
+            echo "    1. Wrap the offending identifier in backticks (canonical doc_markdown fix)."
+            echo "    2. Run cargo clippy with -D clippy::doc_markdown to derive the offending file:line."
+            echo "    3. Add scoped #[allow(clippy::doc_markdown)] with documented rationale."
+        fi
+        if [ "$COUNT" -lt "$EXPECTED" ]; then
+            echo "  CLEANUP (actual < expected): existing residuals fixed WITHOUT updating baseline."
+            echo "    1. Update EXPECTED to $COUNT and document the cleanup SHA in this comment."
+            echo "    2. If the new count is 0, rename to lint-doc-family-strict per the"
+            echo "       clippy-baseline-3 -> clippy-baseline-0 transition pattern (5754742)."
+        fi
+        exit 1
+    fi
+    echo ""
+    echo "== PASS: lint-doc-family strict-pin holds at EXPECTED=ACTUAL=$COUNT =="
+
 
 
 # ------------------------------------------------------------------------------
