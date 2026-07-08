@@ -50,6 +50,7 @@ EXPECTED_RECIPES=(
     flake-soak
     clippy-baseline-0
     gpg-setup
+    lint-doc
 )
 for recipe in "${EXPECTED_RECIPES[@]}"; do
     # The recipes are listed indented, so use a word-boundary match

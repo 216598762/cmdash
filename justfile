@@ -343,6 +343,64 @@ clippy-baseline-0:
     echo "== PASS: clippy-baseline-0 strict-pin holds at EXPECTED=ACTUAL=$COUNT =="
 
 # ------------------------------------------------------------------------------
+# lint-doc: deny-only pin against `clippy::doc_lazy_continuation`.
+# ------------------------------------------------------------------------------
+#
+# Origin: cycle-20 atom-2 (`f92a135`) escalated from 13 -> 18 -> 26 errors
+# of `clippy::doc_lazy_continuation` because each `-D warnings` fixup pass
+# only addressed a SUBSET of the rustdoc prose that the lint misclassified
+# as Markdown list continuations. The 13 -> 18 -> 26 escalation surfaced
+# only at pre-push, after several fixup iterations had been attempted; by
+# the time the tripwire tripped, the prose had been re-edited multiple
+# times in ways that compounded the problem.
+#
+# This recipe runs ONLY this single lint at deny-level, so an editor save
+# hook or pre-commit hook can call it and get a fast targeted signal. The
+# full `cargo clippy --workspace --all-targets -- -D warnings` run still
+# runs in `clippy-baseline-0` and at pre-push; `lint-doc` runs faster
+# (single-lint deny, fewer warning categories scanned) and exits early
+# on the doc-lint family WITHOUT widening the tripwire to all warnings.
+#
+# Forward-fixup candidates when this recipe fails:
+#   1. Rewrite the rustdoc prose so each paragraph fits on a single line
+#      OR is structured as actual Markdown lists (not ambiguous prose).
+#   2. Add a scoped `#[allow(clippy::doc_lazy_continuation)]` with a
+#      documented rationale. Commit `318c6b2` is the precedent (5-line
+#      rationale naming the SHA + AGENTS.md doc-link-hygiene precedent).
+#
+# Editor integration (out of scope for the recipe itself): wire
+# `just lint-doc` to a save-format hook (`cargo install cargo-watch`,
+# then `cargo watch -x 'just lint-doc'`) for sub-second feedback, OR
+# `pre-commit`-style git hook that runs `just lint-doc` on staged files
+# only. The recipe's output is structured so a pre-commit hook can grep
+# `::FAIL::` cleanly.
+#
+# Strict-pin intent: actual residual count of `clippy::doc_lazy_continuation`
+# MUST be zero. The recipe exit-1's on the first trip so `clippy-baseline-0`
+# can stay at the wider `-D warnings` strict-pin without this lint-family
+# shadowing its message.
+[group('lint')]
+lint-doc:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "== lint-doc =="
+    echo "command: cargo clippy --workspace --all-targets -- -D clippy::doc_lazy_continuation"
+    OUT=$(cargo clippy --workspace --all-targets -- -D clippy::doc_lazy_continuation 2>&1) || {
+        echo "::FAIL:: lint-doc tripwire fired; clippy::doc_lazy_continuation residual tripped"
+        echo "::FAIL:: first-10-error-snippets-begin"
+        echo "$OUT" | head -10
+        echo "::FAIL:: first-10-error-snippets-end"
+        echo ""
+        echo "Forward-fixup candidates:"
+        echo "  1. Rewrite the rustdoc prose to escape the doc_lazy_continuation lint on a single line."
+        echo "  2. Add a scoped #[allow(clippy::doc_lazy_continuation)] with documented rationale."
+        echo "     Precedent: commit 318c6b2 (5-line rationale naming the SHA + AGENTS.md doc-link-hygiene workflow)."
+        exit 1
+    }
+    echo "== PASS: lint-doc strict-pin holds at zero doc-lint residuals =="
+
+
+# ------------------------------------------------------------------------------
 # gpg-setup: wire git's gpg.program to scripts/gpg-cmdash-wrapper.sh and
 # re-enable commit.gpgsign. Run once per host. The wrapper ships in the
 # repo and contains no secrets; the passphrase is held host-local at
