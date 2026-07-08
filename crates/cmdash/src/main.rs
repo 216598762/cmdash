@@ -819,10 +819,32 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         // launches stay quiet at INFO level.
         let time_budget = Duration::from_millis(1);
         let mut poll_count: u32 = 0;
-        debug!(
-            "tick_loop event poll N={} time_budget={:?}",
-            poll_count, time_budget
-        );
+        // Reviewer-feedback gate (cycle-19-followup atom
+        // `fd91da4` reviewer request): the INIT log line below
+        // fires once per input_phase_full call (~30 ticks/sec
+        // at the 33 ms cadence), so on a totally idle session
+        // it's ~18 lines/sec of pure idle noise in a routine
+        // `--log=<path>` file capture. Gate it on the
+        // `CMDASH_DEBUG_POLL` env var (any non-empty value
+        // counts as on) so a default launch's file log stays
+        // focused on real event activity; a polling-readiness
+        // investigation can opt in with
+        // `CMDASH_DEBUG_POLL=1 cmdash --log=...`. The
+        // per-poll log line further down (inside the `while`
+        // body) is bounded by real event rate -- one log per
+        // drained event -- so it stays always-on; that's the
+        // load-bearing observability hook for the live-binary
+        // AppNewPane integration test's `Cmd-a` byte trace.
+        let debug_poll_trace = match std::env::var_os("CMDASH_DEBUG_POLL") {
+            Some(v) => !v.is_empty(),
+            None => false,
+        };
+        if debug_poll_trace {
+            debug!(
+                "tick_loop event poll N={} time_budget={:?}",
+                poll_count, time_budget
+            );
+        }
         while event::poll(time_budget)? {
             poll_count += 1;
             debug!(
@@ -847,7 +869,10 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         // Press`. Any other shape (e.g. `code: Null`,
         // `modifiers: NONE`, or no event reaching this line at
         // all) is diagnostic of a PTY-routing regression.
-        debug!("crossterm event = {:?}", evt);
+        // Privacy-redaction hygiene atom: full
+        // rationale + what's-redacted list lives
+        // on `redacted_event_debug`'s rustdoc.
+        debug!("crossterm event = {}", redacted_event_debug(evt));
         if let Some(action) = self.bindings.dispatch_crossterm(evt) {
             self.apply_action_full(action);
             return;
@@ -1597,6 +1622,77 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         }
     }
 }
+/// Render a crossterm `Event` into the file-log payload we
+/// emit at `handle_event_full`'s entry point with the printable
+/// payload content REDACTED before persistence under
+/// `--log=<path>`.
+///
+/// **Privacy story.** Cycle-19 followup atom `fd91da4`
+/// shipped an unredacted
+/// `debug!("crossterm event = {:?}", evt)` trace, which
+/// emits printable text byte-for-byte into the `--log=<path>`
+/// subscriber. Over a long `--log=foo.log` session that means
+/// any printable text reaching the focused pane (passwords,
+/// API keys, essays, clipboard paste contents, etc.) gets
+/// persisted to the log file verbatim -- a privacy leak
+/// independent of cmdash's other scrubbing. The reviewer
+/// flagged the `KeCode::Char(c)` arm in
+/// cycle-19-followup's review pass. Rather than gate the
+/// whole trace on `cfg!(debug_assertions)` (which would strip
+/// the trace from release binaries -- exactly the builds
+/// where the trace is most useful for field debugging),
+/// this helper redacts printable payloads while keeping
+/// everything else observable.
+///
+/// **What's kept vs redacted.**
+/// - REDACTED: `KeyCode::Char(_)` printable character
+///   (`Char(<redacted char>)` sentinel).
+/// - REDACTED: `Event::Paste(_)` pasted string content
+///   (`Paste(<redacted>)` sentinel). Reviewer-feedback
+///   catch on this atom -- clipboard paste events carry
+///   typed passwords / API keys / etc. verbatim, same
+///   severity as the `Char(c)` keystroke leak.
+/// - KEPT (full Debug escape): `modifiers`, `kind`, `state`,
+///   every non-`Char` `KeyCode` variant (`F(n)`, arrows,
+///   `Backspace`, `Tab`, etc. carry no printable text),
+///   `Resize`, `Mouse` (carry geometry + button state;
+///   no printable text), `FocusGained`, `FocusLost`.
+///
+/// **Open-fallback trade-off.** The match's
+/// `_ => format!("{:?}", evt)` arm forwards all UNKNOWN
+/// future crossterm `Event` variants verbatim. If crossterm
+/// ever adds a variant carrying printable text (a hypothetical
+/// `SpeechInput(String)` or `SnippetInsert(String)` payload),
+/// it auto-leaks through this fall-through -- the same root
+/// cause as the `Event::Paste(String)` leak this atom closes.
+/// Re-audit this arm every time `crossterm` is upgraded;
+/// the round-2 paste leak is the precedent.
+///
+/// **Hot-path cost.** One `String` allocation per event the
+/// logger captures (controlled by the file-only subscriber's
+/// level filter; off the hot path under the default launch
+/// where `--log=<path>` is absent). Allocations are bounded
+/// by the real event rate (human-keystroke-rate for `Key`
+/// events, paste-burst-rate for `Paste`, zero for `Resize`
+/// outside a host drag-resize burst).
+fn redacted_event_debug(evt: &Event) -> String {
+    match evt {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char(_),
+            modifiers,
+            kind,
+            state,
+            ..
+        }) => format!(
+            "Key(KeyEvent {{ code: Char(<redacted char>), \
+             modifiers: {:?}, kind: {:?}, state: {:?} }})",
+            modifiers, kind, state,
+        ),
+        Event::Paste(_) => "Paste(<redacted>)".to_string(),
+        _ => format!("{:?}", evt),
+    }
+}
+
 /// Encode an unmatched key press as PTY-friendly bytes for the
 /// focused pane. Returns `None` for variants that should NOT
 /// leak to the PTY (Insert, F-keys above 4, media keys,
