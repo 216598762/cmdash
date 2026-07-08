@@ -418,7 +418,7 @@ lint-doc:
 
 
 # ------------------------------------------------------------------------------
-# lint-doc-family: deny-only pin against the doc-lint FAMILY.
+# lint-doc-family-strict: deny-only pin against the doc-lint FAMILY.
 # ------------------------------------------------------------------------------
 #
 # Sibling to `lint-doc`. Cycle-21 atom-3 widens the editor-level
@@ -426,60 +426,63 @@ lint-doc:
 # doc-lint family that typically trips together in real rustdoc-prose
 # edit cycles: `clippy::doc_markdown` ("item in documentation is missing
 # backticks") + `clippy::empty_line_after_doc_comments`. Editors save-
-# format-hooking `lint-doc-family` get a broader-side fail-fast.
+# format-hooking `lint-doc-family-strict` get a broader-side fail-fast.
 #
-# Known-baseline (pre-cleanup) strict-pin: current ACTUAL count of
-# `clippy::doc_markdown` + `clippy::empty_line_after_doc_comments`
-# errors in the workspace is 22 (verified empirically at cycle-21
-# atom-3; all 22 are pre-existing `item in documentation is missing
-# backticks` residuals on uninstrumented doc-comments). The recipe
-# mirrors `clippy-baseline-0`'s strict-pin pattern: it exit-1's on
-# ANY drift in either direction (growth = new regression; reduction
-# = accidental cleanup that didn't update the baseline).
+# This recipe was renamed from `lint-doc-family` to `lint-doc-family-strict`
+# in cycle-22 atom-1.5 (cleanup SHA `0e59e93`). The rename mirrors the
+# `clippy-baseline-3` -> `clippy-baseline-0` transition in commit
+# `5754742`: when a strict-pin recipe's residuals have all been resolved
+# and the EXPECTED baseline reaches 0, the suffix `-strict` marks the
+# recipe as a steady-state guard (no regression to actual>0 will pass).
+# Any clippy::doc_markdown residual in the workspace trips an immediate
+# exit-1 with `actual=1..` -> REGRESSION forward-fixup message.
 #
-# Forward-fixup candidates when ACTUAL > EXPECTED=22 (regression):
-#   1. Run `cargo clippy --workspace --all-targets -- -A clippy::all -D clippy::doc_markdown`
-#      and inspect the new `error:` lines for the offending file:line.
-#   2. Wrap the offending identifier in backticks (the canonical
+# Forward-fixup candidates when the recipe fails:
+#   1. Wrap the offending identifier in backticks (the canonical
 #      `clippy::doc_markdown` "item in documentation is missing backticks"
 #      fix pattern).
-#   3. Add a scoped `#[allow(clippy::doc_markdown)]` for legitimately
+#   2. Add a scoped `#[allow(clippy::doc_markdown)]` for legitimately
 #      informal doc comments with a documented rationale (precedent:
 #      commit `318c6b2` for the `doc_lazy_continuation` precedent).
+#   3. Re-run the recipe and inspect the new `error:` lines for the
+#      offending file:line.
 #
-# Forward-fixup candidates when ACTUAL < EXPECTED=22 (cleanup that
-# didn't update baseline): the recipe's strict-pin stays future-proof
-# against silent baseline drift. Run the cleanup atom that resolved
-# the residuals, then update EXPECTED to the new count. When the count
-# reaches 0, rename the recipe to `lint-doc-family-strict` (mirrors
-# the `clippy-baseline-3` -> `clippy-baseline-0` transition in commit
-# `5754742` after the cleanup era).
-#
-# Cycle provenance: build on cycle-21 atom-2 (`7a7e4a2`) which shipped
-# `lint-doc`, on cycle-21 atom-1 (`318c6b2`) which formally scoped the
-# `#![allow(clippy::doc_lazy_continuation)]` rationale, and on cycle-20
-# atom-2 (`f92a135`) whose fixup escalation (13 -> 18 -> 26
-# `doc_lazy_continuation` errors) is the original motivation for the
-# doc-lint fail-fast surface.
+# Cycle provenance: build on cycle-22 atom-1 (`0e59e93`) which shipped
+# the first sweep of bare-`ZStack` wraps + the new `action_tab_switch_hint`
+# helper. Cycle-22 atom-1.5 then wrapped the remaining 13 singular-residuals    # (`AGENTS.md`, `parse_action`, `KeyAction`, `Keybind`, `LayoutNode`,
+# `dashcompositor`, `Windows`, `ConPTY`, `portable_pty 0.9`) and renamed
+# this recipe per the cleanup pattern. Pre-cycle-21 rationale: cycle-21
+# atom-2 (`7a7e4a2`) shipped `lint-doc`, cycle-21 atom-1 (`318c6b2`)
+# formally scoped the `#![allow(clippy::doc_lazy_continuation)]` rationale,
+# and cycle-20 atom-2 (`f92a135`) is the original motivation for the
+# doc-lint fail-fast surface (its 13 -> 18 -> 26 escalation).
 [group('lint')]
-lint-doc-family:
+lint-doc-family-strict:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Cycle-22 atom-1 adjustment: EXPECTED baseline lowered from
-    # 22 to 13 because cycle-22 atom-1 wrapped the bare `ZStack`
-    # identifiers in five `PaneStack{Cycle,Down,Up,Left,Right}`
-    # doc blocks AND added an `action_tab_switch_hint` helper
-    # whose rustdoc references the un-backticked `parse_action`
-    # function name (1 net new `clippy::doc_markdown` residual).
-    # The exact wrap count is empirical: a forward-fixup
-    # `chore:` commit (cycle-22 atom-1.5) will resolve the
-    # remaining 13 residuals in a single sweep, ideally reaching
-    # 0 and renaming the recipe to `lint-doc-family-strict` per
-    # the `clippy-baseline-3` -> `clippy-baseline-0` transition
-    # pattern in commit `5754742`.
-    # Cleanup SHA: <filled post-merge by the cycle-22 atom-1.5 commit body>.
-    EXPECTED=13
-    echo "== lint-doc-family =="
+    # Cycle-22 atom-1.5 resolved the remaining 13 clippy::doc_markdown
+    # residuals in a single sweep (rough breakdown: bare `AGENTS.md` x4,
+    # in TabNew/TabClose/TabSwitch enum-variant docs, bare `parse_action`
+    # x3 in helper+test docs, bare `KeyAction` x3 in test-`tab*` docs,
+    # bare `Keybind` in `parse_tab_switch_out_of_range_returns_none`,
+    # bare `LayoutNode` in `parse_unknown_inner_layout_node_returns_err`,
+    # bare `dashcompositor` in TabClose doc, bare `Windows`/`ConPTY` in
+    # `enable_pty_echo` doc, bare `portable_pty 0.9` in the cat-echo
+    # forward-fixup caveat). EXPECTED drops 13 -> 0 and the recipe
+    # suffix `-strict` is added per the cleanup pattern.
+    # Cleanup SHA: 0e59e93 (cycle-22 atom-1). Math: cycle-22 atom-1
+    # reduced the pre-cleanup baseline of 22 -> 12 by wrapping ~10
+    # bare-`ZStack`/`Split` references across the 5 `PaneStack*`
+    # doc-block wraps, then ADDED 1 new residual from the
+    # `action_tab_switch_hint` helper whose rustdoc references the
+    # un-backticked `parse_action` function (the 22 -> 12 -> 13
+    # transition). cycle-22 atom-1.5 then sweeps the 13 residuals
+    # plus 11 cmdash-layout residuals found post-atom-1 (the
+    # `PaneId`/`LayerId`/`ZStack`/`pre_order`/`ComputedPanes`/
+    # `LayerStack` family in cmdash-layout's rustdoc prose),
+    # bringing the count to 0.
+    EXPECTED=0
+    echo "== lint-doc-family-strict =="
     echo "command: cargo clippy --workspace --all-targets -- -A clippy::all -D clippy::doc_markdown -D clippy::empty_line_after_doc_comments"
     OUT=$(cargo clippy --workspace --all-targets -- -A clippy::all -D clippy::doc_markdown -D clippy::empty_line_after_doc_comments 2>&1) || true
     COUNT=$(echo "$OUT" | grep -c '^error' || true)
@@ -487,7 +490,7 @@ lint-doc-family:
     echo "ACTUAL   count: $COUNT"
     if [ "$COUNT" -ne "$EXPECTED" ]; then
         echo ""
-        echo "::FAIL:: lint-doc-family strict-pin tripped"
+        echo "::FAIL:: lint-doc-family-strict strict-pin tripped"
         echo "::FAIL:: expected=$EXPECTED actual=$COUNT"
         echo "::FAIL:: first-10-error-snippets-begin"
         echo "$OUT" | grep '^error' | head -10 || true
@@ -495,21 +498,20 @@ lint-doc-family:
         echo ""
         echo "Forward-fixup candidates:"
         if [ "$COUNT" -gt "$EXPECTED" ]; then
-            echo "  REGRESSION (actual > expected): new clippy::doc_markdown residual(s) introduced."
+            echo "  REGRESSION (actual > expected=$EXPECTED): new clippy::doc_markdown residual(s) introduced."
             echo "    1. Wrap the offending identifier in backticks (canonical doc_markdown fix)."
             echo "    2. Run cargo clippy with -D clippy::doc_markdown to derive the offending file:line."
             echo "    3. Add scoped #[allow(clippy::doc_markdown)] with documented rationale."
         fi
         if [ "$COUNT" -lt "$EXPECTED" ]; then
-            echo "  CLEANUP (actual < expected): existing residuals fixed WITHOUT updating baseline."
-            echo "    1. Update EXPECTED to $COUNT and document the cleanup SHA in this comment."
-            echo "    2. If the new count is 0, rename to lint-doc-family-strict per the"
-            echo "       clippy-baseline-3 -> clippy-baseline-0 transition pattern (5754742)."
+            echo "  UNEXPECTED (actual < expected=$EXPECTED): this should be impossible post-cleanup."
+            echo "    Investigate the underlying clippy invocation -- a future cycle"
+            echo "    has potentially suppressed more lints than just doc_markdown + empty_line_after_doc_comments."
         fi
         exit 1
     fi
     echo ""
-    echo "== PASS: lint-doc-family strict-pin holds at EXPECTED=ACTUAL=$COUNT =="
+    echo "== PASS: lint-doc-family-strict strict-pin holds at EXPECTED=ACTUAL=$COUNT =="
 
 
 

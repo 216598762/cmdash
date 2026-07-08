@@ -870,8 +870,8 @@ impl PanePty {
     /// `MasterPty` trait exposes `as_raw_fd() -> Option<RawFd>`,
     /// so we can manipulate the underlying termios without
     /// dropping down to the lower-level `UnixPtySystem` API.
-    /// On Windows, this fn is not compiled (the trait method
-    /// returns `None`, and ConPTY does not use POSIX termios).
+    /// On `Windows`, this fn is not compiled (the trait method
+    /// returns `None`, and `ConPTY` does not use POSIX termios).
     ///
     /// **Why `ECHO | ICANON` matters.** The cat-echo
     /// round-trip test (`pty_write_to_child_round_trips_via_cat`)
@@ -893,7 +893,7 @@ impl PanePty {
     /// `SlavePty` trait NOT exposing `as_raw_fd()` (only
     /// `MasterPty` does), so we reverted to the master-fd call
     /// point. The cat-echo test therefore STILL races on
-    /// portable_pty 0.9 with the master-fd master-fd termios
+    /// `portable_pty 0.9` with the master-fd master-fd termios
     /// setup; the test is re-`#[ignore]`'d against this
     /// runtime path forward, with a forward-only-no-revert
     /// exception in the run-time path tracked via the

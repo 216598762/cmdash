@@ -51,7 +51,7 @@ EXPECTED_RECIPES=(
     clippy-baseline-0
     gpg-setup
     lint-doc
-    lint-doc-family
+    lint-doc-family-strict
 )
 for recipe in "${EXPECTED_RECIPES[@]}"; do
     # The recipes are listed indented, so use a word-boundary match

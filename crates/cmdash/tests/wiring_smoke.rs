@@ -1,4 +1,4 @@
-//! Wiring smoke: KDL config → layout → PanePty → vte → TextGrid
+//! Wiring smoke: KDL config → layout → `PanePty` → ````vte```` → `TextGrid`
 //! → ratatui `TestBackend`. Asserts that text the child emits ends
 //! up in both the vte-consumed grid and the rendered ratatui
 //! buffer.
@@ -574,13 +574,13 @@ fn relayout_drives_per_pane_resize_via_real_pty() {
 // the public `PaneRunner::Drop -> close_tx -> close_rx` surface.
 // ===========================================================================
 
-/// Phase 2 carry-forward: AppNewPane. Spawn the initial 1-pane tree
+/// Phase 2 carry-forward: `AppNewPane`. Spawn the initial 1-pane tree
 /// via real `spawn_with_graphics`, then inline-replicate the
 /// focused-leaf-IS-root branch of `TickContext::split_focused_for_new_pane`:
 /// the original root is wrapped in `Split { Horizontal, 50,
 /// [original_clone, new_leaf] }`, a fresh `PaneRunner` is spawned
-/// for the new leaf, and the pre-order + PaneLayerId
-/// preservation invariant (Hard rule: no LayerId rebinding) is
+/// for the new leaf, and the pre-order + `PaneLayerId`
+/// preservation invariant (Hard rule: no `LayerId` rebinding) is
 /// pinned through the public `layer_id()` accessor + the resolver
 /// `pre_order` field.
 #[test]
@@ -863,13 +863,13 @@ fn pane_focus_directional_moves_focus_via_adjacent_pane_in_real_pty_tree() {
     drop(close_tx);
 }
 
-/// Phase 2 carry-forward: PaneClose. Spawn the 2-pane Horizontal
+/// Phase 2 carry-forward: `PaneClose`. Spawn the 2-pane Horizontal
 /// split via real `spawn_with_graphics`, focus the closing pane,
 /// then inline-replicate `TickContext::close_focused_and_rebalance`:
-/// remove the focused runner FIRST so Drop's close_tx emit lands
+/// remove the focused runner FIRST so Drop's `close_tx` emit lands
 /// before the tree mutates; rebalance via `cmdash_layout::remove_leaf`
 /// (sibling absorption collapses the 2-child Split to its survivor);
-/// reconcile_runners InPlace on the survivor (label-keyed), rebind
+/// `reconcile_runners` `InPlace` on the survivor (label-keyed), rebind
 /// its `PaneId`, preserve its `PaneLayerId` per Hard rule. Verify
 /// through the public `close_rx`, `layer_id()`, `computed()` surfaces.
 #[test]
@@ -1004,7 +1004,7 @@ fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
 /// Phase 2 carry-forward: PanePreset(name). Spawn the initial 1-pane
 /// tree via real `spawn_with_graphics`, then inline-replicate
 /// `TickContext::swap_to_preset`: drop the old runner (its Drop
-/// fires close_tx), wholesale-set `layout_root` to the named preset
+/// fires `close_tx`), wholesale-set `layout_root` to the named preset
 /// body, spawn fresh runners for each post-layout pane. Verify the
 /// preset body's label/shape surfaces end-to-end.
 #[test]

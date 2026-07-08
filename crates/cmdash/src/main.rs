@@ -83,7 +83,7 @@ use tracing::{debug, info, warn};
 /// unit-test target); `Debug` also lets `expect_err` assertions
 /// print the parse-error string via `{err:?}`. No other
 /// derives are required: `cli_args_tests` compares
-/// `cli.log.as_deref()` (PathBuf's `PartialEq`, not `CliArgs`'s)
+/// `cli.log.as_deref()` (`PathBuf`'s `PartialEq`, not `CliArgs`'s)
 /// and uses `String::contains(...)` for error-message
 /// assertions, not `PartialEq` on `Result<CliArgs, _>`.
 #[derive(Debug)]
@@ -156,7 +156,7 @@ impl CliArgs {
 ///   "all information useful for debugging" target (any filter
 ///   narrower than TRACE would silently drop event categories the
 ///   user is asking to see).
-/// - **no `--log`** ⇒ stdout, INFO default (RUST_LOG env overrides),
+/// - **no `--log`** ⇒ stdout, INFO `default` (`RUST_LOG` env overrides),
 ///   single-line compact. Preserves the prior launch behavior.
 ///
 /// The dual-mode setup keeps the default launch quiet (stdout stays
@@ -477,7 +477,7 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// [`ComputedLayout::compute`] on every host-driven resize.
     /// Held by value so [`Self::relayout`] does not need to
     /// borrow from `cmdash::run`'s stack after construction.
-    /// AGENTS.md §"PaneId stability" — moving the tree by value
+    /// `AGENTS.md` `§` "`PaneId` stability" — moving the tree by value
     /// does not shift pre-order leaf numbering, so the layout
     /// engine produces the same `cmdash_layout::PaneId`
     /// values before and after a relayout.
@@ -492,8 +492,8 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// so the runtime mutation paths (`AppNewPane` reconciliation,
     /// `PanePreset` rebuild) can wire fresh `PaneRunner`s into
     /// the SAME close-channel as the initial-frame spawn, preserving
-    /// the Drop -> close_tx -> GraphicsState::close_pane round-trip.
-    /// AGENTS.md §"Hard rule: one layer per instance" (a LayerId is
+    /// the Drop -> `close_tx` -> `GraphicsState`::`close_pane` round-trip.
+    /// AGENTS.md §"Hard rule: one layer per instance" (`a` `LayerId` is
     /// bound to a pane instance for the instance's whole lifetime
     /// and is NEVER re-bound to a different pane).
     close_tx: PaneCloseTx,
@@ -510,13 +510,13 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// for the new tree.
     presets: BTreeMap<String, LayoutNode>,
     /// Phase 4 carry-forward: per-ZStack focus tracking. Maps
-    /// the focused ZStack member's resolved [`cmdash_layout::PaneId`]
-    /// to its index within the parent ZStack. Survives across
-    /// `AppNewPane`/`PaneClose` InPlace cycles (label-keyed
-    /// reconciliation preserves the member's PaneId when the
+    /// the focused `ZStack` member's resolved [`cmdash_layout::PaneId`]
+    /// to its index within the parent `ZStack`. Survives across
+    /// `AppNewPane`/`PaneClose` `InPlace` cycles (label-keyed
+    /// reconciliation preserves the member's `PaneId` when the
     /// sibling stays under the same Split/ZStack parent);
     /// cleared on `Wholesale` swap (`PanePreset`)
-    /// reconciliation so a reloaded preset's stale PaneIds
+    /// reconciliation so a reloaded preset's stale `PaneIds`
     /// don't linger in the map.
     stack_focus: BTreeMap<PaneId, usize>,
     /// Default shell for runtime-spawned panes. v1 single shell
@@ -525,8 +525,8 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     shell: ShellSpec,
 }
 
-/// Monotonic LayerId allocator for
-/// [`ReconcileMode::Wholesale`] spawns. LayerIds drawn from
+/// Monotonic `LayerId` allocator for
+/// [`ReconcileMode::Wholesale`] spawns. `LayerIds` drawn from
 /// `cmdash::derive_layer_id(&pane_id)` collide when the new
 /// top of the swapped tree also has `pre_order == 0` (both
 /// resolve to `LayerId(0)`), so wholesale spawns draw from
@@ -536,7 +536,7 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
 /// `ReconcileMode::Wholesale` docstring.
 static NEXT_LAYER_ID: AtomicU32 = AtomicU32::new(1);
 
-/// Draw the next monotonic LayerId for a wholesale-swap
+/// Draw the next monotonic `LayerId` for a wholesale-swap
 /// spawn. Relaxed ordering is sufficient — each spawn only
 /// needs "later spawns get later IDs", not strict
 /// serialisation across threads (the binary's tick loop is
@@ -555,13 +555,13 @@ fn alloc_layer_id() -> PaneLayerId {
 pub(crate) enum ReconcileMode {
     /// In-place rebalance (`AppNewPane`, `PaneClose`): match
     /// survivors by their `pane.label` (labels are stable
-    /// across sibling-absorption rebalance; PaneIds are NOT,
+    /// across sibling-absorption rebalance; `PaneIds` are NOT,
     /// so PaneId-keyed matching would drop the survivor
     /// spuriously). Survivors' `PaneLayerId` is preserved per
     /// the AGENTS.md Hard rule.
     InPlace,
     /// Wholesale swap (`PanePreset`): every old runner is
-    /// dropped (its `Drop` revokes the `LayerId` via close_tx)
+    /// dropped (its `Drop` revokes the `LayerId` via `close_tx`)
     /// and every new pane is spawned with a freshly-allocated
     /// `PaneLayerId` (from [`alloc_layer_id`], NOT from
     /// `cmdash::derive_layer_id &pane_id`, because both
@@ -653,7 +653,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// share the same `cmdash_layout::PaneId` because
     /// [`ComputedLayout::compute`] against the same KDL tree
     /// yields the same pre-order leaf numbering (AGENTS.md
-    /// §"PaneId stability"). The defensive `assert_eq!` in
+    /// §"`PaneId` stability"). The defensive `assert_eq!` in
     /// the per-pair loop surfaces a future regression that
     /// breaks the index alignment (e.g. someone introduces a
     /// v2 hot-swap that mutates runner order without
@@ -663,7 +663,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// error is logged via `tracing::warn!` and the loop
     /// continues for siblings — a misbehaved PTY child must
     /// not bring the multiplexer down. An infrequent
-    /// LayoutError or a runner-count mismatch also logs
+    /// `LayoutError` or a runner-count mismatch also logs
     /// without escalating — the next tick's resize signal will
     /// have a fresh chance to succeed.
     pub fn relayout(&mut self, w: u16, h: u16) {
@@ -728,8 +728,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     }
 
     /// Apply a [`KeyAction`] to the full [`TickContext`] —
-    /// both the v1 arms (AppClose, PaneFocusNext,
-    /// PaneFocusPrev, `PaneClose` rebalance) and the
+    /// both the v1 arms (`AppClose`, `PaneFocusNext`,
+    /// `PaneFocusPrev`, `PaneClose` rebalance) and the
     /// carry-forward arms (`AppNewPane`,
     /// `PaneFocus{Up,Down,Left,Right}`, `PanePreset(name)`).
     /// The binary's tick loop drives this method through
@@ -974,11 +974,11 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     }
 
     /// Phase 4 carry-forward: locate the focused pane's
-    /// parent ZStack + its member index. Returns
+    /// parent `ZStack` + its member index. Returns
     /// `Some((parent_path, member_idx))` if the focused
     /// pane is a direct child of a `LayoutNode::ZStack`,
     /// otherwise `None` -- the caller interprets `None`
-    /// as "focused pane is not a ZStack member" and
+    /// as "focused pane is not a `ZStack` member" and
     /// no-ops. `focused_path` is a tree-indexed path
     /// WITHOUT the resolver `path[0]` seed.
     fn focused_zstack_context(
@@ -1008,20 +1008,20 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// This is a **modulo-wrap** primitive. At the LAST
     /// member, the focus wraps BACK to the FIRST via
     /// `(member_idx + 1) % panes.len()` -- it stays
-    /// **inside** the ZStack -- and `self.stack_focus` is
+    /// **inside** the `ZStack` -- and `self.stack_focus` is
     /// **always** updated (even on the wrap-around, since
-    /// the post-wrap focus still lives inside the ZStack
+    /// the post-wrap focus still lives inside the `ZStack`
     /// and the keyed entry tracks the new member index).
     /// `PaneStackCycle` therefore has no handoff path -- it
-    /// is a closed cycle within the ZStack.
+    /// is a closed cycle within the `ZStack`.
     ///
     /// `crosstack_member` looks superficially combinable
-    /// (both primitives drive ZStack member indices) but
+    /// (both primitives drive `ZStack` member indices) but
     /// has the OPPOSITE boundary post-condition: at the
-    /// FIRST or LAST member it **escapes** the ZStack via
+    /// FIRST or LAST member it **escapes** the `ZStack` via
     /// `focus_by_direction(handoff_direction)` and never
     /// mutates `stack_focus` on the handoff path -- the
-    /// new focus lands outside the ZStack, so any keyed
+    /// new focus lands outside the `ZStack`, so any keyed
     /// entry would go stale.
     ///
     /// **Trapdoor precedent** -- [`cmdash_layout::split_rect`] in
@@ -1035,11 +1035,11 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// primitives in a future refactor.**
     ///
     /// Phase 4 carry-forward: `PaneStackCycle`. Find the
-    /// focused pane's parent ZStack + member index, then
+    /// focused pane's parent `ZStack` + member index, then
     /// advance `self.focus` to the next member in
     /// declaration order, wrapping from the last member
     /// back to the first. No-op if the focused pane is
-    /// not a ZStack member.
+    /// not a `ZStack` member.
     fn handle_stack_cycle(&mut self) {
         if self.runners.is_empty() {
             return;
@@ -1079,7 +1079,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     }
 
     /// Phase 4 + 4.5/5 carry-forward consolidation: directed
-    /// ZStack focus primitive. Replaces the 4
+    /// `ZStack` focus primitive. Replaces the 4
     /// near-byte-identical `handle_stack_down`/`up`/`left`/`right`
     /// fns from prior phases; folds their boundary condition
     /// + boundary-handoff shape into a single 2-argument
@@ -1087,7 +1087,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// Arguments:
     /// - `handoff_direction`: the [`Direction`] the helper
     ///   delegates to when the focused member sits at the
-    ///   boundary that needs to escape the ZStack. For advance
+    ///   boundary that needs to escape the `ZStack`. For advance
     ///   (`advance == true`) this is invoked at the LAST
     ///   member; for retreat (`advance == false`) this is
     ///   invoked at the FIRST member. The four directional
@@ -1106,25 +1106,25 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     ///   when the post-boundary handoff finds no neighbour
     ///   via [`cmdash_layout::adjacent_pane`].
     /// - The handoff path does NOT mutate `stack_focus` (the
-    ///   new focus is OUTSIDE the ZStack, so the keyed
+    ///   new focus is OUTSIDE the `ZStack`, so the keyed
     ///   stack-focus-map entry would never be queried).
     /// - Algorithmic-shape divergence vs `handle_stack_cycle`.
     ///   These two primitives look combinable (both drive
-    ///   ZStack member indices in declaration order) but
+    ///   `ZStack` member indices in declaration order) but
     ///   carry fundamentally different post-conditions:
     ///   - `crosstack_member` (this helper) at the FIRST or
     ///     LAST member is a **boundary-hand-off** primitive:
-    ///     it **escapes** the ZStack by delegating to
+    ///     it **escapes** the `ZStack` by delegating to
     ///     `focus_by_direction(handoff_direction)`, and it
     ///     **never mutates `stack_focus`** on the handoff
-    ///     path -- the new focus lands OUTSIDE the ZStack,
+    ///     path -- the new focus lands OUTSIDE the `ZStack`,
     ///     so any keyed entry for the old focus would be
     ///     stale and we deliberately drop it.
     ///   - `handle_stack_cycle` is a **modulo-wrap**
     ///     primitive: at the LAST member the arithmetic
     ///     `(member_idx + 1) % panes.len()` wraps the focus
     ///     BACK to the FIRST member (it stays **inside**
-    ///     the ZStack), and it **always mutates
+    ///     the `ZStack`), and it **always mutates
     ///     `stack_focus`** -- even on the wrap-around, the
     ///     keyed member-index entry tracks the post-wrap
     ///     focus.
@@ -1351,7 +1351,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
 
     /// Carry-forward: `PanePreset(name)`. Look up
     /// `self.presets[name]`. If present, drop ALL runners
-    /// (their `Drop`s revoke every `LayerId` via close_tx
+    /// (their `Drop`s revoke every `LayerId` via `close_tx`
     /// for the AGENTS.md Hard rule), swap
     /// `self.layout_root` to the named body, reset
     /// `self.focus = 0`, and [`Self::reconcile_runners`]
@@ -1395,7 +1395,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     ///      preserved in `post_layout`, keep the runner
     ///      (its `PaneLayerId` stays per AGENTS.md Hard rule);
     ///      otherwise drop it (`Drop` enqueues `PaneLayerId`
-    ///      on close_tx; next phase 1 revokes the
+    ///      on `close_tx`; next phase 1 revokes the
     ///      dashcompositor layer).
     ///    - `Wholesale`: drop ALL old runners; every pane in
     ///      `post_layout` gets a freshly spawned runner with
@@ -2078,8 +2078,8 @@ mod input_tests {
     }
 
     /// Build a single-leaf `LayoutNode` fixture for ctor-arg
-    /// tests that don't exercise the layout::compute path.
-    /// Keeping it tiny avoids hitting MAX_TREE_DEPTH on
+    /// tests that don't exercise the `layout`::`compute` path.
+    /// Keeping it tiny avoids hitting `MAX_TREE_DEPTH` on
     /// out-of-band nesting during negative-test setup.
     fn dummy_layout_root() -> LayoutNode {
         LayoutNode::Pane(CfgPane {
@@ -2100,7 +2100,7 @@ mod input_tests {
     /// `relayout` test re-computes `pre_layout` against the
     /// pre-dispatch `layout_root` + `last_area`).
     ///
-    /// The 2 should_panic tests cannot use this helper:
+    /// The 2 `should_panic` tests cannot use this helper:
     /// they need `runners: Vec::new()` to trigger the
     /// `focus < runners.len()` assert, and this helper
     /// always spawns at least one runner from the parsed
@@ -2566,7 +2566,7 @@ mod input_tests {
     /// `crates/cmdash/tests/wiring_smoke.rs::relayout_drives_per_pane_resize_via_real_pty`
     /// exercises the same wiring end-to-end through real
     /// PTY children; this lib unit-test pins the deterministic
-    /// for_id and for_cells invariants without depending on a
+    /// `for_id` `and` `for_cells` invariants without depending on a
     /// real PTY round-trip.
     #[test]
     fn relayout_emits_resize_per_pane_when_host_signals_resize() {
@@ -2755,12 +2755,12 @@ mod input_tests {
     // v1 input_tests use.
     // ============================================================
 
-    /// AppNewPane against a single-leaf `TickContext`: the
+    /// `AppNewPane` against a single-leaf `TickContext`: the
     /// focused leaf becomes child 0 of a fresh Horizontal
     /// Split (ratio 50), a new leaf spawn at child 1, and
     /// `reconcile_runners` brings `Vec<PaneRunner>` to length
     /// 2. The original focused pane's `LayerId` is stable per
-    /// AGENTS.md Hard rule (a LayerId is bound to a pane
+    /// AGENTS.md Hard rule (a `LayerId` is bound to a pane
     /// instance for its whole lifetime and is NOT re-bound).
     #[test]
     fn app_new_pane_splits_focused_leaf_and_spawns_runner() {
@@ -2915,7 +2915,7 @@ mod input_tests {
         );
     }
 
-    /// PaneClose rebalance: with focus on child 0 of a 2-leaf
+    /// `PaneClose` rebalance: with focus on child 0 of a 2-leaf
     /// Split, the Split's sibling-absorption rebalance
     /// collapses the Split into child 1; `reconcile_runners`
     /// rebuilds `Vec<PaneRunner>` against the post-rebalance
@@ -2997,10 +2997,10 @@ mod input_tests {
         assert_eq!(post_layout.panes.len(), 1);
     }
 
-    /// PanePreset(name): wholesale layout_root swap; the
-    /// original pane's LayerId is revoked (Hard rule); the new
-    /// tree has fresh LayerIds per pane. Pin: distinct fresh
-    /// LayerIds per pane, AND the original LayerId does NOT
+    /// PanePreset(name): wholesale `layout_root` swap; the
+    /// original pane's `LayerId` is revoked (Hard rule); the new
+    /// tree has fresh `LayerIds` per pane. Pin: distinct fresh
+    /// `LayerIds` per pane, AND the `original` `LayerId` does NOT
     /// appear in the post-state Vec.
     #[test]
     fn pane_preset_swaps_layout_root_and_reconciles_runners() {
@@ -3093,10 +3093,10 @@ mod input_tests {
     }
 
     /// Phase 4 carry-forward: `PaneStackCycle` rotates
-    /// focus through a focused ZStack's members with
+    /// focus through a focused `ZStack`'s members with
     /// wrap-around (last member -> first member). The
     /// focused pane is the LAST member (top by z-order /
-    /// pre_order) of a 3-member ZStack; cycling once
+    /// `pre_order`) of a 3-`member` `ZStack`; cycling once
     /// must wrap it to the FIRST member. Pins the
     /// "within-ZStack rotatation" half of the Phase 4
     /// contract.
@@ -3181,7 +3181,7 @@ mod input_tests {
     }
 
     /// Phase 4 carry-forward: `PaneStackDown` when the
-    /// focused member is NOT the last of the ZStack
+    /// focused member is NOT the last of the `ZStack`
     /// advances to the next member in declaration order
     /// (no wrap; no geometric handoff). The handoff case
     /// is covered separately by
@@ -3266,17 +3266,17 @@ mod input_tests {
     }
 
     /// Phase 4 carry-forward: `PaneStackDown` at the
-    /// ZStack's last (top by z-order / pre_order) member
+    /// `ZStack`'s last (top by z-order / `pre_order`) member
     /// hands focus off to the topmost pane geometrically
-    /// below the ZStack via [`adjacent_pane`]. The
+    /// below the `ZStack` via [`adjacent_pane`]. The
     /// fixture's outer horizontal split places one
     /// default-configured pane ("below") under the
-    /// ZStack so the geometry is unambiguous; the ZStack
+    /// `ZStack` so the geometry is unambiguous; `the` `ZStack`
     /// occupies the top half (y=0..12), the below-pane
     /// occupies the bottom half (y=12..24). Focus the
-    /// LAST member of the ZStack ("top") and press
+    /// LAST member of the `ZStack` ("top") and press
     #[test]
-    /// PaneStackDown; focus must hand off to "below"
+    /// `PaneStackDown`; focus must hand off to "below"
     /// (path [0, 1]).
     fn pane_stack_down_at_top_hands_off_to_pane_below() {
         let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
@@ -3576,7 +3576,7 @@ mod input_tests {
     }
 
     /// Phase 4.5/5 carry-forward: `PaneStackLeft` retreats to
-    /// the **previous** member of the focused ZStack in
+    /// the **previous** member of the focused `ZStack` in
     /// declaration order. Stop before the first member (no
     /// handoff in this test).
     #[test]
@@ -3667,7 +3667,7 @@ mod input_tests {
     }
 
     /// Phase 4.5/5 carry-forward: `PaneStackRight` advances
-    /// to the **next** member of the focused ZStack in
+    /// to the **next** member of the focused `ZStack` in
     /// declaration order. Stop before the last member (no
     /// handoff in this test).
     #[test]
@@ -3758,15 +3758,15 @@ mod input_tests {
     }
 
     /// Phase 4.5/5 carry-forward: `PaneStackRight` at the
-    /// ZStack's last (rightmost-by-declaration) member hands
+    /// `ZStack`'s last (rightmost-by-declaration) member hands
     /// focus off to the topmost pane geometrically to the
-    /// RIGHT of the ZStack via [`adjacent_pane`]. The
-    /// fixture's outer horizontal split places the ZStack in
+    /// RIGHT of the `ZStack` via [`adjacent_pane`]. The
+    /// fixture's outer horizontal split places the `ZStack` in
     /// the left column (x=0..40) and a default-configured
-    /// pane ("right_outside") in the right column (x=40..80)
+    /// pane ("`right_outside`") in the right column (x=40..80)
     /// so the geometry is unambiguous. Focus the LAST
-    /// member ("right_inside") and press PaneStackRight;
-    /// focus must hand off to "right_outside" (path [0, 1]).
+    /// member ("`right_inside`") and `press` `PaneStackRight`;
+    /// focus must hand off to "`right_outside`" (path [0, 1]).
     /// Pinned by `split_rect_horizontal_60` in the
     /// cmdash-layout crate's ground-truth unit tests.
     #[test]
@@ -3875,15 +3875,15 @@ mod input_tests {
     }
 
     /// Phase 4.5/5 carry-forward: `PaneStackLeft` at the
-    /// ZStack's first (leftmost-by-declaration) member hands
+    /// `ZStack`'s first (leftmost-by-declaration) member hands
     /// focus off to the topmost pane geometrically to the
-    /// LEFT of the ZStack via [`adjacent_pane`]. The
+    /// LEFT of the `ZStack` via [`adjacent_pane`]. The
     /// fixture's outer horizontal split places a default-
-    /// configured pane ("left_outside") in the left column
-    /// (x=0..40) and the ZStack in the right column
+    /// configured pane ("`left_outside`") in the left column
+    /// (x=0..40) and the `ZStack` in the right column
     /// (x=40..80) so the geometry is unambiguous. Focus the
-    /// FIRST member ("left_inside") and press PaneStackLeft;
-    /// focus must hand off to "left_outside" (path [0, 0]).
+    /// FIRST member ("`left_inside`") and `press` `PaneStackLeft`;
+    /// focus must hand off to "`left_outside`" (path [0, 0]).
     #[test]
     fn pane_stack_left_at_first_member_hands_off_to_pane_left() {
         let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
@@ -3990,19 +3990,19 @@ mod input_tests {
         );
     }
 
-    /// Phase 5.0 carry-forward: `PaneStackRight` on a ZStack
+    /// Phase 5.0 carry-forward: `PaneStackRight` on a `ZStack`
     /// with exactly ONE member must immediately hand off to
     /// `Direction::Right` rather than advancing the focus.
     /// The boundary check `member_idx + 1 == panes.len()`
     /// inside `crosstack_member` triggers regardless of the
-    /// advance/retreat branch (single-member ZStacks hit
+    /// advance/retreat branch (single-member `ZStacks` hit
     /// BOTH boundary conditions by definition: `member_idx
     /// == 0` AND `member_idx + 1 == panes.len()`). This pins
     /// the edge case at the consolidated dispatch site so
     /// future additions of directional variants can't
     /// regress it silently. Use `axis=horizontal` (column
     /// split -- same y, different x) so the side pane sits
-    /// in the geometric right of the 1-member ZStack.
+    /// in the geometric right of the 1-member `ZStack`.
     #[test]
     fn pane_stack_right_on_one_member_zstack_immediately_hands_off_to_right() {
         let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
@@ -4105,14 +4105,14 @@ mod input_tests {
         );
     }
 
-    /// Phase 5.0 carry-forward: `PaneStackLeft` on a ZStack
+    /// Phase 5.0 carry-forward: `PaneStackLeft` on a `ZStack`
     /// with exactly ONE member must immediately hand off to
     /// `Direction::Left` rather than retreating the focus.
     /// Horizontal-axis mirror of
     /// `pane_stack_right_on_one_member_zstack_immediately_hands_off_to_right`;
     /// same dual boundary-condition rationale (single-member
-    /// ZStack hits BOTH `member_idx == 0` and
-    /// `member_idx + 1 == panes.len()` from inside crosstack_member).
+    /// `ZStack` hits BOTH `member_idx == 0` and
+    /// `member_idx + 1 == panes.len()` from inside `crosstack_member`).
     #[test]
     fn pane_stack_left_on_one_member_zstack_immediately_hands_off_to_left() {
         let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
@@ -4228,7 +4228,7 @@ mod input_tests {
     // algorithm -- they would only confound the assertions).
     // ============================================================
 
-    /// Phase 6 carry-forward: `PaneStackCycle` on a ZStack
+    /// Phase 6 carry-forward: `PaneStackCycle` on a `ZStack`
     /// with exactly ONE member wraps modulo-style:
     /// `(0 + 1) % 1 == 0` -- the SAME member. Pin: focus
     /// idx stays at 0 (no escape, no handoff to a sibling
@@ -4242,7 +4242,7 @@ mod input_tests {
     /// early-exits BEFORE the mutating block).
     ///
     /// **Trapdoor avoidance**: the fixture is a pure within-
-    /// stack ZStack at root -- NO `split axis=horizontal` or
+    /// stack `ZStack` at root -- NO `split axis=horizontal` or
     /// `split axis=vertical` Split pane -- so the axis-trapdoor
     /// (which only matters for the boundary-handoff path in
     /// `crosstack_member`) cannot confound the assertion.
@@ -4327,17 +4327,17 @@ mod input_tests {
     }
 
     /// Phase 6 carry-forward: `PaneStackCycle` on a 3-member
-    /// ZStack at the LAST member wraps modulo-style:
+    /// `ZStack` at the LAST member wraps modulo-style:
     /// `(2 + 1) % 3 == 0` -- the FIRST member. Pin: focus
     /// idx shifts from 2 to 0 (full wrap), `stack_focus`
-    /// records (id_a, 0) for the post-wrap focus, AND
-    /// post_focus_id.path()[1] == 0 pins the declaration-
+    /// records (`id_a`, 0) for the post-wrap focus, AND
+    /// `post_focus_id`.`path`()[1] == 0 pins the declaration-
     /// order index of the FIRST member (path[0] is the
     /// resolver seed, always 0; path[1] is the meaningful
     /// ZStack-member index per the resolver convention).
     ///
     /// **Trapdoor avoidance**: deliberately a pure within-
-    /// stack ZStack at root -- NO `split axis=horizontal`
+    /// stack `ZStack` at root -- NO `split axis=horizontal`
     /// ANYWHERE -- because cycle's algorithm has no handoff
     /// path. The axis-trapdoor (column vs row split) only
     /// affects `crosstack_member`'s boundary-handoff path;
@@ -4579,7 +4579,7 @@ mod input_tests {
         );
     }
 
-    /// Edge case: `PaneClose` on a single-leaf TickContext
+    /// Edge case: `PaneClose` on a single-leaf `TickContext`
     /// flips `running = false` (the binary quits) and the
     /// `Vec<PaneRunner>` drains to empty. Pins the
     /// empty-`runners`-post-close -> quit-the-binary arm
@@ -4648,7 +4648,7 @@ mod input_tests {
         );
     }
 
-    /// Edge case: `PanePreset("missing")` on a TickContext
+    /// Edge case: `PanePreset("missing")` on a `TickContext`
     /// whose `presets` map lacks that name must NO-OP. The
     /// swap-to-preset handler logs `unknown name; no-op` and
     /// returns without mutating `self.layout_root` /
@@ -4761,9 +4761,9 @@ mod input_tests {
     /// routes each enqueued id through
     /// `GraphicsState::close_pane` (which revokes the
     /// dashcompositor image registration for that id).
-    /// Verify the close_rx round-trip directly: after
+    /// Verify the `close_rx` round-trip directly: after
     /// `apply_action_full(KeyAction::PaneClose)` on focus=0
-    /// of a 2-pane H-Split, close_rx.try_recv() must yield
+    /// of a 2-pane H-Split, `close_rx`.`try_recv`() must yield
     /// the LEFT pane's dropped `PaneLayerId`, AND the
     /// survivor's `PaneLayerId` is unchanged.
     #[test]
@@ -4850,8 +4850,8 @@ mod input_tests {
     }
 
     /// Structural-finding pin (AGENTS.md Phase 2 carry-forward
-    /// structural-deliverable row item 2: AppNewPane
-    /// survivor's PaneId reconcile-gated-later): after
+    /// structural-deliverable row item 2: `AppNewPane`
+    /// survivor's `PaneId` reconcile-gated-later): after
     /// `apply_action_full(KeyAction::AppNewPane)` on a
     /// single-leaf root, the post-state `Vec<PaneRunner>`
     /// has length 2; the ORIGINAL focused pane's
@@ -4863,8 +4863,8 @@ mod input_tests {
     /// leaf now lives at `path == [0, 0]` (parent-Split +
     /// first-child). The full `PaneId` reconcile is
     /// TickContext-owned (the lib-crate harness pins only
-    /// the path_len invariant; the same algorithm reaches
-    /// through to the vector `PaneId` once TickContext
+    /// the `path_len` invariant; the same algorithm reaches
+    /// through to the vector `PaneId` once `TickContext`
     /// `relayout`s on the next SIGWINCH or zero-area
     /// pin-event).
     #[test]

@@ -70,10 +70,10 @@ pub enum RunnerError {
 }
 
 /// One pane's runtime: a [`PanePtyOps`] trait object + reader
-/// thread + mpsc receiver. v1 uses [`cmdash_pty::PanePty`] as
+/// thread + `mpsc` receiver. v1 uses [`cmdash_pty::PanePty`] as
 /// the production impl behind the trait (boxed at the call site
 /// in [`PaneRunner::spawn_with_graphics`]); tests substitute a
-///`StubPty` (see internal_sanity_tests` below) to pin
+///`StubPty` (see `internal_sanity_tests` below) to pin
 /// invariants like the resize Err path that real-PTY tests
 /// can't reach deterministically.
 pub struct PaneRunner {
@@ -189,12 +189,12 @@ impl PaneRunner {
 
     /// Refresh the cached [`ComputedPane`] (id, rect, label, kind)
     /// without touching the underlying PTY child. Used by the
-    /// runtime mutation paths (AppNewPane, PaneClose, PanePreset
+    /// runtime mutation paths (`AppNewPane`, `PaneClose`, `PanePreset`
     /// reconciliation) to align a survivor runner with the
     /// post-mutation layout tree resolution. The
     /// [`cmdash_pty::PaneLayerId`] is implicit on the PTY child
     /// and stays stable across the rebind, per AGENTS.md §"Hard
-    /// rule: one layer per instance" (LayerId is bound to a pane
+    /// rule: one layer per instance" (`LayerId` is bound to a pane
     /// instance for the instance's whole lifetime; it is NEVER
     /// re-bound to a different pane).
     ///

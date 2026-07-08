@@ -122,7 +122,7 @@ pub struct GraphicsState {
     /// contract; v2 may add `pub fn set_cells` with the same
     /// assert guard.
     cells: (u16, u16),
-    /// Bookkeeping for per-(pane, kitty_image_id) layers.
+    /// Bookkeeping for per-(pane, `kitty_image_id`) layers.
     /// Invariant: for every `pane`, every `kitty_id` recorded in
     /// `pane_images[pane]` is also the second component of a key
     /// in `images`. Maintained by `push_image`, the `on_kitty`
@@ -190,8 +190,8 @@ impl GraphicsState {
     }
 
     /// Push a fresh [`ImageLayer`] onto the stack from a
-    /// pre-decoded RGBA, register it under `(pane, kitty_id)`,
-    /// and add the kitty_id to the pane's image list. Used by
+    /// pre-decoded `RGBA`, register it under `(pane, kitty_id)`,
+    /// and add the `kitty_id` to the `pane`'s image list. Used by
     /// both `Self::on_kitty` (production) and unit/integration
     /// tests (no real PNG decode required).
     pub fn push_image(
@@ -483,7 +483,7 @@ mod internal_sanity_tests {
     }
 
     /// Ctor invariant pin: zero `cell_h` must panic with the same
-    /// exact phrase, symmetric to the cell_w case above and to
+    /// exact phrase, symmetric to the `cell_w` case above and to
     /// `graphics_state_new_panics_on_zero_rows`.
     #[test]
     #[should_panic(expected = "cell_w and cell_h must be non-zero")]
@@ -492,7 +492,7 @@ mod internal_sanity_tests {
     }
 
     /// Regression test for `PaneRunner::Drop` -> `GraphicsState::close_pane`
-    /// coupling through the close-channel. Spawns a real PaneRunner with
+    /// coupling through the close-channel. Spawns a real `PaneRunner` with
     /// the channel sender, drops the runner, drains the receiver
     /// (simulating `tick_loop`'s phase 1), and finally calls
     /// `close_pane` with the received id to assert the bookkeeping

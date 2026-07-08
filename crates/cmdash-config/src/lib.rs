@@ -227,22 +227,22 @@ pub enum KeyAction {
     /// `pane.preset.<name>` - focus a named preset.
     PanePreset(String),
     /// `tab.new` -- create a new empty tab and switch focus to
-    /// it. The new tab holds a single `pane kind=shell leaf at
-    /// the active cell-grid area. AGENTS.md feature #3 "Tabs"
+    /// it. The new tab holds a single `pane kind=shell` leaf at
+    /// the active cell-grid area. `AGENTS.md` feature #3 "Tabs"
     /// (M-t default keybind). Cycle-22 atom-1.
     TabNew,
     /// `tab.close` -- close the active tab. All its
-    /// `PaneRunner`s are dropped (revoking every dashcompositor
-    /// `LayerId` per AGENTS.md Hard rule); `active_tab` is
+    /// `PaneRunner`s are dropped (revoking every `dashcompositor`
+    /// `LayerId` per `AGENTS.md` Hard rule); `active_tab` is
     /// clamped to `tabs.len() - 1`. Closing the last tab
     /// quits the binary (matches the `PaneClose` last-pane
     /// semantics). Falling out of scope: a non-active tab's
     /// close is reserved for a cycle-22 atom-2+ "focus a tab
-    /// before close" extension. AGENTS.md feature #3 "Tabs"
+    /// before close" extension. `AGENTS.md` feature #3 "Tabs"
     /// (M-w default keybind). Cycle-22 atom-1.
     TabClose,
     /// `tab.switch.<n>` (n in 1..=9) -- switch focus to the
-    /// nth tab; the M-1..M-9 default keybinds from AGENTS.md
+    /// nth tab; the M-1..M-9 default keybinds from `AGENTS.md`
     /// feature #3 "Tabs". Cycle-22 atom-1.
     TabSwitch(usize),
 }
@@ -675,7 +675,7 @@ fn entry_to_string(entry: &KdlEntry) -> String {
     String::new()
 }
 
-/// Build a hint suffix for parse_action rejection messages
+/// Build a hint suffix for `parse_action` rejection messages
 /// rooted in the `tab.switch.<n>` family. Returns an empty
 /// string for any input that isn't a `tab.switch.*` shape so
 /// the caller emits the original action string verbatim.
@@ -818,7 +818,7 @@ mod tests {
         }
     }
 
-    /// Negative baseline: an unknown inner LayoutNode name
+    /// Negative baseline: an unknown inner `LayoutNode` name
     /// (`foo`) must surface as `UnknownLayoutNode`. Catches an
     /// accidental `let _ = ...` fallback arm in `read_layout`.
     #[test]
@@ -850,23 +850,23 @@ mod tests {
     //   - negative parse test (out-of-range / wrong string -> None)
     // ============================================================
 
-    /// `tab.new` round-trips into KeyAction::TabNew.
+    /// `tab.new` round-trips into `KeyAction::TabNew`.
     #[test]
     fn parse_tab_new_round_trip() {
         let act = parse_action("tab.new").expect("tab.new parses");
         assert_eq!(act, KeyAction::TabNew);
     }
 
-    /// `tab.close` round-trips into KeyAction::TabClose.
+    /// `tab.close` round-trips into `KeyAction::TabClose`.
     #[test]
     fn parse_tab_close_round_trip() {
         let act = parse_action("tab.close").expect("tab.close parses");
         assert_eq!(act, KeyAction::TabClose);
     }
 
-    /// `tab.switch.<n>` for n in 1..=9 round-trips into
+    /// `tab.switch.<n>` for `n` in 1..=9 round-trips into
     /// `KeyAction::TabSwitch(n)`. Parametric over the full
-    /// M-1..M-9 default keybind range from AGENTS.md feature #3.
+    /// M-1..M-9 default keybind range from `AGENTS.md` feature #3.
     #[test]
     fn parse_tab_switch_n_round_trip() {
         for n in 1..=9usize {
@@ -877,10 +877,10 @@ mod tests {
     }
 
     /// `tab.switch.0` and `tab.switch.10` are OUT OF RANGE
-    /// (the AGENTS.md range is M-1..M-9, ON-BOUNDS EXCLUSIVE of
-    /// 0 and 10). Both parse_action inputs return None as a
+    /// (the `AGENTS.md` range is M-1..M-9, ON-BOUNDS EXCLUSIVE of
+    /// 0 and 10). Both `parse_action` inputs return None as a
     /// forward-fixup candidate signal: at config-parse time,
-    /// a Keybind chord bound to `tab.switch.10` would silently
+    /// a `Keybind` chord bound to `tab.switch.10` would silently
     /// no-op at dispatch time without this rejection.
     #[test]
     fn parse_tab_switch_out_of_range_returns_none() {
@@ -918,7 +918,7 @@ mod tests {
     /// like `tab.newpane` or `tab.close-tab` should NOT fall
     /// through to `pane.preset.foo` (which would wire to
     /// `PanePreset("foo")` — a subtle but real bug shape).
-    /// This pins the parse_action's strip-prefix ordering.
+    /// This pins the `parse_action`'s strip-prefix ordering.
     #[test]
     fn parse_tab_unrelated_prefix_returns_none() {
         assert!(

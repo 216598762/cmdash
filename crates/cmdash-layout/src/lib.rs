@@ -26,13 +26,13 @@
 //!   leaves). If the *root* is a Preset we raise
 //!   [`LayoutError::PresetAtRoot`].
 //!
-//! ## PaneId stability
+//! ## `PaneId` stability
 //!
 //! [`PaneId`] is derived from the leaf's position in the static
 //! [`cmdash_config::LayoutNode`] tree via its pre-order leaf index
 //! plus a compact child-index path. Two `compute()` calls over the
 //! same tree produce identical [`PaneId`]s, so consecutive frames
-//! keep LayerIds bound across resizes.
+//! keep `LayerIds` bound across resizes.
 //!
 //! Live runtime layout mutation (open/close pane at runtime) is
 //! deliberately a v2 concern. In v1 each frame starts from the
@@ -148,7 +148,7 @@ pub enum LayoutError {
     /// A `Split` had a number of children other than 2.
     #[error("split has {got} children; v1 supports exactly 2")]
     SplitChildCount { got: usize },
-    /// The root LayoutNode was a Preset; presets are saved named
+    /// The root `LayoutNode` was a Preset; presets are saved named
     /// layouts, not directly renderable.
     #[error(
         "root LayoutNode is a Preset; presets are named saved layouts, not directly renderable"
@@ -194,7 +194,7 @@ pub enum Direction {
 /// `split_rect_horizontal_60` (column math: same `y`, different
 /// `x`) and `split_rect_vertical_30` (row math: same `x`,
 /// different `y`); see those for the canonical examples. Phase 4
-/// ZStack runtime added these clarifications after a test
+/// `ZStack` runtime added these clarifications after a test
 /// fixture used `axis=horizontal` while asserting row-stacked
 /// neighbours -- which produced silently dead test code masked
 /// by a missing `#[test]` attribute. Future contributors should
@@ -390,7 +390,7 @@ fn resolve_node(
 /// anyway). This invariant unlocks the v2 "Hard rule: one layer
 /// per instance" guarantee — the original leaf's [`LayerId`]
 /// (derived from `pre_order`) is stable across the mutation so the
-/// AGENTS.md "no LayerId rebinding" rule holds without a fresh
+/// `AGENTS.md` "no `LayerId` rebinding" rule holds without a fresh
 /// PTY spawn for the survivor.
 ///
 /// Returns the original leaf's [`LayoutNode`] so callers may inspect
@@ -1054,9 +1054,9 @@ mod internal_sanity_tests {
     /// Rect-proximity adjacency: a 2-pane horizontal-split
     /// layout; focusing left and pressing Right yields the
     /// right pane; focusing right and pressing Left yields the
-    /// left pane. This is the AGENTS.md Phase 2 carry-forward
+    /// left pane. This is the `AGENTS.md` Phase 2 carry-forward
     /// algorithm priority path: max perpendicular overlap,
-    /// then min distance, then min pre_order.
+    /// then min distance, then min `pre_order`.
     #[test]
     fn adjacent_pane_right_left_simple_split() {
         let root = split_h(p(Some("left")), p(Some("right")));
@@ -1129,7 +1129,7 @@ mod internal_sanity_tests {
         assert_eq!(adjacent_pane(&layout, br, Direction::Right), None);
     }
 
-    /// Phase 3: a ZStack nested inside a Split has its members
+    /// Phase 3: a `ZStack` nested inside a Split has its members
     /// overlay the Split's child rect — NOT the root rect. The
     /// resolver passes the path's accumulating area verbatim to
     /// non-stripping children, so overlay rects are scoped to the
@@ -1200,9 +1200,9 @@ mod internal_sanity_tests {
         assert_ne!(ovl_a.id, ovl_b.id);
     }
 
-    /// Phase 3: a 3-member ZStack emits three ComputedPanes each
+    /// Phase 3: a 3-member `ZStack` emits three `ComputedPanes` each
     /// sharing the same rect but with strictly increasing
-    /// pre_orders. The dashcompositor's LayerStack draws pre_order
+    /// `pre_orders`. The dashcompositor's `LayerStack` draws `pre_order`
     /// 2 LAST, so the latest member is the topmost visible pane.
     /// Pins Phase 3's "shared rect, ordered z-stack" invariant.
     #[test]
