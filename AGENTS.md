@@ -1,8 +1,7 @@
 # AGENTS.md — cmdash
 
-A terminal multiplexer and dashboard, written in Rust. This file is the project
-brief: read it before touching code. Future agents (and humans) are expected to
-honor the constraints below.
+A terminal multiplexer and dashboard, written in Rust. Read this
+before touching code.
 
 ## What cmdash is
 
@@ -17,9 +16,9 @@ A single Rust binary that:
   protocol (preferred) or Sixel (fallback).
 
 It is a multiplexer (tmux/zellij-family) plus a widget dashboard, glued
-together by a layer architecture that physically owns every pane on its own
-composited layer rather than treating panes as rectangles in a shared text
-grid.
+together by a layer architecture that physically owns every pane on its
+own composited layer rather than treating panes as rectangles in a shared
+text grid.
 
 cmdash owns **no** graphics path of its own. Every pixel-level render and
 every graphics escape sequence cmdash writes goes through dashcompositor
@@ -47,40 +46,6 @@ Concretely:
 This invariant is what makes nested terminals with the Kitty graphics
 protocol safe: graphics emitted by one pane are routed into that pane's
 layer, never leaking into its neighbors.
-
-## Hard rule: intra-doc-link hygiene
-
-`cargo doc -p cmdash --lib --no-deps -D rustdoc::broken-intra-doc-links`
-is the project doc-build gate. It runs against the **lib crate only**,
-so any `[..]` intra-doc-link that points outside the lib crate's
-rendered surface — bin entrypoints, `#[cfg(test)] mod` items,
-private methods on public structs — is rejected as broken at pre-push
-time. Bare backticks are the safe fallback for anything that won't
-resolve.
-
-Concretely:
-
-- **`[`crate::main::X`]` ALWAYS fails** in lib-crate rustdoc (bin
-  entrypoint, not a lib module). Commit `5a8f4a2`.
-- **`[..]` NEVER resolves to items inside `#[cfg(test)] mod
-  internal_sanity_tests`** of the same crate (test mods excluded
-  from public-doc surface). Commit `bbc28c1` (pane.rs:76) + commit
-  `4ded9e9` (graphics.rs 5 links).
-- **`[`crate::xyz::X`]` MAY resolve** in cross-crate rustdoc if
-  `xyz` is the EXTERNAL crate name; there is no `main.rs` in
-  `cmdash_layout`, so the `crate::main` rule does NOT apply.
-  Cross-crate example: `[`cmdash_layout::split_rect`]` works from
-  cmdash's lib rustdoc.
-- **Bare backticks are the safe fallback** for anything that won't
-  resolve: bin-local items (`TickContext::run`), test-mod stubs
-  (`StubPty`, `Self::push_image`), private methods on public
-  structs (`GraphicsState::on_kitty`). The last case is subtle:
-  the lint runs against the public-doc surface, so it rejects
-  private methods the source AST would otherwise link.
-
-This invariant is what makes the cargo-doc gate enforceable. Without
-the disciplined bare-backtick fallback, every docs-only commit risks
-a gate regression.
 
 ## Non-goals
 
@@ -118,114 +83,125 @@ a gate regression.
 | ---------------------- | -------------------------------------------------------- |
 | `cmdash`               | binary: event loop, glue                                 |
 | `cmdash-config`        | KDL types + parser                                       |
-| `cmdash-layout`        | layout tree: Split / Stack / Pane / Preset               |
+| `cmdash-layout`        | layout tree: Split / Stack / ZStack / Pane / Preset      |
 | `cmdash-keybinds`      | modifier-aware key router, modes, actions                |
 | `cmdash-pty`           | `portable-pty` + `vte` → text grid, kitty-graphics split |
-| `cmdash-widget-sdk`    | c-ABI trait for dynamic widgets (`CmdashWidget`)         |
-| `cmdash-protocol`      | line-delimited script-widget frame protocol spec         |
+| `cmdash-widget-sdk`    | c-ABI trait for dynamic widgets (`CmdashWidget`) — stub  |
+| `cmdash-protocol`      | line-delimited script-widget frame protocol spec — stub  |
 
-### v2 multi-pane per-tick iteration
+### Render loop (one frame)
 
-The `cmdash::main::TickContext::run` loop iterates `self.runners`
-(a `Vec<PaneRunner>`) once per frame and dispatches per pane:
+The `TickContext::run` loop iterates `self.runners` (a `Vec<PaneRunner>`)
+once per frame (~30 fps, 33 ms tick):
 
-- Phase 0 drains crossterm events; `Event::Resize(w, h)` arms
-  `pending_resize`.
-- Phase 0.5 coalesces `pending_resize.take()` and runs
-  `TickContext::relayout(w, h)`, re-resolving the KDL tree against
-  the new cell-grid area and per-pane calling
-  `PaneRunner::resize(pane.rect)`. v2 lifts `(x, y)` so a Split's
-  second child stays at `x = layout_w * ratio`.
-- Phase 3a draws each pane to
-  `ratatui::layout::Rect::new(runner.computed().rect.x,
-  runner.computed().rect.y, runner.computed().rect.w,
-  runner.computed().rect.h)` — no v1-style `(0, 0)` clobber.
+1. **Phase 0** — drain crossterm input events. Unmatched key presses are
+   forwarded as raw bytes to the focused pane's PTY. Matched keybinds
+   dispatch to `apply_action_full`. `Event::Resize(w, h)` arms
+   `pending_resize`.
+2. **Phase 0.5** — coalesce `pending_resize` and run `relayout(w, h)`,
+   which re-resolves the KDL layout tree against the new cell-grid area
+   and per-pane calls `PaneRunner::resize(pane.rect)`. Propagates new
+   dimensions to `GraphicsState::set_cells`.
+3. **Phase 1** — drain the close-channel (`PaneRunner::Drop` messages),
+   poll exits, snapshot each pane's text grid.
+4. **Phase 2** — route kitty graphics events from nested PTY children
+   into `GraphicsState` per-pane image maps.
+5. **Phase 3a** — render each pane's text grid into a ratatui `Frame`
+   at the pane's computed rect (cell-grid `(x, y, w, h)`).
+6. **Phase 3b** — emit dashcompositor kitty graphics through the
+   passthrough encoder (`encode_passthrough_to_writer`). Sixel is the
+   fallback. Degraded text-mode (ratatui only) when neither protocol is
+   detected.
 
-`GraphicsState::set_cells((w, h))` propagates the new dims to
-dashcompositor's framebuffer so the cell-grid → pixel composition
-stays in lock-step.
+### Runtime layout mutations
+
+The following `KeyAction` variants mutate the live layout tree at runtime:
+
+- **`AppNewPane`** — replaces the focused leaf with a
+  `Split { Horizontal, 50, [original, new_shell] }`. Survivors keep
+  their `PaneLayerId` (label-keyed reconciliation).
+- **`PaneClose`** — drops the focused runner (its `Drop` revokes the
+  `LayerId` via close-channel), then rebalances the tree via
+  `remove_leaf` (sibling absorption collapses a 2-child Split to its
+  survivor). Closing the last pane quits.
+- **`PanePreset(name)`** — wholesale-swaps the layout tree for a named
+  preset body. All old runners are dropped; fresh `LayerId`s are
+  allocated from a monotonic counter.
+- **`PaneFocus{Next,Prev,Up,Down,Left,Right}`** — focus navigation
+  via declaration-order or rect-proximity (`adjacent_pane`).
+- **`PaneStack{Cycle,Down,Up,Left,Right}`** — ZStack member focus
+  primitives (within-overlay navigation with geometric handoff at
+  boundaries).
+- **`TabNew` / `TabClose` / `TabSwitch(n)`** — multi-tab operations.
+  `TabStack<T>` carries per-tab state; tab mutations sync v1 fields
+  and reconcile runners. The tab bar is not yet rendered.
+
+### Nested-terminal graphics handling
+
+When a child PTY emits kitty graphics commands, `cmdash-pty` intercepts
+them via a pre-scan state machine before the `vte` parser (vte silently
+drops APC strings). Image uploads are buffered and turned into
+`dashcompositor::ImageLayer`s bound to the originating pane's `LayerId`.
+Placement commands update the layer's position/size. On pane resize,
+placements are reapplied against the new pixel rect.
+
+cmdash does **not** blindly forward graphics escape sequences through its
+own stdout — placement is fragile and pane-local. Capture, extract, route.
 
 ## Key dependencies (do not reinvent these)
 
-Pulled from [awesome-rust](https://github.com/rust-unofficial/awesome-rust)
-and [awesome-ratatui](https://github.com/ratatui/awesome-ratatui).
-
-- `dashcompositor` from `https://github.com/216598762/dashcompositor`,
-  pinned to `branch = "main"` with `default-features = false` and
-  features `kitty-encoder`, `sixel-encoder`, `image-decoder`,
-  `font-rasterizer` (the last is renderer-only). Upstream `v0.4` is
-  not yet on crates.io and is not tagged upstream (`HEAD` is
-  `v0.11.0`); once `v0.4` lands on crates.io, switch the dep to
-  `version = "0.4"` and drop the git fields.
+- `dashcompositor` — git dep pinned to `branch = "main"` with
+  `default-features = false` and features `kitty-encoder`,
+  `sixel-encoder`, `image-decoder`, `font-rasterizer`. Switch to a
+  crates.io version pin once upstream publishes.
 - `ratatui` — text rendering, widget toolkit, frame.
 - `portable-pty` — every child PTY, no roll-our-own.
 - `vte` — VT/ANSI parser into a text grid; never hand-roll.
-- `libloading` — hot-load widget `.so` / `.dll` files at runtime.
-- `knus` or `facet-kdl` — KDL parser.
-- `figment` — layered config: file → env → CLI.
+- `kdl` (kdl-rs) — KDL config parser. Chosen over `knus` for full spec
+  coverage (property-only nodes, positional args, type annotations).
+- `crossterm` — terminal I/O (events, raw mode, alternate screen).
+- `image` — PNG decode for kitty graphics payloads.
 - `tracing` + `tracing-subscriber` — structured logging.
-- `tokio` — async runtime for IO and event dispatch.
-- `serde` / `serde_json` — internal messages.
+- `libloading` — hot-load widget `.so` / `.dll` files at runtime (planned).
+- `serde` / `serde_json` — internal messages (planned).
 - `anyhow` / `thiserror` at crate seams.
 
-## Feature checklist
+## Feature status
 
-1. **Nested terminals.** Recursive splits; every split level adds panes
-   without a hard depth limit (only OS resource limits). Each nested
-   terminal is its own layer.
-2. **Kitty graphics protocol — full support.** Concretely this means:
-   - cmdash emits graphics escape sequences via
-     `dashcompositor::encoder::kitty::encode_passthrough_to_writer`
-     (the O(1) streaming entry point);
-   - graphics escape sequences emitted by a nested PTY child are
-     intercepted by `cmdash-pty` and re-routed into the originating
-     pane's layer (so `img2sixel`-style apps work inside nested
-     terminals);
-   - placement / control commands (`a=p`, `a=d`, `d`, `c`, …) are
-     honored against the pane's pixel rect and reapplied on resize.
-3. **Tabs.** Tab bar is its own layer; each tab holds one layout tree.
-   Keybinds `M-1`..`M-9` switch, `M-t` new, `M-w` close.
-4. **Drop-in ratatui widgets.** Rust users author against
-   `cmdash-widget-sdk` and produce a `cdylib`. cmdash loads the lib via
-   `libloading`. Each loaded widget instance is a separate layer.
-   Hot-reload is out of scope for v1.
-5. **Drop-in scripts as widgets.** Any executable. cmdash opens
-   `stdin`/`stdout` pipes and speaks the line-delimited frame protocol
-   defined in `crates/cmdash-protocol/README.md`.
-6. **Modifier-based keybinds.** One global modifier. Default is
-   `MOD_LEFTALT`; config-overridable. See *Keybinding system* below.
-7. **Custom keybinds.** User-defined in KDL.
-8. **Configurable layouts.** KDL layout tree.
-9. **Layout presets.** Named presets, callable by keybind
-   (`M-p` enters preset picker, or directly via `RunPreset("name")`).
-10. **v2 multi-pane reflow across host resizes.** Each
-    `Event::Resize` from the host terminal cascades through
-    `TickContext::relayout`; every pane's `computed().rect` is
-    updated against the new `cmdash_layout::Rect` so a Split's
-    children stay at their `(ratio * w, 0)` offsets. The v2
-    `PaneRunner::resize(rect: LayoutRect)` signature is what makes
-    this coordinate-safe; v1's `(cols, rows)` API clobbered the
-    origin.
+| Feature | Status |
+|---------|--------|
+| Nested terminals (recursive splits) | ✅ Working |
+| Kitty graphics protocol (full support) | ✅ Working (intercept + re-route) |
+| Multi-pane reflow on host resize | ✅ Working |
+| Runtime layout mutations (new pane, close, preset swap) | ✅ Working |
+| Directional focus navigation | ✅ Working |
+| ZStack overlay + focus primitives | ✅ Working |
+| Tabs (TabStack, tab actions) | ⚠️ Partially implemented (actions wired, tab bar not rendered) |
+| Configurable layouts (KDL) | ✅ Working (compile-time embedded) |
+| Layout presets | ✅ Working |
+| Modifier-based keybinds | ✅ Working (Normal mode only; other modes are stubs) |
+| Native Rust widgets (cmdash-widget-sdk) | ❌ Stub only |
+| Script widgets (cmdash-protocol) | ❌ Stub only |
+| Runtime config file loading (~/.config/cmdash/) | ❌ Not implemented (compile-time `include_str!` only) |
+| Sixel fallback | ⚠️ Code path exists, untested |
 
 ## Keybinding system
 
-- One global **modifier** (`MOD_LEFTALT` by default). Overridable in
-  config to `ctrl`, `super`, or `shift` (shift is discouraged because it
-  conflicts with text selection).
-- **Modes:** `Normal`, `PaneResize`, `TabSwitch`, `PresetPick` — each
-  with its own binding set.
-- **Actions:** enum-driven, e.g. `FocusNext`, `FocusPrev`, `SplitV`,
-  `SplitH`, `NewTab`, `CloseTab`, `SwitchTab(n)`, `RunPreset(name)`,
-  `ReloadConfig`, `SetModifier(mod)`.
+- One global **modifier** (`alt` by default, config-overridable to
+  `ctrl`, `super`, or `shift`).
+- **Modes:** `Normal`, `PaneResize`, `TabSwitch`, `PresetPick` — v1
+  only routes `Normal`; others are enum stubs for future work.
+- **Actions:** enum-driven (`KeyAction`), 15 variants covering pane
+  management, focus navigation, ZStack cycling, preset swapping, tab
+  management, and app close. 18 variants total.
 
 KDL binding example:
 
 ```kdl
-keybind {
-    mod "alt"
-    key "c"
-    action "run_preset"
-    arg "coding"
+keybinds {
+    bind "alt-w"  action="pane.close"
+    bind "alt-q"  action="app.close"
+    bind "ctrl-a" action="app.new-pane"
 }
 ```
 
@@ -233,48 +209,30 @@ keybind {
 
 Layout node kinds:
 
-- `split { axis "h"|"v", ratio 0.6, a {...}, b {...} }`
-- `stack { a {...}, b {...} }` — internal tabbed viewer
-- `pane { kind "pty"|"widget"|"script" ref "<name>" title "..." }`
-- `preset name "coding" { ...layout body... }`
+- `split { axis "h"|"v", ratio 0.6, a {...}, b {...} }` — binary split
+  (exactly 2 children). `axis=horizontal` is a **column** split (left/
+  right); `axis=vertical` is a **row** split (top/bottom). The naming is
+  a known trapdoor — see `split_rect` rustdoc.
+- `stack { pane* }` — equal-height vertical strips (not tabbed viewer).
+- `zstack { pane* }` — overlay z-stack; every member shares the parent's
+  rect. Distinct `PaneId`s per member. Z-order = resolver pre-order.
+- `pane { kind "shell" [label "..."] }` — leaf PTY.
+- `preset name "coding" { ...layout body... }` — named saved layout.
 
-Resolved each frame into a tree of `(PaneId, Rect)`. Resolution is
-deterministic so that layer ids stay stable across relayouts of the same
-tab. **Idempotent:** two `ComputedLayout::compute` calls against the
-same tree produce the same `PaneId`s, so the tick loop's per-pane
-pairing (`runners[i].computed().id == layout.panes[i].id`) holds
-across host resizes. The v2 `PaneRunner::resize(rect: LayoutRect)`
-signature (Phase 1, commit `de7ccae`) is the API that lets the blit
-path at phase 3a honor the Split-derived `x`/`y` instead of v1's
-hardcoded `(0, 0)` clobber.
+Resolved each frame into a tree of `(PaneId, Rect)`. `PaneId` is derived
+from pre-order leaf index + child-index path; deterministic so layer IDs
+stay stable across resizes of the same tree. Max tree depth: 8.
 
-## Rendering pipeline (one frame)
+## Config model
 
-1. Resolve the active tab's layout tree into `(PaneId, Rect)[]`.
-   **v2:** resolve runs at `cmdash::run` entry against the host's
-   `crossterm::terminal::size()`, and re-runs once per host
-   `Event::Resize(w, h)` via `TickContext::relayout(w, h)`. The
-   `Tree → (PaneId, Rect)` cache means phase 3a always reads the
-   current `(PaneId, Rect)` without a tree walk.
-2. For each pane:
-   - **PTY** → advance `vte`, get a `TextGrid`, draw into a ratatui
-     `Frame` for the text body.
-   - **Native widget** → call `widget.render(area, frame)`.
-   - **Script widget** → consume the most recent frame from the exec
-     pipe, blit into the region.
-3. Look up (or create) the pane's `LayerId` in the dashcompositor
-   `LayerStack`. Bounds = pane rect in cells → pixels.
-4. Push overlay layers (tab bar, focus ring, keybind help) on top.
-5. `LayerStack::render_to_current_terminal()` → `FrameBuffer`.
-6. Stream-encode to stdout:
-   - preferred: `dashcompositor::encoder::kitty::encode_passthrough_to_writer`
-   - fallback: `dashcompositor::encoder::sixel::encode_to_writer`
-7. **Degraded text-mode** when neither protocol is detected: render
-   through ratatui only, log the degraded mode at startup.
+- **v1:** config is embedded at compile time via `include_str!` from
+  `crates/cmdash/config.kdl`. Editing requires a recompile.
+- **Planned:** `~/.config/cmdash/config.kdl` runtime loading via `figment`,
+  with env-var overrides (`CMDASH_MODIFIER`, `CMDASH_CONFIG_DIR`).
 
-## Plugin model — native Rust widgets
+## Plugin model — native Rust widgets (planned)
 
-`cmdash-widget-sdk` exposes a c-ABI-safe trait:
+`cmdash-widget-sdk` will expose a c-ABI-safe trait:
 
 ```rust
 pub trait CmdashWidget: Send + Sync {
@@ -284,181 +242,59 @@ pub trait CmdashWidget: Send + Sync {
 }
 ```
 
-User flow:
-
-1. `cargo new --lib my-widget`, set `crate-type = ["cdylib"]`.
-2. Add `cmdash-widget-sdk = "<version>"` as a dep.
-3. Export a C symbol `cmdash_widget_create` returning a boxed trait object
-   pinned to a published ABI version.
-4. Drop the compiled `.so` / `.dll` into
-   `~/.config/cmdash/widgets/<name>/`.
-5. Reference from layout: `pane { kind "widget" ref "my-widget" }`.
+User flow: `cargo new --lib my-widget` → set `crate-type = ["cdylib"]` →
+add `cmdash-widget-sdk` dep → export `cmdash_widget_create` → drop `.so`
+into `~/.config/cmdash/widgets/<name>/` → reference from layout.
 
 Two instances of the same widget are two layers, two `PaneId`s, two
-loaded copies.
+loaded copies. Hot-reload is out of scope for v1.
 
-## Script-as-widget protocol
+## Script-as-widget protocol (planned)
 
-Spawn a child with piped `stdin`/`stdout`. Line-delimited, versioned
-prefix:
+Spawn a child with piped `stdin`/`stdout`. Line-delimited, versioned:
 
-cmdash → script (per frame request):
+cmdash → script: `FRAME width=80 height=24 gen=42` / `KEY key=h mod=alt` /
+`RESIZE w=80 h=24` / `MOUSE x=10 y=5 kind=press btn=left`
 
-```
-FRAME width=80 height=24 gen=42
-KEY key=h mod=alt
-RESIZE w=80 h=24
-MOUSE x=10 y=5 kind=press btn=left
-```
+script → cmdash: `FRAME width=80 height=24` + ANSI text body.
 
-script → cmdash (frame reply):
+v1 = line+ANSI only. Pixel-bitmap frame mode is a future goal.
 
-```
-FRAME width=80 height=24
-<ANSI text — interpreted like a tiny terminal>
-```
+## Rendering pipeline details
 
-Pixel-bitmap frame mode is a planned v2. v1 = line+ANSI only. Full spec
-lives at `crates/cmdash-protocol/README.md` (not yet written — write it
-before implementing script widgets).
+`GraphicsState` owns the `dashcompositor::LayerStack` and per-pane image
+maps (`HashMap<(PaneLayerId, kitty_image_id), ImageEntry>`). Each entry
+caches the decoded RGBA so `Place` commands can rebuild the `ImageLayer`
+without re-decoding.
 
-A script process is one layer, one `PaneId`, same as any other pane.
+`PaneRunner::Drop` sends its `PaneLayerId` into an mpsc close-channel;
+the tick loop drains it at the start of each tick and calls
+`GraphicsState::close_pane` for each id. This avoids wrapping
+`GraphicsState` in `Arc<Mutex<>>` (which fails clippy because
+`LayerStack` is not `Sync`).
 
-## Nested-terminal graphics handling
+## Doc-link hygiene
 
-When a child PTY emits kitty graphics commands, `cmdash-pty` intercepts
-them in the `vte` stream:
-
-- image uploads are buffered and turned into
-  `dashcompositor::ImageLayer`s bound to the originating pane's `LayerId`;
-- placement commands (`a=p`, `a=d`, `d=a`, etc.) update the layer's
-  position/size;
-- on pane resize, placements are reapplied against the new pixel rect.
-
-cmdash does **not** blindly forward graphics escape sequences through its
-own stdout — placement is fragile and pane-local. Capture, extract, route.
-
-## Config & on-disk layout
-
-- `~/.config/cmdash/config.kdl` — global: modifier, theme, keybinds,
-  default tab.
-- `~/.config/cmdash/layouts/*.kdl` — named layout presets.
-- `~/.config/cmdash/widgets/<name>/` — installed dynamic libs and/or
-  script executables.
-
-Discovery: `figment` over `knus`-parsed KDL files, with env-var overrides
-(`CMDASH_MODIFIER`, `CMDASH_CONFIG_DIR`).
-
-## Repository layout (planned)
-
-```
-cmdash/
-├── Cargo.toml              # workspace
-├── crates/
-│   ├── cmdash/             # binary
-│   ├── cmdash-config/
-│   ├── cmdash-layout/
-│   ├── cmdash-keybinds/
-│   ├── cmdash-pty/
-│   ├── cmdash-widget-sdk/
-│   └── cmdash-protocol/
-├── examples/
-│   ├── widget-clock/       # cdylib sample
-│   ├── script-hello/       # exec sample
-│   └── layouts/            # example KDL layouts
-└── docs/
-    ├── script-widget-protocol.md
-    └── kitty-in-nested-pty.md
-```
-
-## Phase 2 of v2 split-pane nesting
-
-Phase 1 — *v2 `PaneRunner::resize` contract lift* (commit `de7ccae`)
-— changed the signature from `(cols: u16, rows: u16)` to
-`(rect: cmdash_layout::Rect)`. The body is
-`self.pty.resize(rect.w, rect.h)?; self.computed.rect = rect;`,
-so the layout-engine's `(x, y)` carry forward instead of v1's
-hardcoded `(0, 0)`. The cached `ComputedPane::rect` now matches
-the layout engine across the pane's whole lifetime. The pairing
-invariant (`runners[i].computed().id == layout.panes[i].id`) is
-locked at the `computed()` accessor and verified by every
-regression test in `cmdash::src::main.rs::input_tests` and
-`wiring_smoke.rs`.
-
-Phase 2 — *host SIGWINCH multi-pane wiring* (commit `31c47b7`) —
-sources the initial cell-grid area from
-`crossterm::terminal::size()` with a zero-area / `Err` fallback
-to `(80, 24)` and drops the hardcoded `DEFAULT_AREA_*` constants.
-`cmdash::main::TickContext` gains two fields (`layout_root:
-LayoutNode`, `pending_resize: Option<(u16, u16)>`), a top-of-tick
-phase 0.5 that coalesces `Event::Resize` signals, and a
-`TickContext::relayout(w, h)` helper that re-runs
-`ComputedLayout::compute` and per-pane calls `runner.resize(pane.rect)`.
-`GraphicsState::set_cells` propagates the new dims to
-dashcompositor's framebuffer. Six new tests pin the behavior: the
-`assert_eq!(runner.computed().id, pane.id)` pairing,
-coalesce-on-overwrite, and the Split-derived rect round-trip
-against real PTY children.
-
-Phase 2 carry-forward — *focus navigation + runtime mutations*
-(next) — wires the AGENTS.md `KeyAction` arms that are currently
-no-ops in `cmdash::main::apply_action`:
-
-- `AppNewPane`: insert a leaf into the live KDL tree under
-  `TickContext::layout_root`; reflow on the new leaf count via
-  `relayout`.
-- `PaneFocus{Up,Down,Left,Right}`: look up the adjacent pane via
-  `ComputedLayout`'s side-of-rect resolution; swap
-  `TickContext.focus`. v1's existing `PaneFocus{Next,Prev}`
-  wrappers stay as lexical-order fallbacks.
-- `PanePreset(name)`: swap the active layout tree from
-  `cmdash_config::Config.presets`, drive a `relayout` on the new
-  tree.
-
-Each branch needs a regression test in
-`cmdash::src::main.rs::input_tests` against a multi-pane fixture
-and a focused `wiring_smoke.rs` test that drives the same path
-through real `PaneRunner::spawn_with_graphics` children.
+`cargo doc -p cmdash --lib --no-deps -D rustdoc::broken-intra-doc-links`
+is the project doc-build gate (lib crate only). Use **bare backticks**
+for any item that won't resolve in the lib rustdoc surface: bin
+entrypoints, `#[cfg(test)]` mod items, private methods on public
+structs. `[`crate::main::X`]` always fails; `[`cmdash_layout::split_rect`]`
+works cross-crate.
 
 ## Development workflow
 
-- Commit often. Multi-line commit messages, conventional prefix:
-  `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `style:` (see
-  commit `14ad9a0`), `chore:` (build/deps); each new prefix needs
-  a precedent atom first.
-- Push major changes. (No remote configured yet — add one when the user
-  provides a URL, then push.)
-- Feature branches: `feat/<short-name>`. Squash into `main`.
+- Use conventional commit prefixes: `feat:`, `fix:`, `refactor:`, `docs:`,
+  `test:`, `style:`, `chore:`.
+- Run `cargo fmt --all` before committing.
 - Before push: `cargo clippy --workspace --all-targets -- -D warnings`
   and `cargo test --workspace` — both must pass.
 - Reuse over reinvention: search awesome-rust / awesome-ratatui first.
   If a crate does the job, pull it in.
-- Always run `cargo fmt --all` before committing.
-- **GPG signing (TTY-less hosts).** If the host's `gpg-agent` cannot satisfy
-  passphrase requests through its standard cache path (e.g. `ERR 67108933
-  Not implemented` on the `preset_passphrase` assuan command, or
-  `gpg-preset-passphrase` binary missing on the host's PATH), use the
-  reproducible `scripts/gpg-cmdash-wrapper.sh`. The wrapper is committed
-  to the repo and contains NO secrets; the user's GPG key passphrase
-  lives in `~/.config/cmdash/gpg-passphrase` (chmod 600, host-local,
-  NOT committed; `.gitignore` excludes `*gpg-passphrase*` patterns).
-  Run `just gpg-setup` once per host to wire git's `gpg.program` +
-  re-enable `commit.gpgsign=true`. See
-  `scripts/gpg-cmdash-wrapper.README.md` + `docs/ci-evidence.md` audit
-  cycle 12 for the full diagnostic.
-- **doc-link-hygiene workflow.** When swapping a `[..]` intra-doc-link
-  for a bare-backtick form to clear the rustdoc gate, commit TWO
-  atoms atomically: the FIX itself uses a `fix:` prefix; the
-  NARRATIVE atom documenting the fix-design decision uses a `docs:`
-  prefix via `git commit --allow-empty`. See commit `15e4362` for the
-  canonical pattern.
-- In the NARRATIVE atom's body, NAME the audit-requested form verbatim
-  (e.g. `[`crate::pane::StubPty`]`, not "the more-qualified form") and
-  cite the file:line of any `#[cfg(test)]`-private item.
-- Cite the eventual resolution for out-of-scope items in the same
-  chain (e.g. `bbc28c1` → `4ded9e9` for graphics.rs's 5 residuals).
-- When genuinely stuck on a design choice, ask the user with concrete
-  options rather than picking silently.
+- GPG signing on TTY-less hosts: use `scripts/gpg-cmdash-wrapper.sh`
+  (committed, no secrets). Run `just gpg-setup` once per host. The
+  passphrase lives in `~/.config/cmdash/gpg-passphrase` (chmod 600,
+  host-local, gitignored).
 
 ## MUST (for agents and contributors)
 

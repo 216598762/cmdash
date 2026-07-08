@@ -16,8 +16,7 @@ use cmdash_pty::{
 /// Compute the drain deadline default, honoring the env-overridable
 /// `CMDASH_TEST_DRAIN_SECS` so devs debugging locally can extend the
 /// window without touching the helper or its call sites. Defaults to
-/// 2 seconds (matches the cat-stall threshold that was set when the
-/// drain-deadline atom landed in `85355ff`).
+/// 2 seconds.
 ///
 /// **Bounds.** The parsed value is clamped to `[1, 30]` seconds to
 /// defend against `CMDASH_TEST_DRAIN_SECS=0` (silent empty-drain that
@@ -363,7 +362,7 @@ fn pty_osc_title_changes_event_stream() {
     assert!(got, "expected TitleChanged event, got {:?}", events);
 }
 
-#[ignore = "portable_pty 0.9 PTY-alloc races against kernel line discipline: master-fd tcsetattr(ECHO|ICANON|VEOF=0) post atom 581ddec+e1050a8 produced drain()=0 bytes (grid(0,0).ch=' '). Slave-fd switch blocked because portable_pty::SlavePty trait does not expose as_raw_fd() in 0.9. Forward-only silence preserves the b7de7dd gate; f158ea0 --(1,30)-clamp drain_deadline_default() remains the CI safety net. See atom chain 581ddec -> e1050a8."]
+#[ignore = "portable_pty 0.9 PTY-alloc races against kernel line discipline: master-fd tcsetattr(ECHO|ICANON|VEOF=0) produced drain()=0 bytes (grid(0,0).ch=' '). Slave-fd switch blocked because portable_pty::SlavePty trait does not expose as_raw_fd() in 0.9. The clamped drain_deadline_default() remains the CI safety net."]
 #[test]
 fn pty_write_to_child_round_trips_via_cat() {
     let (mut pty, reader) = PanePty::spawn(

@@ -473,23 +473,19 @@ fn layout_preset_inside_stack_is_ignored() {
 
 #[test]
 fn layout_empty_split_errors() {
-    let cfg = parse(
+    // A 1-child split is now rejected at parse time by
+    // `cmdash_config::ConfigError::SplitChildCount`, before the
+    // layout engine ever sees it.
+    let err = parse(
         r#"layout {
         split axis=horizontal {
             pane kind=shell
         }
     }"#,
     )
-    .unwrap();
-    let err = ComputedLayout::compute(
-        &cfg.layout.unwrap(),
-        Rect {
-            x: 0,
-            y: 0,
-            w: 80,
-            h: 24,
-        },
-    )
-    .unwrap_err();
-    assert!(matches!(err, LayoutError::SplitChildCount { got: 1 }));
+    .expect_err("1-child split must be rejected at parse time");
+    assert!(
+        matches!(err, cmdash_config::ConfigError::SplitChildCount(1)),
+        "expected ConfigError::SplitChildCount(1), got: {err:?}"
+    );
 }

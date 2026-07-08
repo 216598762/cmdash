@@ -2,38 +2,13 @@ layout {
     pane kind=shell label="default"
 }
 
-// v1 keybind surface. `alt-w` revokes the focused pane's
-// dashcompositor layers via the close-channel plumbing added
-// alongside this file (see crates/cmdash/src/pane.rs and
-// crates/cmdash/src/main.rs). v2 will register additional
-// chord-to-action verbs here as the layout engine gains
-// dynamic splits, presets, and per-tab navigation.
+// Default keybind surface. `alt-w` closes the focused pane (revoking
+// its dashcompositor layers via the close-channel). `alt-q` quits.
+// `ctrl-a` splits the focused pane (app.new-pane).
 //
-// `ctrl-a` is the canonical "add a new pane" verb (the
-// tmux-prefix convention repurposed for cmdash's v1 single-
-// chord model). It's also load-bearing for the end-to-end
-// live-binary AppNewPane integration test in
-// `crates/cmdash/tests/wiring_smoke.rs::app_new_pane_via_ctrl_a_keypress_in_live_binary`,
-// which spawns the compiled binary attached to a portable-pty
-// PTY and drives byte 0x01 through the master fd. Without this
-// keybind, the binary's `handle_event_full` falls through to
-// `PaneRunner::write_input(&[0x01])` and the keypress lands in
-// the focused shell's readline buffer (where `^A` means
-// "beginning of line"), never reaching
-// `apply_action_full(KeyAction::AppNewPane)`.
-
-// Cycle-22 atom-1: adds the v2 tab-axis default keybinds
-// `M-1`..`M-9` for tab switch, `M-t` for tab.new, `M-w` for
-// tab.close. The cmdash-config parse_action extension accepts
-// all 9 (`tab.switch.1`..`tab.switch.9`) and the KDL keybind
-// resolver maps `M-<n>` onto `tab.switch.<n>` for `n in 1..=9`.
-// Each M-N press flows through cmdash's tick-loop dispatch
-// surface to the cycle-22 atom-1 placeholder arm and becomes
-// functional across the cycle-22 atom-2 field refactor. Users
-// wanting non-default keybinds can extend the binds in their
-// own `~/.config/cmdash/config.kdl`; cycle-21 atom-3 left
-// `alt-w`/`alt-q`/`ctrl-a` unchanged to preserve the existing
-// surface.
+// Tab keybinds: `M-t` new tab, `M-w` close tab, `M-1`..`M-9` switch
+// to tab N. Users wanting non-default keybinds can extend the binds
+// in their own config (once runtime config loading is implemented).
 keybinds {
     bind "alt-w"  action="pane.close"
     bind "alt-q"  action="app.close"

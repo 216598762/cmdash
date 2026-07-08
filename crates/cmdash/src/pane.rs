@@ -77,22 +77,21 @@ pub enum RunnerError {
 /// invariants like the resize Err path that real-PTY tests
 /// can't reach deterministically.
 ///
-/// ## Manual `Clone` impl (cycle-22 atom-4)
+/// ## Manual `Clone` impl
 ///
 /// `PaneRunner` is a runtime resource (PTY child + dashcompositor
 /// layer + reader thread); the trait object field
 /// `pty: Box<dyn PanePtyOps + Send>` is not `Clone` by default.
-/// The additive `TabStack<TabState>` integration in
-/// `cmdash::main` needs `TabState: Clone` (the upstream
-/// `Tab<T>: Clone` derive in `crate::tabs` requires it), and
-/// `TabState` carries a `runners: Vec<PaneRunner>` field. The
-/// manual `Clone` impl below returns a "shell" with `pty: None`
-/// and `reader_thread: None` so the v1 field's runners (the real
-/// ones) stay intact while the `TabState`'s runners are
-/// decorative shells — `TabState.runners` is never used at
-/// runtime (the v1 field's runners are authoritative for v1
-/// code paths, and tab mutations always go through
-/// `reconcile_runners` which spawns fresh real runners).
+/// The `TabStack<TabState>` integration in `cmdash::main` needs
+/// `TabState: Clone` (the `Tab<T>: Clone` derive in `crate::tabs`
+/// requires it), and `TabState` carries a `runners: Vec<PaneRunner>`
+/// field. The manual `Clone` impl below returns a "shell" with
+/// `pty: None` and `reader_thread: None` so the v1 field's runners
+/// (the real ones) stay intact while the `TabState`'s runners are
+/// decorative shells — `TabState.runners` is never used at runtime
+/// (the v1 field's runners are authoritative, and tab mutations
+/// always go through `reconcile_runners` which spawns fresh real
+/// runners).
 pub struct PaneRunner {
     /// Source pane description (rect, kind, label).
     computed: ComputedPane,

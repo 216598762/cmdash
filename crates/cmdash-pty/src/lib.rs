@@ -880,29 +880,21 @@ impl PanePty {
     /// `cfmakeraw`), so even though `ECHO` is preserved in
     /// `c_lflag` it has NO effect when `ICANON` is off — the
     /// line discipline doesn't buffer by line and doesn't fire
-    /// the echo path in raw mode. Adding ONLY `ECHO` (the
-    /// initial forward-fixup in atom `581ddec`) was therefore
-    /// insufficient; the runtime test failure stack-trace from
-    /// my followup commit (post-`581ddec`) showed the same
-    /// `left == right` failure with `left: ' '`. Adding
-    /// `ICANON` alongside `ECHO` re-enables line-discipline
-    /// buffering + synchronous echo on the master fd.
-    /// **Forward-fixup caveat:** the slave-fd switch
-    /// (i.e. `pair.slave.as_raw_fd()`) was attempted in a
-    /// follow-up atom but blocked by `portable_pty 0.9`'s
-    /// `SlavePty` trait NOT exposing `as_raw_fd()` (only
-    /// `MasterPty` does), so we reverted to the master-fd call
-    /// point. The cat-echo test therefore STILL races on
-    /// `portable_pty 0.9` with the master-fd master-fd termios
-    /// setup; the test is re-`#[ignore]`'d against this
-    /// runtime path forward, with a forward-only-no-revert
-    /// exception in the run-time path tracked via the
-    /// `f158ea0` `--(1, 30)`-clamp `drain_deadline_default()`
-    /// CI safety net. The `libc` direct-dep additions are
-    /// preserved because they remain load-bearing for the
-    /// `tcgetattr` / `std::mem::zeroed::<libc::termios>()` /
-    /// `tcsetattr` call path that's wired through the master
-    /// fd here.
+    /// the echo path in raw mode. Adding ONLY `ECHO` was
+    /// insufficient; adding `ICANON` alongside `ECHO` re-enables
+    /// line-discipline buffering + synchronous echo on the
+    /// master fd.
+    ///
+    /// **Caveat:** the slave-fd switch
+    /// (i.e. `pair.slave.as_raw_fd()`) is blocked by
+    /// `portable_pty 0.9`'s `SlavePty` trait NOT exposing
+    /// `as_raw_fd()` (only `MasterPty` does), so the master-fd
+    /// call point is the only viable path. The cat-echo test
+    /// therefore still races on `portable_pty 0.9`; the test is
+    /// `#[ignore]`'d with a clamped `drain_deadline_default()`
+    /// as a CI safety net. The `libc` direct-dep is preserved
+    /// because it remains load-bearing for the `tcgetattr` /
+    /// `tcsetattr` call path wired through the master fd.
     #[cfg(unix)]
     fn enable_pty_echo(fd: std::os::fd::RawFd) -> Result<(), std::io::Error> {
         // SAFETY: `libc::tcgetattr` writes through the
@@ -969,13 +961,11 @@ impl PanePty {
         // echo-enabled line discipline). On non-Unix the
         // branch is cfg-gated out entirely; on Unix the trait
         // method `as_raw_fd` returns `Some(master_fd)`.
-        // **Forward-fixup note:** `portable_pty 0.9`'s
-        // `SlavePty` trait does NOT expose `as_raw_fd()`,
-        // so we cannot switch the call point to the slave
-        // fd; the master-fd path is the only nc-friendly path
-        // through the trait API, and the cat-echo test
-        // therefore remains gated by the `f158ea0` clamp and
-        // the `b7de7dd` `#[ignore]` until a future nix-crate
+        // Note: `portable_pty 0.9`'s `SlavePty` trait does NOT
+        // expose `as_raw_fd()`, so we cannot switch the call
+        // point to the slave fd; the master-fd path is the only
+        // viable path through the trait API, and the cat-echo
+        // test remains `#[ignore]`'d until a future nix-crate
         // or lower-level UnixPtySystem path becomes viable.
         #[cfg(unix)]
         if let Some(fd) = pair.master.as_raw_fd() {

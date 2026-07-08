@@ -20,9 +20,6 @@ via `--pinentry-mode loopback --no-tty --batch --passphrase-fd 3`.
 Every commit invocation re-enters the passphrase, but the wrapper
 itself is committed and reproducible across hosts.
 
-See `docs/ci-evidence.md` `### Audit cycle 12 - reproducible GPG signing wrapper`
-for the full diagnostic + trade-off analysis.
-
 ## Setup (host-local; not committed)
 
 The wrapper is committed to the public repo, so it contains NO secrets.

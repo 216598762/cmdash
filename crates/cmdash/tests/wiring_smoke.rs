@@ -4,9 +4,7 @@
 //! buffer.
 
 // `clippy::doc_lazy_continuation` misreads multi-paragraph prose
-// rustdoc as Markdown list continuations; scoped allow gates cycle-20
-// atom-2 visual-state proof (atom-1 SHA c850601). Per AGENTS.md
-// "doc-link-hygiene" workflow, lint-named scoped allows are preferred
+// rustdoc as Markdown list continuations. Scoped allow is preferred
 // over fighting clippy on prose style.
 #![allow(clippy::doc_lazy_continuation)]
 
@@ -1165,27 +1163,23 @@ fn pane_preset_swap_layout_via_real_pty_wholesale_spawn() {
 // loop (1.5 s max) instead of a blind sleep so the assertion
 // has a representative tail of post-Ctrl-a frames.
 //
-// Cycle-18 → cycle-19 history: the cycle-18 commit `dba1604`
-// shipped this test `#[ignore]`-gated because the pre/post
-// ring hashes matched (statistically impossible barring
-// byte-identical emission), indicating the Ctrl-a byte never
-// reached `TickContext::handle_event_full`. The cycle-18
-// preserved TRACE log (9 731 B, 135 lines) showed cmdash
-// kept rendering frames at ~50 ms cadence throughout the
-// post-Ctrl-a window with `focus_idx` permanently pinned at
+// History: this test was originally `#[ignore]`-gated because
+// the pre/post ring hashes matched (byte-identical emission),
+// indicating the Ctrl-a byte never reached
+// `TickContext::handle_event_full`. The preserved TRACE log
+// showed cmdash kept rendering frames at ~50 ms cadence throughout
+// the post-Ctrl-a window with `focus_idx` permanently pinned at
 // 0 — cmdash was NOT crashed, the byte just never became a
 // routed key event. The root cause was
 // `event::poll(Duration::from_millis(0))` in
-// [`TickContext::input_phase_full`] at main.rs:790
-// starving the mio readiness check against the PTY fd on
-// Unix. Cycle-19 lifts the poll dwell to 1 ms (negligible
-// vs. the 33 ms tick cadence, ~3% per-frame budget) so the
-// OS forces a fresh readiness probe against the PTY buffer
-// every input phase; combined with the RAII CleanupGuard
-// pattern below (which preserves cmdash's TRACE log on
-// failure), this test is the wire-level witness that
-// Ctrl-a → AppNewPane → 2-pane re-render is observed
-// end-to-end through real PTY children.
+// [`TickContext::input_phase_full`] starving the mio readiness
+// check against the PTY fd on Unix. Lifting the poll dwell to 1 ms
+// (negligible vs. the 33 ms tick cadence, ~3% per-frame budget) so
+// the OS forces a fresh readiness probe against the PTY buffer
+// every input phase; combined with the RAII CleanupGuard pattern
+// below (which preserves cmdash's TRACE log on failure), this test
+// is the wire-level witness that Ctrl-a → AppNewPane → 2-pane
+// re-render is observed end-to-end through real PTY children.
 // ===========================================================================
 
 /// RAII guard that wraps the live-binary test's PTY master,
@@ -1200,7 +1194,7 @@ fn pane_preset_swap_layout_via_real_pty_wholesale_spawn() {
 /// inspection via
 /// `grep -n <event-name> /tmp/cmdash-e2e-appnewpane.log | tail`).
 ///
-/// The cycle-18 cleanup pattern (process cleanup AFTER
+/// The prior cleanup pattern (process cleanup AFTER
 /// assertions, log cleanup AFTER assertions) leaked the
 /// reader thread on every failed assertion — `Drop` of
 /// stack-locals was never reached because `assert!` panics
@@ -1362,7 +1356,7 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
 
     // Drive Ctrl-a (byte 0x01) through the PTY master. With
     // main.rs:790's `event::poll(Duration::from_millis(1))`
-    // (cycle-19 fix to the cycle-18 `poll(0)` starvation),
+    // (1ms poll dwell fix for the `poll(0)` starvation),
     // the next tick's input phase surfaces it as
     // `KeyEvent { code: Char('a'), modifiers: CONTROL, kind:
     // Press }`. The `cmdash-keybinds` Router matches it
@@ -1411,10 +1405,10 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     );
 
     // ====================================================================
-    // Cycle-23 atom-2 removed the prior cycle-20 byte-diff hash-differ
-    // `assert_ne!(pre_hash, post_hash, ...)` guard. The hash-differ
-    // assertion is structurally unreachable on this host's degraded
-    // text-mode + dashcompositor passthrough-encoder architecture:
+    // The prior byte-diff hash-differ `assert_ne!(pre_hash, post_hash, ...)`
+    // guard was removed. The hash-differ assertion is structurally
+    // unreachable on this host's degraded text-mode + dashcompositor
+    // passthrough-encoder architecture:
     // the encoder emits a steady stream of byte-identical empty-framebuffer
     // emission at every ~33 ms tick, saturating the 1 MiB ring buffer
     // regardless of pane-layout changes. Both pre_snapshot and
@@ -1463,7 +1457,7 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     //
     // Cycle-20 visual-state assertion: parse the preserved
     // `--log=<path>` file for `blitting pane` lines emitted by
-    // the cycle-20 atom-1 trace added at
+    // the `blitting pane` trace added at
     // `crates/cmdash/src/main.rs` ~line 1960
     // (`TickContext::run` phase 3a `debug!` block carrying
     // `(layer_id, rect.w, rect.h, "blitting pane")`). Cmdash's
@@ -1489,13 +1483,9 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     // = 40/80 = 0.5 EXACTLY (asserted within a ±0.05 brute-
     // tolerance window that covers layout-engine rounding).
     //
-    // The forward-fixup arc: cycle-19's `feat(poll-dwell)`
-    // commit `0e02852` unstuck the live-binary hash-differ
-    // assertion (1ms poll dwell against the PTY fd); this
-    // atom-2 closes the cycle-19 FOLLOWUP note's forward-
-    // cycle observation that "cycle-20+ can add visual-state
-    // assertions ... once a CI-friendly non-flaky visual
-    // probe is designed" by parsing the already-present
+    // The 1ms poll dwell unstuck the live-binary hash-differ
+    // assertion (1ms poll dwell against the PTY fd); the
+    // visual-state assertion parses the already-present
     // `blitting pane` debug trace for the post-split
     // `rect.w child = 40` values, end-to-end through the
     // preserved `--log=<path>` artifact.
@@ -1548,13 +1538,13 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     // Pin: at least ONE `blitting pane` line must have been
     // captured (cmdash under `--log=<path>` runs at TRACE
     // level with the format on; a zero-line parse means the
-    // subscriber never initialised or atom-1's trace was
+    // subscriber never initialised or the  trace was
     // accidentally gated off -- both warrant a distinct
     // diagnostic from a split-never-happened failure).
     assert!(
         blitting_pane_lines > 0,
         "no `blitting pane` debug lines found in preserved --log=<path> file; \
-         the cycle-20 atom-1 trace was either gated off or never reached \
+         the `blitting pane` trace was either gated off or never reached \
          --log=<path>; log_path={:?} total_log_lines={} blitting_pane_count=0",
         log_path,
         log_text.lines().count(),
@@ -1652,15 +1642,15 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     // TRACE log is deleted to keep /tmp tidy.
 }
 
-// `fn hash_bytes` removed in cycle-23 atom-2: was the load-bearing
-// helper for the now-removed `assert_ne!` hash-differ guard above.
+// `fn hash_bytes` was removed: was the load-bearing helper for
+// the now-removed `assert_ne!` hash-differ guard above.
 // The visual-state asserts (`distinct_rect_widths` parsing the
 // preserved `--log=<path>`) are the load-bearing contract for
 // `Ctrl-a -> AppNewPane -> 2-pane re-render` after the
 // hash-differ removal.
 
 /// Parse a `u16` integer immediately following a `field` token
-/// in `line`. Helper for the cycle-20 visual-state assertion
+/// in `line`. Helper for the visual-state assertion
 /// parser (used to extract `rect.w: 80` -> `Some(80)` from the
 /// preserved `--log=<path>` file's pretty-formatted output).
 ///
@@ -1678,7 +1668,7 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
 /// defensive hedge in case the pretty-formatter transitions
 /// to a compact/alternate shape in a future `tracing-subscriber`
 /// upgrade (the compact form is the enum-default, which the
-/// atom-1 init code explicitly opted OUT of via `.pretty()`).
+/// init code explicitly opted OUT of via `.pretty()`).
 /// Returns `None` if `field` is absent or no parseable digits
 /// follow.
 /// Strip ANSI CSI (Control Sequence Introducer) escape
@@ -1740,7 +1730,7 @@ fn strip_ansi_csi(line: &str) -> String {
 }
 
 /// Parse a `u16` integer immediately following a `field`
-/// token in `line`. Helper for the cycle-20 visual-state
+/// token in `line`. Helper for the visual-state
 /// assertion parser (used to extract `rect.w: 80` ->
 /// `Some(80)` from the preserved `--log=<path>` file's
 /// pretty-formatted output, AFTER `strip_ansi_csi` has
@@ -1760,8 +1750,8 @@ fn strip_ansi_csi(line: &str) -> String {
 /// `=` as a defensive hedge in case the pretty-formatter
 /// transitions to a compact/alternate shape in a future
 /// `tracing-subscriber` upgrade (the compact form is the
-/// enum-default, which the atom-1 init code explicitly
-/// opted OUT of via `.pretty()`). Returns `None` if `field`
+/// enum-default, which the init code explicitly opted OUT
+/// of via `.pretty()`). Returns `None` if `field`
 /// is absent or no parseable digits follow.
 fn extract_u16_after(line: &str, field: &str) -> Option<u16> {
     let pos = line.find(field)?;

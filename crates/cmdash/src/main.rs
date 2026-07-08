@@ -68,20 +68,7 @@ use ratatui::Terminal;
 use tracing::{debug, info, warn};
 
 /// Command-line arguments parsed at binary entry. v1 ships
-/// only `--log=<path>`; the upstream chain tip's
-/// `--log-level=<level>` + `--help` + `-h` flags
-/// (commits `4c5ed96`, `db9de89`, `0a855c7`) are
-/// superseded by this atom via forward-fixup (those SHAs
-/// remain on the chain for the audit-protocol lineage;
-/// this atom adds the new CLI surface ATOF `0a855c7`
-/// per AGENTS.md forward-only-no-rewind discipline).
-///
-/// Future v1.0.X CLI additions (`--config=<path>`, `--dry-run`,
-/// `--list-presets`, etc.) extend this struct so the parser
-/// surface stays a one-pass argv scan and each flag earns
-/// its own audit-cycle atom in the forward-fixup chain
-/// (the project's forward-only-no-rewind discipline per
-/// commit `109375e`).
+/// only `--log=<path>`.
 ///
 /// `Debug` is derived so `Result<CliArgs, _>` can be used as an
 /// assertion expectation type, matching the binary's
@@ -439,7 +426,7 @@ impl Drop for TerminalGuard {
 /// Per-tab payload carried by every [`Tab<T>`] in the
 /// `cmdash::main::TickContext::tabs: TabStack<TabState>` stack.
 ///
-/// ## Cycle-22 atom-4 ADDITIVE design
+/// ## Tab-state design
 ///
 /// The fields here MIRROR the v1 singular fields on
 /// [`TickContext`] (`runners`, `focus`, `layout_root`,
@@ -455,15 +442,11 @@ impl Drop for TerminalGuard {
 ///
 /// ## Why the v1 + tabs duplication
 ///
-/// The full Option-A rewrite (cycle-22 atom-2 deferred) hit a
-/// cascade of issues with the sentinel-byte sed pipeline
-/// (it only matched `self.X` patterns, missing the 100+ test
-/// fixture bare-name `pane.X` / `ctx.X` accesses). The
-/// additive design avoids the cascade: v1 fields stay
-/// (no test fixture changes), the new `tabs` field is added
-/// alongside, and the tab actions go through a new code path
-/// that syncs the v1 fields from the active tab after every
-/// tab mutation.
+/// The additive design avoids changing existing call sites:
+/// v1 fields stay (no test fixture changes), the new `tabs`
+/// field is added alongside, and the tab actions go through
+/// a new code path that syncs the v1 fields from the active
+/// tab after every tab mutation.
 ///
 /// ## `Clone` bound for `Tab<T>: Clone`
 ///
@@ -586,12 +569,11 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// (`LoginShell`) — `cmdash::run` wires the constant. A future
     /// per-pane shell override slots in here.
     shell: ShellSpec,
-    /// Cycle-22 atom-4 ADDITIVE: per-tab payload stack. The
-    /// v1 singular `runners` / `focus` / `layout_root` /
-    /// `stack_focus` fields above are UNAFFECTED by the
-    /// tab-axis actions; the 100+ call sites that read them
-    /// directly continue to work. The `tabs` field is
-    /// authoritative ONLY for the tab-axis actions
+    /// Per-tab payload stack. The v1 singular `runners` /
+    /// `focus` / `layout_root` / `stack_focus` fields above
+    /// are unaffected by the tab-axis actions; the call sites
+    /// that read them directly continue to work. The `tabs`
+    /// field is authoritative ONLY for the tab-axis actions
     /// (`KeyAction::TabNew` / `TabClose` / `TabSwitch(n)`),
     /// which mutate `self.tabs` and then call
     /// [`Self::sync_v1_from_active_tab`] + [`Self::reconcile_runners`]
@@ -690,8 +672,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             "TickContext::new_full: focus ({focus}) is out of bounds for {} runners",
             runners.len(),
         );
-        // Cycle-22 atom-4 ADDITIVE: seed the per-tab stack
-        // with the initial 1-tab payload. The TabState's
+        // Seed the per-tab stack with the initial 1-tab
+        // payload. The TabState's
         // `runners` is a CLONE of the input Vec (shells:
         // `PaneRunner::clone` returns pty-less shells per the
         // manual `Clone` impl in `pane.rs`); the v1 field's
@@ -827,9 +809,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// `PaneFocus{Up,Down,Left,Right}`, `PanePreset(name)`).
     /// The binary's tick loop drives this method through
     /// [`Self::handle_event_full`]; the prior v1 free-fn
-    /// `apply_action` (atom `b315047`-predecessor) was removed
-    /// in this atom so test + production share the same
-    /// reconcile path end-to-end.
+    /// `apply_action` was removed so test + production share
+    /// the same reconcile path end-to-end.
     pub fn apply_action_full(&mut self, action: KeyAction) {
         match action {
             KeyAction::AppClose => {
@@ -872,18 +853,9 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             KeyAction::AppNewPane => self.split_focused_for_new_pane(),
             KeyAction::PaneClose => self.close_focused_and_rebalance(),
             KeyAction::PanePreset(name) => self.swap_to_preset(&name),
-            // Cycle-22 atom-1: tab-axis actions are PLACEHOLDER
-            // no-ops in v1 until the TickContext field refactor
-            // lands in cycle-22 atom-2. The data surface and
-            // 2-tab fixture tests live in `crate::tabs` (the
-            // generic `Tab<T>` / `TabStack<T>` primitives
-            // exercised by input_tests against `TabStack<()>`).
-            // The cmdash-config-side parse_action arms accept
-            // the 3 new keybind tokens at KDL load time, so the
-            // keyrouter successfully dispatches here; until
-            // atom-2 wires these arms to a per-tab-state TickContext
-            // extension, the dispatch surface stays a clean
-            // // TODO marker with the atom-2 reference.
+            // Tab-axis actions: dispatched through per-tab-state
+            // methods below. The cmdash-config-side parse_action
+            // arms accept the 3 keybind tokens at KDL load time.
             KeyAction::TabNew => self.create_new_tab(),
             KeyAction::TabClose => self.close_active_tab(),
             KeyAction::TabSwitch(n) => self.switch_to_tab(n),
@@ -907,42 +879,36 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// negligible against the 33ms tick cadence (~3% of the
     /// per-frame budget) and cheap to amortize.
     pub fn input_phase_full(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Observability hook (cycle-19 followup atom): log the
-        // tick_loop's poll state at INIT and after each
-        // successful `event::poll`, so a future run of the
-        // live-binary AppNewPane integration test (which
-        // injects `Ctrl-a` over the PTY master) can directly
-        // see whether the byte reached the poll loop. With the
-        // cycle-19 1ms dwell in place, an `Ctrl-a` byte
-        // submitted between ticks rounds-trips through
+        // Observability hook: log the tick_loop's poll state at
+        // INIT and after each successful `event::poll`, so a
+        // future run of the live-binary AppNewPane integration
+        // test (which injects `Ctrl-a` over the PTY master) can
+        // directly see whether the byte reached the poll loop.
+        // With the 1ms dwell in place, a `Ctrl-a` byte
+        // submitted between ticks round-trips through
         // `event::poll(time_budget) -> event::read() ->
-        // handle_event_full` within ONE tick; the
-        // corresponding debug line jumps `poll_count: 0 -> 1`
-        // and the `handle_event_full` line below surfaces the
-        // matching `Key` event. If the line stays at
-        // `poll_count: 0` for the entire test window, the byte
-        // never reached the poll loop (a PTY-routing
-        // regression). Debug level -- the file-only
-        // subscriber under `--log=<path>` outputs it; default
-        // launches stay quiet at INFO level.
+        // handle_event_full` within ONE tick; the corresponding
+        // debug line jumps `poll_count: 0 -> 1` and the
+        // `handle_event_full` line below surfaces the matching
+        // `Key` event. If the line stays at `poll_count: 0` for
+        // the entire test window, the byte never reached the
+        // poll loop (a PTY-routing regression). Debug level --
+        // the file-only subscriber under `--log=<path>` outputs
+        // it; default launches stay quiet at INFO level.
         let time_budget = Duration::from_millis(1);
         let mut poll_count: u32 = 0;
-        // Reviewer-feedback gate (cycle-19-followup atom
-        // `fd91da4` reviewer request): the INIT log line below
-        // fires once per input_phase_full call (~30 ticks/sec
-        // at the 33 ms cadence), so on a totally idle session
-        // it's ~18 lines/sec of pure idle noise in a routine
-        // `--log=<path>` file capture. Gate it on the
+        // The INIT log line fires once per input_phase_full call
+        // (~30 ticks/sec at the 33 ms cadence), so on a totally
+        // idle session it's ~18 lines/sec of pure idle noise in
+        // a routine `--log=<path>` file capture. Gate it on the
         // `CMDASH_DEBUG_POLL` env var (any non-empty value
         // counts as on) so a default launch's file log stays
         // focused on real event activity; a polling-readiness
         // investigation can opt in with
-        // `CMDASH_DEBUG_POLL=1 cmdash --log=...`. The
-        // per-poll log line further down (inside the `while`
-        // body) is bounded by real event rate -- one log per
-        // drained event -- so it stays always-on; that's the
-        // load-bearing observability hook for the live-binary
-        // AppNewPane integration test's `Cmd-a` byte trace.
+        // `CMDASH_DEBUG_POLL=1 cmdash --log=...`. The per-poll
+        // log line further down (inside the `while` body) is
+        // bounded by real event rate -- one log per drained
+        // event -- so it stays always-on.
         let debug_poll_trace = match std::env::var_os("CMDASH_DEBUG_POLL") {
             Some(v) => !v.is_empty(),
             None => false,
@@ -966,20 +932,18 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     }
 
     pub fn handle_event_full(&mut self, evt: &Event) {
-        // Observability hook (cycle-19 followup atom): log
-        // every crossterm event that reaches the dispatch
-        // surface so a future run of the live-binary
-        // AppNewPane integration test can directly inspect
-        // what key tuple (if any) the router saw for the
-        // `Ctrl-a` byte. The expected observation for the
+        // Observability hook: log every crossterm event that
+        // reaches the dispatch surface so a future run of the
+        // live-binary AppNewPane integration test can directly
+        // inspect what key tuple (if any) the router saw for
+        // the `Ctrl-a` byte. The expected observation for the
         // AppNewPane happy-path test is a `Key` event with
         // `code: Char('a')`, `modifiers: CONTROL`, `kind:
         // Press`. Any other shape (e.g. `code: Null`,
         // `modifiers: NONE`, or no event reaching this line at
         // all) is diagnostic of a PTY-routing regression.
-        // Privacy-redaction hygiene atom: full
-        // rationale + what's-redacted list lives
-        // on `redacted_event_debug`'s rustdoc.
+        // Privacy-redaction: full rationale + what's-redacted
+        // list lives on `redacted_event_debug`'s rustdoc.
         debug!("crossterm event = {}", redacted_event_debug(evt));
         if let Some(action) = self.bindings.dispatch_crossterm(evt) {
             self.apply_action_full(action);
@@ -1587,13 +1551,11 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                 let layer_id = if matches!(mode, ReconcileMode::Wholesale) {
                     alloc_layer_id()
                 } else {
-                    // Cycle-22 atom-4 ADDITIVE: tab-aware
-                    // LayerId so a v2 multi-tab reconcile
-                    // produces collision-free ids across
-                    // tabs. For a single-tab binary
-                    // (`active_tab_idx_u32() == 0 == SINGLE_TAB`)
-                    // this matches the v1 `derive_layer_id`
-                    // call sites byte-for-byte.
+                    // Tab-aware LayerId so a multi-tab reconcile
+                    // produces collision-free ids across tabs.
+                    // For a single-tab binary this matches the
+                    // v1 `derive_layer_id` call sites
+                    // byte-for-byte.
                     cmdash::derive_layer_id_for_tab(&pane.id, self.active_tab_idx_u32())
                 };
                 let tx: PaneCloseTx = self.close_tx.clone();
@@ -1622,33 +1584,29 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             .set_cells((self.last_area.w, self.last_area.h));
     }
 
-    /// Cycle-22 atom-4 ADDITIVE: the active tab's index as
-    /// `u32` for `cmdash::derive_layer_id_for_tab`. The
+    /// The active tab's index as `u32` for
+    /// `cmdash::derive_layer_id_for_tab`. The
     /// `reconcile_runners` InPlace path passes this as the
     /// second arg so multi-tab LayerIds are collision-free.
-    /// For a single-tab binary (`active_tab_idx_u32() == 0 ==
-    /// SINGLE_TAB`) this matches the v1 `derive_layer_id`
-    /// call sites byte-for-byte, so existing tests are
-    /// unaffected. Private (no `pub`) because the only call
-    /// site is `reconcile_runners` in this same `impl` block;
-    /// widening to `pub(crate)` is a single-keyword change
-    /// for a future external test surface that needs the
-    /// active tab index.
+    /// For a single-tab binary this matches the v1
+    /// `derive_layer_id` call sites byte-for-byte, so existing
+    /// tests are unaffected. Private (no `pub`) because the
+    /// only call site is `reconcile_runners` in this same
+    /// `impl` block.
     fn active_tab_idx_u32(&self) -> u32 {
         self.tabs.active_idx() as u32
     }
 
-    /// Cycle-22 atom-4 ADDITIVE: copy the active tab's
-    /// `focus` / `layout_root` / `stack_focus` into the v1
-    /// fields so v1 code paths see the post-tab-mutation
-    /// state. The v1 `runners` field is NOT synced here
-    /// (the active tab's `runners` is a Vec of clone-shells;
-    /// the authoritative real runners are written by the
-    /// subsequent [`Self::reconcile_runners`] call). The
+    /// Copy the active tab's `focus` / `layout_root` /
+    /// `stack_focus` into the v1 fields so v1 code paths see
+    /// the post-tab-mutation state. The v1 `runners` field is
+    /// NOT synced here (the active tab's `runners` is a Vec of
+    /// clone-shells; the authoritative real runners are written
+    /// by the subsequent [`Self::reconcile_runners`] call). The
     /// tick loop's `if !self.running { return Ok(()) }` check
     /// fires BEFORE any access after a `close_active_tab` of
-    /// the last tab empties the stack, so this helper's
-    /// no-op on empty stack is safe.
+    /// the last tab empties the stack, so this helper's no-op
+    /// on empty stack is safe.
     fn sync_v1_from_active_tab(&mut self) {
         if let Some(active) = self.tabs.active() {
             self.focus = active.state.focus;
@@ -1657,11 +1615,11 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         }
     }
 
-    /// Cycle-22 atom-4 ADDITIVE: create a new tab with a
-    /// single default-shell pane and switch focus to it. The
-    /// active tab's `layout_root` is a 1-leaf `LayoutNode::Pane`
-    /// so the subsequent `reconcile_runners(Wholesale)` spawns
-    /// one fresh runner for the new tab.
+    /// Create a new tab with a single default-shell pane and
+    /// switch focus to it. The active tab's `layout_root` is a
+    /// 1-leaf `LayoutNode::Pane` so the subsequent
+    /// `reconcile_runners(Wholesale)` spawns one fresh runner
+    /// for the new tab.
     fn create_new_tab(&mut self) {
         let new_state = TabState {
             runners: Vec::new(),
@@ -1677,10 +1635,10 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         self.reconcile_runners(ReconcileMode::Wholesale);
     }
 
-    /// Cycle-22 atom-4 ADDITIVE: close the active tab. Empty
-    /// stack quits the binary; otherwise sync the v1 fields
-    /// and reconcile (Wholesale) so the dashcompositor layer
-    /// book-keeping tracks the new active tab's pane geometry.
+    /// Close the active tab. Empty stack quits the binary;
+    /// otherwise sync the v1 fields and reconcile (Wholesale)
+    /// so the dashcompositor layer book-keeping tracks the new
+    /// active tab's pane geometry.
     fn close_active_tab(&mut self) {
         let _removed = self.tabs.remove_active();
         if self.tabs.is_empty() {
@@ -1691,9 +1649,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         }
     }
 
-    /// Cycle-22 atom-4 ADDITIVE: switch to tab `n`
-    /// (out-of-range is silent no-op per M-1..M-9 keybind
-    /// semantics; mirrors `TabStack::switch_to`).
+    /// Switch to tab `n` (out-of-range is silent no-op per
+    /// M-1..M-9 keybind semantics; mirrors `TabStack::switch_to`).
     fn switch_to_tab(&mut self, n: usize) {
         if self.tabs.switch_to(n) {
             self.sync_v1_from_active_tab();
@@ -1715,7 +1672,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             // + PanePreset). Non-blocking with a 1ms minimum dwell;
             // see [`Self::input_phase_full`] rustdoc for the rationale
             // (a `poll(0)` swallowed Ctrl-a on Unix PTYs in the
-            // cycle-18 AppNewPane live-binary integration test).
+            // the AppNewPane live-binary integration test).
             // Each Press event is routed through
             // [`Self::handle_event_full`] which dispatches via
             // [`Self::apply_action_full`], OR forwarded as bytes
@@ -1785,15 +1742,15 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                 debug!(focus_idx = focus_idx_dbg, "rendering frame");
                 let buf = frame.buffer_mut();
                 for (runner, snap) in self.runners.iter().zip(snapshots.iter()) {
-                    // Cycle-20 visual-state proof: emit a
-                    // structured `blitting pane` line carrying
-                    // the `(layer_id, rect.w, rect.h)` triple
-                    // so the cycle-21 wiring_smoke live-binary
-                    // integration test can parse the
-                    // `--log=<path>` file and verify
-                    // `rect_width(child_0) / rect_width(parent)
-                    // \u2248 0.5` after `AppNewPane` (a
-                    // deterministic Horizontal-50 split per
+                    // Visual-state proof: emit a structured
+                    // `blitting pane` line carrying the
+                    // `(layer_id, rect.w, rect.h)` triple so
+                    // the wiring_smoke live-binary integration
+                    // test can parse the `--log=<path>` file
+                    // and verify `rect_width(child_0) /
+                    // rect_width(parent) \u2248 0.5` after
+                    // `AppNewPane` (a deterministic
+                    // Horizontal-50 split per
                     // [`Self::split_focused_for_new_pane`]).
                     // Fires once per frame per pane, so the
                     // accumulated log yields a chronologically
@@ -1845,29 +1802,26 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
 /// payload content REDACTED before persistence under
 /// `--log=<path>`.
 ///
-/// **Privacy story.** Cycle-19 followup atom `fd91da4`
-/// shipped an unredacted
-/// `debug!("crossterm event = {:?}", evt)` trace, which
-/// emits printable text byte-for-byte into the `--log=<path>`
+/// **Privacy story.** An unredacted
+/// `debug!("crossterm event = {:?}", evt)` trace would emit
+/// printable text byte-for-byte into the `--log=<path>`
 /// subscriber. Over a long `--log=foo.log` session that means
 /// any printable text reaching the focused pane (passwords,
 /// API keys, essays, clipboard paste contents, etc.) gets
-/// persisted to the log file verbatim -- a privacy leak
-/// independent of cmdash's other scrubbing. The reviewer
-/// flagged the `KeCode::Char(c)` arm in
-/// cycle-19-followup's review pass. Rather than gate the
-/// whole trace on `cfg!(debug_assertions)` (which would strip
-/// the trace from release binaries -- exactly the builds
-/// where the trace is most useful for field debugging),
-/// this helper redacts printable payloads while keeping
-/// everything else observable.
+/// persisted to the log file verbatim -- a privacy leak.
+/// Rather than gate the whole trace on
+/// `cfg!(debug_assertions)` (which would strip the trace from
+/// release binaries -- exactly the builds where the trace is
+/// most useful for field debugging), this helper redacts
+/// printable payloads while keeping everything else
+/// observable.
 ///
 /// **What's kept vs redacted.**
 /// - REDACTED: `KeyCode::Char(_)` printable character
 ///   (`Char(<redacted char>)` sentinel).
 /// - REDACTED: `Event::Paste(_)` pasted string content
 ///   (`Paste(<redacted>)` sentinel). Reviewer-feedback
-///   catch on this atom -- clipboard paste events carry
+///   catch here -- clipboard paste events carry
 ///   typed passwords / API keys / etc. verbatim, same
 ///   severity as the `Char(c)` keystroke leak.
 /// - KEPT (full Debug escape): `modifiers`, `kind`, `state`,
@@ -1882,7 +1836,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
 /// ever adds a variant carrying printable text (a hypothetical
 /// `SpeechInput(String)` or `SnippetInsert(String)` payload),
 /// it auto-leaks through this fall-through -- the same root
-/// cause as the `Event::Paste(String)` leak this atom closes.
+/// cause as the `Event::Paste(String)` leak this helper closes.
 /// Re-audit this arm every time `crossterm` is upgraded;
 /// the round-2 paste leak is the precedent.
 ///
@@ -2164,18 +2118,10 @@ mod input_tests {
     /// using `/bin/true` (fast-exit child) so `Drop::drop`
     /// rejoins the reader thread promptly in tests.
     ///
-    /// `#[allow(dead_code)]` after the
-    /// `setup_fixture_ctx` extraction atom migrated the
-    /// 2 v1 free-fn tests that used this helper
-    /// (`pane_close_last_pane_quits_binary` +
-    /// `handle_event_resize_event_arms_pending_resize`)
-    /// onto the new fixture. The helper is retained
-    /// (not deleted) because the 2 `should_panic` tests
-    /// use `make_runner_with_id` (the sibling helper
-    /// below) and a future test author may want a
-    /// single-pane `make_runner` shortcut; the AGENTS.md
-    /// forward-only-no-rewind discipline prefers a
-    /// dead-code annotation over a deletion.
+    /// `#[allow(dead_code)]` because the `should_panic` tests
+    /// use `make_runner_with_id` (the sibling helper below)
+    /// and a future test author may want a single-pane
+    /// `make_runner` shortcut.
     #[allow(dead_code)]
     fn make_runner(label: &str, close_tx: PaneCloseTx) -> PaneRunner {
         let cfg = cmdash_config::parse(&format!("layout {{ pane kind=shell label=\"{label}\" }}"))
@@ -2586,9 +2532,9 @@ mod input_tests {
     /// regression test" rule for the focus invariant.
     /// Uses a `ratatui::backend::TestBackend` to construct a
     /// real `Terminal` without writing to stdout.
-    /// Migrated to `TickContext::new_full` (was `new`) by the
-    /// atom that deleted the v1 10-arg ctor; the focus-bound
-    /// panic invariant is now enforced at the 14-arg ctor.
+    /// Migrated to `TickContext::new_full` (was `new`);
+    /// the focus-bound panic invariant is enforced at the
+    /// 14-arg ctor.
     #[test]
     #[should_panic(expected = "focus")]
     fn tick_context_new_full_panics_when_focus_out_of_bounds() {
@@ -4631,10 +4577,8 @@ mod input_tests {
     // `PaneClose`, `PanePreset`) driven through
     // `TickContext::apply_action_full`. The four primary tests
     // above pin the happy-path; this block pins the boundary /
-    // no-op / AGENTS.md-audit-trail surfaces that cycle 16's
-    // audit-protocol entry (`### Audit cycle 16` in
-    // `docs/ci-evidence.md`) explicitly cited as the
-    // structural-deliverable row's deferred lib-crate half.
+    // no-op surfaces that the structural-deliverable row's
+    // deferred lib-crate half covers.
     //
     // AGENTS.md Hard rule + structural-finding pins covered:
     // - close_rx round-trip pin (Hard rule: one layer per

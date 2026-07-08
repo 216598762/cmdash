@@ -228,22 +228,18 @@ pub enum KeyAction {
     PanePreset(String),
     /// `tab.new` -- create a new empty tab and switch focus to
     /// it. The new tab holds a single `pane kind=shell` leaf at
-    /// the active cell-grid area. `AGENTS.md` feature #3 "Tabs"
-    /// (M-t default keybind). Cycle-22 atom-1.
+    /// the active cell-grid area. (M-t default keybind).
     TabNew,
     /// `tab.close` -- close the active tab. All its
     /// `PaneRunner`s are dropped (revoking every `dashcompositor`
     /// `LayerId` per `AGENTS.md` Hard rule); `active_tab` is
     /// clamped to `tabs.len() - 1`. Closing the last tab
     /// quits the binary (matches the `PaneClose` last-pane
-    /// semantics). Falling out of scope: a non-active tab's
-    /// close is reserved for a cycle-22 atom-2+ "focus a tab
-    /// before close" extension. `AGENTS.md` feature #3 "Tabs"
-    /// (M-w default keybind). Cycle-22 atom-1.
+    /// semantics). A non-active tab's close is a future
+    /// extension. (M-w default keybind).
     TabClose,
     /// `tab.switch.<n>` (n in 1..=9) -- switch focus to the
-    /// nth tab; the M-1..M-9 default keybinds from `AGENTS.md`
-    /// feature #3 "Tabs". Cycle-22 atom-1.
+    /// nth tab; the M-1..M-9 default keybinds.
     TabSwitch(usize),
 }
 
@@ -278,6 +274,8 @@ pub enum ConfigError {
     InvalidChord(String),
     #[error("invalid action: {0}")]
     InvalidAction(String),
+    #[error("`split` must have exactly 2 children; got {0}")]
+    SplitChildCount(usize),
 }
 
 /// Parse a cmdash configuration from raw KDL source.
@@ -396,6 +394,9 @@ fn read_split(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
         for child in c.nodes() {
             kids.push(read_layout(child)?);
         }
+    }
+    if kids.len() != 2 {
+        return Err(ConfigError::SplitChildCount(kids.len()));
     }
     let pct = (ratio * 100.0).round().clamp(0.0, 100.0) as u8;
     Ok(LayoutNode::Split {
@@ -526,11 +527,9 @@ fn read_keybind(n: &KdlNode) -> Result<Keybind, ConfigError> {
         action_str.ok_or_else(|| ConfigError::InvalidAction("missing action".into()))?;
     let (mods, key) =
         parse_chord(&chord_str).ok_or_else(|| ConfigError::InvalidChord(chord_str.clone()))?;
-    // Cycle-22 atom-1 hint-augmented reject path: when parse_action
-    // declines a tab.switch.<n> input the user now sees the valid
-    // range (1..=9) instead of just the echo of their own string.
-    // parse_action's contract stays Option<KeyAction>; this is
-    // read-keybind-local UX.
+    // Hint-augmented reject path: when parse_action declines a
+    // tab.switch.<n> input the user sees the valid range (1..=9)
+    // instead of just the echo of their own string.
     let action = match parse_action(&action_str) {
         Some(a) => a,
         None => {
@@ -622,13 +621,12 @@ fn parse_action(s: &str) -> Option<KeyAction> {
         "pane.stack.left" => Some(KeyAction::PaneStackLeft),
         "pane.stack.right" => Some(KeyAction::PaneStackRight),
         "pane.preset" => Some(KeyAction::PanePreset(String::new())),
-        // Cycle-22 atom-1: tab-axis actions. `tab.new`,
-        // `tab.close`, `tab.switch.<n>` (n in 1..=9) wire the
-        // AGENTS.md feature #3 "Tabs" keybinds (M-t / M-w /
-        // M-1..M-9). The `tab.switch` PLANE (no `<n>` suffix)
-        // is rejected so a future typo or partial binding
-        // surfaces as `InvalidAction` at config-parse time
-        // rather than as a runtime no-op.
+        // Tab-axis actions. `tab.new`, `tab.close`,
+        // `tab.switch.<n>` (n in 1..=9) wire the tab keybinds
+        // (M-t / M-w / M-1..M-9). The `tab.switch` PLANE (no
+        // `<n>` suffix) is rejected so a future typo or partial
+        // binding surfaces as `InvalidAction` at config-parse
+        // time rather than as a runtime no-op.
         "tab.new" => Some(KeyAction::TabNew),
         "tab.close" => Some(KeyAction::TabClose),
         other => {
@@ -679,7 +677,6 @@ fn entry_to_string(entry: &KdlEntry) -> String {
 /// rooted in the `tab.switch.<n>` family. Returns an empty
 /// string for any input that isn't a `tab.switch.*` shape so
 /// the caller emits the original action string verbatim.
-/// Cycle-22 atom-1.
 fn action_tab_switch_hint(s: &str) -> String {
     if s == "tab.switch" {
         return "; missing `.<n>` suffix (use `tab.switch.1`..`tab.switch.9`)".into();
@@ -837,17 +834,11 @@ mod tests {
     }
 
     // ============================================================
-    // Cycle-22 atom-1: tab-action parsing tests.
+    // Tab-action parsing tests.
     //
     // Each new KeyAction variant MUST have a parse_action round-trip test
-    // here. Without these, a typo in parse_action (e.g. a missing digit
-    // arm or a `tab.switch.10` out-of-range bug) silently regresses to
-    // `None` and surfaces to the user as an `InvalidAction` config parse
-    // error at startup — which is correct behavior for a wrong string,
-    // but a misdiagnosed root cause for an arm missing entirely.
-    // Pattern-test mirrors the parse_*_layout_round_trip family above:
-    //   - positive parse test (action string -> KeyAction::TabNew etc.)
-    //   - negative parse test (out-of-range / wrong string -> None)
+    // here. Without these, a typo in parse_action silently regresses to
+    // `None` and surfaces as `InvalidAction` at config parse time.
     // ============================================================
 
     /// `tab.new` round-trips into `KeyAction::TabNew`.
@@ -879,7 +870,7 @@ mod tests {
     /// `tab.switch.0` and `tab.switch.10` are OUT OF RANGE
     /// (the `AGENTS.md` range is M-1..M-9, ON-BOUNDS EXCLUSIVE of
     /// 0 and 10). Both `parse_action` inputs return None as a
-    /// forward-fixup candidate signal: at config-parse time,
+    /// candidate signal: at config-parse time,
     /// a `Keybind` chord bound to `tab.switch.10` would silently
     /// no-op at dispatch time without this rejection.
     #[test]
@@ -929,27 +920,69 @@ mod tests {
         assert!(parse_action("tab.close-tab").is_none());
     }
 
+    /// `split` with 3 children is rejected at parse time.
+    #[test]
+    fn parse_split_three_children_returns_err() {
+        let src = r#"
+            layout {
+                split axis=horizontal ratio=0.5 {
+                    pane kind=shell label="a"
+                    pane kind=shell label="b"
+                    pane kind=shell label="c"
+                }
+            }
+        "#;
+        let err = parse(src).expect_err("3-child split must error");
+        assert!(
+            matches!(err, ConfigError::SplitChildCount(3)),
+            "expected SplitChildCount(3), got: {err:?}"
+        );
+    }
+
+    /// `split` with 1 child is rejected at parse time.
+    #[test]
+    fn parse_split_one_child_returns_err() {
+        let src = r#"
+            layout {
+                split axis=horizontal ratio=0.5 {
+                    pane kind=shell label="a"
+                }
+            }
+        "#;
+        let err = parse(src).expect_err("1-child split must error");
+        assert!(
+            matches!(err, ConfigError::SplitChildCount(1)),
+            "expected SplitChildCount(1), got: {err:?}"
+        );
+    }
+
+    /// `split` with 0 children is rejected at parse time.
+    #[test]
+    fn parse_split_zero_children_returns_err() {
+        let src = r#"
+            layout {
+                split axis=horizontal ratio=0.5 {
+                }
+            }
+        "#;
+        let err = parse(src).expect_err("0-child split must error");
+        assert!(
+            matches!(err, ConfigError::SplitChildCount(0)),
+            "expected SplitChildCount(0), got: {err:?}"
+        );
+    }
+
     // ===========================================================
-    // Cycle-23 atom-1 followup: parse_chord aliases for `m`/`M`.
+    // parse_chord aliases for `m`/`M`.
     //
     // Pin that `M-` and `m-` chords route to Modifiers.alt so
     // a future contributor who accidentally drops the lowercase
-    // `m` arm (or normalizes the modifier lookups) cannot silently
-    // regress the `cmdash/config.kdl`'s 11 `M-1..M-9` + `M-t` +
-    // `M-w` keybinds. See the cycle-22 atom-1 followup audit:
-    // cd5169c had pass_rate=73% on the wiring_smoke
-    // app_new_pane_via_ctrl_a_keypress_in_live_binary live-binary
-    // test; HEAD=68eb89c regressed to 0% because the binary was
-    // crashing at config-parse with ConfigError::InvalidChord("M-1")
-    // before reaching the AppNewPane handler. Cycle-23 atom-1
-    // adds the `m` / `M` arms to parse_chord; these tests pin the
-    // regression-source assumption forward.
+    // `m` arm cannot silently regress the `cmdash/config.kdl`'s
+    // `M-1`..`M-9` + `M-t` + `M-w` keybinds.
     // ===========================================================
 
     /// `bind "M-t"` parses as (mods.alt=true, key=t) — pins the
-    /// uppercase-M arm added in cycle-23 atom-1. Cycle-22 atom-1
-    /// used this prefix for `M-1..M-9`, `M-t`, `M-w` keybinds;
-    /// without the arm all 11 binds rejected at config-parse.
+    /// uppercase-M arm.
     #[test]
     fn parse_chord_uppercase_m_alias_routes_to_alt() {
         let (mods, _key) = parse_chord("M-t").expect("M-t must parse");
@@ -960,8 +993,8 @@ mod tests {
     }
 
     /// `bind "m-t"` parses as (mods.alt=true, key=t) — pins the
-    /// lowercase-m arm added in cycle-23 atom-1. Conventional
-    /// short form for alt/meta in zellij / older tmux configs.
+    /// lowercase-m arm. Conventional short form for alt/meta in
+    /// zellij / older tmux configs.
     #[test]
     fn parse_chord_lowercase_m_alias_routes_to_alt() {
         let (mods, _key) = parse_chord("m-t").expect("m-t must parse");
@@ -1031,119 +1064,21 @@ mod tests {
     }
 
     // ============================================================
-    // parse_chord audit: cycle-22 atom-3 followup.
+    // parse_chord audit tests.
     //
-    // Across crates/cmdash/config.kdl's 14 default keybinds
-    // and the v2 augmentation surface (ctrl/alt/shift/super
-    // combos never seeded in v1), `parse_chord` must:
+    // `parse_chord` must:
+    //   1. parse all default chords from config.kdl via the
+    //      public `parse()` API without `ConfigError::InvalidChord`.
+    //   2. parse the canonical modifier prefixes: `ctrl`,
+    //      `control`, `ctl`, `shift`, `alt`, `meta`, `m`, `M`,
+    //      `super`, `cmd`, `win`.
+    //   3. ANY OTHER modifier prefix MUST surface as
+    //      `ConfigError::InvalidChord` rather than panic or
+    //      silently mis-parse the prefix as the key token.
     //
-    //   1. parse KDL's 14 default chords end-to-end via
-    //      the public `parse()` API without surfacing
-    //      `ConfigError::InvalidChord`;
-    //
-    //   2. parse the v1 canonical modifier prefixes
-    //      `ctrl`, `control`, `ctl`, `shift`, `alt`,
-    //      `meta`, `m`, `M`, `super`, `cmd`, `win`, plus
-    //      any `X-<key>` augmentation future keybindings
-    //      follow on (where X is one or more of those prefixes);
-    //
-    //   3. ANY OTHER modifier prefix (e.g. `hyper-<key>`,
-    //      `leader-<key>`, `mod-<key>`, `altgr-<key>`,
-    //      `fn-<key>`) MUST surface as
-    //      `ConfigError::InvalidChord` rather than panic
-    //      AND rather than silently mis-parse the prefix
-    //      as the key token (the "treat unknown prefix as
-    //      key" anti-pattern).
-    //
-    // Pins the panic-safety contract documented in the
-    // cycle-19-followup audit note. Without these tests a
-    // future contributor could accidentally:
-    //
-    //   - drop a modifier arm from `parse_chord`'s match
-    //     -> regression surfaces as a parse-error at
-    //     startup; caught by test (1) or (2).
-    //
-    //   - introduce a panic in `parse_chord`'s loop body
-    //     -> regression surfaces as a binary crash mid-
-    //     load; caught by test (4) (the `parse_chord`
-    //     direct call panics the process if a panic is
-    //     reachable, so the test process aborts).
-    //
-    //   - silently treat unknown modifier as the key
-    //     -> regression silently mis-binds prior-prefix
-    //     keybinds to bogus KeyTokens; caught by test
-    //     (3) which asserts InvalidChord on unknown
-    //     prefixes so the user sees the typo.
-    //
-    // ## Forward-fixup commitment (cycle-22 atom-3 followup)
-    //
-    // The audit-trail of THIS atom (commit c3a0979) commits to
-    // a documented AMEND-IN-SAME-ATOM rule for any future cycle
-    // that widens `parse_chord`'s modifier arms. The trigger is
-    // an addition to `parse_chord`'s match arms (in the source
-    // below) of any new canonical modifier alias. The
-    // enumerated triggers pinned at audit-time are:
-    //
-    //   - `altgr-<key>` -- the IBM PC AltGr / Right-Alt
-    //     modifier used by European keyboard layouts to
-    //     reach a third keymap layer.
-    //   - `hyper-<key>` -- the Emacs Hyper modifier (the
-    //     'Hyper' key on Lisp-machine-derived keyboards;
-    //     also a documented X11 keysym).
-    //   - `mod-<key>` -- the i3 / Sway `Mod` modifier,
-    //     which defaults to the Super / Windows key but is
-    //     rebindable per-user. i3 config example:
-    //     `bindsym Mod+Return exec terminal`.
-    //   - `super-<key>` is ALREADY in the match arms (via
-    //     `super`, `cmd`, `win`), so no-op trigger.
-    //
-    // When such an arm is added, the v1.1 atom that adds the
-    // arm MUST update the audit-tests in the SAME atom.
-    // Per-test motion direction:
-    //
-    //   - `audit_canonical_config_kdl_14_chords_round_trip`:
-    //     NO CHANGE expected. The 14 default keybinds ship now
-    //     and a v1.1 augmentation only ADDS aliases to
-    //     `parse_chord`'s match arms -- it does not
-    //     retroactively rename chords. If a v1.1 atom also
-    //     augments `crates/cmdash/config.kdl` with new chord
-    //     entries, that atom MUST also extend
-    //     `canonical_chords` + `expected_mods` in a parallel
-    //     edit. Without this fence, a config rewrite could
-    //     regress silently.
-    //
-    //   - `audit_ctrl_shift_super_prefixed_chords_parse`:
-    //     NO CHANGE expected for the canonical v1 modifier
-    //     augmentation surface (the augmented list already
-    //     exercises `ctrl`, `control`, `ctl`, `shift`, `alt`,
-    //     `meta`, `m`, `M`, `super`, `cmd`, `win`). If a v1.1
-    //     atom adds a new canonical-augmentation chord to the
-    //     default config (e.g. `super-f1` opening the help
-    //     overlay), that atom MUST extend `augmented` in a
-    //     parallel edit.
-    //
-    //   - `audit_unknown_modifier_prefix_returns_invalid_chord_not_panic`:
-    //     REMOVE the new prefix from the
-    //     `unknown_prefix_chords` array IN THE SAME ATOM.
-    //     Leaving the prefix in this list claims the
-    //     `parse_chord` arm doesn't exist when it does -- a
-    //     regression that surfaces for the user as "my new
-    //     chord raises `InvalidChord` despite being in the
-    //     docs as supported", which is exactly the
-    //     audit-misdiagnosis the test was written to prevent.
-    //
-    //   - `audit_parse_chord_direct_call_never_panics`:
-    //     MOVE the new prefix from `unknown_prefixes` to
-    //     `known_chords` with the documented expected mask
-    //     tuple. The tuple shape mirrors test (2)'s
-    //     `(ctrl, shift, alt, super)` form. Leaving the
-    //     prefix in `unknown_prefixes` produces a
-    //     same-atom-pair-failure where `assert!(parse_chord(c).is_none())`
-    //     trips on a now-recognised prefix.
-    //
-    // v1.1+ contributor checkpoint: before landing any commit
-    // that widens `parse_chord`'s modifier arms, run the
-    // per-test motion table above against the trigger prefix.
+    // When adding a new modifier arm to `parse_chord`, update
+    // these tests in the same commit: move the prefix from the
+    // `unknown_prefixes` list to `known_chords`.
     // ============================================================
 
     /// (1) Verbatim copy of the 14 default keybinds from
@@ -1173,7 +1108,7 @@ mod tests {
         kdl.push_str("}\n");
         let cfg = parse(&kdl).expect(
             "all 14 cmdash/config.kdl default keybinds must parse without surfacing \
-             ConfigError::InvalidChord (the cycle-22 atom-1 regression-trip wire)",
+             ConfigError::InvalidChord",
         );
         assert_eq!(
             cfg.keybinds.len(),

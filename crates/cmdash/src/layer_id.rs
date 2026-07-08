@@ -9,12 +9,12 @@
 //! high half so a v2 with multiple tabs can extend this without
 //! re-deriving any pane-layer id (collision-free per tab).
 //!
-//! Cycle-22 atom-1 introduces multi-tab support: the
-//! [`derive_layer_id_for_tab`] helper takes the tab id alongside
-//! the [`PaneId`] so the high half carries the tab identifier at
-//! per-tab granularity. The legacy [`derive_layer_id`] alias is
-//! preserved for callers that hardcode the v1 single-tab path
-//! (it returns `derive_layer_id_for_tab(pane, SINGLE_TAB)`).
+//! Multi-tab support: the [`derive_layer_id_for_tab`] helper takes
+//! the tab id alongside the [`PaneId`] so the high half carries the
+//! tab identifier at per-tab granularity. The legacy
+//! [`derive_layer_id`] alias is preserved for callers that hardcode
+//! the v1 single-tab path (it returns
+//! `derive_layer_id_for_tab(pane, SINGLE_TAB)`).
 
 use cmdash_layout::PaneId;
 use cmdash_pty::PaneLayerId;
@@ -30,10 +30,10 @@ pub const SINGLE_TAB: u32 = 0;
 /// `((tab_id as u64) << 32) | (pre_order as u64)` keeps each tab's
 /// IDs collision-free in v2 when multiple tabs land.
 ///
-/// Cycle-22 atom-1: prefer [`derive_layer_id_for_tab`] when the
-/// caller has a `tab_id` available so multi-tab runners get
-/// collision-free layer ids. This alias pins the v1 shape at
-/// [`SINGLE_TAB`] for tests that hardcode the single-tab path.
+/// Prefer [`derive_layer_id_for_tab`] when the caller has a
+/// `tab_id` available so multi-tab runners get collision-free
+/// layer ids. This alias pins the v1 shape at [`SINGLE_TAB`] for
+/// tests that hardcode the single-tab path.
 pub fn derive_layer_id(pane: &PaneId) -> PaneLayerId {
     derive_layer_id_for_tab(pane, SINGLE_TAB)
 }
@@ -54,15 +54,10 @@ pub fn derive_layer_id(pane: &PaneId) -> PaneLayerId {
 /// would collide with the high-bit sign of `PaneLayerId` only if
 /// the upstream type is signed; today it's `u64`, so the
 /// collision-free guarantee holds for the entire `u32` range.
-/// Cycle-22 atom-1.
 pub fn derive_layer_id_for_tab(pane: &PaneId, tab_id: u32) -> PaneLayerId {
-    // Runtime cap added by cycle-22 atom-1 ship-green review
-    // (reviewer item B): tab_id must stay below the high-bit
-    // sign boundary of the u64 packing, otherwise two panes on
-    // the same tab could alias via the high-bit sign flip. A
-    // future cycle (atom-2+) that accidentally passes
-    // tab_id=0x8000_0000 now panics in debug builds instead of
-    // silently aliasing LayerIds.
+    // Runtime cap: tab_id must stay below the high-bit sign
+    // boundary of the u64 packing, otherwise two panes on the
+    // same tab could alias via the high-bit sign flip.
     debug_assert!(
         tab_id <= u32::MAX >> 1,
         "tab_id overflows the high-32-bits cap ({tab_id} > u32::MAX/2)"
@@ -138,8 +133,7 @@ mod tests {
     /// this, a v2 multi-pane tab would alias every geometry
     /// cell to `LayerId(0x7_0000_0000)` once `pre_order=0`
     /// is reached, and dashcompositor's `LayerStack::render`
-    /// would clobber every pane on top of the first. Cycle-22
-    /// atom-1.
+    /// would clobber every pane on top of the first.
     #[test]
     fn derive_layer_id_for_tab_distinguishes_panes_in_same_tab() {
         // Build a 2-leaf horizontal-split layout and resolve

@@ -1,12 +1,6 @@
 //! Tab-axis data surface for cmdash's `KeyAction::{TabNew,
 //! TabClose, TabSwitch(n)}` runtime primitives.
 //!
-//! Cycle-22 atom-1 left the `KeyAction` enum variants, the KDL
-//! `parse_action` arms, and the `cmdash::layer_id`::
-//! `derive_layer_id_for_tab` LayerId-namepacks already in place;
-//! atom-2 wires them through [`TabStack`] bound to a per-tab-state
-//! `TickContext` extension.
-//!
 //! ## Design
 //!
 //! `Tab<T>` is a single-tab wrapper holding a payload `T` plus a
@@ -24,22 +18,14 @@
 //! Every fresh pane spawn in a tab MUST pass the tab's
 //! `TabStack::active_idx()` (cast to `u32`) into
 //! `derive_layer_id_for_tab`, so two tabs with the same pre-order
-//! geometry never alias to the same `LayerId`. The
-//! `cmdash_config::KeyAction::TabNew` rustdoc prescribes this:
-//!
-//! > `AGENTS.md` feature #3 "Tabs" — each tab holds one layout
-//! > tree, and panes drawn into different tabs accept distinct
-//! > `dashcompositor` `LayerId`s via per-tab pre_order indexing.
+//! geometry never alias to the same `LayerId`.
 //!
 //! InPlace survivor rebinds in `TickContext::reconcile_runners`
 //! deliberately preserve the survivor's `PaneLayerId` per AGENTS.md
 //! "Hard rule: one layer per instance".
 //!
-//! user-facing label (AGENTS.md feature #3 "Tabs" mentions a
-//! tab bar layer); cycle-22 atom-3+ lands it once the keyboard
-//! model settles.
-//!
-//! Cycle-22 atom-2.
+//! The tab bar is not yet rendered; it will be added once the
+//! keyboard model settles.
 
 /// A single tab; holds the per-tab payload `T` plus an optional
 /// human-readable title.
@@ -59,9 +45,8 @@ pub struct Tab<T> {
     /// Optional human-readable title surfaced through the
     /// future tab-bar layer (`AGENTS.md` §"Tabs"). Currently
     /// populated via [`TabStack::new_with_label`] for the
-    /// initial-frame tab; runtime `TabNew` arms in atom-2 wire
-    /// `TabStack.push` with `label: None` and the tab bar (atom-3+)
-    /// subsequently auto-labels by index.
+    /// initial-frame tab; runtime `TabNew` arms wire `TabStack.push`
+    /// with `label: None`.
     pub label: Option<String>,
 }
 
@@ -120,7 +105,6 @@ impl<T> TabStack<T> {
     /// Construct a `TabStack` containing a single `Tab` of initial
     /// payload `state` with `active_idx = 0`. The `initial-frame`
     /// shape used by `cmdash::run`'s top-level wiring so the
-    /// single-state surface from cycle-22 atom-1 collapses into a
     /// 1-tab `TabStack` with minimal call-site edits.
     pub fn new(state: T) -> Self {
         Self {
@@ -225,8 +209,7 @@ impl<T> TabStack<T> {
     }
 
     /// Iterate all tabs (label + state). Used by phase 3a's
-    /// terminal-draw future tab-bar render (cycle-22 atom-3
-    /// forward-fixup — NOT bundled here) and by tests that need
+    /// terminal-draw future tab-bar render and by tests that need
     /// to drive per-tab assertions without exposing the inner
     /// Vec.
     pub fn iter(&self) -> impl Iterator<Item = &Tab<T>> {
@@ -367,7 +350,7 @@ mod tests {
 
     /// `iter` returns every tab in declaration order; `iter_mut`
     /// supports mutation. Pin both for the future tab-bar layer's
-    /// render pass (cycle-22 atom-3 forward-fixup).
+    /// render pass.
     #[test]
     fn iter_yields_all_tabs_in_declaration_order() {
         let mut ts: TabStack<u32> = TabStack::new(0);

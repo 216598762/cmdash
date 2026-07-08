@@ -16,8 +16,6 @@
 # agent-cache path so commits can sign without manual `--no-gpgsign`
 # per-command workarounds.
 #
-# See docs/ci-evidence.md `### Audit cycle 12 - reproducible GPG signing wrapper`
-# for the full diagnostic + trade-off analysis.
 #
 # SECURITY: this script is COMMITTED to the public repo and contains
 # NO secrets. The passphrase lives in $PASSPHRASE_FILE (host-local,
