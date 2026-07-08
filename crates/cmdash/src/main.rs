@@ -799,7 +799,36 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// negligible against the 33ms tick cadence (~3% of the
     /// per-frame budget) and cheap to amortize.
     pub fn input_phase_full(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        while event::poll(Duration::from_millis(1))? {
+        // Observability hook (cycle-19 followup atom): log the
+        // tick_loop's poll state at INIT and after each
+        // successful `event::poll`, so a future run of the
+        // live-binary AppNewPane integration test (which
+        // injects `Ctrl-a` over the PTY master) can directly
+        // see whether the byte reached the poll loop. With the
+        // cycle-19 1ms dwell in place, an `Ctrl-a` byte
+        // submitted between ticks rounds-trips through
+        // `event::poll(time_budget) -> event::read() ->
+        // handle_event_full` within ONE tick; the
+        // corresponding debug line jumps `poll_count: 0 -> 1`
+        // and the `handle_event_full` line below surfaces the
+        // matching `Key` event. If the line stays at
+        // `poll_count: 0` for the entire test window, the byte
+        // never reached the poll loop (a PTY-routing
+        // regression). Debug level -- the file-only
+        // subscriber under `--log=<path>` outputs it; default
+        // launches stay quiet at INFO level.
+        let time_budget = Duration::from_millis(1);
+        let mut poll_count: u32 = 0;
+        debug!(
+            "tick_loop event poll N={} time_budget={:?}",
+            poll_count, time_budget
+        );
+        while event::poll(time_budget)? {
+            poll_count += 1;
+            debug!(
+                "tick_loop event poll N={} time_budget={:?}",
+                poll_count, time_budget
+            );
             let evt = event::read()?;
             self.handle_event_full(&evt);
         }
@@ -807,6 +836,18 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     }
 
     pub fn handle_event_full(&mut self, evt: &Event) {
+        // Observability hook (cycle-19 followup atom): log
+        // every crossterm event that reaches the dispatch
+        // surface so a future run of the live-binary
+        // AppNewPane integration test can directly inspect
+        // what key tuple (if any) the router saw for the
+        // `Ctrl-a` byte. The expected observation for the
+        // AppNewPane happy-path test is a `Key` event with
+        // `code: Char('a')`, `modifiers: CONTROL`, `kind:
+        // Press`. Any other shape (e.g. `code: Null`,
+        // `modifiers: NONE`, or no event reaching this line at
+        // all) is diagnostic of a PTY-routing regression.
+        debug!("crossterm event = {:?}", evt);
         if let Some(action) = self.bindings.dispatch_crossterm(evt) {
             self.apply_action_full(action);
             return;
