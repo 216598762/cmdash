@@ -1591,6 +1591,30 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                 debug!(focus_idx = focus_idx_dbg, "rendering frame");
                 let buf = frame.buffer_mut();
                 for (runner, snap) in self.runners.iter().zip(snapshots.iter()) {
+                    // Cycle-20 visual-state proof: emit a
+                    // structured `blitting pane` line carrying
+                    // the `(layer_id, rect.w, rect.h)` triple
+                    // so the cycle-21 wiring_smoke live-binary
+                    // integration test can parse the
+                    // `--log=<path>` file and verify
+                    // `rect_width(child_0) / rect_width(parent)
+                    // \u2248 0.5` after `AppNewPane` (a
+                    // deterministic Horizontal-50 split per
+                    // [`Self::split_focused_for_new_pane`]).
+                    // Fires once per frame per pane, so the
+                    // accumulated log yields a chronologically
+                    // ordered window of pre- and post-split
+                    // `(layer_id, rect.w)` triples. Privacy:
+                    // only numeric rect dims are emitted; no
+                    // keystroke text or pane content reaches
+                    // the log via this hook.
+                    let computed_rect = runner.computed().rect;
+                    debug!(
+                        layer_id = ?runner.layer_id(),
+                        rect.w = computed_rect.w,
+                        rect.h = computed_rect.h,
+                        "blitting pane"
+                    );
                     let area = ratatui::layout::Rect::new(
                         runner.computed().rect.x,
                         runner.computed().rect.y,
