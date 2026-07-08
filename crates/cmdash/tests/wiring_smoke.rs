@@ -1464,7 +1464,7 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     // Cycle-20 visual-state assertion: parse the preserved
     // `--log=<path>` file for `blitting pane` lines emitted by
     // the cycle-20 atom-1 trace added at
-    // `crates/cmdash/src/main.rs` ~line 1396
+    // `crates/cmdash/src/main.rs` ~line 1960
     // (`TickContext::run` phase 3a `debug!` block carrying
     // `(layer_id, rect.w, rect.h, "blitting pane")`). Cmdash's
     // pretty-formatted tracing-subscriber writes one line per
