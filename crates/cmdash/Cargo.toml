@@ -21,6 +21,18 @@ thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+[dev-dependencies]
+# `portable-pty` is a transitive dep via `cmdash-pty` but is NOT
+# re-exported by that crate's public surface, so the
+# `wiring_smoke::app_new_pane_via_ctrl_a_keypress_in_live_binary`
+# integration test (which spawns the compiled `cmdash` binary
+# attached to a PTY pair to drive a Ctrl-a keypress through
+# the REAL `TerminalGuard` + `ratatui::CrosstermBackend`)
+# declares it directly here. Versioned to match `cmdash-pty`'s
+# declared dep so the workspace has a single `portable-pty`
+# version on the build graph.
+portable-pty = "0.9.0"
+
 [[bin]]
 name = "cmdash"
 path = "src/main.rs"

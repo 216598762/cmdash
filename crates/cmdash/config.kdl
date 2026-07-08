@@ -8,7 +8,21 @@ layout {
 // crates/cmdash/src/main.rs). v2 will register additional
 // chord-to-action verbs here as the layout engine gains
 // dynamic splits, presets, and per-tab navigation.
+//
+// `ctrl-a` is the canonical "add a new pane" verb (the
+// tmux-prefix convention repurposed for cmdash's v1 single-
+// chord model). It's also load-bearing for the end-to-end
+// live-binary AppNewPane integration test in
+// `crates/cmdash/tests/wiring_smoke.rs::app_new_pane_via_ctrl_a_keypress_in_live_binary`,
+// which spawns the compiled binary attached to a portable-pty
+// PTY and drives byte 0x01 through the master fd. Without this
+// keybind, the binary's `handle_event_full` falls through to
+// `PaneRunner::write_input(&[0x01])` and the keypress lands in
+// the focused shell's readline buffer (where `^A` means
+// "beginning of line"), never reaching
+// `apply_action_full(KeyAction::AppNewPane)`.
 keybinds {
     bind "alt-w"  action="pane.close"
     bind "alt-q"  action="app.close"
+    bind "ctrl-a" action="app.new-pane"
 }
