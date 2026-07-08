@@ -2436,6 +2436,95 @@ mod cli_args_tests {
             assert!(path.is_some(), "non-bundled label must have a path");
         }
     }
+
+    /// End-to-end integration test: read a config file from disk
+    /// via `read_config_text` + `resolve_config_path` and verify
+    /// the parsed config produces the expected layout. Uses a
+    /// temp file with a two-pane split (distinct from the bundled
+    /// single-pane default) so we can confirm the file-sourced
+    /// text is actually being parsed.
+    #[test]
+    fn config_file_loading_end_to_end() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("cmdash_config_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.kdl");
+        let kdl_src = r#"layout {
+            split axis=horizontal ratio=0.7 {
+                pane kind=shell label="editor"
+                pane kind=shell label="terminal"
+            }
+        }
+        keybinds {
+            bind "alt-w" action="pane.close"
+            bind "alt-q" action="app.close"
+        }
+        "#;
+        let mut f = std::fs::File::create(&path).expect("create temp config");
+        f.write_all(kdl_src.as_bytes()).expect("write config");
+        drop(f);
+
+        // Simulate the resolution chain with explicit --config path.
+        let (resolved_path, label) = resolve_config_path(Some(&path));
+        assert_eq!(label, "--config=<path>");
+        assert_eq!(resolved_path.as_deref(), Some(path.as_path()));
+
+        let cfg_text = read_config_text(resolved_path.as_deref(), label);
+        let cfg = cmdash_config::parse(&cfg_text).expect("parse config from file");
+        let layout_root = cfg.layout.expect("layout block present");
+        match layout_root {
+            cmdash_config::LayoutNode::Split {
+                axis,
+                ratio,
+                children,
+            } => {
+                assert_eq!(axis, cmdash_config::SplitAxis::Horizontal);
+                assert_eq!(ratio, cmdash_config::Ratio(70));
+                assert_eq!(children.len(), 2, "split must have 2 children");
+            }
+            other => panic!(
+                "expected Split layout from file, got: {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+        assert_eq!(cfg.keybinds.len(), 2, "2 keybinds in file");
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// End-to-end integration test: missing config file falls
+    /// back to the bundled default (single-pane layout). Confirms
+    /// that `read_config_text` returns valid KDL when the resolved
+    /// path doesn't exist on disk.
+    #[test]
+    fn config_file_missing_falls_back_to_bundled() {
+        let nonexistent =
+            std::path::PathBuf::from("/tmp/cmdash_nonexistent_config.kdl");
+        let _ = std::fs::remove_file(&nonexistent); // ensure it doesn't exist
+
+        let (path, label) = resolve_config_path(Some(&nonexistent));
+        assert_eq!(path.as_deref(), Some(nonexistent.as_path()));
+
+        let cfg_text = read_config_text(path.as_deref(), label);
+        let cfg = cmdash_config::parse(&cfg_text).expect("bundled fallback must parse");
+        let layout_root = cfg.layout.expect("layout block present");
+        // Bundled default is a single pane.
+        match layout_root {
+            cmdash_config::LayoutNode::Pane(p) => {
+                assert_eq!(
+                    p.label.as_deref(),
+                    Some("default"),
+                    "bundled default has label 'default'"
+                );
+            }
+            other => panic!(
+                "expected Pane (bundled default), got: {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
 }
 
 // Existing `input_tests` module: tick-loop regression tests that

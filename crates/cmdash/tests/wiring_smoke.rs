@@ -1598,6 +1598,13 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     let mut cmd = CommandBuilder::new(CMDASH_BIN);
     cmd.arg(format!("--log={}", log_path.display()));
     cmd.env("TERM", "xterm-256color");
+    // Bypass ~/.config/cmdash/config.kdl (XDG default) so the
+    // test always uses the bundled config, regardless of what's
+    // on the host filesystem. A non-existent directory makes
+    // resolve_config_path find the env var (non-empty), try to
+    // read the file (missing), and fall back to bundled default
+    // with a warn log.
+    cmd.env("CMDASH_CONFIG_DIR", "/nonexistent/cmdash-no-xdg-config");
 
     let child = pair
         .slave
