@@ -1029,4 +1029,322 @@ mod tests {
             ),
         }
     }
+
+    // ============================================================
+    // parse_chord audit: cycle-22 atom-3 followup.
+    //
+    // Across crates/cmdash/config.kdl's 14 default keybinds
+    // and the v2 augmentation surface (ctrl/alt/shift/super
+    // combos never seeded in v1), `parse_chord` must:
+    //
+    //   1. parse KDL's 14 default chords end-to-end via
+    //      the public `parse()` API without surfacing
+    //      `ConfigError::InvalidChord`;
+    //
+    //   2. parse the v1 canonical modifier prefixes
+    //      `ctrl`, `control`, `ctl`, `shift`, `alt`,
+    //      `meta`, `m`, `M`, `super`, `cmd`, `win`, plus
+    //      any `X-<key>` augmentation future keybindings
+    //      follow on (where X is one or more of those prefixes);
+    //
+    //   3. ANY OTHER modifier prefix (e.g. `hyper-<key>`,
+    //      `leader-<key>`, `mod-<key>`, `altgr-<key>`,
+    //      `fn-<key>`) MUST surface as
+    //      `ConfigError::InvalidChord` rather than panic
+    //      AND rather than silently mis-parse the prefix
+    //      as the key token (the "treat unknown prefix as
+    //      key" anti-pattern).
+    //
+    // Pins the panic-safety contract documented in the
+    // cycle-19-followup audit note. Without these tests a
+    // future contributor could accidentally:
+    //
+    //   - drop a modifier arm from `parse_chord`'s match
+    //     -> regression surfaces as a parse-error at
+    //     startup; caught by test (1) or (2).
+    //
+    //   - introduce a panic in `parse_chord`'s loop body
+    //     -> regression surfaces as a binary crash mid-
+    //     load; caught by test (4) (the `parse_chord`
+    //     direct call panics the process if a panic is
+    //     reachable, so the test process aborts).
+    //
+    //   - silently treat unknown modifier as the key
+    //     -> regression silently mis-binds prior-prefix
+    //     keybinds to bogus KeyTokens; caught by test
+    //     (3) which asserts InvalidChord on unknown
+    //     prefixes so the user sees the typo.
+    // ============================================================
+
+    /// (1) Verbatim copy of the 14 default keybinds from
+    /// `crates/cmdash/config.kdl`. Drives each through the
+    /// public `parse()` API in a single round-trip and
+    /// asserts EVERY chord survives without surfacing
+    /// `ConfigError::InvalidChord`. Pins the wire-level
+    /// contract that `cmdash::run`'s config-parse step
+    /// (which converts KDL into `Router`) succeeds for
+    /// the canonical default surface.
+    #[test]
+    fn audit_canonical_config_kdl_14_chords_round_trip() {
+        // Verbatim chord strings from `crates/cmdash/config.kdl`.
+        let canonical_chords = [
+            "alt-w", "alt-q", "ctrl-a", "M-t", "M-w", "M-1", "M-2", "M-3", "M-4", "M-5", "M-6",
+            "M-7", "M-8", "M-9",
+        ];
+        assert_eq!(
+            canonical_chords.len(),
+            14,
+            "fixture invariant: cmdash/config.kdl ships exactly 14 default keybinds",
+        );
+        let mut kdl = String::from("keybinds {\n");
+        for chord in canonical_chords.iter() {
+            kdl.push_str(&format!("    bind \"{chord}\" action=\"app.new-pane\"\n"));
+        }
+        kdl.push_str("}\n");
+        let cfg = parse(&kdl).expect(
+            "all 14 cmdash/config.kdl default keybinds must parse without surfacing \
+             ConfigError::InvalidChord (the cycle-22 atom-1 regression-trip wire)",
+        );
+        assert_eq!(
+            cfg.keybinds.len(),
+            14,
+            "all 14 chord strings must round-trip into 14 Keybind entries",
+        );
+        // Shape pin: per-chord expectations on (mods.mask).
+        // The expected list mirrors `canonical_chords` index-
+        // for-index so a reader can diff the two side by side.
+        // Order: (ctrl, shift, alt, super).
+        let expected_mods: &[(bool, bool, bool, bool)] = &[
+            (false, false, true, false), // alt-w
+            (false, false, true, false), // alt-q
+            (true, false, false, false), // ctrl-a
+            (false, false, true, false), // M-t
+            (false, false, true, false), // M-w
+            (false, false, true, false), // M-1
+            (false, false, true, false), // M-2
+            (false, false, true, false), // M-3
+            (false, false, true, false), // M-4
+            (false, false, true, false), // M-5
+            (false, false, true, false), // M-6
+            (false, false, true, false), // M-7
+            (false, false, true, false), // M-8
+            (false, false, true, false), // M-9
+        ];
+        assert_eq!(
+            canonical_chords.len(),
+            expected_mods.len(),
+            "fixture invariant: canonical_chords.len() == expected_mods.len()",
+        );
+        for (idx, chord) in canonical_chords.iter().enumerate() {
+            let got = &cfg.keybinds[idx];
+            let got_mods = (got.mods.ctrl, got.mods.shift, got.mods.alt, got.mods.super_);
+            assert_eq!(
+                got_mods, expected_mods[idx],
+                "modifier mask mismatch for canonical {chord}",
+            );
+        }
+    }
+
+    /// (2) Augmentation surface: future one-off keybind
+    /// prefixes layering `super` / `shift` / multi-modifier
+    /// combos on the canonical v1 surface. Without this pin a
+    /// future contributor who accidentally drops the `super` /
+    /// `shift` arms from `parse_chord`'s match silently
+    /// regresses; this test asserts the modifier-arm coverage
+    /// for the v1 modifiers so any drop fails immediately at
+    /// unit-test time, NOT at binary startup.
+    // The unmodified modifier-mask tuple shape
+    // `(&str, (bool, bool, bool, bool))` is the test's
+    // natural data form. The clippy `type_complexity`
+    // lint's threshold is conservatively configured for
+    // production code; the test surface is hand-curated
+    // and the tuple shape reads more clearly than a
+    // factored `type` alias -- `clippy::type_complexity`
+    // is allowed here.
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn audit_ctrl_shift_super_prefixed_chords_parse() {
+        let augmented: &[(&str, (bool, bool, bool, bool))] = &[
+            // (chord, (ctrl, shift, alt, super))
+            ("ctrl-x", (true, false, false, false)),
+            ("ctrl-tab", (true, false, false, false)),
+            ("ctrl-shift-a", (true, true, false, false)),
+            ("super-r", (false, false, false, true)),
+            ("super-l", (false, false, false, true)),
+            ("shift-tab", (false, true, false, false)),
+            ("ctrl-alt-a", (true, false, true, false)),
+            ("ctrl-ctl-x", (true, false, false, false)),
+            ("shift-shift-a", (false, true, false, false)),
+            ("alt-meta-a", (false, false, true, false)), // NOTE: parse_chord treats `cmd` and `win` as
+            // `super` aliases (see `parse_chord`'s match arms).
+            // Chords that combine `alt` with `cmd`/`win`
+            // therefore produce BOTH alt+super in the
+            // returned `Mods`, not just alt -- this is the
+            // documented v1 alias shape. The test's expected
+            // mask mirrors that.
+            ("alt-cmd-a", (false, false, true, true)),
+            ("alt-win-a", (false, false, true, true)),
+            ("control-a", (true, false, false, false)),
+        ];
+        for (chord, exp_mods) in augmented.iter() {
+            // Drive through the public `parse` API for the
+            // wire-level round-trip.
+            let kdl = format!("keybinds {{\n    bind \"{chord}\" action=\"app.new-pane\"\n}}\n");
+            let cfg = parse(&kdl).unwrap_or_else(|e| {
+                panic!("{chord} must parse through the public parse() API: {e:?}")
+            });
+            let kb = cfg
+                .keybinds
+                .first()
+                .unwrap_or_else(|| panic!("{chord} must yield at least one Keybind"));
+            let got_mods = (kb.mods.ctrl, kb.mods.shift, kb.mods.alt, kb.mods.super_);
+            assert_eq!(
+                got_mods, *exp_mods,
+                "modifier mask mismatch for augmented {chord}",
+            );
+            // Confirm SOME key shape was parsed (we don't pin
+            // the exact KeyToken variant because augmented
+            // chords may legally use Named or F variants).
+            match &kb.key {
+                KeyToken::Char(_) | KeyToken::Named(_) | KeyToken::F(_) => {}
+            }
+        }
+    }
+
+    /// (3) Negative side of the audit contract: future
+    /// un-handled modifier prefixes (e.g. `hyper-<key>`,
+    /// `leader-<key>`, `mod-<key>`, `altgr-<key>`,
+    /// `fn-<key>`) MUST surface as `ConfigError::InvalidChord`
+    /// rather than panic AND rather than silently mis-parse
+    /// the prefix as the key token. Pins the panic-safety +
+    /// fail-loud-at-parse-time contract.
+    ///
+    /// Input list is exhaustively partitioned into three
+    /// categories:
+    ///
+    ///   (a) Real-world un-handled modifier aliases (`hyper`,
+    ///       `leader`, `mod`, `altgr`, `fn`). The category
+    ///       that motivated the audit.
+    ///   (b) Empty / degenerate inputs that must NOT panic.
+    ///       `""`, `"-"`, `"-a"`, `"--a"`, `"ctrl-"`.
+    ///       Defensive: panic-safety holds even on malformed
+    ///       KDL input.
+    ///   (c) Multi-char unknown tokens that look like keys.
+    ///       `"abc"`, `"f99"`, `"f0"`, `"f-1"`. These would
+    ///       silently succeed in a buggy impl that falls
+    ///       back to "treat the unknown-prefix as key" inside
+    ///       `parse_chord`'s `other` arm. The
+    ///       `parse_key_token` rejection must surface as
+    ///       `InvalidChord`.
+    #[test]
+    fn audit_unknown_modifier_prefix_returns_invalid_chord_not_panic() {
+        let unknown_prefix_chords = [
+            // (a) Real-world un-handled modifier aliases.
+            "hyper-a", "leader-a", "mod-a", "altgr-a", "fn-a",
+            // (b) Empty / degenerate inputs.
+            "", "-", "-a", "--a", "ctrl-", // (c) Multi-char unknown tokens.
+            "abc", "f99", "f0", "f-1",
+        ];
+        for chord in unknown_prefix_chords.iter() {
+            let kdl = format!("keybinds {{\n    bind \"{chord}\" action=\"app.new-pane\"\n}}\n");
+            let result = parse(&kdl);
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!(
+                    "{chord:?} must NOT parse cleanly (parse_chord silently \
+                     treats the unknown prefix as a key token)"
+                ),
+            };
+            assert!(
+                matches!(err, ConfigError::InvalidChord(_)),
+                "{chord:?} must surface as ConfigError::InvalidChord; got {err:?}",
+            );
+        }
+    }
+
+    /// (4) Direct-call panic-safety pin. `parse_chord` is
+    /// `fn` (not `pub fn`), but the descending-mod rule lets
+    /// cfg(test) read it. Calls `parse_chord` on every
+    /// unknown-modifier-prefix input from the audit surface
+    /// AND on every canonical/augmented chord (positive
+    /// controls) and asserts that NONE of them panics. A
+    /// future contributor who introduces a panic path in
+    /// `parse_chord`'s body would surface as a test-process
+    /// abort (the panic propagates out of the loop), exactly
+    /// the symptom the audit asks to prevent. We
+    /// intentionally do NOT `assert!` on the return value --
+    /// only on the absence of panic -- because tests (1)/(2)
+    /// and (3) cover the wire-level shape.
+    /// (4) Direct-call panic-safety + return-value-shape pin.
+    /// Strengthened vs the prior `let _ = parse_chord(chord)`
+    /// shape: the test now asserts BOTH panic-safety AND
+    /// return-value shape. A future contributor who
+    /// accidentally swaps the `Some(_)/None` return-value sign
+    /// in `parse_chord`'s body without introducing a panic
+    /// previously slipped through the audit since the loop
+    /// body's only assertion was "did not panic". Splitting
+    /// `known_chords` from `unknown_prefixes` and asserting
+    /// the expected shape on each closes that hole at
+    /// unit-test time. `parse_chord` is `fn` (not `pub fn`),
+    /// but the descending-mod rule lets cfg(test) read it.
+    #[test]
+    fn audit_parse_chord_direct_call_never_panics() {
+        // The 14 canonical cmdash/config.kdl chords MUST
+        // return `Some((mods, key))`. The 4 augmented chords
+        // (ctrl/alt/shift/super positive controls) likewise.
+        let known_chords = [
+            // Canonical 14 (from cmdash/config.kdl).
+            "alt-w",
+            "alt-q",
+            "ctrl-a",
+            "M-t",
+            "M-w",
+            "M-1",
+            "M-2",
+            "M-3",
+            "M-4",
+            "M-5",
+            "M-6",
+            "M-7",
+            "M-8",
+            "M-9",
+            // Augmented positive control.
+            "ctrl-x",
+            "super-r",
+            "shift-tab",
+            "ctrl-alt-a",
+        ];
+        // Real-world un-handled modifiers + degenerate
+        // inputs + multi-char unknown tokens. None of them
+        // map to BOTH a recognised `parse_chord` arm AND a
+        // recognised `KeyToken`, so the function MUST return
+        // `None` for each.
+        let unknown_prefixes = [
+            // Real-world un-handled modifiers.
+            "hyper-a", "leader-a", "mod-a", "altgr-a", "fn-a", // Empty / degenerate.
+            "", "-", "-a", "--a", "ctrl-", // Multi-char unknown.
+            "abc", "f99", "f0", "f-1",
+        ];
+        // Panic-safety: any panic propagates out of the test
+        // process and surfaces as a `cargo test` failure for
+        // the entire test binary. There is no `catch_unwind`
+        // surrounding these calls so the test is
+        // intentionally strict -- a panic = a CI fail = a
+        // wire-level alarm that `parse_chord` regressed.
+        // The combined shape checks panic-safety +
+        // return-value at the same time.
+        for chord in known_chords.iter() {
+            assert!(
+                parse_chord(chord).is_some(),
+                "{chord} must return Some((mods, key))"
+            );
+        }
+        for chord in unknown_prefixes.iter() {
+            assert!(
+                parse_chord(chord).is_none(),
+                "{chord:?} must return None (no recognised \
+                 prefix-plus-key shape)"
+            );
+        }
+    }
 }
