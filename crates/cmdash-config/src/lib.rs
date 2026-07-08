@@ -552,7 +552,7 @@ fn parse_chord(s: &str) -> Option<(Modifiers, KeyToken)> {
         match part {
             "ctrl" | "control" | "ctl" => mods.ctrl = true,
             "shift" => mods.shift = true,
-            "alt" | "meta" => mods.alt = true,
+            "alt" | "meta" | "m" | "M" => mods.alt = true,
             "super" | "cmd" | "win" => mods.super_ = true,
             other => {
                 if key_part.is_some() {
@@ -927,6 +927,59 @@ mod tests {
         );
         assert!(parse_action("tab.newpane").is_none());
         assert!(parse_action("tab.close-tab").is_none());
+    }
+
+    // ===========================================================
+    // Cycle-23 atom-1 followup: parse_chord aliases for `m`/`M`.
+    //
+    // Pin that `M-` and `m-` chords route to Modifiers.alt so
+    // a future contributor who accidentally drops the lowercase
+    // `m` arm (or normalizes the modifier lookups) cannot silently
+    // regress the `cmdash/config.kdl`'s 11 `M-1..M-9` + `M-t` +
+    // `M-w` keybinds. See the cycle-22 atom-1 followup audit:
+    // cd5169c had pass_rate=73% on the wiring_smoke
+    // app_new_pane_via_ctrl_a_keypress_in_live_binary live-binary
+    // test; HEAD=68eb89c regressed to 0% because the binary was
+    // crashing at config-parse with ConfigError::InvalidChord("M-1")
+    // before reaching the AppNewPane handler. Cycle-23 atom-1
+    // adds the `m` / `M` arms to parse_chord; these tests pin the
+    // regression-source assumption forward.
+    // ===========================================================
+
+    /// `bind "M-t"` parses as (mods.alt=true, key=t) — pins the
+    /// uppercase-M arm added in cycle-23 atom-1. Cycle-22 atom-1
+    /// used this prefix for `M-1..M-9`, `M-t`, `M-w` keybinds;
+    /// without the arm all 11 binds rejected at config-parse.
+    #[test]
+    fn parse_chord_uppercase_m_alias_routes_to_alt() {
+        let (mods, _key) = parse_chord("M-t").expect("M-t must parse");
+        assert!(mods.alt);
+        assert!(!mods.ctrl);
+        assert!(!mods.shift);
+        assert!(!mods.super_);
+    }
+
+    /// `bind "m-t"` parses as (mods.alt=true, key=t) — pins the
+    /// lowercase-m arm added in cycle-23 atom-1. Conventional
+    /// short form for alt/meta in zellij / older tmux configs.
+    #[test]
+    fn parse_chord_lowercase_m_alias_routes_to_alt() {
+        let (mods, _key) = parse_chord("m-t").expect("m-t must parse");
+        assert!(mods.alt);
+        assert!(!mods.ctrl);
+        assert!(!mods.shift);
+        assert!(!mods.super_);
+    }
+
+    /// `parse_chord("M")` (single token, no dash) returns `None`.
+    /// Pins the negative case: a single-token modifier alias without
+    /// a key_part must NOT slip through to `Some((Mods::alt, KeyToken::Char('M')))`.
+    /// Without this pin, a future refactor that defaults the
+    /// missing key_part to the modifier string would regress.
+    #[test]
+    fn parse_chord_bare_m_returns_none() {
+        assert!(parse_chord("M").is_none());
+        assert!(parse_chord("m").is_none());
     }
 
     /// A `zstack` nested inside a `split` round-trips: the
