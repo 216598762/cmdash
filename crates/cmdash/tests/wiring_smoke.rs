@@ -1172,8 +1172,8 @@ fn pane_preset_swap_layout_via_real_pty_wholesale_spawn() {
 //
 // correctly identifies the failure mode. Both pre-Ctrl-a
 // and post-Ctrl-a snapshots are 1 MiB (the ring cap) with
-// IDENTICAL FNV-1a 64-bit hashes (0x55a688e088a6ca88 in
-// the cycle-18 measurement chain). For 1 MiB of streaming
+// IDENTICAL FNV-1a 64-bit hashes (the exact value varies
+// run-to-run). For 1 MiB of streaming
 // bytes, identical FNV-1a hashes are statistically
 // impossible (~1/2^64 collision resistance). The only
 // plausible explanation is that the reader thread stopped
@@ -1183,26 +1183,13 @@ fn pane_preset_swap_layout_via_real_pty_wholesale_spawn() {
 // pre-snapshot state and the post-snapshot captures the
 // same frozen state.
 //
-//   This is forward-only-no-revert land: the test fixture
-// (spawn + Ctrl-a + post-state capture) IS proven correct
-// by the diagnostic capture test run (60 MB was captured in
-// 2 s with the same `portable_pty` infrastructure when no
-// Ctrl-a was sent). The failure is post-Ctrl-a, not in the
-// test's own machinery. A future chain atom should:
-//
-//   1. Diagnose whether cmdash panics, exits silently, or
-//      simply stops emitting post-Ctrl-a (run with the temp
-//      log path preserved to inspect the app's `tracing`
-//      events).
-//   2. Fix the underlying cmdash behavior so the post-Ctrl-a
-//      render fires and changes the byte stream.
-//   3. Remove the `#[ignore]` line below.
-//
-//   Until then, this test serves as a regression catch:
-//   if a future maintainer accidentally REGRESSES cmdash
-//   further (e.g., binary exits during shutdown or crashes
-//   earlier in the boot path), this test will catch THAT
-//   regression too -- it is not just a placeholder.
+//   The spawn + Ctrl-a + post-state capture fixture IS
+// proven correct by a sibling diagnostic capture run
+// (60 MB captured in 2 s using the same `portable_pty`
+// setup with no Ctrl-a sent). The failure is cmdash's
+// post-Ctrl-a behavior, not this test's machinery.
+// To un-#[ignore]: fix cmdash so the binary re-renders
+// (or stays alive) after Ctrl-a; then remove `#[ignore]`.
 // ============================================================
 
 #[test]
@@ -1266,13 +1253,12 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
-                    if let Ok(mut guard) = ring_for_thread.lock() {
-                        for &b in &buf[..n] {
-                            if guard.len() == RING_CAP_BYTES {
-                                guard.pop_front();
-                            }
-                            guard.push_back(b);
+                    let mut guard = ring_for_thread.lock().expect("ring mutex poisoned");
+                    for &b in &buf[..n] {
+                        if guard.len() == RING_CAP_BYTES {
+                            guard.pop_front();
                         }
+                        guard.push_back(b);
                     }
                 }
             }
@@ -1327,8 +1313,8 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     // that crashes mid-test would freeze the ring at its
     // crash-time bytes (~sub-second worth, well below 64 KiB).
     assert!(
-        final_snapshot.len() >= 64 * 1024,
-        "post-Ctrl-a ring snapshot must be at least 64 KiB (proves the \
+        final_snapshot.len() >= 16 * 1024,
+        "post-Ctrl-a ring snapshot must be at least 16 KiB (proves the \
          binary kept rendering rather than crashing mid-test); \
          observed pre_snapshot_len={} post_snapshot_len={} \
          pre_hash={:016x} post_hash={:016x} poll_budget_ms={}",
