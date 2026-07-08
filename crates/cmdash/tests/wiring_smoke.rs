@@ -3,6 +3,14 @@
 //! up in both the vte-consumed grid and the rendered ratatui
 //! buffer.
 
+// clippy `doc_lazy_continuation` (clippy 1.96+) misreads multi-paragraph
+// prose rustdoc as Markdown list continuations; scoped allow for the test
+// file's existing + new doc comments. Per AGENTS.md "doc-link-hygiene"
+// discipline: lint-named + scoped allow attributes are preferred over
+// fighting clippy on prose style when the prose is genuinely prose
+// (not Markdown list items).
+#![allow(clippy::doc_lazy_continuation)]
+
 use std::time::Duration;
 
 use cmdash::pane::{PaneCloseTx, PaneRunner};
@@ -1429,6 +1437,199 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
         post_hash,
     );
 
+    // ====================================================================
+    // Cycle-20 visual-state assertion: parse the preserved
+    // `--log=<path>` file for `blitting pane` lines emitted by
+    // the cycle-20 atom-1 trace added at
+    // `crates/cmdash/src/main.rs` ~line 1396
+    // (`TickContext::run` phase 3a `debug!` block carrying
+    // `(layer_id, rect.w, rect.h, "blitting pane")`). Cmdash's
+    // pretty-formatted tracing-subscriber writes one line per
+    // pane per frame to `log_path` with the inline-comma-
+    // separated shape:
+    //
+    //   YYYY-MM-DDTHH:MM:SS.fffZ DEBUG cmdash: blitting pane,
+    //     layer_id: PaneLayerId(N), rect.w: W, rect.h: H
+    //     at crates/cmdash/src/main.rs:<line> on main ThreadId(1)
+    //
+    // Across the test window (pre-Ctrl-a + post-Ctrl-a):
+    //   - pre-Ctrl-a frame:  cmdash renders ONE 80-col pane
+    //                        -> 1 blitting-pane line w/ rect.w=80
+    //   - post-Ctrl-a frame: cmdash renders TWO 40+40-col
+    //                        children via AppNewPane's
+    //                        deterministic Horizontal-50 split
+    //                        -> 2 blitting-pane lines w/
+    //                        rect.w=40 each
+    //
+    // The SET of distinct rect.w values across the preserved
+    // log file is therefore {40, 80}; min(rect.w)/max(rect.w)
+    // = 40/80 = 0.5 EXACTLY (asserted within a ±0.05 brute-
+    // tolerance window that covers layout-engine rounding).
+    //
+    // The forward-fixup arc: cycle-19's `feat(poll-dwell)`
+    // commit `0e02852` unstuck the live-binary hash-differ
+    // assertion (1ms poll dwell against the PTY fd); this
+    // atom-2 closes the cycle-19 FOLLOWUP note's forward-
+    // cycle observation that "cycle-20+ can add visual-state
+    // assertions ... once a CI-friendly non-flaky visual
+    // probe is designed" by parsing the already-present
+    // `blitting pane` debug trace for the post-split
+    // `rect.w child = 40` values, end-to-end through the
+    // preserved `--log=<path>` artifact.
+    //
+    // The READ happens BEFORE `cleanup_guard` drops at fn
+    // scope-exit. Drop's `panicking()`-aware log-preservation
+    // branch keeps `log_path` on disk if THIS assertion fails
+    // (or any prior assertion in this fn), so a future reader
+    // can `grep -n blitting pane /tmp/cmdash-e2e-appnewpane.log`
+    // for the post-mortem exactly the same way they would
+    // for a hash-differ failure.
+    // ====================================================================
+    let log_text = std::fs::read_to_string(&log_path).unwrap_or_else(|e| {
+        panic!(
+            "read preserved --log=<path> file {:?} must succeed (the file \
+             is either kept by CleanupGuard on assertion failure OR freshly \
+             appended at fn-scope exit on success -- in either case present \
+             at this read); open error: {}",
+            log_path, e,
+        )
+    }); // Parse: collect ALL distinct `rect.w: <num>` numerics
+        // found on any line containing `blitting pane`. Hand-
+        // rolled substring parser (no `regex` crate dep) since
+        // the pretty-formatter keeps every output field INLINE
+        // after the message (one `blitting pane` substring-hit
+        // per line; no multi-line state machine required).
+        //
+        // ANSI escape strip caveat: the pretty-formatter
+        // writes SGR (Select Graphic Rendition) terminal-color
+        // codes inline between the message and each structured
+        // field (e.g. `\x1b[1;34mrect.w\x1b[0m: 80`). The
+        // raw byte stream therefore has `<ESC>` bytes between
+        // `rect.w` and the `:`, NOT a clean `:` separator.
+        // `strip_ansi_csi` drops those codes BEFORE the
+        // substring parser runs so the digit-terminator
+        // detector sees a clean `:` + space + digit run.
+    let mut distinct_rect_widths: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut blitting_pane_lines: usize = 0;
+    for raw_line in log_text.lines() {
+        if !raw_line.contains("blitting pane") {
+            continue;
+        }
+        blitting_pane_lines += 1;
+        let line = strip_ansi_csi(raw_line);
+        if let Some(w) = extract_u16_after(&line, "rect.w") {
+            distinct_rect_widths.insert(w);
+        }
+    }
+
+    // Pin: at least ONE `blitting pane` line must have been
+    // captured (cmdash under `--log=<path>` runs at TRACE
+    // level with the format on; a zero-line parse means the
+    // subscriber never initialised or atom-1's trace was
+    // accidentally gated off -- both warrant a distinct
+    // diagnostic from a split-never-happened failure).
+    assert!(
+        blitting_pane_lines > 0,
+        "no `blitting pane` debug lines found in preserved --log=<path> file; \
+         the cycle-20 atom-1 trace was either gated off or never reached \
+         --log=<path>; log_path={:?} total_log_lines={} blitting_pane_count=0",
+        log_path,
+        log_text.lines().count(),
+    );
+
+    // Pin: the AppNewPane splittable-event rolled out across
+    // at least 2 frames (pre-split at 80, post-split at 40).
+    // A single distinct value (e.g. only 80s) means cmdash
+    // never swapped to the 2-pane tree even though Ctrl-a
+    // dispatched -- i.e. a relayout/draw-call regression.
+    assert!(
+        distinct_rect_widths.len() >= 2,
+        "post-Ctrl-a log must contain at least 2 distinct rect.w values \
+         (proves the AppNewPane splittable-event rolled out across frames \
+         -- pre-split 80-col + post-split 40+40-col children): \
+         observed distinct values={:?} \
+         blitting_pane_lines={} blitting_pane_line_count_threshold=2 \
+         pre_hash={:016x} post_hash={:016x}",
+        distinct_rect_widths,
+        blitting_pane_lines,
+        pre_hash,
+        post_hash,
+    );
+
+    let min_w = *distinct_rect_widths
+        .iter()
+        .min()
+        .expect("non-empty: >= 2 distinct values asserted above");
+    let max_w = *distinct_rect_widths
+        .iter()
+        .max()
+        .expect("non-empty: >= 2 distinct values asserted above");
+
+    // Pin (rect-3): the AppNewPane split math must surface
+    // THE EXACT pre/post values, not just a min/max that
+    // could be satisfied by a regression-shaped alternative
+    // (e.g. `{30, 80}` ratio = 0.375 — out of ±0.05 window
+    // and correctly caught — vs `{40, 80}` ratio = 0.5 caught
+    // only by this explicit-set assertion). The deterministic
+    // math per [`TickContext::split_focused_for_new_pane`] +
+    // [`cmdash_layout::split_rect`] over (`PtySize` cols=80,
+    // `SplitAxis::Horizontal`, `Ratio(50)`):
+    //   pre-split pane:  rect.w = (80 * 100) / 100 = 80
+    //   post-split child: rect.w = (80 * 50) / 100 = 40
+    // So `distinct_rect_widths` MUST contain BOTH 40 AND 80.
+    // This explicit-set assertion catches regressions the
+    // min/max-ratio assertion alone would let through:
+    // (a) "rect.w stays at 80 throughout" — caught here as
+    // `!contains(&40)`, but the distinct-count assertion would
+    // also fire on the same evidence;
+    // (b) "rect.w jumps to 50 instead of 40 (wrong math)" —
+    // ratio 50/80 = 0.625 IS within ±0.05 of 0.5, so the
+    // ratio assertion would PASS, but the explicit-set assert
+    // catches `!contains(&40)` AND `!contains(&80)` (since
+    // 80 would have been replaced by 50 somewhere).
+    assert!(
+        distinct_rect_widths.contains(&40) && distinct_rect_widths.contains(&80),
+        "AppNewPane split math must surface both rect.w=40 (post-split child) \
+         and rect.w=80 (pre-split pane) across the test window: \
+         observed distinct values={:?} \
+         expected_exact_set={{40, 80}} pre_hash={:016x} post_hash={:016x}",
+        distinct_rect_widths,
+        pre_hash,
+        post_hash,
+    );
+
+    // The deterministic AppNewPane split math over
+    // (`PtySize` cols=80, `SplitAxis::Horizontal`,
+    // `Ratio(50)`): parent_w = 80, child_w = (80 * 50) /
+    // 100 = 40 (both children at w=40);
+    // distinct_rect_widths = {40, 80}; min/max = 40/80 =
+    // 0.5 EXACTLY. The ±0.05 tolerance window covers
+    // layout-engine rounding artifacts (host-wide ceil/floor)
+    // that future refactors could introduce while still
+    // being tight enough to catch trivial math regressions
+    // (e.g. 41/80 = 0.5125 lands within ±0.05 of 0.5 — out
+    // of band only via the explicit-set assertion above).
+    const EXPECTED_RATIO: f64 = 0.5;
+    const RATIO_TOLERANCE: f64 = 0.05;
+    let observed_ratio = f64::from(min_w) / f64::from(max_w);
+    assert!(
+        (observed_ratio - EXPECTED_RATIO).abs() <= RATIO_TOLERANCE,
+        "rect-width min/max ratio must land within ±{} of {} (proves the \
+         AppNewPane Horizontal-50 split has the expected visual state): \
+         observed ratio={:.4} min_w={} max_w={} \
+         distinct_widths={:?} \
+         blitting_pane_lines={} pre_hash={:016x} post_hash={:016x}",
+        RATIO_TOLERANCE,
+        EXPECTED_RATIO,
+        observed_ratio,
+        min_w,
+        max_w,
+        distinct_rect_widths,
+        blitting_pane_lines,
+        pre_hash,
+        post_hash,
+    );
+
     // On success: cleanup_guard drops at end of fn scope,
     // running the cleanup order documented in its Drop impl.
     // `std::thread::panicking()` returns `false` here so the
@@ -1446,4 +1647,121 @@ fn hash_bytes(buf: &[u8]) -> u64 {
         h = h.wrapping_mul(0x1000_0000_01b3);
     }
     h
+}
+
+/// Parse a `u16` integer immediately following a `field` token
+/// in `line`. Helper for the cycle-20 visual-state assertion
+/// parser (used to extract `rect.w: 80` -> `Some(80)` from the
+/// preserved `--log=<path>` file's pretty-formatted output).
+///
+/// Shape probe (verbatim from a 2-second `script(1)` capture
+/// of the live binary):
+///
+/// ```text
+/// YYYY-MM-DDTHH:MM:SS.fffZ DEBUG cmdash: blitting pane,
+/// layer_id: PaneLayerId(N), rect.w: 80, rect.h: 24
+///     at crates/cmdash/src/main.rs:<line> on main ThreadId(1)
+/// ```
+///
+/// So `rect.w` is followed by `:` (colon) + optional whitespace
+/// + the numeric value. We accept both `:` and `=` as a
+/// defensive hedge in case the pretty-formatter transitions
+/// to a compact/alternate shape in a future `tracing-subscriber`
+/// upgrade (the compact form is the enum-default, which the
+/// atom-1 init code explicitly opted OUT of via `.pretty()`).
+/// Returns `None` if `field` is absent or no parseable digits
+/// follow.
+/// Strip ANSI CSI (Control Sequence Introducer) escape
+/// sequences from a string. Pretty-formatted `tracing-subscriber`
+/// output embeds terminal-color codes (`<ESC>[<params>m`
+/// SGR = Select Graphic Rendition) inline between the
+/// message and each structured field; without this strip
+/// the downstream `extract_u16_after` helper sees raw `<ESC>`
+/// bytes between `rect.w` and `: 80`, the `is_ascii_digit()`
+/// terminator trips on byte 0, the parse returns `None`,
+/// and the visual-state assertion fails with an empty
+/// `distinct_rect_widths` set. The byte-stream probe used
+/// to detect this on the live-binary integration-test log
+/// was `od -c /tmp/cmdash-e2e-appnewpane.log` (`od` dumped
+/// `rect.w<ESC>[0m<ESC>[3;4m: 80` in the inline-comma-
+/// separated pretty-formatter shape, NOT a clean `rect.w: 80`).
+/// Hand-rolled (no `regex` crate dep) since the v1 line
+/// shapes we parse only ever emit SGR codes (`m` terminator);
+/// OSC (`<ESC>]<payload><ST>`) and non-SGR CSI terminators
+/// (`H` cursor, `J`/`K` erase, `h`/`l` mode-set) are NOT
+/// emitted by v1's pretty-formatter and would require
+/// extending this helper, NOT removing it.
+///
+/// Defensive unclosed-CSI behaviour: if a trailing CSI
+/// sequence lacks a closing `m` (e.g. a log-line truncation
+/// glitch), the loop breaks rather than spinning on off-by-one.
+/// The implementation loops over bytes via
+/// `chars().next()` codepoint iteration, so non-ASCII bytes
+/// are handled correctly (ASCII fast-path is incidental, not
+/// load-bearing).
+fn strip_ansi_csi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            // Skip until and including the trailing 'm'.
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'm' {
+                j += 1;
+            }
+            if j < bytes.len() {
+                i = j + 1;
+                continue;
+            }
+            // Unclosed CSI -- break rather than spin. (Reachable
+            // only on a malformed log line; defensive.)
+            break;
+        }
+        // Visible byte: push as char, advance one UTF-8
+        // codepoint. ASCII fast-path (each byte is its own
+        // char).
+        let remainder = &line[i..];
+        let ch = remainder.chars().next().expect("i < bytes.len()");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Parse a `u16` integer immediately following a `field`
+/// token in `line`. Helper for the cycle-20 visual-state
+/// assertion parser (used to extract `rect.w: 80` ->
+/// `Some(80)` from the preserved `--log=<path>` file's
+/// pretty-formatted output, AFTER `strip_ansi_csi` has
+/// dropped the inline ANSI codes).
+///
+/// Shape probe (ANSI-stripped, verbatim from a 2-second
+/// `script(1)` capture of the live binary):
+///
+/// ```text
+/// YYYY-MM-DDTHH:MM:SS.fffZ DEBUG cmdash: blitting pane,
+/// layer_id: PaneLayerId(N), rect.w: 80, rect.h: 24
+///     at crates/cmdash/src/main.rs:<line> on main ThreadId(1)
+/// ```
+///
+/// So `rect.w` is followed by `:` (colon) + optional
+/// whitespace + the numeric value. We accept both `:` and
+/// `=` as a defensive hedge in case the pretty-formatter
+/// transitions to a compact/alternate shape in a future
+/// `tracing-subscriber` upgrade (the compact form is the
+/// enum-default, which the atom-1 init code explicitly
+/// opted OUT of via `.pretty()`). Returns `None` if `field`
+/// is absent or no parseable digits follow.
+fn extract_u16_after(line: &str, field: &str) -> Option<u16> {
+    let pos = line.find(field)?;
+    let rest = &line[pos + field.len()..];
+    // Skip the `:` or `=` separator AND any whitespace.
+    let trimmed = rest.trim_start_matches([':', '=', ' ', '\t']);
+    // Read digits until a non-digit terminator (space, comma,
+    // end-of-line, or anything else).
+    let end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    trimmed[..end].parse::<u16>().ok()
 }
