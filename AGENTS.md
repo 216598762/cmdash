@@ -275,7 +275,7 @@ the tick loop drains it at the start of each tick and calls
 
 ## Doc-link hygiene
 
-`cargo doc -p cmdash --lib --no-deps -D rustdoc::broken-intra-doc-links`
+`RUSTDOCFLAGS='-D rustdoc::broken-intra-doc-links' cargo doc -p cmdash --lib --no-deps`
 is the project doc-build gate (lib crate only). Use **bare backticks**
 for any item that won't resolve in the lib rustdoc surface: bin
 entrypoints, `#[cfg(test)]` mod items, private methods on public

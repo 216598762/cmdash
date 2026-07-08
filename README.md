@@ -139,7 +139,7 @@ Quick smoke checks (pre-push):
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo doc -p cmdash --lib --no-deps -D rustdoc::broken-intra-doc-links
+RUSTDOCFLAGS='-D rustdoc::broken-intra-doc-links' cargo doc -p cmdash --lib --no-deps
 ```
 
 ## Documentation map
@@ -164,7 +164,7 @@ Before push, run:
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo doc -p cmdash --lib --no-deps -D rustdoc::broken-intra-doc-links
+RUSTDOCFLAGS='-D rustdoc::broken-intra-doc-links' cargo doc -p cmdash --lib --no-deps
 ```
 
 Conventional-commit prefixes: `feat:`, `fix:`, `refactor:`, `docs:`,
