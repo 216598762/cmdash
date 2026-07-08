@@ -7,9 +7,9 @@ user-facing companion to the architectural rules in
 [`AGENTS.md`](../AGENTS.md) and the high-level overview in
 [`README.md`](../README.md).
 
-> **TL;DR.** cmdash v1 is a single Rust binary. Configuration is
-> **embedded at compile time** (`include_str!`); editing it requires
-> a recompile. The KDL schema is small — three top-level blocks
+> **TL;DR.** cmdash is a single Rust binary. Configuration is
+> loaded at runtime from a KDL file, falling back to a bundled
+> default. The KDL schema is small — three top-level blocks
 > (`layout` / `keybinds` / `presets`) — and the runtime mutation
 > toolbox is built around a five-variant layout-tree grammar
 > (`split` / `stack` / `zstack` / `pane` / `preset`).
@@ -37,7 +37,7 @@ cmdash
 
 When you launch it:
 
-1. The bundled `config.kdl` is parsed in-process (see §2).
+1. Config is loaded from the first available source (see §2).
 2. `crossterm::terminal::size()` reports the host-window cell-grid
    area. If the host reports zero-area or the call fails, cmdash
    falls back to **80 × 24** and logs a `warn!` line.
@@ -46,14 +46,25 @@ When you launch it:
 4. Each pane spawns its own login shell.
 5. A **tick loop** runs at 33 ms cadence (~30 fps).
 
-### 1.3. Exiting
+### 1.3. CLI flags
+
+```
+cmdash [OPTIONS]
+
+OPTIONS:
+  --config=<path>   Path to a KDL config file (default: ~/.config/cmdash/config.kdl)
+  --log=<path>      Write trace-level diagnostics to <path> (stdout is silent)
+  --help, -h        Print help message
+```
+
+### 1.4. Exiting
 
 Use **`Alt-Q`** (`app.close`), or close the last pane via **`Alt-W`**
 (`pane.close`).
 
 ---
 
-### 1.4. Logging
+### 1.5. Logging
 
 cmdash uses `tracing` + `tracing-subscriber`. Two orthogonal knobs:
 
@@ -82,12 +93,19 @@ Parser error classes:
 
 ---
 
-## 2. The v1 config model — embedded at compile time
+## 2. Config file loading — runtime resolution
 
-> **Pitfall #1 — Recompile to edit the config.**
-> `cmdash::run` reads its config from `include_str!("../config.kdl")`.
-> v1 does not consult `~/.config/cmdash/config.kdl`. To change your
-> config, edit `crates/cmdash/config.kdl` and rebuild.
+> **Pitfall #1 (resolved) — Config is now loaded at runtime.**
+> cmdash resolves its config file using the following priority chain:
+>
+> 1. `--config=<path>` (explicit CLI override)
+> 2. `$CMDASH_CONFIG_DIR/config.kdl` (environment variable override)
+> 3. `~/.config/cmdash/config.kdl` (XDG default)
+> 4. Bundled `config.kdl` (compiled-in fallback)
+>
+> If a file path is resolved but the file is missing or unreadable,
+> cmdash logs a `warn` and falls back to the bundled default.
+> To customize, create `~/.config/cmdash/config.kdl` and restart.
 
 ---
 

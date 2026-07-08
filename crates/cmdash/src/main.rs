@@ -68,7 +68,7 @@ use ratatui::Terminal;
 use tracing::{debug, info, warn};
 
 /// Command-line arguments parsed at binary entry. v1 ships
-/// only `--log=<path>`.
+/// `--log=<path>`, `--config=<path>`, and `--help`.
 ///
 /// `Debug` is derived so `Result<CliArgs, _>` can be used as an
 /// assertion expectation type, matching the binary's
@@ -90,28 +90,32 @@ pub(crate) struct CliArgs {
     /// immediately rather than chasing phantom debug logs from a
     /// different working directory later.
     pub(crate) log: Option<std::path::PathBuf>,
+    /// `--config=<path>` overrides the config file path. When
+    /// absent, the resolution chain is:
+    /// 1. `$CMDASH_CONFIG_DIR/config.kdl` (env override)
+    /// 2. `~/.config/cmdash/config.kdl` (XDG default)
+    /// 3. bundled `config.kdl` (`include_str!` fallback)
+    pub(crate) config: Option<std::path::PathBuf>,
 }
 
 impl CliArgs {
-    /// Hand-rolled argv parser; v1 only knows `--log=<path>`. Scan
-    /// is one-pass over argv (skipping `argv[0]` = program name);
-    /// each recognized flag wins its own slot; the first occurrence of
-    /// `--log=<path>` wins and subsequent ones are noted-but-ignored
-    /// so launch scripts that pass `--log=<x>` more than once don't
-    /// quietly retarget on the user mid-run.
+    /// Hand-rolled argv parser; v1 knows `--log=<path>`,
+    /// `--config=<path>`, and `--help`. Scan is one-pass over
+    /// argv (skipping `argv[0]` = program name); each recognized
+    /// flag wins its own slot; the first occurrence of each flag
+    /// wins and subsequent ones are noted-but-ignored so launch
+    /// scripts that duplicate flags don't break silently.
     ///
-    /// Errors fall into 3 buckets:
-    /// 1. **Bare `--log`** (no `=<path>`) is rejected: ambiguous
-    ///    between "no log" and "missing value"; both look like bugs.
-    /// 2. **`--log=`** (empty value) is rejected: a `PathBuf("")`
-    ///    silently trips Rust's "no such file" error downstream
-    ///    instead of a clear upfront message.
+    /// Errors fall into 3 buckets (same as v1):
+    /// 1. **Bare `--log` / `--config`** (no `=<path>`) is rejected:
+    ///    ambiguous between "no value" and "missing value".
+    /// 2. **`--log=` / `--config=`** (empty value) is rejected.
     /// 3. **Unrecognized flag** is silently accepted as a
-    ///    forward-compat hedge so future flag additions don't break
-    ///    existing launch scripts (given a warn to stderr, not a
-    ///    parse error).
+    ///    forward-compat hedge (warned to stderr).
     pub fn parse(argv: &[String]) -> Result<Self, String> {
         let mut log: Option<std::path::PathBuf> = None;
+        let mut config: Option<std::path::PathBuf> = None;
+        let mut help = false;
         for token in argv.iter().skip(1) {
             if let Some(value) = token.strip_prefix("--log=") {
                 if log.is_some() {
@@ -129,6 +133,29 @@ impl CliArgs {
                     "--log=<path> requires an =<path> argument; bare `--log` not accepted".into(),
                 );
             }
+            if let Some(value) = token.strip_prefix("--config=") {
+                if config.is_some() {
+                    eprintln!(
+                        "cmdash: --config=<path> specified more than once; keeping first"
+                    );
+                    continue;
+                }
+                if value.is_empty() {
+                    return Err("--config=<path> requires a non-empty <path> argument".into());
+                }
+                config = Some(std::path::PathBuf::from(value));
+                continue;
+            }
+            if token == "--config" {
+                return Err(
+                    "--config=<path> requires an =<path> argument; bare `--config` not accepted"
+                        .into(),
+                );
+            }
+            if token == "--help" || token == "-h" {
+                help = true;
+                continue;
+            }
             // Forward-compat hedge: future flags leak through v1's
             // parser without aborting. Error-only-not-warn would
             // force every script to be re-paged against the latest
@@ -137,7 +164,10 @@ impl CliArgs {
                 eprintln!("cmdash: warning: ignoring unrecognized flag `{token}` (forward-compat)");
             }
         }
-        Ok(Self { log })
+        if help {
+            return Err("HELP".into());
+        }
+        Ok(Self { log, config })
     }
 }
 
@@ -205,11 +235,106 @@ fn init_tracing(log_path: Option<&std::path::Path>) {
     }
 }
 
+/// Print the `--help` banner and exit. Kept as a standalone fn
+/// so the `HELP` sentinel from `CliArgs::parse` has a single
+/// call site.
+fn print_help() {
+    eprintln!(concat!(
+        "cmdash \u{2014} terminal multiplexer + dashboard",
+        "\n",
+        "\nUSAGE:",
+        "\n  cmdash [OPTIONS]",
+        "\n",
+        "\nOPTIONS:",
+        "\n  --config=<path>   Path to a KDL config file (default: ~/.config/cmdash/config.kdl)",
+        "\n  --log=<path>      Write trace-level diagnostics to <path> (stdout is silent)",
+        "\n  --help, -h        Print this help message",
+        "\n",
+        "\nCONFIG RESOLUTION:",
+        "\n  1. --config=<path> (explicit CLI override)",
+        "\n  2. $CMDASH_CONFIG_DIR/config.kdl (env override)",
+        "\n  3. ~/.config/cmdash/config.kdl (XDG default)",
+        "\n  4. bundled default (compiled-in fallback)",
+    ));
+}
+
+/// Resolve the config file path using the priority chain:
+/// 1. Explicit `--config=<path>` (already resolved by caller)
+/// 2. `$CMDASH_CONFIG_DIR/config.kdl` env override
+/// 3. `~/.config/cmdash/config.kdl` XDG default
+/// 4. `None` → use bundled fallback
+///
+/// Returns `(path, source_label)` where `source_label` is a
+/// human-readable description for tracing.
+fn resolve_config_path(cli_config: Option<&std::path::Path>) -> (Option<std::path::PathBuf>, &'static str) {
+    // Priority 1: explicit CLI override.
+    if let Some(path) = cli_config {
+        return (Some(path.to_path_buf()), "--config=<path>");
+    }
+    // Priority 2: $CMDASH_CONFIG_DIR env override.
+    if let Ok(dir) = std::env::var("CMDASH_CONFIG_DIR") {
+        if !dir.is_empty() {
+            let path = std::path::PathBuf::from(dir).join("config.kdl");
+            return (Some(path), "$CMDASH_CONFIG_DIR");
+        }
+    }
+    // Priority 3: XDG default (~/.config/cmdash/config.kdl).
+    if let Some(home) = std::env::var_os("HOME") {
+        let path = std::path::PathBuf::from(home)
+            .join(".config")
+            .join("cmdash")
+            .join("config.kdl");
+        return (Some(path), "~/.config/cmdash/config.kdl");
+    }
+    // Priority 4: bundled fallback.
+    (None, "bundled default")
+}
+
+/// Read the config text from the resolved path, falling back to
+/// the bundled default if the file is missing or unreadable.
+/// Returns a `Cow<'static, str>` so the borrowed-bundled path
+/// avoids a heap allocation.
+fn read_config_text(
+    path: Option<&std::path::Path>,
+    source_label: &str,
+) -> std::borrow::Cow<'static, str> {
+    match path {
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(text) => {
+                info!(
+                    path = %p.display(),
+                    source = source_label,
+                    bytes = text.len(),
+                    "config file loaded"
+                );
+                std::borrow::Cow::Owned(text)
+            }
+            Err(e) => {
+                warn!(
+                    path = %p.display(),
+                    error = %e,
+                    source = source_label,
+                    "config file not readable; falling back to bundled default"
+                );
+                std::borrow::Cow::Borrowed(include_str!("../config.kdl"))
+            }
+        },
+        None => {
+            info!(source = source_label, "using bundled default config");
+            std::borrow::Cow::Borrowed(include_str!("../config.kdl"))
+        }
+    }
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let cli = match CliArgs::parse(&argv) {
         Ok(c) => c,
         Err(e) => {
+            if e == "HELP" {
+                print_help();
+                std::process::exit(0);
+            }
             eprintln!("cmdash: {e}");
             std::process::exit(2);
         }
@@ -230,15 +355,16 @@ fn main() {
         );
     }
     info!("cmdash starting (ratatui text body + dashcompositor kitty graphics)");
-    if let Err(e) = run() {
+    if let Err(e) = run(&cli) {
         eprintln!("cmdash: fatal: {e}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cfg_text = include_str!("../config.kdl");
-    let cfg = parse_config(cfg_text)?;
+fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (config_path, source_label) = resolve_config_path(cli.config.as_deref());
+    let cfg_text = read_config_text(config_path.as_deref(), source_label);
+    let cfg = parse_config(&cfg_text)?;
     // Move `cfg.layout` out of `cfg` (Option<LayoutNode>) so the
     // layout tree can be moved into `TickContext::new` at the
     // bottom of this function and reused on every host-driven
@@ -2165,6 +2291,150 @@ mod cli_args_tests {
             Some(std::path::Path::new("/tmp/foo.log")),
             "first valid --log=X must win; --log= after must warn-and-continue"
         );
+    }
+
+    // ==========================================================
+    // --config=<path> parsing tests.
+    // ==========================================================
+
+    /// `--config=/tmp/custom.kdl` is the basic happy path.
+    #[test]
+    fn parse_config_equals_path_is_some() {
+        let argv = vec![arg("cmdash"), arg("--config=/tmp/custom.kdl")];
+        let cli = CliArgs::parse(&argv).expect("parse");
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("/tmp/custom.kdl")),
+            "--config=/tmp/custom.kdl must yield Some(\"/tmp/custom.kdl\")"
+        );
+    }
+
+    /// `--config=` (empty value) is REJECTED.
+    #[test]
+    fn parse_config_empty_value_errors() {
+        let argv = vec![arg("cmdash"), arg("--config=")];
+        let err = CliArgs::parse(&argv).expect_err("--config= with empty value must error");
+        assert!(
+            err.contains("--config"),
+            "error message must reference --config: {err:?}"
+        );
+    }
+
+    /// Bare `--config` (no `=<path>`) is REJECTED.
+    #[test]
+    fn parse_config_bare_no_equals_errors() {
+        let argv = vec![arg("cmdash"), arg("--config")];
+        let err = CliArgs::parse(&argv).expect_err("bare --config must error");
+        assert!(
+            err.contains("=path") || err.contains("=<path>"),
+            "error message must point at the =<path> syntax: {err:?}"
+        );
+    }
+
+    /// First `--config=<path>` wins; subsequent ones warn-and-ignore.
+    #[test]
+    fn parse_config_first_wins() {
+        let argv = vec![
+            arg("cmdash"),
+            arg("--config=/tmp/a.kdl"),
+            arg("--config=/tmp/b.kdl"),
+        ];
+        let cli = CliArgs::parse(&argv).expect("parse");
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("/tmp/a.kdl")),
+            "first --config=X must win over subsequent --config=Y"
+        );
+    }
+
+    /// `--config` absent: the field stays `None`.
+    #[test]
+    fn parse_config_absent_returns_none() {
+        let argv = vec![arg("cmdash")];
+        let cli = CliArgs::parse(&argv).expect("parse");
+        assert!(cli.config.is_none(), "--config absence must yield None");
+    }
+
+    /// Both `--log` and `--config` can be set independently.
+    #[test]
+    fn parse_log_and_config_both_set() {
+        let argv = vec![
+            arg("cmdash"),
+            arg("--log=/tmp/debug.log"),
+            arg("--config=/tmp/custom.kdl"),
+        ];
+        let cli = CliArgs::parse(&argv).expect("parse");
+        assert_eq!(
+            cli.log.as_deref(),
+            Some(std::path::Path::new("/tmp/debug.log")),
+        );
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("/tmp/custom.kdl")),
+        );
+    }
+
+    // ==========================================================
+    // --help / -h parsing tests.
+    // ==========================================================
+
+    /// `--help` returns the HELP sentinel.
+    #[test]
+    fn parse_help_returns_help_sentinel() {
+        let argv = vec![arg("cmdash"), arg("--help")];
+        let err = CliArgs::parse(&argv).expect_err("--help must return HELP sentinel");
+        assert_eq!(err, "HELP", "--help must return the HELP sentinel");
+    }
+
+    /// `-h` returns the HELP sentinel.
+    #[test]
+    fn parse_h_returns_help_sentinel() {
+        let argv = vec![arg("cmdash"), arg("-h")];
+        let err = CliArgs::parse(&argv).expect_err("-h must return HELP sentinel");
+        assert_eq!(err, "HELP", "-h must return the HELP sentinel");
+    }
+
+    // ==========================================================
+    // resolve_config_path tests.
+    //
+    // These test the resolution priority chain. Environment
+    // variable tests use a unique prefix to avoid collisions
+    // with other tests running in parallel.
+    // ==========================================================
+
+    /// Priority 1: explicit CLI override wins over everything.
+    #[test]
+    fn resolve_config_path_cli_override_wins() {
+        let explicit = Some(std::path::Path::new("/tmp/explicit.kdl"));
+        let (path, label) = resolve_config_path(explicit);
+        assert_eq!(path.as_deref(), Some(std::path::Path::new("/tmp/explicit.kdl")));
+        assert_eq!(label, "--config=<path>");
+    }
+
+    /// Priority 3: XDG default (~/.config/cmdash/config.kdl)
+    /// is returned when no CLI override and no env var.
+    /// We can't easily clear CMDASH_CONFIG_DIR in a test
+    /// (parallel tests share the process env), so we test
+    /// the CLI-override path which is the priority-1 winner.
+    #[test]
+    fn resolve_config_path_xdg_default_shape() {
+        // With no CLI override, the result should be
+        // Some(<path>) with the XDG default shape, unless
+        // CMDASH_CONFIG_DIR is set (which may happen in CI).
+        // We only verify the return shape, not the exact path.
+        let (path, label) = resolve_config_path(None);
+        // label is either "$CMDASH_CONFIG_DIR" or "~/.config/cmdash/config.kdl"
+        // depending on env. Both are valid.
+        assert!(
+            label == "$CMDASH_CONFIG_DIR"
+                || label == "~/.config/cmdash/config.kdl"
+                || label == "bundled default",
+            "unexpected label: {label}"
+        );
+        // If not bundled fallback, path must be Some.
+        if label != "bundled default" {
+            assert!(path.is_some(), "non-bundled label must have a path");
+        }
     }
 }
 
