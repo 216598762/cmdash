@@ -1074,6 +1074,76 @@ mod tests {
     //     keybinds to bogus KeyTokens; caught by test
     //     (3) which asserts InvalidChord on unknown
     //     prefixes so the user sees the typo.
+    //
+    // ## Forward-fixup commitment (cycle-22 atom-3 followup)
+    //
+    // The audit-trail of THIS atom (commit c3a0979) commits to
+    // a documented AMEND-IN-SAME-ATOM rule for any future cycle
+    // that widens `parse_chord`'s modifier arms. The trigger is
+    // an addition to `parse_chord`'s match arms (in the source
+    // below) of any new canonical modifier alias. The
+    // enumerated triggers pinned at audit-time are:
+    //
+    //   - `altgr-<key>` -- the IBM PC AltGr / Right-Alt
+    //     modifier used by European keyboard layouts to
+    //     reach a third keymap layer.
+    //   - `hyper-<key>` -- the Emacs Hyper modifier (the
+    //     'Hyper' key on Lisp-machine-derived keyboards;
+    //     also a documented X11 keysym).
+    //   - `mod-<key>` -- the i3 / Sway `Mod` modifier,
+    //     which defaults to the Super / Windows key but is
+    //     rebindable per-user. i3 config example:
+    //     `bindsym Mod+Return exec terminal`.
+    //   - `super-<key>` is ALREADY in the match arms (via
+    //     `super`, `cmd`, `win`), so no-op trigger.
+    //
+    // When such an arm is added, the v1.1 atom that adds the
+    // arm MUST update the audit-tests in the SAME atom.
+    // Per-test motion direction:
+    //
+    //   - `audit_canonical_config_kdl_14_chords_round_trip`:
+    //     NO CHANGE expected. The 14 default keybinds ship now
+    //     and a v1.1 augmentation only ADDS aliases to
+    //     `parse_chord`'s match arms -- it does not
+    //     retroactively rename chords. If a v1.1 atom also
+    //     augments `crates/cmdash/config.kdl` with new chord
+    //     entries, that atom MUST also extend
+    //     `canonical_chords` + `expected_mods` in a parallel
+    //     edit. Without this fence, a config rewrite could
+    //     regress silently.
+    //
+    //   - `audit_ctrl_shift_super_prefixed_chords_parse`:
+    //     NO CHANGE expected for the canonical v1 modifier
+    //     augmentation surface (the augmented list already
+    //     exercises `ctrl`, `control`, `ctl`, `shift`, `alt`,
+    //     `meta`, `m`, `M`, `super`, `cmd`, `win`). If a v1.1
+    //     atom adds a new canonical-augmentation chord to the
+    //     default config (e.g. `super-f1` opening the help
+    //     overlay), that atom MUST extend `augmented` in a
+    //     parallel edit.
+    //
+    //   - `audit_unknown_modifier_prefix_returns_invalid_chord_not_panic`:
+    //     REMOVE the new prefix from the
+    //     `unknown_prefix_chords` array IN THE SAME ATOM.
+    //     Leaving the prefix in this list claims the
+    //     `parse_chord` arm doesn't exist when it does -- a
+    //     regression that surfaces for the user as "my new
+    //     chord raises `InvalidChord` despite being in the
+    //     docs as supported", which is exactly the
+    //     audit-misdiagnosis the test was written to prevent.
+    //
+    //   - `audit_parse_chord_direct_call_never_panics`:
+    //     MOVE the new prefix from `unknown_prefixes` to
+    //     `known_chords` with the documented expected mask
+    //     tuple. The tuple shape mirrors test (2)'s
+    //     `(ctrl, shift, alt, super)` form. Leaving the
+    //     prefix in `unknown_prefixes` produces a
+    //     same-atom-pair-failure where `assert!(parse_chord(c).is_none())`
+    //     trips on a now-recognised prefix.
+    //
+    // v1.1+ contributor checkpoint: before landing any commit
+    // that widens `parse_chord`'s modifier arms, run the
+    // per-test motion table above against the trigger prefix.
     // ============================================================
 
     /// (1) Verbatim copy of the 14 default keybinds from
