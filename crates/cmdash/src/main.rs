@@ -784,10 +784,22 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
 
     /// Phase 0 of the AGENTS.md rendering pipeline, full
     /// version. Drains crossterm events and routes each one
-    /// through [`Self::handle_event_full`]. Non-blocking;
-    /// bounded by `event::poll(0)`.
+    /// through [`Self::handle_event_full`]. Non-blocking with
+    /// a 1ms minimum dwell: `event::poll(Duration::from_millis(1))`.
+    /// A sub-millisecond `poll(0)` was wrong on Unix PTYs
+    /// whose mio readiness state was not re-armed between
+    /// frames; crossterm/mio's readiness check returned false
+    /// before the underlying kernel buffer was re-queried, so
+    /// keypress bytes sat unconsumed in the PTY slave until
+    /// the next frame's poll ran (the live-binary
+    /// `app_new_pane_via_ctrl_a_keypress_in_live_binary`
+    /// integration test surfaced this with pre/post
+    /// identical FNV-1a hashes on the binary's stdout when
+    /// `Ctrl-a` was written to the PTY master). 1ms is
+    /// negligible against the 33ms tick cadence (~3% of the
+    /// per-frame budget) and cheap to amortize.
     pub fn input_phase_full(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        while event::poll(Duration::from_millis(0))? {
+        while event::poll(Duration::from_millis(1))? {
             let evt = event::read()?;
             self.handle_event_full(&evt);
         }
@@ -1440,12 +1452,15 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         loop {
             // Phase 0: drain input events via the FULL action
             // handler (v1 arms + AppNewPane + PaneFocus{Direction}
-            // + PanePreset). Non-blocking; bound by
-            // `event::poll(Duration::from_millis(0))`. Each Press
-            // event is routed through [`Self::handle_event_full`]
-            // which dispatches via [`Self::apply_action_full`],
-            // OR forwarded as bytes to the focused pane. The
-            // carry-forward UX reaches the user through this path.
+            // + PanePreset). Non-blocking with a 1ms minimum dwell;
+            // see [`Self::input_phase_full`] rustdoc for the rationale
+            // (a `poll(0)` swallowed Ctrl-a on Unix PTYs in the
+            // cycle-18 AppNewPane live-binary integration test).
+            // Each Press event is routed through
+            // [`Self::handle_event_full`] which dispatches via
+            // [`Self::apply_action_full`], OR forwarded as bytes
+            // to the focused pane. The carry-forward UX reaches
+            // the user through this path.
             self.input_phase_full()?;
             if !self.running {
                 return Ok(());

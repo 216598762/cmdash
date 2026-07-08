@@ -1157,43 +1157,101 @@ fn pane_preset_swap_layout_via_real_pty_wholesale_spawn() {
 // Ctrl-a snapshot is captured via a 50 ms × 30-attempt poll
 // loop (1.5 s max) instead of a blind sleep so the assertion
 // has a representative tail of post-Ctrl-a frames.
+//
+// Cycle-18 → cycle-19 history: the cycle-18 commit `dba1604`
+// shipped this test `#[ignore]`-gated because the pre/post
+// ring hashes matched (statistically impossible barring
+// byte-identical emission), indicating the Ctrl-a byte never
+// reached `TickContext::handle_event_full`. The cycle-18
+// preserved TRACE log (9 731 B, 135 lines) showed cmdash
+// kept rendering frames at ~50 ms cadence throughout the
+// post-Ctrl-a window with `focus_idx` permanently pinned at
+// 0 — cmdash was NOT crashed, the byte just never became a
+// routed key event. The root cause was
+// `event::poll(Duration::from_millis(0))` in
+// [`TickContext::input_phase_full`] at main.rs:790
+// starving the mio readiness check against the PTY fd on
+// Unix. Cycle-19 lifts the poll dwell to 1 ms (negligible
+// vs. the 33 ms tick cadence, ~3% per-frame budget) so the
+// OS forces a fresh readiness probe against the PTY buffer
+// every input phase; combined with the RAII CleanupGuard
+// pattern below (which preserves cmdash's TRACE log on
+// failure), this test is the wire-level witness that
+// Ctrl-a → AppNewPane → 2-pane re-render is observed
+// end-to-end through real PTY children.
 // ===========================================================================
 
-// ============================================================
-// KNOWN-FAILING: this test is `#[ignore]`'d until a future PR
-// fixes the underlying cmdash behavior. We LAND THE
-// INFRASTRUCTURE here so a future maintainer can simply
-// remove the `#[ignore]` and have a working test (no
-// shipped-but-broken CI failure, no need to reintroduce this
-// test from scratch once cmdash is fixed). The hash-differ
-// assertion:
-//
-//   pre_hash != post_hash
-//
-// correctly identifies the failure mode. Both pre-Ctrl-a
-// and post-Ctrl-a snapshots are 1 MiB (the ring cap) with
-// IDENTICAL FNV-1a 64-bit hashes (the exact value varies
-// run-to-run). For 1 MiB of streaming
-// bytes, identical FNV-1a hashes are statistically
-// impossible (~1/2^64 collision resistance). The only
-// plausible explanation is that the reader thread stopped
-// pushing bytes (either the binary EOF'd the PTY slave by
-// exiting, or the reader hit `Ok(0)`/`Err(_)` somewhere in
-// the post-Ctrl-a window). The ring freezes at the
-// pre-snapshot state and the post-snapshot captures the
-// same frozen state.
-//
-//   The spawn + Ctrl-a + post-state capture fixture IS
-// proven correct by a sibling diagnostic capture run
-// (60 MB captured in 2 s using the same `portable_pty`
-// setup with no Ctrl-a sent). The failure is cmdash's
-// post-Ctrl-a behavior, not this test's machinery.
-// To un-#[ignore]: fix cmdash so the binary re-renders
-// (or stays alive) after Ctrl-a; then remove `#[ignore]`.
-// ============================================================
+/// RAII guard that wraps the live-binary test's PTY master,
+/// child process, output writer, and reader thread. On
+/// `Drop` the guard flushes the writer, kills the child,
+/// drops the master fd (causing the reader thread's
+/// `read` to return EOF), and joins the reader thread, in
+/// that order. `std::thread::panicking()` distinguishes
+/// the test's success path (`false` → log file removed) from
+/// its failure path (`true` → log file PRESERVED at the
+/// canonical /tmp/cmdash-e2e-appnewpane.log for post-mortem
+/// inspection via
+/// `grep -n <event-name> /tmp/cmdash-e2e-appnewpane.log | tail`).
+///
+/// The cycle-18 cleanup pattern (process cleanup AFTER
+/// assertions, log cleanup AFTER assertions) leaked the
+/// reader thread on every failed assertion — `Drop` of
+/// stack-locals was never reached because `assert!` panics
+/// short-circuit the cleanup block below them. The guard's
+/// `Drop` fires on normal scope-exit AND on `assert!` /
+/// `assert_ne!` panic-unwind, so cleanup is automatic in
+/// both paths while STILL preserving the diagnostic
+/// artifact for the failure path.
+struct CleanupGuard {
+    writer: Option<Box<dyn std::io::Write + Send>>,
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    log_path: std::path::PathBuf,
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        // Order matters: flush the writer + kill the child
+        // BEFORE dropping the master fd so the PTY slave
+        // sees its master side disappear only AFTER the
+        // child has terminated. Drop the master fd LAST so
+        // the reader thread's `read` returns EOF and the
+        // JoinHandle below unblocks. The `Option::take()`
+        // pattern makes each step idempotent (Drop runs
+        // exactly once even if a `?`-style early-exit
+        // pattern were added later).
+        if let Some(mut w) = self.writer.take() {
+            let _ = w.flush();
+        }
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        // Dropping the master fd closes the master side of
+        // the PTY pair; the child's PTY slave fd sees a
+        // hangup signal the next time it reads. The
+        // cross-thread synchronization (master dropped ->
+        // reader's read() returns EOF -> reader_handle join
+        // unblocks) relies on this ordering, NOT on the
+        // child.kill/wait — a child that exited naturally
+        // before we got here still needs the master dropped
+        // so the reader thread doesn't block forever.
+        drop(self.master.take());
+        if let Some(h) = self.reader.take() {
+            let _ = h.join();
+        }
+        // PRESERVE cmdash's TRACE log on assertion failure
+        // so a maintainer reading a failed run can pinpoint
+        // the line where the binary stopped emitting. DELETE
+        // on success to keep /tmp tidy across repeated runs.
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_file(&self.log_path);
+        }
+    }
+}
 
 #[test]
-#[ignore = "cmdash likely crashes/exits shortly after Ctrl-a fires; pre/post hash equality indicates ring freeze. Future PR should fix cmdash + remove this #[ignore]."]
 fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::collections::VecDeque;
@@ -1232,7 +1290,7 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     cmd.arg(format!("--log={}", log_path.display()));
     cmd.env("TERM", "xterm-256color");
 
-    let mut child = pair
+    let child = pair
         .slave
         .spawn_command(cmd)
         .expect("spawn cmdash attached to PTY");
@@ -1242,7 +1300,7 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
         .master
         .try_clone_reader()
         .expect("clone PTY master reader for background drain");
-    let mut writer = pair
+    let writer = pair
         .master
         .take_writer()
         .expect("take PTY master writer for Ctrl-a injection");
@@ -1277,15 +1335,40 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
         .copied()
         .collect();
 
-    // Drive Ctrl-a (byte 0x01) through the PTY master. The
-    // next `crossterm::event::read()` tick surfaces it as
+    // Build the cleanup guard AFTER the pre-snapshot but
+    // BEFORE the Ctrl-a write. From here on every assertion
+    // failure runs the guard's `Drop` impl on unwind, which
+    // flushes the writer, kills the child, drops the master
+    // fd, joins the reader thread, AND (via
+    // `std::thread::panicking()`) preserves the cmdash TRACE
+    // log for post-mortem. The guard drops naturally at end
+    // of fn scope on the success path too, where `panicking()`
+    // returns `false` and the log is removed to keep /tmp
+    // tidy across repeated test runs.
+    let mut cleanup_guard = CleanupGuard {
+        writer: Some(writer),
+        child: Some(child),
+        master: Some(pair.master),
+        reader: Some(reader_handle),
+        log_path: log_path.clone(),
+    };
+
+    // Drive Ctrl-a (byte 0x01) through the PTY master. With
+    // main.rs:790's `event::poll(Duration::from_millis(1))`
+    // (cycle-19 fix to the cycle-18 `poll(0)` starvation),
+    // the next tick's input phase surfaces it as
     // `KeyEvent { code: Char('a'), modifiers: CONTROL, kind:
     // Press }`. The `cmdash-keybinds` Router matches it
     // against the default config.kdl bind `ctrl-a →
     // app.new-pane` and dispatches `KeyAction::AppNewPane` to
-    // `TickContext::apply_action_full`.
-    writer.write_all(&[0x01]).expect("write Ctrl-a byte (0x01)");
-    writer.flush().ok();
+    // `TickContext::apply_action_full`, which renders a new
+    // 2-pane frame visible in the post-Ctrl-a ring snapshot.
+    if let Some(w) = cleanup_guard.writer.as_mut() {
+        w.write_all(&[0x01]).expect("write Ctrl-a byte (0x01)");
+    }
+    if let Some(w) = cleanup_guard.writer.as_mut() {
+        let _ = w.flush();
+    }
 
     // Poll the ring buffer (50 ms × 30 attempts = 1.5 s max).
     // We capture continuously and pin the FINAL snapshot so
@@ -1311,7 +1394,7 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     // Substantial-size guard: the binary must be alive and
     // emitting throughout the post-Ctrl-a window. A binary
     // that crashes mid-test would freeze the ring at its
-    // crash-time bytes (~sub-second worth, well below 64 KiB).
+    // crash-time bytes (~sub-second worth, well below 16 KiB).
     assert!(
         final_snapshot.len() >= 16 * 1024,
         "post-Ctrl-a ring snapshot must be at least 16 KiB (proves the \
@@ -1346,17 +1429,10 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
         post_hash,
     );
 
-    // Best-effort cleanup: drop the writer (closes any
-    // buffered writes), SIGKILL + reap the child, drop the
-    // master fd (causes the reader thread's `read` to return
-    // EOF), join the reader thread, remove the temp log file.
-    let _ = writer.flush();
-    drop(writer);
-    let _ = child.kill();
-    let _ = child.wait();
-    drop(pair.master);
-    let _ = reader_handle.join();
-    let _ = std::fs::remove_file(&log_path);
+    // On success: cleanup_guard drops at end of fn scope,
+    // running the cleanup order documented in its Drop impl.
+    // `std::thread::panicking()` returns `false` here so the
+    // TRACE log is deleted to keep /tmp tidy.
 }
 
 /// FNV-1a 64-bit hash of a byte slice. Stable byte-level diff
