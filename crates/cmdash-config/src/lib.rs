@@ -384,7 +384,9 @@ fn read_split(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
                 return Err(ConfigError::InvalidAxis(raw));
             }
             (Some("ratio"), _) => {
-                ratio = raw.parse().unwrap_or(0.5);
+                ratio = raw
+                    .parse::<f64>()
+                    .map_err(|_| ConfigError::InvalidRatio(raw.clone()))?;
             }
             _ => {}
         }
@@ -449,6 +451,11 @@ fn read_preset(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
                 break;
             }
         }
+    }
+    if name.is_empty() {
+        return Err(ConfigError::InvalidAction(
+            "preset node requires a name argument".into(),
+        ));
     }
     Ok(LayoutNode::Preset { name })
 }
@@ -620,7 +627,10 @@ fn parse_action(s: &str) -> Option<KeyAction> {
         "pane.stack.up" => Some(KeyAction::PaneStackUp),
         "pane.stack.left" => Some(KeyAction::PaneStackLeft),
         "pane.stack.right" => Some(KeyAction::PaneStackRight),
-        "pane.preset" => Some(KeyAction::PanePreset(String::new())),
+        // `pane.preset` (bare, no name suffix) is rejected so a
+        // missing name surfaces as `InvalidAction` at config-parse
+        // time rather than as a runtime no-op — mirrors the
+        // `tab.switch` (no n suffix) convention.
         // Tab-axis actions. `tab.new`, `tab.close`,
         // `tab.switch.<n>` (n in 1..=9) wire the tab keybinds
         // (M-t / M-w / M-1..M-9). The `tab.switch` PLANE (no
@@ -886,6 +896,18 @@ mod tests {
         assert!(
             parse_action("tab.switch.99").is_none(),
             "n=99 is out of range"
+        );
+    }
+
+    /// `pane.preset` (NO name suffix) is rejected: a config
+    /// that forgets the name should fail loudly at parse time,
+    /// not silently no-op at dispatch time. Mirrors the
+    /// `tab.switch` (no n suffix) convention.
+    #[test]
+    fn parse_pane_preset_no_name_returns_none() {
+        assert!(
+            parse_action("pane.preset").is_none(),
+            "pane.preset without name is invalid"
         );
     }
 
@@ -1351,5 +1373,47 @@ mod tests {
                  prefix-plus-key shape)"
             );
         }
+    }
+
+    /// `ratio=abc` (non-parseable float) is rejected at parse
+    /// time with `ConfigError::InvalidRatio`. Pins the fix that
+    /// wired the previously-dead `InvalidRatio` variant into
+    /// `read_split`; before the fix, `unwrap_or(0.5)` silently
+    /// produced a 50/50 split with no warning.
+    #[test]
+    fn parse_invalid_ratio_returns_err() {
+        let src = r#"
+            layout {
+                split axis=horizontal ratio=abc {
+                    pane kind=shell label="a"
+                    pane kind=shell label="b"
+                }
+            }
+        "#;
+        let err = parse(src).expect_err("invalid ratio must error");
+        assert!(
+            matches!(err, ConfigError::InvalidRatio(ref s) if s == "abc"),
+            "expected InvalidRatio(\"abc\"), got: {err:?}"
+        );
+    }
+
+    /// `preset` with no name argument in the layout tree is
+    /// rejected at parse time. Mirrors the `read_named_preset`
+    /// check for the top-level `presets` block. Without this,
+    /// a bare `preset` node would be silently skipped by the
+    /// resolver (nested presets are no-ops), hiding a user
+    /// config error.
+    #[test]
+    fn parse_preset_no_name_returns_err() {
+        let src = r#"
+            layout {
+                preset
+            }
+        "#;
+        let err = parse(src).expect_err("preset with no name must error");
+        assert!(
+            matches!(err, ConfigError::InvalidAction(_)),
+            "expected InvalidAction, got: {err:?}"
+        );
     }
 }

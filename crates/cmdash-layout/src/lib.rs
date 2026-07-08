@@ -139,7 +139,13 @@ pub struct ComputedPane {
 /// Layout-resolution errors.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LayoutError {
-    /// The given `Rect` had zero width or zero height.
+    /// A `Rect` had zero width or zero height. This is raised
+    /// both for the root area (checked in [`ComputedLayout::compute`])
+    /// and for child rects produced by `split_rect` or Stack
+    /// division (checked in `resolve_node`). Surfacing zero-area
+    /// children at resolution time gives a clearer error than
+    /// the downstream `PtyError::InvalidSize` it would otherwise
+    /// surface at PTY spawn time.
     #[error("zero-area Rect: {w}x{h} at ({x},{y})")]
     ZeroArea { x: u16, y: u16, w: u16, h: u16 },
     /// A `Split` or `Stack` had no children.
@@ -294,6 +300,20 @@ fn resolve_node(
                 });
             }
             let (left, right) = split_rect(area, *axis, *ratio);
+            // Pre-validate both children before recursing into either,
+            // so a zero-area child 1 doesn't leave child 0's panes
+            // partially resolved in `out` (harmless since `out` is
+            // discarded on Err, but pre-validating is cleaner).
+            for child_area in [left, right] {
+                if child_area.w == 0 || child_area.h == 0 {
+                    return Err(LayoutError::ZeroArea {
+                        x: child_area.x,
+                        y: child_area.y,
+                        w: child_area.w,
+                        h: child_area.h,
+                    });
+                }
+            }
             for (i, child) in children.iter().enumerate() {
                 if path_len as usize >= MAX_TREE_DEPTH {
                     return Err(LayoutError::TreeTooDeep(path_len as usize + 1));
@@ -331,6 +351,14 @@ fn resolve_node(
                     w: area.w,
                     h: child_h,
                 };
+                if child_area.w == 0 || child_area.h == 0 {
+                    return Err(LayoutError::ZeroArea {
+                        x: child_area.x,
+                        y: child_area.y,
+                        w: child_area.w,
+                        h: child_area.h,
+                    });
+                }
                 resolve_node(child, child_area, path, path_len + 1, next_preorder, out)?;
             }
         }
@@ -388,7 +416,7 @@ fn resolve_node(
 /// new pane takes the next available pre-order slot (which may
 /// shift downstream leaves' pre-order, but they are post-mutation
 /// anyway). This invariant unlocks the v2 "Hard rule: one layer
-/// per instance" guarantee — the original leaf's [`LayerId`]
+/// per instance" guarantee — the original leaf's `LayerId`
 /// (derived from `pre_order`) is stable across the mutation so the
 /// `AGENTS.md` "no `LayerId` rebinding" rule holds without a fresh
 /// PTY spawn for the survivor.
@@ -1239,5 +1267,114 @@ mod internal_sanity_tests {
                 }
             }
         }
+    }
+    /// Ratio(0) produces a zero-width left child. The resolver
+    /// now rejects zero-area child rects at resolution time with
+    /// `LayoutError::ZeroArea` instead of deferring the error to
+    /// PTY spawn time.
+    #[test]
+    fn split_ratio_zero_rejected_as_zero_area() {
+        let root = LayoutNode::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: Ratio(0),
+            children: vec![p(None), p(Some("right"))],
+        };
+        let result = ComputedLayout::compute(
+            &root,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        );
+        assert!(
+            matches!(result, Err(LayoutError::ZeroArea { w: 0, h: 24, .. })),
+            "Ratio(0) left child must be rejected as ZeroArea; got {:?}",
+            result
+        );
+    }
+
+    /// Vertical split with Ratio(0) produces a zero-height top
+    /// child. Same code path as the horizontal case but exercises
+    /// the `child_area.h == 0` branch explicitly.
+    #[test]
+    fn split_vertical_ratio_zero_rejected_as_zero_area() {
+        let root = LayoutNode::Split {
+            axis: SplitAxis::Vertical,
+            ratio: Ratio(0),
+            children: vec![p(None), p(Some("bottom"))],
+        };
+        let result = ComputedLayout::compute(
+            &root,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        );
+        assert!(
+            matches!(result, Err(LayoutError::ZeroArea { w: 80, h: 0, .. })),
+            "vertical Ratio(0) top child must be rejected as ZeroArea; got {:?}",
+            result
+        );
+    }
+
+    /// Ratio(100) produces a zero-width right child — the
+    /// symmetric case to Ratio(0). Rejected as `ZeroArea`.
+    #[test]
+    fn split_ratio_hundred_rejected_as_zero_area() {
+        let root = LayoutNode::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: Ratio(100),
+            children: vec![p(Some("left")), p(None)],
+        };
+        let result = ComputedLayout::compute(
+            &root,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        );
+        assert!(
+            matches!(result, Err(LayoutError::ZeroArea { w: 0, h: 24, .. })),
+            "Ratio(100) right child must be rejected as ZeroArea; got {:?}",
+            result
+        );
+    }
+
+    /// A stack with more children than available rows produces
+    /// zero-height children. The resolver now rejects this at
+    /// resolution time with `LayoutError::ZeroArea` instead of
+    /// deferring the error to PTY spawn time.
+    #[test]
+    fn stack_more_children_than_rows_rejected_as_zero_area() {
+        let root = LayoutNode::Stack {
+            panes: vec![
+                p(Some("a")),
+                p(Some("b")),
+                p(Some("c")),
+                p(Some("d")),
+                p(Some("e")),
+            ],
+        };
+        let result = ComputedLayout::compute(
+            &root,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 2,
+            },
+        );
+        // base_h = 2 / 5 = 0, so child 0 gets h=0; rejected.
+        assert!(
+            matches!(result, Err(LayoutError::ZeroArea { w: 80, h: 0, .. })),
+            "stack overflow must be rejected as ZeroArea; got {:?}",
+            result
+        );
     }
 }

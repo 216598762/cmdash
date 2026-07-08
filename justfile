@@ -96,6 +96,38 @@ lint-doc-family-strict:
     echo "== PASS: lint-doc-family-strict strict-pin holds at EXPECTED=ACTUAL=$COUNT =="
 
 # ------------------------------------------------------------------------------
+# nextest: run the full workspace test suite via cargo-nextest.
+#
+# Faster than `cargo test` due to per-binary parallelism and
+# process isolation. Requires `cargo-nextest` to be installed.
+# ------------------------------------------------------------------------------
+[group('test')]
+nextest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "== nextest =="
+    echo "command: cargo nextest run --workspace"
+    cargo nextest run --workspace
+    echo ""
+    echo "== PASS: nextest completed successfully =="
+
+# ------------------------------------------------------------------------------
+# doc-gate: deny broken intra-doc links in the cmdash lib crate.
+#
+# Uses RUSTDOCFLAGS because newer cargo versions do not forward
+# bare `-D` flags from the cargo doc command line.
+# ------------------------------------------------------------------------------
+[group('lint')]
+doc-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "== doc-gate =="
+    echo "command: RUSTDOCFLAGS='-D rustdoc::broken-intra-doc-links' cargo doc -p cmdash --lib --no-deps"
+    RUSTDOCFLAGS='-D rustdoc::broken-intra-doc-links' cargo doc -p cmdash --lib --no-deps 2>&1
+    echo ""
+    echo "== PASS: doc-gate: no broken intra-doc links =="
+
+# ------------------------------------------------------------------------------
 # gpg-setup: wire git's gpg.program to scripts/gpg-cmdash-wrapper.sh and
 # re-enable commit.gpgsign. Run once per host. The wrapper ships in the
 # repo and contains no secrets; the passphrase is held host-local at

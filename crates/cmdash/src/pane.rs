@@ -410,9 +410,6 @@ impl Drop for PaneRunner {
                 debug!(error = ?e, layer_id = ?pty.layer_id(), "kill on drop");
             }
         }
-        if let Some(handle) = self.reader_thread.take() {
-            let _ = handle.join();
-        }
         // AGENTS.md §"Hard rule: one layer per instance" -- the
         // PaneLayerId binding ends at pane close. Notify the main
         // loop so its next tick can call
@@ -421,11 +418,25 @@ impl Drop for PaneRunner {
         // Skipped for clone-shells (pty: None) since the source
         // runner's `Drop` is the authoritative emitter of the
         // close-channel message.
+        //
+        // **Ordering: send BEFORE joining the reader thread.** If
+        // `kill()` failed and the child keeps the PTY master open,
+        // the reader thread's `read()` blocks indefinitely and
+        // `handle.join()` hangs — the close notification would
+        // never reach `GraphicsState`, stranding the
+        // dashcompositor layer. Sending first guarantees the
+        // main loop's next tick can revoke the `LayerId` even
+        // if `join()` never returns.
         if let (Some(tx), Some(pty)) = (self.close_tx.as_ref(), self.pty.as_ref()) {
             if let Err(e) = tx.send(pty.layer_id()) {
                 debug!(error = ?e, layer_id = ?pty.layer_id(),
                        "close_tx send on drop failed (receiver gone?)");
             }
+        }
+        // Join the reader thread AFTER the close_tx send so a
+        // hang on join doesn't strand the close notification.
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -637,5 +648,92 @@ mod internal_sanity_tests {
             target,
             "resize success must overwrite self.computed.rect with the caller-supplied full rect"
         );
+    }
+
+    /// Smoke test: `Drop` sends the `PaneLayerId` into the
+    /// close channel. Uses `StubPty` with `reader_thread: None`
+    /// so `join()` is a no-op. Pins the basic close-channel
+    /// contract — that `close_tx.send()` fires at all during
+    /// `Drop`.
+    #[test]
+    fn drop_sends_close_tx_on_drop() {
+        let computed = make_test_pane();
+        let layer_id = PaneLayerId(42);
+        let (close_tx, close_rx) = std::sync::mpsc::channel::<PaneLayerId>();
+        let stub = StubPty::new(layer_id);
+        let runner =
+            PaneRunner::with_pty_for_test(computed, layer_id, Box::new(stub), Some(close_tx));
+        drop(runner);
+        let received = close_rx.try_recv();
+        assert!(
+            received.is_ok(),
+            "Drop must send PaneLayerId into close_tx; got {:?}",
+            received
+        );
+        assert_eq!(
+            received.unwrap(),
+            layer_id,
+            "Drop must send the correct PaneLayerId"
+        );
+    }
+
+    /// Ordering test: `close_tx.send()` fires BEFORE
+    /// `handle.join()`. Without this ordering, a `kill()` failure
+    /// that leaves the reader thread blocked on `read()` would
+    /// hang `join()` and the close notification would never reach
+    /// `GraphicsState`, stranding the dashcompositor layer.
+    ///
+    /// This test constructs a `PaneRunner` with a real blocking
+    /// reader thread (blocks on a channel `recv` that never
+    /// fires), then drops the runner on a separate thread. If the
+    /// ordering is "send before join", `close_rx` receives the
+    /// `PaneLayerId` promptly even though `join()` is stuck. If
+    /// the ordering were "join before send", `close_rx` would
+    /// time out because `join()` hangs forever.
+    #[test]
+    fn drop_sends_close_tx_before_joining_blocking_reader_thread() {
+        use std::time::Duration;
+        let computed = make_test_pane();
+        let layer_id = PaneLayerId(99);
+        let (close_tx, close_rx) = std::sync::mpsc::channel::<PaneLayerId>();
+        // Spawn a reader thread that blocks forever on a channel
+        // recv — simulates a hung reader (kill() failed, child
+        // keeps PTY master open, read() never returns EOF).
+        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
+        let blocking_thread = thread::spawn(move || {
+            let _ = block_rx.recv();
+        });
+        // Construct PaneRunner directly (same-module private
+        // field access) with the blocking thread + real close_tx.
+        let (_dummy_tx, dummy_rx) = channel::<Vec<u8>>();
+        let stub = StubPty::new(layer_id);
+        let runner = PaneRunner {
+            computed,
+            pty: Some(Box::new(stub)),
+            bytes_rx: dummy_rx,
+            reader_thread: Some(blocking_thread),
+            close_tx: Some(close_tx),
+        };
+        // Drop on a separate thread so the test thread can check
+        // close_rx without hanging on the blocking join().
+        let drop_handle = thread::spawn(move || {
+            drop(runner);
+        });
+        // If ordering is correct (send before join), this
+        // succeeds within milliseconds. If ordering is wrong
+        // (join before send), this times out at 2s because
+        // join() hangs on the blocking reader thread.
+        let result = close_rx.recv_timeout(Duration::from_secs(2));
+        assert!(
+            result.is_ok(),
+            "close_tx must be sent BEFORE join(); if join() hangs, \
+             the close notification is stranded. Got: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), layer_id);
+        // Unblock the reader thread so the drop_handle thread can
+        // complete (join() returns) and the test doesn't leak.
+        let _ = block_tx.send(());
+        let _ = drop_handle.join();
     }
 }

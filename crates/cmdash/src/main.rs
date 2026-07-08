@@ -1476,7 +1476,15 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         // pre_order, so PaneId-keyed matching would drop the
         // survivor). Wholesale: every old runner goes to
         // `to_drop` for `LayerId` revocation.
-        let mut survivors: std::collections::HashMap<String, PaneRunner> =
+        // Survivors keyed by pane label, using a `Vec<PaneRunner>`
+        // per label so configs with DUPLICATE labels don't silently
+        // drop a survivor. Without the Vec, a second `insert(label, r)`
+        // would overwrite the first runner, causing its `Drop` to fire
+        // spuriously and the second pane with the same label to get a
+        // fresh spawn instead of inheriting the survivor. The Vec
+        // preserves insertion order so survivors are consumed in the
+        // same order they were collected (pre-order runner order).
+        let mut survivors: std::collections::HashMap<String, Vec<PaneRunner>> =
             std::collections::HashMap::new();
         let mut to_drop: Vec<PaneRunner> = Vec::with_capacity(old_runners.len());
         match mode {
@@ -1500,7 +1508,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                             .iter()
                             .any(|p| p.label.as_deref() == Some(label.as_str()));
                         if preserved {
-                            survivors.insert(label, r);
+                            survivors.entry(label).or_default().push(r);
                             continue;
                         }
                     }
@@ -1522,7 +1530,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                 pane.label
                     .as_deref()
                     .map(str::to_string)
-                    .and_then(|l| survivors.remove(&l))
+                    .and_then(|l| survivors.get_mut(&l).and_then(|v| v.pop()))
             } else {
                 None
             };
@@ -1896,6 +1904,96 @@ fn event_to_bytes(code: KeyCode) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(bytes.to_vec())
+}
+
+#[cfg(test)]
+mod redacted_event_debug_tests {
+    use super::*;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    /// `Char(c)` keystroke: the printable character is
+    /// redacted to `Char(<redacted char>)` while modifiers,
+    /// kind, and state are preserved. Pins the privacy
+    /// redaction so a future crossterm upgrade that changes
+    /// the `KeyEvent` field order doesn't silently leak
+    /// printable text into `--log=<path>`.
+    #[test]
+    fn char_key_event_redacts_printable_char() {
+        let evt = Event::Key(KeyEvent {
+            code: KeyCode::Char('Z'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        let s = redacted_event_debug(&evt);
+        assert!(
+            s.contains("Char(<redacted char>)"),
+            "Char must be redacted; got: {s}"
+        );
+        assert!(
+            !s.contains("Char(Z)"),
+            "the actual character must not appear as Char(Z) in the redacted output; got: {s}"
+        );
+        assert!(
+            s.contains("CONTROL"),
+            "modifiers must be preserved; got: {s}"
+        );
+        assert!(s.contains("Press"), "kind must be preserved; got: {s}");
+    }
+
+    /// `Event::Paste` event: the pasted string content is redacted
+    /// to `Paste(<redacted>)`. Pins the reviewer-feedback catch
+    /// that clipboard paste events carry typed passwords / API
+    /// keys verbatim.
+    #[test]
+    fn paste_event_redacts_content() {
+        let evt = Event::Paste("secret-password".into());
+        let s = redacted_event_debug(&evt);
+        assert!(
+            s.contains("Paste(<redacted>)"),
+            "Paste content must be redacted; got: {s}"
+        );
+        assert!(
+            !s.contains("secret"),
+            "the actual paste content must not appear; got: {s}"
+        );
+    }
+
+    /// Non-`Char` `KeyCode` variants (arrows, F-keys,
+    /// Backspace, etc.) carry no printable text, so the full
+    /// `{:?}` escape is forwarded without redaction. Pins the
+    /// "KEPT (full Debug escape)" contract for non-printable
+    /// key codes.
+    #[test]
+    fn non_char_key_event_passes_through_unredacted() {
+        let evt = Event::Key(KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        let s = redacted_event_debug(&evt);
+        assert!(
+            s.contains("Up"),
+            "non-Char KeyCode must pass through unredacted; got: {s}"
+        );
+        assert!(
+            !s.contains("redacted"),
+            "non-Char KeyCode must not contain 'redacted'; got: {s}"
+        );
+    }
+
+    /// `Event::Resize` event carries only geometry — no printable
+    /// text — so it passes through unredacted.
+    #[test]
+    fn resize_event_passes_through_unredacted() {
+        let evt = Event::Resize(132, 50);
+        let s = redacted_event_debug(&evt);
+        assert!(
+            s.contains("132") && s.contains("50"),
+            "Resize must pass through unredacted; got: {s}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3114,6 +3212,114 @@ mod input_tests {
         let post_layout = ComputedLayout::compute(&ctx.layout_root, ctx.last_area)
             .expect("post-rebalance compute");
         assert_eq!(post_layout.panes.len(), 1);
+    }
+
+    /// Duplicate-label survivor preservation: a config with two
+    /// panes sharing the same label ("dup") undergoes
+    /// `AppNewPane` on the first pane. The InPlace reconcile
+    /// path must preserve BOTH survivors — without the
+    /// `HashMap<String, Vec<PaneRunner>>` fix, the second
+    /// `insert` would overwrite the first survivor, causing its
+    /// `Drop` to fire spuriously and the second same-labeled
+    /// pane to get a fresh spawn instead of inheriting the
+    /// survivor. Pins the duplicate-label collision fix.
+    #[test]
+    fn reconcile_inplace_preserves_both_survivors_with_duplicate_labels() {
+        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+        let shell = ShellSpec::Command {
+            argv: vec!["true".into()],
+        };
+        let cfg_text = r#"layout {
+            split axis=horizontal ratio=0.5 {
+                pane kind=shell label="dup"
+                pane kind=shell label="dup"
+            }
+        }"#;
+        let cfg = cmdash_config::parse(cfg_text).expect("parse");
+        let layout_root = cfg.layout.expect("layout block");
+        let initial_layout = ComputedLayout::compute(
+            &layout_root,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute");
+        assert_eq!(initial_layout.panes.len(), 2);
+        let pane_a = initial_layout.panes[0].clone();
+        let pane_b = initial_layout.panes[1].clone();
+        let id_a = cmdash::derive_layer_id(&pane_a.id);
+        let id_b = cmdash::derive_layer_id(&pane_b.id);
+        let r0 =
+            PaneRunner::spawn_with_graphics(pane_a, id_a, shell.clone(), Some(close_tx.clone()))
+                .expect("spawn r0");
+        let r1 =
+            PaneRunner::spawn_with_graphics(pane_b, id_b, shell.clone(), Some(close_tx.clone()))
+                .expect("spawn r1");
+        let layer_a = r0.layer_id();
+        let layer_b = r1.layer_id();
+        let graphics = GraphicsState::new(Metrics::default(), (80, 24));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let bindings = Router::new(vec![Keybind {
+            mods: CfgModifiers {
+                ctrl: true,
+                ..CfgModifiers::default()
+            },
+            key: KeyToken::Char('a'),
+            action: KeyAction::AppNewPane,
+        }]);
+        let last_area = LayoutRect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
+        let mut ctx = TickContext::new_full(
+            vec![r0, r1],
+            bindings,
+            0,
+            true,
+            close_tx,
+            _close_rx_unused,
+            graphics,
+            &mut terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            last_area,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            shell,
+        );
+        ctx.apply_action_full(KeyAction::AppNewPane);
+        // After AppNewPane on focus=0 of a 2-leaf Split with
+        // duplicate labels: the tree becomes a 3-leaf Split
+        // (original child 0 is now itself a Split of [dup, new]).
+        // The InPlace reconcile must preserve BOTH "dup"-labeled
+        // survivors (r0 and r1) by their LayerIds. The new pane
+        // (label=None) gets a fresh spawn.
+        assert_eq!(
+            ctx.runners.len(),
+            3,
+            "AppNewPane on a 2-pane split yields 3 panes"
+        );
+        // Collect all surviving LayerIds.
+        let survivor_layer_ids: Vec<PaneLayerId> =
+            ctx.runners.iter().map(|r| r.layer_id()).collect();
+        // Both original LayerIds must be present (the duplicate-label
+        // fix preserves both; without the fix, one would be dropped
+        // and replaced by a fresh spawn).
+        assert!(
+            survivor_layer_ids.contains(&layer_a),
+            "survivor A's LayerId must be preserved after AppNewPane with duplicate labels"
+        );
+        assert!(
+            survivor_layer_ids.contains(&layer_b),
+            "survivor B's LayerId must be preserved after AppNewPane with duplicate labels"
+        );
     }
 
     /// PanePreset(name): wholesale `layout_root` swap; the
