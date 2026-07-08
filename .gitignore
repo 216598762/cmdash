@@ -8,3 +8,4 @@ Cargo.lock.bak
 
 # Security: prevent accidental commits of local GPG passphrases
 *gpg-passphrase*
+logs/
