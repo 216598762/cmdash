@@ -3,12 +3,11 @@
 //! up in both the vte-consumed grid and the rendered ratatui
 //! buffer.
 
-// clippy `doc_lazy_continuation` (clippy 1.96+) misreads multi-paragraph
-// prose rustdoc as Markdown list continuations; scoped allow for the test
-// file's existing + new doc comments. Per AGENTS.md "doc-link-hygiene"
-// discipline: lint-named + scoped allow attributes are preferred over
-// fighting clippy on prose style when the prose is genuinely prose
-// (not Markdown list items).
+// `clippy::doc_lazy_continuation` misreads multi-paragraph prose
+// rustdoc as Markdown list continuations; scoped allow gates cycle-20
+// atom-2 visual-state proof (atom-1 SHA c850601). Per AGENTS.md
+// "doc-link-hygiene" workflow, lint-named scoped allows are preferred
+// over fighting clippy on prose style.
 #![allow(clippy::doc_lazy_continuation)]
 
 use std::time::Duration;
