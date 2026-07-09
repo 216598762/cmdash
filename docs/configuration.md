@@ -158,10 +158,25 @@ presets {
 ### 4.1. `pane` — a leaf PTY
 
 ```kdl
-pane kind=shell [label="<text>"]
+pane kind=shell [label="<text>"] [command="<cmd>"]
 ```
 
 `kind=shell` is the **only** valid value in v1.
+
+**Optional fields:**
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `label` | `None` | Display label shown in the tab bar and used for survivor matching across runtime mutations. |
+| `command` | `None` | Per-pane shell command override. When set, the pane spawns this command instead of the default login shell (`$SHELL` / `/bin/sh`). |
+
+**`command` field details:**
+
+- The command string is **split by whitespace** into argv at spawn time. `command="htop --delay=5 --color"` produces `["htop", "--delay=5", "--color"]`.
+- The command is executed directly (no shell) — pipes (`|`), redirects (`>`), variable expansion (`$VAR`), and other shell features are **not** available. For complex commands, wrap in a shell: `command="sh -c 'cargo build && echo DONE'"`.
+- If the command binary is not found on `$PATH`, the PTY child fails to spawn and cmdash logs a warning. The pane will appear blank.
+- An empty `command=""` falls back to the default login shell.
+- Each pane in a layout can have its own independent `command`.
 
 ### 4.2. `split` — a binary tree split (TWO children exactly)
 
@@ -368,7 +383,38 @@ keybinds {
 }
 ```
 
-### 6.5. Advanced — 4-pane 2×2 grid
+### 6.5. Per-pane commands — override the default shell
+
+*(See [`examples/05-per-pane-commands.kdl`](../examples/05-per-pane-commands.kdl))*
+
+Each pane can specify a `command` to run instead of the default
+login shell. The command string is split by whitespace into argv;
+shell metacharacters are not supported.
+
+```kdl
+layout {
+    split axis=horizontal ratio=0.6 {
+        pane kind=shell label="editor" command="nvim"
+        pane kind=shell label="monitor" command="htop --delay=5"
+    }
+}
+
+keybinds {
+    bind "alt-w"   action="pane.close"
+    bind "alt-q"   action="app.close"
+}
+```
+
+This opens `nvim` in the left pane and `htop --delay=5` in the
+right pane, instead of spawning login shells.
+
+**Shell wrapper for complex commands:**
+
+```kdl
+pane kind=shell label="build" command="sh -c 'cargo build && echo DONE'"
+```
+
+### 6.6. Advanced — 4-pane 2×2 grid
 
 *(See [`examples/04-four-pane-tiled.kdl`](../examples/04-four-pane-tiled.kdl))*
 

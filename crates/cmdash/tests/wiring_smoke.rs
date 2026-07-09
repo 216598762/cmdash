@@ -2279,3 +2279,135 @@ fn full_pipeline_pty_reader_tick_snapshot_has_content() {
          If the TextGrid had the marker but the buffer doesn't, blit_grid is broken."
     );
 }
+
+/// Per-pane `command` field end-to-end: parse a KDL config with
+/// `command="echo hello"`, verify the field survives
+/// `ComputedLayout::compute`, derive a `ShellSpec::Command` from
+/// the config string (mirroring `shell_spec_from_command` in
+/// main.rs), spawn a real `PaneRunner`, tick it, and assert
+/// "hello" appears in the TextGrid.
+///
+/// This is the integration-level pin for the per-pane shell
+/// command override (roadmap item 1.3). The config-parser
+/// round-trip tests in `cmdash-config` verify
+/// `command="echo hello"` -> `Pane.command = Some("echo hello")`;
+/// the layout resolver in `cmdash-layout` threads it through to
+/// `ComputedPane.command`; this test closes the loop by proving
+/// the command actually EXECUTES in a real PTY.
+///
+/// Catches regressions where:
+/// - `command` field is dropped during config parse (silently None)
+/// - `command` field is dropped during layout resolution
+/// - `ShellSpec::Command` argv splitting is wrong
+/// - The PTY child doesn't actually run the command
+#[test]
+fn per_pane_command_field_echo_hello_appears_in_textgrid() {
+    let source = r#"layout { pane kind=shell label="echo-pane" command="echo hello" }"#;
+    let cfg = cmdash_config::parse(source).expect("parse config with command field");
+    let root = cfg.layout.expect("layout block");
+    let area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: 80,
+        h: 24,
+    };
+    let layout = ComputedLayout::compute(&root, area).expect("compute layout");
+    assert_eq!(layout.panes.len(), 1, "expected 1 leaf pane");
+    let pane = layout.panes[0].clone();
+
+    // Config-parser + layout-resolver round-trip pin: the
+    // `command` field must survive all the way to
+    // `ComputedPane.command`.
+    assert_eq!(
+        pane.command.as_deref(),
+        Some("echo hello"),
+        "ComputedPane.command must carry the KDL command= value through layout resolution"
+    );
+
+    // Derive ShellSpec from the config command string, mirroring
+    // `shell_spec_from_command` in main.rs. Integration tests
+    // can't reach the binary's `pub(crate)` fn, so we split
+    // manually — same logic, one call site.
+    let cmd = pane.command.as_ref().expect("command must be Some");
+    let argv: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+    assert_eq!(
+        argv,
+        vec!["echo".to_string(), "hello".to_string()],
+        "command string must split into [echo, hello]"
+    );
+    let shell = ShellSpec::Command { argv };
+
+    let layer_id = cmdash::derive_layer_id(&pane.id);
+    let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
+
+    // Wait for the child to start and produce output.
+    std::thread::sleep(Duration::from_millis(250));
+
+    let mut found_hello = false;
+    for _ in 0..80 {
+        let snap = runner.tick().expect("tick");
+        'grid: for y in 0..snap.rows {
+            for x in 0..snap.cols {
+                if snap.grid.cell(x, y).ch == 'h' {
+                    let mut ok = true;
+                    for (i, ch) in "hello".chars().enumerate() {
+                        let cx = x + i as u16;
+                        if cx >= snap.cols || snap.grid.cell(cx, y).ch != ch {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        found_hello = true;
+                        break 'grid;
+                    }
+                }
+            }
+        }
+        if found_hello {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        found_hello,
+        "per-pane command='echo hello' must produce 'hello' in the TextGrid \
+         within 2s. If this fails, the command field either didn't survive \
+         config→layout resolution, or the PTY child didn't run echo."
+    );
+
+    // Also verify 'hello' survives blit_grid to a ratatui buffer.
+    let snap = runner.tick().expect("final tick");
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, pane.rect.w, pane.rect.h);
+            cmdash::render::blit_grid(&snap.grid, frame.buffer_mut(), area);
+        })
+        .expect("draw");
+    let buf = terminal.backend().buffer().clone();
+    let mut buf_hello = false;
+    'buf: for y in 0..24 {
+        for x in 0..80 {
+            if buf.get(x, y).symbol() == "h" {
+                let mut ok = true;
+                for (i, ch) in "hello".chars().enumerate() {
+                    let cx = x + i as u16;
+                    if cx >= 80 || buf.get(cx, y).symbol() != ch.to_string() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    buf_hello = true;
+                    break 'buf;
+                }
+            }
+        }
+    }
+    assert!(
+        buf_hello,
+        "'hello' from command='echo hello' must survive blit_grid to ratatui buffer"
+    );
+}

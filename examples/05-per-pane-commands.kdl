@@ -1,0 +1,34 @@
+// 05-per-pane-commands.kdl — per-pane shell command overrides.
+//
+// Each pane can specify a `command` to run instead of the default
+// login shell ($SHELL / /bin/sh). The command string is split by
+// whitespace into argv and executed directly (no shell). Shell
+// metacharacters (pipes, redirects, variable expansion) are NOT
+// available — wrap in `sh -c '...'` for complex commands.
+//
+// See docs/configuration.md §4.1 and §6.5 for full details.
+//
+// To try it: copy this file on top of `crates/cmdash/config.kdl`
+// (which the binary embeds via `include_str!`) and rebuild.
+// See docs/configuration.md §2 (Pitfall #1) and §6 intro.
+
+layout {
+    split axis=horizontal ratio=0.5 {
+        pane kind=shell label="editor" command="nvim"
+        split axis=vertical ratio=0.6 {
+            pane kind=shell label="monitor" command="htop --delay=5"
+            pane kind=shell label="logs" command="sh -c 'tail -f /var/log/syslog 2>/dev/null || echo no syslog'"
+        }
+    }
+}
+
+keybinds {
+    bind "alt-w"   action="pane.close"
+    bind "alt-q"   action="app.close"
+    bind "ctrl-a"  action="app.new-pane"
+    bind "ctrl-h"  action="pane.focus.left"
+    bind "ctrl-j"  action="pane.focus.down"
+    bind "ctrl-k"  action="pane.focus.up"
+    bind "ctrl-l"  action="pane.focus.right"
+    bind "tab"     action="pane.focus.next"
+}
