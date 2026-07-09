@@ -2529,3 +2529,147 @@ fn per_pane_command_with_args_echo_hello_world_appears_in_textgrid() {
         "'hello world' from command='echo hello world' must survive blit_grid to ratatui buffer"
     );
 }
+
+/// Scrollback round-trip: a real PTY child prints enough lines
+/// to overflow the 24-row grid AND push the earliest SCROLL
+/// lines fully into the scrollback buffer. The test waits
+/// until `scrollback_len() >= 1` (NOT until a specific
+/// character appears — the earlier 'S'-detection draft could
+/// fire before any rows had scrolled off, leaving
+/// `scrollback_len() == 0`). It then enters scrollback mode,
+/// verifies the buffer has non-blank content, and renders via
+/// `blit_grid` into a `ratatui::TestBackend` to prove the full
+/// PTY→VTE→TextGrid→scrollback→blit_grid→Buffer round trip.
+///
+/// With 50 numbered lines on a 24-row grid, after all lines
+/// are printed the live grid holds SCROLL_027..SCROLL_050 and
+/// the scrollback buffer holds the shell prompt +
+/// SCROLL_001..SCROLL_026 (27+ rows). SCROLL_001 is therefore
+/// well inside scrollback, not on the live grid.
+#[test]
+fn scrollback_round_trip_renders_scrolled_off_content() {
+    // 50 numbered lines + sleep + exit. On a 24-row grid,
+    // lines 1–26+ get scrolled off into scrollback after all
+    // lines are printed, guaranteeing SCROLL_001 is in
+    // scrollback (not on the live grid).
+    let script_lines: String = (1..=50)
+        .map(|i| format!("printf 'SCROLL_{:03}\\n'", i))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let command = format!("{}; sleep 0.1; exit 0", script_lines);
+
+    let cfg_text = r#"layout { pane kind=shell label="scrollback-test" }"#;
+    let cfg = cmdash_config::parse(cfg_text).expect("parse config");
+    let root = cfg.layout.expect("layout block");
+    let area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: 80,
+        h: 24,
+    };
+    let layout = ComputedLayout::compute(&root, area).expect("compute layout");
+    let pane = &layout.panes[0];
+    let layer_id = cmdash::derive_layer_id(&pane.id);
+    let shell = ShellSpec::Command {
+        argv: vec!["sh".to_string(), "-c".to_string(), command],
+    };
+    let (close_tx, _close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let mut runner = PaneRunner::spawn_with_graphics(pane.clone(), layer_id, shell, Some(close_tx))
+        .expect("spawn runner");
+
+    // Tick until scrollback has content. This is the critical
+    // difference from the earlier 'S'-detection draft: we wait
+    // until at least one row has scrolled off the top of the
+    // grid into the scrollback buffer, guaranteeing the ring
+    // buffer is populated before we inspect it.
+    let mut snap = None;
+    for _ in 0..200 {
+        std::thread::sleep(Duration::from_millis(25));
+        let s = runner.tick().expect("tick");
+        if s.grid.scrollback_len() >= 1 {
+            snap = Some(s);
+            break;
+        }
+    }
+    let mut snap = snap.expect("scrollback must populate within 5s");
+
+    let sb_len = snap.grid.scrollback_len();
+    assert!(
+        sb_len >= 1,
+        "scrollback must contain at least 1 row; got {sb_len}"
+    );
+
+    // Enter scrollback mode by scrolling up to the oldest
+    // captured rows.
+    snap.grid.scrollback_up(sb_len);
+    assert!(
+        snap.grid.in_scrollback(),
+        "scrollback_up must enter scrollback mode"
+    );
+
+    // Verify the scrollback buffer has non-blank content in
+    // row 0 (the oldest captured row — either the shell prompt
+    // or an early SCROLL line). We check for ANY non-space
+    // character rather than assuming a specific one lands at
+    // index 0.
+    let sb_row = snap
+        .grid
+        .scrollback_row(0)
+        .expect("scrollback row 0 must exist");
+    let has_non_blank = sb_row.iter().any(|c| c.ch != ' ');
+    assert!(
+        has_non_blank,
+        "oldest scrollback row must contain non-blank content"
+    );
+
+    // Render the scrollback viewport into a ratatui buffer via
+    // blit_grid. The scrollback rows should appear at the top
+    // of the rendered area.
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+    let mut non_space_at_row0 = false;
+    terminal
+        .draw(|frame| {
+            let buf = frame.buffer_mut();
+            let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+            cmdash::render::blit_grid(&snap.grid, buf, area);
+            // Check if row 0 has any non-space content from
+            // the scrollback rows rendered by blit_grid.
+            for x in 0..80u16 {
+                if buf.get(x, 0).symbol() != " " {
+                    non_space_at_row0 = true;
+                    break;
+                }
+            }
+        })
+        .expect("draw");
+    assert!(
+        non_space_at_row0,
+        "blit_grid must render scrollback content at row 0 of the ratatui buffer"
+    );
+
+    // Verify SCROLL_001 is in scrollback (not on the live
+    // grid). With 50 lines on a 24-row grid, SCROLL_001
+    // should have scrolled off by now.
+    let mut found_in_scrollback = false;
+    for idx in 0..sb_len {
+        if let Some(row) = snap.grid.scrollback_row(idx) {
+            if row.first().map(|c| c.ch) == Some('S') {
+                found_in_scrollback = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        found_in_scrollback,
+        "SCROLL_001 must be in the scrollback buffer (not on the live grid) \
+         after 50 lines on a 24-row grid; scrollback_len={sb_len}"
+    );
+
+    // Exit scrollback mode and verify the live grid is restored.
+    snap.grid.scrollback_reset();
+    assert!(
+        !snap.grid.in_scrollback(),
+        "scrollback_reset must return to live view"
+    );
+}
