@@ -463,8 +463,7 @@ fn run_reader(mut reader: PaneReader, tx: std::sync::mpsc::Sender<Vec<u8>>) {
                 } else {
                     debug!(
                         reads = read_count,
-                        total_bytes,
-                        "pane reader: EOF after reading bytes"
+                        total_bytes, "pane reader: EOF after reading bytes"
                     );
                 }
                 break;
@@ -475,8 +474,7 @@ fn run_reader(mut reader: PaneReader, tx: std::sync::mpsc::Sender<Vec<u8>>) {
                 if tx.send(buf[..n].to_vec()).is_err() {
                     debug!(
                         reads = read_count,
-                        total_bytes,
-                        "pane reader: receiver dropped; stopping"
+                        total_bytes, "pane reader: receiver dropped; stopping"
                     );
                     break; // Receiver dropped; binary is exiting.
                 }

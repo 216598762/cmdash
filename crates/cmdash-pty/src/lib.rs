@@ -987,9 +987,7 @@ impl PanePty {
         let master = pair.master;
         debug!(
             layer_id = layer_id.0,
-            cols,
-            rows,
-            "PanePty::spawn: child spawned successfully"
+            cols, rows, "PanePty::spawn: child spawned successfully"
         );
         Ok((
             Self {

@@ -200,12 +200,18 @@ mod tests {
             .expect("draw");
         let buf = terminal.backend().buffer().clone();
         assert!(
-            buf.get(0, 0).style().add_modifier.contains(ratatui::style::Modifier::REVERSED),
+            buf.get(0, 0)
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED),
             "cursor at (0,0) must have REVERSED modifier"
         );
         // Cell (1, 0) must NOT have REVERSED.
         assert!(
-            !buf.get(1, 0).style().add_modifier.contains(ratatui::style::Modifier::REVERSED),
+            !buf.get(1, 0)
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED),
             "non-cursor cell (1,0) must NOT have REVERSED modifier"
         );
     }
@@ -256,7 +262,10 @@ mod tests {
         );
         // The cursor-reversed cell at (40, 10) must have REVERSED.
         assert!(
-            buf.get(40, 10).style().add_modifier.contains(ratatui::style::Modifier::REVERSED),
+            buf.get(40, 10)
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED),
             "cursor maps to (40,10) and must have REVERSED modifier"
         );
     }

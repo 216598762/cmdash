@@ -35,7 +35,12 @@ fn blank_screen_detection_pty_echo_must_appear_in_buffer() {
     let source = r#"layout { pane kind=shell label="blank-test" }"#;
     let cfg = cmdash_config::parse(source).expect("parse config");
     let root = cfg.layout.expect("layout block");
-    let area = LayoutRect { x: 0, y: 0, w: 80, h: 24 };
+    let area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: 80,
+        h: 24,
+    };
     let layout = ComputedLayout::compute(&root, area).expect("compute layout");
     let pane = layout.panes[0].clone();
     let layer_id = cmdash::derive_layer_id(&pane.id);
@@ -61,7 +66,9 @@ fn blank_screen_detection_pty_echo_must_appear_in_buffer() {
                     break;
                 }
             }
-            if found { break; }
+            if found {
+                break;
+            }
         }
         if found {
             snap = Some(s);
@@ -138,7 +145,12 @@ fn shell_startup_produces_visible_content_in_textgrid() {
     let source = r#"layout { pane kind=shell label="shell-startup" }"#;
     let cfg = cmdash_config::parse(source).expect("parse config");
     let root = cfg.layout.expect("layout block");
-    let area = LayoutRect { x: 0, y: 0, w: 80, h: 24 };
+    let area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: 80,
+        h: 24,
+    };
     let layout = ComputedLayout::compute(&root, area).expect("compute layout");
     let pane = layout.panes[0].clone();
     let layer_id = cmdash::derive_layer_id(&pane.id);
@@ -175,9 +187,13 @@ fn shell_startup_produces_visible_content_in_textgrid() {
                     }
                 }
             }
-            if found_marker { break; }
+            if found_marker {
+                break;
+            }
         }
-        if found_marker { break; }
+        if found_marker {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
     assert!(
@@ -303,7 +319,12 @@ fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
     let source = r#"layout { pane kind=shell label="phase-order" }"#;
     let cfg = cmdash_config::parse(source).expect("parse config");
     let root = cfg.layout.expect("layout block");
-    let area = LayoutRect { x: 0, y: 0, w: 80, h: 24 };
+    let area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: 80,
+        h: 24,
+    };
     let layout = ComputedLayout::compute(&root, area).expect("compute layout");
     let pane = layout.panes[0].clone();
     let layer_id = cmdash::derive_layer_id(&pane.id);
@@ -329,7 +350,9 @@ fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
                     break;
                 }
             }
-            if found { break; }
+            if found {
+                break;
+            }
         }
         if found {
             snap = Some(s);
@@ -388,9 +411,7 @@ fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
     // overwriting the text. We verify by scanning for the
     // ASCII bytes of "VISIBLE_TEXT" in the combined stream.
     let needle = b"VISIBLE_TEXT";
-    let found = combined
-        .windows(needle.len())
-        .any(|w| w == needle);
+    let found = combined.windows(needle.len()).any(|w| w == needle);
     assert!(
         found,
         "phase 3a text 'VISIBLE_TEXT' must survive in the combined \
@@ -932,6 +953,7 @@ fn app_new_pane_splits_focused_leaf_in_real_pty_tree() {
             LayoutNode::Pane(CfgPane {
                 kind: PaneKind::Shell,
                 label: None,
+                command: None,
             }),
         ],
     };
@@ -1246,6 +1268,7 @@ fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
         LayoutNode::Pane(CfgPane {
             kind: PaneKind::Shell,
             label: Some("kept".to_string()),
+            command: None,
         }),
         "PaneClose (closing child 1 of Horizontal Split) collapses the Split to leaf `kept`"
     );
@@ -2119,7 +2142,12 @@ fn full_pipeline_pty_reader_tick_snapshot_has_content() {
     let source = r#"layout { pane kind=shell label="pipeline" }"#;
     let cfg = cmdash_config::parse(source).expect("parse config");
     let root = cfg.layout.expect("layout block");
-    let area = LayoutRect { x: 0, y: 0, w: 80, h: 24 };
+    let area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: 80,
+        h: 24,
+    };
     let layout = ComputedLayout::compute(&root, area).expect("compute layout");
     let pane = layout.panes[0].clone();
     let layer_id = cmdash::derive_layer_id(&pane.id);
@@ -2135,13 +2163,8 @@ fn full_pipeline_pty_reader_tick_snapshot_has_content() {
         ],
     };
     let close_tx: PaneCloseTx = std::sync::mpsc::channel().0;
-    let mut runner = PaneRunner::spawn_with_graphics(
-        pane.clone(),
-        layer_id,
-        shell,
-        Some(close_tx),
-    )
-    .expect("spawn_with_graphics must succeed");
+    let mut runner = PaneRunner::spawn_with_graphics(pane.clone(), layer_id, shell, Some(close_tx))
+        .expect("spawn_with_graphics must succeed");
 
     // Wait for the child to start and produce output.
     std::thread::sleep(Duration::from_millis(250));
@@ -2185,11 +2208,15 @@ fn full_pipeline_pty_reader_tick_snapshot_has_content() {
                         }
                     }
                 }
-                if found_marker { break; }
+                if found_marker {
+                    break;
+                }
             }
         }
         last_snap = Some(snap);
-        if found_marker { break; }
+        if found_marker {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
 
