@@ -142,7 +142,7 @@ impl GraphicsProtocol {
     ///    `wezterm`) → Sixel
     /// 4. `CMDASH_GRAPHICS` env override (`kitty`, `sixel`,
     ///    `none`) — explicit user choice wins
-    /// 5. Otherwise → TextOnly
+    /// 5. Otherwise → `TextOnly`
     pub fn detect() -> Self {
         // Explicit override takes priority.
         if let Ok(val) = std::env::var("CMDASH_GRAPHICS") {
@@ -947,8 +947,8 @@ mod internal_sanity_tests {
     /// one 1×1 image should produce a compressed passthrough
     /// frame well under 4 MiB.
     ///
-    /// Explicit Kitty protocol: `new()` detects TextOnly in CI
-    /// (no real terminal), which early-outs via the TextOnly
+    /// Explicit Kitty protocol: `new()` detects `TextOnly` in CI
+    /// (no real terminal), which early-outs via the `TextOnly`
     /// guard before encoding, causing this test to pass with
     /// 0 bytes (wrong reason).
     #[test]
@@ -1126,7 +1126,7 @@ mod internal_sanity_tests {
     }
 
     /// `update_tab_bar` is a no-op when `kitty_capable` is
-    /// false AND protocol is TextOnly. The guard
+    /// false AND protocol is `TextOnly`. The guard
     /// (`kitty_capable || protocol != TextOnly`) gates tab bar
     /// dashcompositor layers so non-graphics terminals never
     /// emit garbled APC-G/Sixel output.
@@ -1177,7 +1177,7 @@ mod internal_sanity_tests {
         assert_eq!(g.protocol(), GraphicsProtocol::Kitty);
     }
 
-    /// `GraphicsProtocol::new_with_protocol` with TextOnly
+    /// `GraphicsProtocol::new_with_protocol` with `TextOnly`
     /// must return `TextOnly`.
     #[test]
     fn new_with_protocol_text_only_returns_text_only() {
@@ -1321,7 +1321,7 @@ mod internal_sanity_tests {
         );
     }
 
-    /// `update_tab_bar` with TextOnly protocol must NOT push
+    /// `update_tab_bar` with `TextOnly` protocol must NOT push
     /// tab bar layers (no graphics path available). Symmetric
     /// to `update_tab_bar_noop_when_not_kitty_capable`.
     #[test]

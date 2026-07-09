@@ -2542,12 +2542,12 @@ fn per_pane_command_with_args_echo_hello_world_appears_in_textgrid() {
 /// `scrollback_len() == 0`). It then enters scrollback mode,
 /// verifies the buffer has non-blank content, and renders via
 /// `blit_grid` into a `ratatui::TestBackend` to prove the full
-/// PTY→VTE→TextGrid→scrollback→blit_grid→Buffer round trip.
+/// PTY→VTE→TextGrid→scrollback→`blit_grid`→Buffer round trip.
 ///
 /// With 50 numbered lines on a 24-row grid, after all lines
-/// are printed the live grid holds SCROLL_027..SCROLL_050 and
+/// are printed the live grid holds `SCROLL_027..SCROLL_050` and
 /// the scrollback buffer holds the shell prompt +
-/// SCROLL_001..SCROLL_026 (27+ rows). SCROLL_001 is therefore
+/// `SCROLL_001..SCROLL_026` (27+ rows). `SCROLL_001` is therefore
 /// well inside scrollback, not on the live grid.
 #[test]
 fn scrollback_round_trip_renders_scrolled_off_content() {

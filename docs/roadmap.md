@@ -12,19 +12,26 @@ driver terminal multiplexer.
 
 ### 1.1 Runtime config file loading
 
-**Current state:** Config is embedded at compile time via
-`include_str!("../config.kdl")`. Changing keybinds or layout requires
-recompiling.
+**Status:** ✅ Working.
 
-**Goal:** Load `~/.config/cmdash/config.kdl` at startup. Fall back to the
-bundled default if the file is missing or unreadable. Support
-`CMDASH_CONFIG_DIR` env var override.
+**Current state:** Config is loaded at startup via a priority chain:
+`--config` CLI flag → `$CMDASH_CONFIG_DIR` env → `~/.config/cmdash/config.kdl`
+XDG default → bundled `include_str!("../config.kdl")` fallback. A
+filesystem watcher hot-reloads the config when the file changes at
+runtime (re-parses and signals the main loop via channel).
 
-**Steps:**
-- Add `figment` as a dependency for layered config (file → env → CLI).
-- Wire `cmdash::run` to read from the config dir path at startup.
-- Add `--config=<path>` CLI flag for explicit override.
-- Add `ReloadConfig` key action to hot-reload at runtime.
+**Implementation:**
+- `resolve_config_path()` resolves the path from the priority chain.
+- `read_config_text()` reads from the resolved path, falling back to the
+  bundled default with appropriate logging.
+- `--config=<path>` CLI flag for explicit override.
+- `CMDASH_CONFIG_DIR` environment variable override.
+- Filesystem watcher for runtime hot-reload.
+
+**Remaining:**
+- `figment` was originally planned for layered config (file → env → CLI)
+  but was not needed — direct `std::fs` + `std::env` calls suffice.
+- Pretty-print errors with file:line context (deferred to §3.6).
 
 ### 1.2 Tab bar rendering
 
