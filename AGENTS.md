@@ -134,7 +134,8 @@ The following `KeyAction` variants mutate the live layout tree at runtime:
   boundaries).
 - **`TabNew` / `TabClose` / `TabSwitch(n)`** — multi-tab operations.
   `TabStack<T>` carries per-tab state; tab mutations sync v1 fields
-  and reconcile runners. The tab bar is not yet rendered.
+  and reconcile runners. The tab bar is rendered as both a ratatui
+  text fallback (phase 3a) and a dashcompositor pixel overlay (phase 3b).
 
 ### Nested-terminal graphics handling
 

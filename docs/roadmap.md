@@ -35,23 +35,26 @@ runtime (re-parses and signals the main loop via channel).
 
 ### 1.2 Tab bar rendering
 
+**Status:** ✅ Working.
+
 **Current state:** `TabStack<TabState>` is implemented and tab actions
-(`TabNew`, `TabClose`, `TabSwitch(n)`) are wired through
-`TickContext`. But no tab bar is rendered — the user has no visual
-indication of how many tabs exist or which is active.
+(`TabNew`, `TabClose`, `TabSwitch(n)`) are wired through `TickContext`.
+The tab bar is rendered in two layers:
 
-**Goal:** Render a tab bar as its own layer at the top (or bottom) of the
-screen. Show tab titles, highlight the active tab, support click-to-focus
-(future).
+- **Phase 3a (text):** `render_tab_bar()` renders a ratatui text tab bar
+  at row 0 with active tab highlighted (Blue bg, White bold) and
+  inactive tabs styled DarkGray/Gray. Called unconditionally in
+  `TickContext::run` after pane grid rendering.
+- **Phase 3b (pixel):** `graphics.update_tab_bar()` pushes dashcompositor
+  `RectLayer` + `TextLayer` overlays that overwrite the text tab bar on
+  Kitty/Sixel-capable hosts.
+- `TAB_BAR_HEIGHT` (1 row) reserves space at the top of the terminal;
+  the layout area is reduced by that amount.
 
-**Steps:**
-- Add a tab-bar render pass in `TickContext::run` (phase 3a, after pane
-  rendering).
-- Reserve 1 row at the top of the terminal for the tab bar; reduce the
-  layout area by that amount.
-- Render tab labels from `TabStack::iter()`, highlighting
-  `active_idx()`.
-- The tab bar is its own layer per the one-layer-per-instance rule.
+**Remaining:**
+- Click-to-focus (future, requires mouse support §3.2).
+- Configurable tab bar position (top/bottom) via KDL.
+- Tab bar hidden when only 1 tab exists (configurable).
 
 ### 1.3 Per-pane shell specification
 
