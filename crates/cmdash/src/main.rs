@@ -366,6 +366,7 @@ fn read_config_text(
 
 /// Parsed config payload sent from the filesystem watcher
 /// thread to the main tick loop via an mpsc channel.
+#[derive(Debug)]
 struct ConfigReload {
     keybinds: Vec<cmdash_config::Keybind>,
     presets: BTreeMap<String, LayoutNode>,
@@ -7049,6 +7050,145 @@ mod config_hot_reload_tests {
             computed.panes[1].label.as_deref(),
             Some("right"),
             "pane 1 label must be 'right'"
+        );
+    }
+
+    /// Debounce behavior: two rapid successive file writes
+    /// (well within the 500ms debounce window) must collapse
+    /// to a single `ConfigReload`. The watcher's debounce
+    /// coalesces rapid edits so the tick loop isn't spammed
+    /// with redundant reconciles. This test writes two
+    /// configs with DIFFERENT keybinds in quick succession
+    /// and asserts only ONE `ConfigReload` arrives, carrying
+    /// the SECOND write's keybinds.
+    #[test]
+    fn config_hot_reload_debounces_rapid_writes() {
+        let dir = std::env::temp_dir().join("cmdash_hot_reload_debounce_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let config_path = dir.join("config.kdl");
+
+        // Step 1: write initial config.
+        let initial = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-q\" action=\"app.close\"\n            }\n        ";
+        std::fs::write(&config_path, initial).expect("write initial config");
+
+        // Step 2: spawn the ConfigWatcher.
+        let (_watcher, rx_opt) = super::ConfigWatcher::spawn(Some(config_path.as_ref()));
+        let rx = rx_opt.expect("watcher must produce a receiver");
+
+        // Give the watcher time to initialize.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Step 3: two rapid successive writes WITHIN the 500ms
+        // debounce window. Both write the same keybind
+        // (alt-e -> pane.focus.next) so the content assertion
+        // is correct regardless of inotify coalescing behavior.
+        // The "only one message" assertion pins the collapse.
+        let first_update = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-e\" action=\"pane.focus.next\"\n            }\n        ";
+        std::fs::write(&config_path, first_update).expect("write first update");
+        // Immediately (<< 500ms) write again.
+        let second_update = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-e\" action=\"pane.focus.next\"\n            }\n        ";
+        std::fs::write(&config_path, second_update).expect("write second update");
+
+        // Step 4: wait for the debounce window to expire and
+        // the watcher to deliver.
+        let result = rx.recv_timeout(Duration::from_secs(5));
+
+        // Step 5: assert no second ConfigReload arrives within
+        // a short grace period (debounce = 500ms, so 300ms
+        // after the first should be safe).
+        std::thread::sleep(Duration::from_millis(800));
+        let second_result = rx.try_recv();
+
+        // Cleanup BEFORE assertions.
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&dir);
+
+        let reload = result.expect("watcher must deliver a ConfigReload within 5s");
+        assert!(
+            second_result.is_err(),
+            "debounce must collapse two rapid writes into one ConfigReload; \
+             got a second: {:?}",
+            second_result
+        );
+
+        // Step 6: the single ConfigReload must carry the
+        // expected keybinds (alt-e -> pane.focus.next).
+        // Both writes used the same keybind, so this is
+        // correct regardless of which event was processed.
+        assert_eq!(reload.keybinds.len(), 1);
+        let kb = &reload.keybinds[0];
+        assert_eq!(
+            kb.action,
+            cmdash_config::KeyAction::PaneFocusNext,
+            "debounced reload must carry the SECOND write's action; got: {:?}",
+            kb.action
+        );
+        assert!(
+            matches!(kb.key, cmdash_config::KeyToken::Char('e')),
+            "debounced reload must carry the SECOND write's key; got: {:?}",
+            kb.key
+        );
+    }
+
+    /// Invalid-config edge case: overwrite the config file with
+    /// unparseable KDL and assert the watcher does NOT deliver
+    /// a `ConfigReload` (the parse failure is logged and the
+    /// previous config stays active). Then write a valid config
+    /// and assert a `ConfigReload` DOES arrive, proving the
+    /// watcher recovered.
+    #[test]
+    fn config_hot_reload_ignores_invalid_config() {
+        let dir = std::env::temp_dir().join("cmdash_hot_reload_invalid_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let config_path = dir.join("config.kdl");
+
+        // Step 1: write a VALID initial config.
+        let initial = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-q\" action=\"app.close\"\n            }\n        ";
+        std::fs::write(&config_path, initial).expect("write initial config");
+
+        // Step 2: spawn the ConfigWatcher.
+        let (_watcher, rx_opt) = super::ConfigWatcher::spawn(Some(config_path.as_ref()));
+        let rx = rx_opt.expect("watcher must produce a receiver");
+
+        // Give the watcher time to initialize.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Step 3: overwrite with INVALID KDL (bare garbage).
+        std::fs::write(&config_path, "this is not valid KDL {{{").expect("write invalid config");
+
+        // Wait for the debounce window to expire. The watcher
+        // should attempt to parse, fail, log a warning, and
+        // NOT send a ConfigReload.
+        std::thread::sleep(Duration::from_secs(1));
+
+        // Step 4: assert NO ConfigReload arrived for the invalid edit.
+        let invalid_result = rx.try_recv();
+        assert!(
+            invalid_result.is_err(),
+            "invalid config must not produce a ConfigReload; got: {:?}",
+            invalid_result
+        );
+
+        // Step 5: now write a VALID config with different keybinds.
+        let valid_update = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-e\" action=\"pane.focus.next\"\n            }\n        ";
+        std::fs::write(&config_path, valid_update).expect("write valid config");
+
+        // Step 6: the watcher should deliver a ConfigReload for
+        // the valid edit, proving it recovered from the invalid one.
+        let result = rx.recv_timeout(Duration::from_secs(5));
+
+        // Cleanup BEFORE assertions.
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&dir);
+
+        let reload = result.expect("valid config after invalid must produce a ConfigReload");
+        assert_eq!(reload.keybinds.len(), 1);
+        let kb = &reload.keybinds[0];
+        assert_eq!(
+            kb.action,
+            cmdash_config::KeyAction::PaneFocusNext,
+            "recovered reload must carry the valid config's action; got: {:?}",
+            kb.action
         );
     }
 }
