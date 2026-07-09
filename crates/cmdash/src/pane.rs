@@ -360,6 +360,38 @@ impl PaneRunner {
             .layer_id()
     }
 
+    /// Move the scrollback viewport up by `n` rows.
+    pub fn scrollback_up(&mut self, n: usize) {
+        self.pty
+            .as_mut()
+            .expect("PaneRunner::scrollback_up: pty is None")
+            .scrollback_up(n);
+    }
+
+    /// Move the scrollback viewport down by `n` rows.
+    pub fn scrollback_down(&mut self, n: usize) {
+        self.pty
+            .as_mut()
+            .expect("PaneRunner::scrollback_down: pty is None")
+            .scrollback_down(n);
+    }
+
+    /// Reset the scrollback viewport to live view.
+    pub fn scrollback_reset(&mut self) {
+        self.pty
+            .as_mut()
+            .expect("PaneRunner::scrollback_reset: pty is None")
+            .scrollback_reset();
+    }
+
+    /// Returns `true` when the user is viewing scrollback history.
+    pub fn in_scrollback(&self) -> bool {
+        self.pty
+            .as_ref()
+            .expect("PaneRunner::in_scrollback: pty is None")
+            .in_scrollback()
+    }
+
     /// Test-only ctor that injects a [`PanePtyOps`] trait object
     /// WITHOUT spawning a real PTY reader thread. Used by the
     /// `#[cfg(test)] mod internal_sanity_tests` block below to
@@ -557,6 +589,12 @@ mod internal_sanity_tests {
         }
         fn kill(&mut self) -> Result<(), PtyError> {
             Ok(())
+        }
+        fn scrollback_up(&mut self, _n: usize) {}
+        fn scrollback_down(&mut self, _n: usize) {}
+        fn scrollback_reset(&mut self) {}
+        fn in_scrollback(&self) -> bool {
+            false
         }
     }
 

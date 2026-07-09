@@ -1258,6 +1258,47 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         if !matches!(kind, KeyEventKind::Press) {
             return;
         }
+        // Intercept PageUp/PageDown for scrollback navigation.
+        // These keys control the scrollback viewport instead of
+        // being forwarded to the child PTY. Any other key
+        // resets scrollback to live view before forwarding.
+        let page_size = self
+            .runners
+            .get(self.focus)
+            .map(|r| r.computed().rect.h as usize)
+            .unwrap_or(24);
+        match code {
+            KeyCode::PageUp => {
+                if let Some(runner) = self.runners.get_mut(self.focus) {
+                    runner.scrollback_up(page_size);
+                }
+                return;
+            }
+            KeyCode::PageDown => {
+                // Only intercept PageDown when already in
+                // scrollback mode. Otherwise forward to the
+                // PTY so pagers (less, man) receive it.
+                let in_sb = self
+                    .runners
+                    .get(self.focus)
+                    .map(|r| r.in_scrollback())
+                    .unwrap_or(false);
+                if in_sb {
+                    if let Some(runner) = self.runners.get_mut(self.focus) {
+                        runner.scrollback_down(page_size);
+                    }
+                    return;
+                }
+            }
+            _ => {
+                // Reset scrollback on any other key press.
+                if let Some(runner) = self.runners.get_mut(self.focus) {
+                    if runner.in_scrollback() {
+                        runner.scrollback_reset();
+                    }
+                }
+            }
+        }
         let Some(bytes) = event_to_bytes(*code) else {
             return;
         };

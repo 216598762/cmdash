@@ -176,13 +176,14 @@ own stdout — placement is fragile and pane-local. Capture, extract, route.
 | Runtime layout mutations (new pane, close, preset swap) | ✅ Working |
 | Directional focus navigation | ✅ Working |
 | ZStack overlay + focus primitives | ✅ Working |
-| Tabs (TabStack, tab actions) | ⚠️ Partially implemented (actions wired, tab bar not rendered) |
+| Tabs (TabStack, tab actions + tab bar rendering) | ✅ Working |
 | Configurable layouts (KDL) | ✅ Working |
 | Layout presets | ✅ Working |
 | Modifier-based keybinds | ✅ Working (Normal mode only; other modes are stubs) |
 | Native Rust widgets (cmdash-widget-sdk) | ❌ Stub only |
 | Script widgets (cmdash-protocol) | ❌ Stub only |
 | Runtime config file loading (~/.config/cmdash/) | ✅ Working (priority chain: `--config`, `$CMDASH_CONFIG_DIR`, XDG default, bundled fallback) |
+| Scrollback buffer | ✅ Working (ring buffer, PageUp/PageDown, ESC [3J clear) |
 | Sixel fallback | ⚠️ Code path exists, untested |
 
 ## Keybinding system

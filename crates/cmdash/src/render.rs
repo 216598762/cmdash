@@ -45,20 +45,46 @@ pub fn pty_attrs_to_modifier(a: CellAttrs) -> Modifier {
 /// still the canonical blank (space + default fg/bg + no attrs)
 /// are skipped, so a smaller grid does not erase pre-existing
 /// content stamped by an earlier pane.
+///
+/// ## Scrollback rendering
+///
+/// When the grid's `scrollback_offset` is > 0 (the user is
+/// viewing scrollback history), the top rows of the area are
+/// filled from the scrollback ring buffer and the bottom rows
+/// from the live grid. The mapping is:
+///
+/// - Visible row `y < offset` → scrollback row
+///   `scrollback.len() - offset + y` (newest scrollback rows
+///   first, filling downward).
+/// - Visible row `y >= offset` → live grid row `y - offset`.
 pub fn blit_grid(grid: &TextGrid, buf: &mut Buffer, area: RatRect) {
     let cols = grid.cols();
     let rows = grid.rows();
-    for y in 0..rows {
-        if y >= area.height {
-            break;
-        }
-        for x in 0..cols {
-            if x >= area.width {
-                break;
-            }
-            let cell = grid.cell(x, y);
+    let offset = grid.scrollback_offset();
+    let sb_len = grid.scrollback_len();
+    let visible_rows = area.height as usize;
+    for vy in 0..visible_rows {
+        let x_limit = cols.min(area.width);
+        for x in 0..x_limit {
+            // Resolve the source cell: scrollback row or live
+            // grid row, depending on the viewport offset.
+            let cell_ref: Option<&cmdash_pty::Cell> = if vy < offset && offset <= sb_len {
+                let sb_idx = sb_len - offset + vy;
+                grid.scrollback_row(sb_idx)
+                    .and_then(|row| row.get(x as usize))
+            } else {
+                let gy = if vy >= offset { vy - offset } else { vy };
+                if gy < rows as usize {
+                    Some(grid.cell(x, gy as u16))
+                } else {
+                    None
+                }
+            };
+            let Some(cell) = cell_ref else {
+                continue;
+            };
             let bx = area.x + x;
-            let by = area.y + y;
+            let by = area.y + vy as u16;
             if bx >= buf.area.width || by >= buf.area.height {
                 continue;
             }

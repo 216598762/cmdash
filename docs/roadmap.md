@@ -62,19 +62,20 @@ screen. Show tab titles, highlight the active tab, support click-to-focus
 
 ### 1.4 Scrollback / alternate screen
 
-**Current state:** `TextGrid` is a fixed-size grid with no scrollback
-buffer. When content scrolls past the bottom, it's lost. This is a
-daily-driver blocker — most terminal users expect scrollback as a
-basic feature.
+**Current state:** ✅ Implemented. `TextGrid` has a ring-buffer scrollback
+(`VecDeque<Vec<Cell>>`, default capacity 1000 rows). `scroll_up_one`
+captures the top row into scrollback before shifting. `PageUp` enters
+scrollback mode; `PageDown` scrolls toward live view (only intercepted
+when already in scrollback, otherwise forwarded to the PTY for pagers).
+Any non-PageUp/PageDown key resets to live view. `ESC [3J` clears the
+scrollback buffer; `ESC [2J` only clears the visible screen (xterm
+semantics). `blit_grid` renders scrollback rows above the live grid
+when the viewport offset is > 0.
 
-**Goal:** Add a scrollback buffer per pane with keyboard navigation.
-
-**Steps:**
-- Add a `scrollback: Vec<Vec<Cell>>` to `TextGrid` (or a ring buffer).
-- On `scroll_up_one`, push the scrolled row into scrollback.
-- Add `PageUp`/`PageDown` handling in the binary to view scrollback
-  (with a visual indicator).
-- Limit scrollback size (configurable, default 1000 lines).
+**Remaining:**
+- Alternate screen detection/toggle (DECSET/DECRST 1047/1049).
+- Scroll-wheel scrollback navigation (Tier 3.2 mouse support).
+- Configurable scrollback capacity via KDL.
 
 ### 1.5 Sixel fallback verification
 

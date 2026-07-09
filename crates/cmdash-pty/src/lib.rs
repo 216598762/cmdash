@@ -34,7 +34,7 @@
 //! `put`/`unhook` for kitty (those callbacks never fire for APC).
 
 use base64::Engine;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -49,6 +49,9 @@ pub const DEFAULT_COLS: u16 = 80;
 
 /// Default row count when the caller doesn't override.
 pub const DEFAULT_ROWS: u16 = 24;
+
+/// Default maximum number of rows in the scrollback buffer.
+pub const DEFAULT_SCROLLBACK_CAPACITY: usize = 1000;
 
 // ---------- public types ----------
 
@@ -123,6 +126,20 @@ pub struct TextGrid {
     /// survives until the next printable).
     pending_wrap: bool,
     dirty_rows: Vec<u16>,
+    /// Scrollback buffer: rows that have been scrolled off the
+    /// top of the visible grid. Ring buffer with a configurable
+    /// maximum capacity (default [`DEFAULT_SCROLLBACK_CAPACITY`]).
+    /// Each entry is one row of `cols` cells.
+    scrollback: VecDeque<Vec<Cell>>,
+    /// Maximum number of rows to retain in the scrollback buffer.
+    /// When the buffer reaches this capacity, the oldest row is
+    /// discarded on the next `scroll_up_one`.
+    scrollback_capacity: usize,
+    /// Current scrollback viewport offset. 0 = live view (the
+    /// visible grid). >0 = the user is viewing scrollback; the
+    /// value indicates how many rows above the live grid to show.
+    /// Clamped to `scrollback.len()`.
+    scrollback_offset: usize,
 }
 
 impl TextGrid {
@@ -136,6 +153,9 @@ impl TextGrid {
             cursor_y: 0,
             pending_wrap: false,
             dirty_rows: Vec::new(),
+            scrollback: VecDeque::new(),
+            scrollback_capacity: DEFAULT_SCROLLBACK_CAPACITY,
+            scrollback_offset: 0,
         }
     }
     pub fn cols(&self) -> u16 {
@@ -182,6 +202,44 @@ impl TextGrid {
         let mut v = std::mem::take(&mut self.dirty_rows);
         v.sort_unstable();
         v
+    }
+    /// Move the scrollback viewport up by `n` rows (toward
+    /// older content). Clamps to `scrollback.len()`.
+    /// Calling this method enters scrollback mode
+    /// (`scrollback_offset > 0`), which freezes the live grid
+    /// and renders historical rows instead.
+    pub fn scrollback_up(&mut self, n: usize) {
+        self.scrollback_offset = (self.scrollback_offset + n).min(self.scrollback.len());
+    }
+    /// Move the scrollback viewport down by `n` rows (toward
+    /// the live grid). When offset reaches 0 the view returns
+    /// to live mode.
+    pub fn scrollback_down(&mut self, n: usize) {
+        self.scrollback_offset = self.scrollback_offset.saturating_sub(n);
+    }
+    /// Return to live view (offset = 0). Called when the user
+    /// presses any key other than PageUp/PageDown, or when a
+    /// child writes new output.
+    pub fn scrollback_reset(&mut self) {
+        self.scrollback_offset = 0;
+    }
+    /// Returns `true` when the user is viewing scrollback
+    /// history rather than the live grid.
+    pub fn in_scrollback(&self) -> bool {
+        self.scrollback_offset > 0
+    }
+    /// Current scrollback viewport offset. 0 = live view.
+    pub fn scrollback_offset(&self) -> usize {
+        self.scrollback_offset
+    }
+    /// Total number of rows stored in the scrollback buffer.
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+    /// Access a scrollback row by its index (0 = oldest).
+    /// Returns `None` if out of bounds.
+    pub fn scrollback_row(&self, idx: usize) -> Option<&[Cell]> {
+        self.scrollback.get(idx).map(Vec::as_slice)
     }
     fn put(&mut self, x: u16, y: u16, fg: Color, bg: Color, attrs: CellAttrs, ch: char) {
         let idx = self.cell_idx(x, y);
@@ -247,11 +305,30 @@ impl TextGrid {
             }
         }
     }
+    /// Clear the scrollback buffer and reset the viewport to
+    /// live view. Called on `ESC [3J` (ED mode 3), which is
+    /// the standard escape for "clear scrollback". Distinct
+    /// from `clear_all` (`ESC [2J`) which only clears the
+    /// visible screen.
+    pub(crate) fn clear_scrollback(&mut self) {
+        self.scrollback.clear();
+        self.scrollback_offset = 0;
+    }
     fn scroll_up_one(&mut self) {
         let cols = self.cols as usize;
         let total = self.cells.len();
         if total == 0 || cols == 0 {
             return;
+        }
+        // Capture the top row into the scrollback ring buffer
+        // BEFORE shifting cells up. If scrollback is at
+        // capacity, drop the oldest (front) row first.
+        if self.scrollback_capacity > 0 {
+            let top_row: Vec<Cell> = self.cells[..cols].to_vec();
+            if self.scrollback.len() >= self.scrollback_capacity {
+                self.scrollback.pop_front();
+            }
+            self.scrollback.push_back(top_row);
         }
         self.cells.copy_within(cols..total, 0);
         let blank = Cell::default();
@@ -667,6 +744,11 @@ impl<'a> VtePerf<'a> {
                         .grid
                         .clear_above(self.grid.cursor_y, self.grid.cursor_x),
                     2 => self.grid.clear_all(),
+                    // ESC [3J — clear scrollback buffer only.
+                    // Distinct from ESC [2J which clears the
+                    // visible screen. xterm and most modern
+                    // terminals support mode 3.
+                    3 => self.grid.clear_scrollback(),
                     _ => {}
                 }
             }
@@ -1286,6 +1368,10 @@ pub trait PanePtyOps {
     fn snapshot(&mut self) -> PaneTerminalState;
     fn try_wait(&mut self) -> Result<Option<i32>, PtyError>;
     fn kill(&mut self) -> Result<(), PtyError>;
+    fn scrollback_up(&mut self, n: usize);
+    fn scrollback_down(&mut self, n: usize);
+    fn scrollback_reset(&mut self);
+    fn in_scrollback(&self) -> bool;
 }
 
 /// Production impl behind the trait. Uses UFCS (`PanePty::resize`) so
@@ -1315,6 +1401,18 @@ impl PanePtyOps for PanePty {
     }
     fn kill(&mut self) -> Result<(), PtyError> {
         PanePty::kill(self)
+    }
+    fn scrollback_up(&mut self, n: usize) {
+        self.grid.scrollback_up(n);
+    }
+    fn scrollback_down(&mut self, n: usize) {
+        self.grid.scrollback_down(n);
+    }
+    fn scrollback_reset(&mut self) {
+        self.grid.scrollback_reset();
+    }
+    fn in_scrollback(&self) -> bool {
+        self.grid.in_scrollback()
     }
 }
 
@@ -1721,4 +1819,259 @@ mod internal_sanity_tests {
         assert_eq!(snap.grid.cell(3, 0).ch, 'T');
         assert_eq!(pty.apc.state, ApcScannerState::Idle);
     }
+}
+
+// ------------------------------------------------------------------
+// Scrollback buffer tests
+// ------------------------------------------------------------------
+
+/// `scroll_up_one` captures the top row into the scrollback
+/// ring buffer before shifting cells up. After one scroll,
+/// `scrollback_len()` is 1 and the captured row contains
+/// the character that was on row 0.
+#[test]
+fn scroll_up_one_captures_top_row_into_scrollback() {
+    let mut g = TextGrid::new(3, 3);
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'X',
+    );
+    g.scroll_up_one();
+    assert_eq!(g.scrollback_len(), 1);
+    let row = g.scrollback_row(0).expect("row 0");
+    assert_eq!(row[0].ch, 'X');
+}
+
+/// Multiple scrolls accumulate rows in the scrollback buffer
+/// in FIFO order. After 3 scrolls, `scrollback_len()` is 3
+/// and the rows are in chronological order (oldest first).
+#[test]
+fn scrollback_accumulates_rows_in_fifo_order() {
+    let mut g = TextGrid::new(2, 2);
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'A',
+    );
+    g.scroll_up_one();
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'B',
+    );
+    g.scroll_up_one();
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'C',
+    );
+    g.scroll_up_one();
+    assert_eq!(g.scrollback_len(), 3);
+    assert_eq!(g.scrollback_row(0).unwrap()[0].ch, 'A');
+    assert_eq!(g.scrollback_row(1).unwrap()[0].ch, 'B');
+    assert_eq!(g.scrollback_row(2).unwrap()[0].ch, 'C');
+}
+
+/// Scrollback ring buffer respects capacity. When the buffer
+/// is full, the oldest row is discarded on each new scroll.
+#[test]
+fn scrollback_ring_buffer_drops_oldest_at_capacity() {
+    let mut g = TextGrid::new(2, 2);
+    // Set capacity to 2 rows.
+    g.scrollback_capacity = 2;
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'A',
+    );
+    g.scroll_up_one();
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'B',
+    );
+    g.scroll_up_one();
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'C',
+    );
+    g.scroll_up_one();
+    // Oldest row 'A' was dropped; buffer has 'B' and 'C'.
+    assert_eq!(g.scrollback_len(), 2);
+    assert_eq!(g.scrollback_row(0).unwrap()[0].ch, 'B');
+    assert_eq!(g.scrollback_row(1).unwrap()[0].ch, 'C');
+}
+
+/// `scrollback_up(n)` moves the viewport offset into
+/// scrollback history. `scrollback_down(n)` returns to
+/// live view. `in_scrollback()` tracks the state.
+#[test]
+fn scrollback_up_down_and_in_scrollback() {
+    let mut g = TextGrid::new(2, 2);
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'A',
+    );
+    g.scroll_up_one();
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'B',
+    );
+    g.scroll_up_one();
+    // 2 rows in scrollback. Start in live view.
+    assert!(!g.in_scrollback());
+    assert_eq!(g.scrollback_offset(), 0);
+    // Scroll up by 1.
+    g.scrollback_up(1);
+    assert!(g.in_scrollback());
+    assert_eq!(g.scrollback_offset(), 1);
+    // Scroll up by 1 more — now at full depth.
+    g.scrollback_up(1);
+    assert_eq!(g.scrollback_offset(), 2);
+    // Scroll up beyond capacity — clamped.
+    g.scrollback_up(100);
+    assert_eq!(g.scrollback_offset(), 2);
+    // Scroll back down.
+    g.scrollback_down(1);
+    assert_eq!(g.scrollback_offset(), 1);
+    g.scrollback_down(1);
+    assert_eq!(g.scrollback_offset(), 0);
+    assert!(!g.in_scrollback());
+    // Down beyond 0 — clamped.
+    g.scrollback_down(100);
+    assert_eq!(g.scrollback_offset(), 0);
+}
+
+/// `scrollback_reset()` returns the viewport to live view
+/// from any offset.
+#[test]
+fn scrollback_reset_returns_to_live_view() {
+    let mut g = TextGrid::new(2, 2);
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'A',
+    );
+    g.scroll_up_one();
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'B',
+    );
+    g.scroll_up_one();
+    g.scrollback_up(2);
+    assert!(g.in_scrollback());
+    g.scrollback_reset();
+    assert!(!g.in_scrollback());
+    assert_eq!(g.scrollback_offset(), 0);
+}
+/// `clear_scrollback()` (ESC [3J) clears the scrollback
+/// buffer and resets the offset. `clear_all()` (ESC [2J)
+/// only clears the visible screen and does NOT touch
+/// scrollback — matching xterm / VTE semantics.
+#[test]
+fn clear_scrollback_resets_buffer_and_offset() {
+    let mut g = TextGrid::new(2, 2);
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'A',
+    );
+    g.scroll_up_one();
+    g.scrollback_up(1);
+    assert!(g.in_scrollback());
+    assert_eq!(g.scrollback_len(), 1);
+    g.clear_scrollback();
+    assert_eq!(g.scrollback_len(), 0);
+    assert_eq!(g.scrollback_offset(), 0);
+    assert!(!g.in_scrollback());
+}
+
+/// `clear_all()` (ESC [2J) clears the visible screen but
+/// does NOT clear the scrollback buffer. This is the
+/// correct xterm/VTE behavior: ESC [2J only affects the
+/// display, not the history.
+#[test]
+fn clear_all_preserves_scrollback() {
+    let mut g = TextGrid::new(2, 2);
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'A',
+    );
+    g.scroll_up_one();
+    assert_eq!(g.scrollback_len(), 1);
+    g.clear_all();
+    // Scrollback is preserved — only ESC [3J clears it.
+    assert_eq!(g.scrollback_len(), 1);
+}
+
+/// Capacity=0 disables scrollback capture entirely (the
+/// ring buffer stays empty even after many scrolls).
+#[test]
+fn scrollback_capacity_zero_disables_capture() {
+    let mut g = TextGrid::new(2, 2);
+    g.scrollback_capacity = 0;
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'A',
+    );
+    g.scroll_up_one();
+    g.put(
+        0,
+        0,
+        Color::Default,
+        Color::Default,
+        CellAttrs::default(),
+        'B',
+    );
+    g.scroll_up_one();
+    assert_eq!(g.scrollback_len(), 0);
 }
