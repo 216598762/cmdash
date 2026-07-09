@@ -96,8 +96,13 @@ protocol, with TextOnly early-out. Startup logs the chosen protocol.
 
 **Remaining:**
 - Manual testing against `xterm` with Sixel support and `mlterm`.
-- Device-attributes query (`ESC[c`) for runtime capability detection
-  (deferred to v2).
+
+**Device Attributes (DA1) query:** `query_device_attributes()` sends
+`ESC[c` to the terminal and parses the response for Sixel attribute
+4. Uses `poll(2)` via `extern "C"` (no background thread, no stray
+bytes consumed on timeout). Gated behind `is_terminal()` so it's
+skipped in CI/non-TTY environments. Only runs when env-var detection
+yields `TextOnly` (avoids startup delay for configured users).
 
 ## Tier 2: Extensibility
 

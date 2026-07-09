@@ -492,11 +492,6 @@ fn main() {
             p.display(),
         );
     }
-    let gfx_protocol = cmdash::GraphicsProtocol::detect();
-    info!(
-        graphics = gfx_protocol.name(),
-        "cmdash starting (ratatui text body + dashcompositor graphics)"
-    );
     if let Err(e) = run(&cli) {
         eprintln!("cmdash: fatal: {e}");
         std::process::exit(1);
@@ -504,6 +499,11 @@ fn main() {
 }
 
 fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut gfx_protocol = cmdash::GraphicsProtocol::detect();
+    info!(
+        graphics = gfx_protocol.name(),
+        "cmdash starting (ratatui text body + dashcompositor graphics)"
+    );
     let (config_path, source_label) = resolve_config_path(cli.config.as_deref());
     let cfg_text = read_config_text(config_path.as_deref(), source_label);
     let cfg = parse_config(&cfg_text)?;
@@ -568,8 +568,6 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "layout resolved"
     );
 
-    let graphics = GraphicsState::new(Metrics::default(), (total.w, total.h));
-
     // PaneRunner::Drop sends its `PaneLayerId` into this channel;
     // tick_loop drains it at the start of phase 1 to call
     // `GraphicsState::close_pane` for each id. Drop order: the
@@ -614,6 +612,28 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let running = true;
 
     let mut guard = TerminalGuard::enter()?;
+
+    // DA1 capability probe: if env-var detection yielded
+    // TextOnly, send a DEC VT220 Primary Device Attributes
+    // query (ESC[c) to detect Sixel support at runtime.
+    // Only runs after raw mode is active so the response is
+    // byte-oriented (not line-buffered). Skipped when
+    // CMDASH_GRAPHICS or TERM already identified a protocol.
+    if gfx_protocol == cmdash::GraphicsProtocol::TextOnly {
+        if let Some(detected) =
+            cmdash::GraphicsProtocol::query_device_attributes(Duration::from_millis(100))
+        {
+            info!(
+                protocol = detected.name(),
+                "DA1 query detected graphics protocol"
+            );
+            gfx_protocol = detected;
+        }
+    }
+
+    let graphics =
+        GraphicsState::new_with_protocol(Metrics::default(), (total.w, total.h), gfx_protocol);
+
     let tick = Duration::from_millis(33);
     let mut ctx = TickContext::new_full(
         runners,

@@ -181,6 +181,107 @@ impl GraphicsProtocol {
         }
     }
 
+    /// Send a DEC VT220 Primary Device Attributes (DA1) query
+    /// (`ESC[c`) to the terminal and parse the response to detect
+    /// graphics capabilities. Returns `Some(Sixel)` if the
+    /// response contains attribute 4 (Sixel support), `None`
+    /// on timeout or malformed response.
+    ///
+    /// This is called at startup (after raw mode is enabled) only
+    /// when env-var detection yielded `TextOnly`, as a runtime
+    /// fallback. The `CMDASH_GRAPHICS` override and `TERM`/`TERM_PROGRAM`
+    /// checks always take priority.
+    ///
+    /// **Timeout:** If the terminal does not respond within `timeout`
+    /// (typically 100ms), returns `None` — this handles piped output,
+    /// non-interactive sessions, and terminals that don't support DA1.
+    pub fn query_device_attributes(timeout: std::time::Duration) -> Option<Self> {
+        use std::fs::File;
+        use std::io::{IsTerminal, Read};
+        use std::mem::ManuallyDrop;
+        use std::os::raw::{c_int, c_short, c_ulong};
+        use std::os::unix::io::FromRawFd;
+        use std::time::Instant;
+
+        // Skip in CI, piped environments, or non-TTY stdin.
+        // Avoids the 100ms timeout penalty and prevents the
+        // DA1 query from interfering with test keystrokes.
+        if !std::io::stdin().is_terminal() {
+            return None;
+        }
+
+        // libc poll(2) binding — avoids adding `libc` crate.
+        #[repr(C)]
+        struct PollFd {
+            fd: c_int,
+            events: c_short,
+            revents: c_short,
+        }
+        const POLLIN: c_short = 1;
+        extern "C" {
+            fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
+        }
+
+        // Send DA1 query: ESC[c
+        let mut stdout = std::io::stdout();
+        if stdout.write_all(b"\x1b[c").is_err() || stdout.flush().is_err() {
+            return None;
+        }
+
+        // Poll stdin fd 0 for readability, then read only when
+        // data is available. This avoids a background thread
+        // entirely — no stray bytes consumed on timeout, no
+        // stdin lock contention with crossterm.
+        //
+        // Uses `ManuallyDrop<File::from_raw_fd(0)>` to bypass
+        // the global `Stdin` mutex. `ManuallyDrop` prevents
+        // `Drop` from closing fd 0.
+        let mut pfd = PollFd {
+            fd: 0,
+            events: POLLIN,
+            revents: 0,
+        };
+        let mut stdin_fd = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
+        let end_time = Instant::now() + timeout;
+        let mut acc = Vec::with_capacity(64);
+
+        loop {
+            let remaining_ms = end_time
+                .saturating_duration_since(Instant::now())
+                .as_millis();
+            if remaining_ms == 0 {
+                break;
+            }
+            pfd.revents = 0;
+            let res = unsafe { poll(&mut pfd, 1, remaining_ms as c_int) };
+            if res < 0 {
+                // EINTR (signal interruption) — retry; any other
+                // error — give up.
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if res == 0 {
+                break; // timeout
+            }
+            // poll confirmed data is available — read will not block.
+            let mut buf = [0u8; 1];
+            match stdin_fd.read(&mut buf) {
+                Ok(1) => {
+                    acc.push(buf[0]);
+                    if buf[0] == b'c' {
+                        break; // DA1 response terminator
+                    }
+                }
+                _ => break, // EOF or error
+            }
+        }
+
+        parse_da1_response(&acc)
+    }
+
     /// Parse a protocol override string (as from `CMDASH_GRAPHICS`).
     /// Used by tests to exercise detection logic without
     /// manipulating environment variables. Returns `TextOnly`
@@ -199,6 +300,67 @@ impl GraphicsProtocol {
 impl Default for GraphicsProtocol {
     fn default() -> Self {
         Self::detect()
+    }
+}
+/// Parse a DEC VT220 Primary Device Attributes (DA1) response.
+/// The response has the form `ESC [ ? {params} c` where params
+/// are semicolon-separated integers. Returns `Some(Sixel)` if
+/// param 4 is present (Sixel graphics support). Kitty is NOT
+/// detected via DA1 — it uses `TERM`/`TERM_PROGRAM` env vars
+/// in [`GraphicsProtocol::detect()`] instead.
+///
+/// This is a pure function (no I/O) so it can be exhaustively
+/// unit-tested in CI without a real terminal.
+pub(crate) fn parse_da1_response(bytes: &[u8]) -> Option<GraphicsProtocol> {
+    // DA1 response: ESC [ ? <params> c
+    // Find the ESC[? prefix.
+    let mut i = 0;
+    // Skip to ESC (0x1b).
+    while i < bytes.len() && bytes[i] != 0x1b {
+        i += 1;
+    }
+    if i + 2 >= bytes.len() {
+        return None;
+    }
+    if bytes[i + 1] != b'[' || bytes[i + 2] != b'?' {
+        return None;
+    }
+    i += 3; // past ESC[?
+            // Read params until 'c' (0x63).
+    let mut has_sixel = false;
+    let mut current_num: u32 = 0;
+    let mut reading_num = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' => {
+                reading_num = true;
+                current_num = current_num.wrapping_mul(10) + (bytes[i] - b'0') as u32;
+            }
+            b';' => {
+                if reading_num {
+                    if current_num == 4 {
+                        has_sixel = true;
+                    }
+                    current_num = 0;
+                    reading_num = false;
+                }
+            }
+            b'c' => {
+                // Final parameter (no trailing semicolon).
+                if reading_num && current_num == 4 {
+                    has_sixel = true;
+                }
+                break;
+            }
+            _ => {} // ignore unexpected bytes
+        }
+        i += 1;
+    }
+    if has_sixel {
+        Some(GraphicsProtocol::Sixel)
+    } else {
+        // Valid DA1 response but no graphics capability reported.
+        None
     }
 }
 
@@ -1340,6 +1502,123 @@ mod internal_sanity_tests {
         assert!(
             g.tab_bar_layers.is_empty(),
             "TextOnly protocol must not push tab bar layers"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // DA1 (Device Attributes) response parsing tests.
+    // ------------------------------------------------------------------
+
+    /// `parse_da1_response` with a standard xterm DA1 response
+    /// (`ESC[?62;22c`) must return `None` — no Sixel attribute.
+    #[test]
+    fn parse_da1_xterm_no_sixel() {
+        let resp = b"[?62;22c";
+        assert!(
+            parse_da1_response(resp).is_none(),
+            "xterm DA1 without attribute 4 must return None"
+        );
+    }
+
+    /// `parse_da1_response` with Sixel attribute 4
+    /// (`ESC[?62;4c`) must return `Some(Sixel)`.
+    #[test]
+    fn parse_da1_sixel_detected() {
+        let resp = b"[?62;4c";
+        assert_eq!(
+            parse_da1_response(resp),
+            Some(GraphicsProtocol::Sixel),
+            "DA1 response with attribute 4 must detect Sixel"
+        );
+    }
+    /// `parse_da1_response` with attribute 31 only
+    /// (`ESC[?62;31c`) must return `None`. Kitty is detected
+    /// via `TERM`/`TERM_PROGRAM`, not DA1.
+    #[test]
+    fn parse_da1_attr_31_returns_none() {
+        let resp = b"\x1b[?62;31c";
+        assert!(
+            parse_da1_response(resp).is_none(),
+            "DA1 attribute 31 is not Sixel; must return None"
+        );
+    }
+
+    /// `parse_da1_response` with both Sixel (4) and attr 31
+    /// must still detect Sixel (31 is irrelevant).
+    #[test]
+    fn parse_da1_sixel_with_attr_31_still_detects_sixel() {
+        let resp = b"\x1b[?62;4;31c";
+        assert_eq!(
+            parse_da1_response(resp),
+            Some(GraphicsProtocol::Sixel),
+            "DA1 with both 4 and 31 must detect Sixel"
+        );
+    }
+    /// return `None`.
+    #[test]
+    fn parse_da1_empty_returns_none() {
+        assert!(parse_da1_response(b"").is_none());
+        assert!(parse_da1_response(b"garbage").is_none());
+        assert!(parse_da1_response(b"[c").is_none());
+    }
+
+    /// `parse_da1_response` with a partial response (no
+    /// terminator `c`) must return `None`.
+    #[test]
+    fn parse_da1_partial_returns_none() {
+        let resp = b"[?62;4";
+        assert!(
+            parse_da1_response(resp).is_none(),
+            "partial DA1 response without terminator must return None"
+        );
+    }
+
+    /// `parse_da1_response` with a response that has trailing
+    /// bytes after the `c` terminator must still parse
+    /// correctly (the parser stops at the first `c`).
+    #[test]
+    fn parse_da1_trailing_bytes_ok() {
+        let resp = b"[?62;4c[?1;2;3c";
+        assert_eq!(
+            parse_da1_response(resp),
+            Some(GraphicsProtocol::Sixel),
+            "trailing bytes after DA1 terminator must not break parsing"
+        );
+    }
+
+    /// `parse_da1_response` with Sixel as the sole parameter
+    /// (`ESC[?4c`) must return `Some(Sixel)`.
+    #[test]
+    fn parse_da1_sole_param_sixel() {
+        let resp = b"[?4c";
+        assert_eq!(
+            parse_da1_response(resp),
+            Some(GraphicsProtocol::Sixel),
+            "DA1 with sole param 4 must detect Sixel"
+        );
+    }
+
+    /// `parse_da1_response` with many parameters including 4
+    /// must detect Sixel. Mimics real terminals that report
+    /// multiple capabilities.
+    #[test]
+    fn parse_da1_many_params_with_sixel() {
+        let resp = b"[?62;1;2;4;9;15;22c";
+        assert_eq!(
+            parse_da1_response(resp),
+            Some(GraphicsProtocol::Sixel),
+            "DA1 with many params including 4 must detect Sixel"
+        );
+    }
+
+    /// `parse_da1_response` with a response missing the `?`
+    /// prefix after `ESC[` must return `None`.
+    #[test]
+    fn parse_da1_missing_question_mark() {
+        let resp = b"[62;4c";
+        assert!(
+            parse_da1_response(resp).is_none(),
+            "DA1 response missing ? after ESC[ must return None"
         );
     }
 }
