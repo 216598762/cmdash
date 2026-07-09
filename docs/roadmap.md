@@ -58,17 +58,25 @@ The tab bar is rendered in two layers:
 
 ### 1.3 Per-pane shell specification
 
-**Current state:** All panes spawn `ShellSpec::LoginShell`. The
-`ShellSpec::Command { argv }` variant exists but is only used in tests.
+**Status:** ✅ Working.
 
-**Goal:** Allow the KDL config to specify per-pane shell commands.
+**Current state:** `cmdash_config::Pane` has an optional `command: Option<String>`
+field parsed from KDL (`pane kind=shell command="htop"`). `shell_spec_from_command()`
+in `main.rs` converts the string into a `ShellSpec::Command { argv }` by
+splitting on whitespace, falling back to `ShellSpec::LoginShell` when `None`.
+The command is wired through `TickContext` during pane spawning.
 
-**Steps:**
-- Extend `cmdash_config::Pane` with an optional `command` field.
-- Parse `pane kind=shell command="htop"` in `read_pane`.
-- Wire `TickContext` to use the per-pane shell spec when spawning.
-- Handle `AppNewPane` — new panes should inherit the focused pane's
-  shell spec (or default to login shell).
+**Implementation:**
+- `Pane.command` field in `cmdash-config` (line 132).
+- `read_pane()` parser handles `command="..."` entries.
+- `shell_spec_from_command()` utility in `main.rs` (line 81).
+- Example config: `examples/05-per-pane-commands.kdl`.
+
+**Remaining:**
+- `AppNewPane` spawns with `ShellSpec::LoginShell`, not the focused
+  pane's command — could inherit for consistency.
+- `split_whitespace()` doesn't handle shell metacharacters (quotes,
+  redirects) — documented caveat.
 
 ### 1.4 Scrollback / alternate screen
 
