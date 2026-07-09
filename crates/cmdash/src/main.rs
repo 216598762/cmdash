@@ -63,6 +63,34 @@ use cmdash_layout::{
 };
 use cmdash_pty::PaneLayerId;
 use cmdash_pty::{PaneEvent, ShellSpec};
+
+/// Convert a per-pane `command` override into a [`ShellSpec`].
+/// `None` falls back to `default` (typically [`ShellSpec::LoginShell`]
+/// for initial spawns, or `self.shell` for runtime-spawned panes).
+/// `Some(cmd)` splits by whitespace into argv and spawns `argv[0]`
+/// with `argv[1..]` as arguments. Called from `run()` and
+/// `reconcile_runners` when spawning a fresh pane.
+///
+/// **Limitation:** The command is split on whitespace via
+/// `str::split_whitespace()`. This means shell metacharacters
+/// (pipes, redirects, quoted arguments with spaces) are NOT
+/// supported. For example, `command="echo 'hello world'"`
+/// produces `["echo", "'hello", "world'"]` (broken quoting).
+/// This is an acceptable v1 limitation — users should avoid
+/// shell metacharacters in the `command` field.
+fn shell_spec_from_command(command: &Option<String>, default: &ShellSpec) -> ShellSpec {
+    match command {
+        Some(cmd) => {
+            let argv: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+            if argv.is_empty() {
+                default.clone()
+            } else {
+                ShellSpec::Command { argv }
+            }
+        }
+        None => default.clone(),
+    }
+}
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::Terminal;
@@ -144,9 +172,7 @@ impl CliArgs {
             }
             if let Some(value) = token.strip_prefix("--config=") {
                 if config.is_some() {
-                    eprintln!(
-                        "cmdash: --config=<path> specified more than once; keeping first"
-                    );
+                    eprintln!("cmdash: --config=<path> specified more than once; keeping first");
                     continue;
                 }
                 if value.is_empty() {
@@ -275,7 +301,9 @@ fn print_help() {
 ///
 /// Returns `(path, source_label)` where `source_label` is a
 /// human-readable description for tracing.
-fn resolve_config_path(cli_config: Option<&std::path::Path>) -> (Option<std::path::PathBuf>, &'static str) {
+fn resolve_config_path(
+    cli_config: Option<&std::path::Path>,
+) -> (Option<std::path::PathBuf>, &'static str) {
     // Priority 1: explicit CLI override.
     if let Some(path) = cli_config {
         return (Some(path.to_path_buf()), "--config=<path>");
@@ -449,12 +477,8 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for pane in &layout.panes {
         let layer_id = cmdash::derive_layer_id(&pane.id);
         let tx: PaneCloseTx = close_tx.clone();
-        match PaneRunner::spawn_with_graphics(
-            pane.clone(),
-            layer_id,
-            ShellSpec::LoginShell,
-            Some(tx),
-        ) {
+        let shell = shell_spec_from_command(&pane.command, &ShellSpec::LoginShell);
+        match PaneRunner::spawn_with_graphics(pane.clone(), layer_id, shell, Some(tx)) {
             Ok(r) => runners.push(r),
             Err(e) => warn!(error = %e, ?layer_id, "failed to spawn pane"),
         }
@@ -1472,6 +1496,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                     LayoutNode::Pane(CfgPane {
                         kind: PaneKind::Shell,
                         label: None,
+                        command: None,
                     }),
                 ],
             };
@@ -1481,6 +1506,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         let new_leaf = LayoutNode::Pane(CfgPane {
             kind: PaneKind::Shell,
             label: None,
+            command: None,
         });
         match replace_leaf_with_split(
             &mut self.layout_root,
@@ -1715,12 +1741,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                     cmdash::derive_layer_id_for_tab(&pane.id, self.active_tab_idx_u32())
                 };
                 let tx: PaneCloseTx = self.close_tx.clone();
-                match PaneRunner::spawn_with_graphics(
-                    pane.clone(),
-                    layer_id,
-                    self.shell.clone(),
-                    Some(tx),
-                ) {
+                let shell = shell_spec_from_command(&pane.command, &self.shell);
+                match PaneRunner::spawn_with_graphics(pane.clone(), layer_id, shell, Some(tx)) {
                     Ok(r) => new_runners.push(r),
                     Err(e) => {
                         warn!(
@@ -1783,6 +1805,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             layout_root: LayoutNode::Pane(CfgPane {
                 kind: PaneKind::Shell,
                 label: None,
+                command: None,
             }),
             stack_focus: BTreeMap::new(),
         };
@@ -1933,52 +1956,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                         blit_cursor(&snap.grid, buf, area);
                     }
                 }
-                // Tab bar: render into row 0 of the buffer.
-                // Tab labels show " N:label " or " N:TabN ";
-                // the active tab is highlighted with a blue
-                // background; inactive tabs use a dim style.
-                // At most one row is used regardless of tab
-                // count; tabs that don't fit are silently
-                // truncated.
-                let bar_width = buf.area.width as usize;
-                // Clear the tab bar row.
-                for x in 0..bar_width {
-                    let cell = buf.get_mut(x as u16, 0);
-                    cell.set_symbol(" ");
-                    cell.set_style(
-                        Style::default().bg(Color::DarkGray).fg(Color::Gray),
-                    );
-                }
-                let mut col: usize = 0;
-                for (idx, tab) in self.tabs.iter().enumerate() {
-                    if col >= bar_width { break; }
-                    let is_active = idx == self.tabs.active_idx();
-                    let label = tab.label.as_deref().filter(|l| !l.is_empty());
-                    let tab_text = if let Some(l) = label {
-                        format!(" {}:{} ", idx + 1, l)
-                    } else {
-                        format!(" {} ", idx + 1)
-                    };
-                    let style = if is_active {
-                        Style::default()
-                            .bg(Color::Blue)
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().bg(Color::DarkGray).fg(Color::Gray)
-                    };
-                    for ch in tab_text.chars() {
-                        if col >= bar_width { break; }
-                        let cell = buf.get_mut(col as u16, 0);
-                        cell.set_symbol(&ch.to_string());
-                        cell.set_style(style);
-                        col += 1;
-                    }
-                    // Separator space between tabs.
-                    if col < bar_width && idx + 1 < self.tabs.len() {
-                        col += 1;
-                    }
-                }
+                render_tab_bar(buf, &self.tabs);
             })?;
 
             // Phase 3b: emit dashcompositor kitty graphics through
@@ -1987,6 +1965,19 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             // escapes overlay on kitty-capable hosts and degrade
             // gracefully elsewhere. AGENTS.md §"Rendering
             // pipeline" step 6 prescribes this exact path.
+            //
+            // Before compositing, rebuild the tab bar as
+            // dashcompositor layers (RectLayer background +
+            // TextLayer per tab via fontdue). The ratatui
+            // text tab bar from phase 3a is preserved as a
+            // degraded-mode fallback; the pixel overlay
+            // overwrites it on kitty-capable hosts.
+            let tab_bar_data = cmdash::graphics::TabBarData {
+                labels: self.tabs.iter().map(|t| t.label.as_deref()).collect(),
+                active_idx: self.tabs.active_idx(),
+                bar_width_cells: self.graphics.cells().0,
+            };
+            self.graphics.update_tab_bar(&tab_bar_data);
             let mut stdout = std::io::stdout();
             if let Err(e) = self.graphics.render_and_write(&mut stdout) {
                 warn!(error = %e, "graphics emit failed");
@@ -1999,6 +1990,59 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         }
     }
 }
+/// Render the tab bar into row 0 of `buf`. Extracted from
+/// [`TickContext::run`] so the rendering logic is testable
+/// against [`ratatui::backend::TestBackend`] without needing
+/// the full tick-loop machinery.
+///
+/// Tab labels show ` N:label ` or ` N `; the active tab is
+/// highlighted with a blue background + white bold text;
+/// inactive tabs use a dim dark-gray style. Tabs that don't
+/// fit within `buf.area.width` are silently truncated.
+fn render_tab_bar(buf: &mut ratatui::buffer::Buffer, tabs: &TabStack<TabState>) {
+    let bar_width = buf.area.width as usize;
+    // Clear the tab bar row.
+    for x in 0..bar_width {
+        let cell = buf.get_mut(x as u16, 0);
+        cell.set_symbol(" ");
+        cell.set_style(Style::default().bg(Color::DarkGray).fg(Color::Gray));
+    }
+    let mut col: usize = 0;
+    for (idx, tab) in tabs.iter().enumerate() {
+        if col >= bar_width {
+            break;
+        }
+        let is_active = idx == tabs.active_idx();
+        let label = tab.label.as_deref().filter(|l| !l.is_empty());
+        let tab_text = if let Some(l) = label {
+            format!(" {}:{} ", idx + 1, l)
+        } else {
+            format!(" {} ", idx + 1)
+        };
+        let style = if is_active {
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(Color::DarkGray).fg(Color::Gray)
+        };
+        for ch in tab_text.chars() {
+            if col >= bar_width {
+                break;
+            }
+            let cell = buf.get_mut(col as u16, 0);
+            cell.set_symbol(&ch.to_string());
+            cell.set_style(style);
+            col += 1;
+        }
+        // Separator space between tabs.
+        if col < bar_width && idx + 1 < tabs.len() {
+            col += 1;
+        }
+    }
+}
+
 /// Render a crossterm `Event` into the file-log payload we
 /// emit at `handle_event_full`'s entry point with the printable
 /// payload content REDACTED before persistence under
@@ -2475,7 +2519,10 @@ mod cli_args_tests {
     fn resolve_config_path_cli_override_wins() {
         let explicit = Some(std::path::Path::new("/tmp/explicit.kdl"));
         let (path, label) = resolve_config_path(explicit);
-        assert_eq!(path.as_deref(), Some(std::path::Path::new("/tmp/explicit.kdl")));
+        assert_eq!(
+            path.as_deref(),
+            Some(std::path::Path::new("/tmp/explicit.kdl"))
+        );
         assert_eq!(label, "--config=<path>");
     }
 
@@ -2568,8 +2615,7 @@ mod cli_args_tests {
     /// path doesn't exist on disk.
     #[test]
     fn config_file_missing_falls_back_to_bundled() {
-        let nonexistent =
-            std::path::PathBuf::from("/tmp/cmdash_nonexistent_config.kdl");
+        let nonexistent = std::path::PathBuf::from("/tmp/cmdash_nonexistent_config.kdl");
         let _ = std::fs::remove_file(&nonexistent); // ensure it doesn't exist
 
         let (path, label) = resolve_config_path(Some(&nonexistent));
@@ -2729,6 +2775,7 @@ mod input_tests {
         LayoutNode::Pane(CfgPane {
             kind: PaneKind::Shell,
             label: None,
+            command: None,
         })
     }
 
@@ -5698,6 +5745,891 @@ mod input_tests {
             ctx.runners[0].layer_id(),
             original_layer,
             "AppNewPane: original focused pane's LayerId is preserved (Hard rule)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shell_spec_from_command_tests {
+    use super::*;
+
+    /// `None` command returns the default shell.
+    #[test]
+    fn none_returns_default() {
+        let default = ShellSpec::LoginShell;
+        let result = shell_spec_from_command(&None, &default);
+        assert_eq!(result, ShellSpec::LoginShell);
+    }
+
+    /// `Some("")` (empty string) returns the default shell
+    /// because `split_whitespace()` yields an empty iterator.
+    #[test]
+    fn empty_string_returns_default() {
+        let default = ShellSpec::LoginShell;
+        let result = shell_spec_from_command(&Some(String::new()), &default);
+        assert_eq!(result, ShellSpec::LoginShell);
+    }
+
+    /// `Some("  ")` (whitespace-only) returns the default shell
+    /// because `split_whitespace()` yields an empty iterator.
+    #[test]
+    fn whitespace_only_returns_default() {
+        let default = ShellSpec::LoginShell;
+        let result = shell_spec_from_command(&Some("  ".to_string()), &default);
+        assert_eq!(result, ShellSpec::LoginShell);
+    }
+
+    /// `Some("htop")` produces `Command { argv: ["htop"] }`.
+    #[test]
+    fn simple_command() {
+        let default = ShellSpec::LoginShell;
+        let result = shell_spec_from_command(&Some("htop".to_string()), &default);
+        assert_eq!(
+            result,
+            ShellSpec::Command {
+                argv: vec!["htop".to_string()]
+            }
+        );
+    }
+
+    /// `Some("htop --arg1 --arg2")` produces
+    /// `Command { argv: ["htop", "--arg1", "--arg2"] }`.
+    #[test]
+    fn command_with_args() {
+        let default = ShellSpec::LoginShell;
+        let result = shell_spec_from_command(&Some("htop --arg1 --arg2".to_string()), &default);
+        assert_eq!(
+            result,
+            ShellSpec::Command {
+                argv: vec![
+                    "htop".to_string(),
+                    "--arg1".to_string(),
+                    "--arg2".to_string()
+                ]
+            }
+        );
+    }
+
+    /// `Some("echo hello world")` produces
+    /// `Command { argv: ["echo", "hello", "world"] }`.
+    #[test]
+    fn command_with_multiple_args() {
+        let default = ShellSpec::LoginShell;
+        let result = shell_spec_from_command(&Some("echo hello world".to_string()), &default);
+        assert_eq!(
+            result,
+            ShellSpec::Command {
+                argv: vec!["echo".to_string(), "hello".to_string(), "world".to_string()]
+            }
+        );
+    }
+
+    /// Different default shell is preserved when command is `None`.
+    #[test]
+    fn none_preserves_custom_default() {
+        let default = ShellSpec::Command {
+            argv: vec!["/bin/bash".to_string()],
+        };
+        let result = shell_spec_from_command(&None, &default);
+        assert_eq!(
+            result,
+            ShellSpec::Command {
+                argv: vec!["/bin/bash".to_string()]
+            }
+        );
+    }
+
+    /// Explicit command overrides the default shell.
+    #[test]
+    fn some_overrides_default() {
+        let default = ShellSpec::Command {
+            argv: vec!["/bin/bash".to_string()],
+        };
+        let result = shell_spec_from_command(&Some("/bin/zsh".to_string()), &default);
+        assert_eq!(
+            result,
+            ShellSpec::Command {
+                argv: vec!["/bin/zsh".to_string()]
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod tab_bar_render_tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    /// Helper: build a minimal `TabStack<TabState>` with `n` tabs,
+    /// the first tab active, no labels. Each `TabState` is
+    /// constructed with an empty runner Vec and a single-pane
+    /// layout root so `TabStack` invariants hold.
+    fn make_tabs(n: usize) -> TabStack<TabState> {
+        let dummy_state = TabState {
+            runners: Vec::new(),
+            focus: 0,
+            layout_root: LayoutNode::Pane(CfgPane {
+                kind: PaneKind::Shell,
+                label: None,
+                command: None,
+            }),
+            stack_focus: BTreeMap::new(),
+        };
+        let mut tabs = TabStack::new(dummy_state);
+        for _ in 1..n {
+            tabs.push(TabState {
+                runners: Vec::new(),
+                focus: 0,
+                layout_root: LayoutNode::Pane(CfgPane {
+                    kind: PaneKind::Shell,
+                    label: None,
+                    command: None,
+                }),
+                stack_focus: BTreeMap::new(),
+            });
+        }
+        // `push` sets the new tab as active; switch back to tab 0
+        // so the first tab is active by default.
+        tabs.switch_to(0);
+        tabs
+    }
+
+    /// Helper: build a `TabStack` with labels on specific tabs.
+    /// `labels[i]` is the label for tab `i`; `None` means no label.
+    fn make_tabs_with_labels(labels: &[Option<&str>]) -> TabStack<TabState> {
+        assert!(!labels.is_empty(), "need at least one tab");
+        let dummy_state = TabState {
+            runners: Vec::new(),
+            focus: 0,
+            layout_root: LayoutNode::Pane(CfgPane {
+                kind: PaneKind::Shell,
+                label: None,
+                command: None,
+            }),
+            stack_focus: BTreeMap::new(),
+        };
+        let mut tabs = if let Some(l) = labels[0] {
+            TabStack::new_with_label(dummy_state, l)
+        } else {
+            TabStack::new(dummy_state)
+        };
+        for l in &labels[1..] {
+            let st = TabState {
+                runners: Vec::new(),
+                focus: 0,
+                layout_root: LayoutNode::Pane(CfgPane {
+                    kind: PaneKind::Shell,
+                    label: None,
+                    command: None,
+                }),
+                stack_focus: BTreeMap::new(),
+            };
+            match l {
+                Some(label) => {
+                    tabs.push_with_label(st, *label);
+                }
+                None => {
+                    tabs.push(st);
+                }
+            }
+        }
+        // `push` / `push_with_label` sets the new tab as active;
+        // switch back to tab 0 so the first tab is active by default.
+        tabs.switch_to(0);
+        tabs
+    }
+
+    /// Helper: extract the text content of row 0 from a buffer
+    /// as a `String` (symbol per cell, spaces included).
+    fn row_text(buf: &Buffer) -> String {
+        let w = buf.area.width as usize;
+        let mut s = String::with_capacity(w);
+        for x in 0..w {
+            s.push_str(buf.get(x as u16, 0).symbol());
+        }
+        s
+    }
+
+    /// Helper: extract the `Style` of a single cell at `(x, 0)`.
+    fn cell_style(buf: &Buffer, x: u16) -> ratatui::style::Style {
+        buf.get(x, 0).style()
+    }
+
+    /// Single tab with no label: row 0 shows " 1 " starting at
+    /// column 0 with blue bg + white bold style (active tab).
+    #[test]
+    fn single_tab_no_label() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+        let tabs = make_tabs(1);
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        assert!(
+            text.starts_with(" 1 "),
+            "single unlabeled tab must render as ' 1 '; got: {:?}",
+            &text[..5.min(text.len())]
+        );
+        // Active tab: blue bg, white fg, bold.
+        let s = cell_style(&buf, 1);
+        assert_eq!(s.bg, Some(Color::Blue), "active tab bg must be Blue");
+        assert_eq!(s.fg, Some(Color::White), "active tab fg must be White");
+        assert!(
+            s.add_modifier.contains(Modifier::BOLD),
+            "active tab must be bold"
+        );
+    }
+
+    /// Single tab with a label: row 0 shows " 1:main ".
+    #[test]
+    fn single_tab_with_label() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+        let tabs = make_tabs_with_labels(&[Some("main")]);
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        assert!(
+            text.starts_with(" 1:main "),
+            "single labeled tab must render as ' 1:main '; got: {:?}",
+            &text[..10.min(text.len())]
+        );
+    }
+
+    /// Empty-string label is treated as `None` (no dangling colon).
+    #[test]
+    fn empty_label_filtered_to_no_colon() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+        let tabs = make_tabs_with_labels(&[Some("")]);
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        assert!(
+            text.starts_with(" 1 "),
+            "empty label must render as unlabeled ' 1 '; got: {:?}",
+            &text[..5.min(text.len())]
+        );
+        assert!(
+            !text.starts_with(" 1:"),
+            "empty label must NOT produce a colon after the number"
+        );
+    }
+
+    /// Multi-tab layout: 3 tabs, first active. Verify ordering,
+    /// separator spaces, and that tab 2+3 use inactive style.
+    #[test]
+    fn multi_tab_ordering_and_separator() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+        let tabs = make_tabs_with_labels(&[Some("a"), Some("b"), Some("c")]);
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        // " 1:a " + " " + " 2:b " + " " + " 3:c "
+        assert!(
+            text.starts_with(" 1:a   2:b   3:c "),
+            "3-tab layout must show ' 1:a   2:b   3:c '; got: {:?}",
+            &text[..20.min(text.len())]
+        );
+    }
+
+    /// Active tab highlight: tab 1 (idx 0) is active (blue bg);
+    /// tab 2 (idx 1) is inactive (dark gray bg).
+    #[test]
+    fn active_highlight_vs_inactive() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+        let tabs = make_tabs_with_labels(&[Some("active"), Some("inactive")]);
+        render_tab_bar(&mut buf, &tabs);
+        // Active tab cell (column 1, inside ' 1:active ').
+        let active_s = cell_style(&buf, 1);
+        assert_eq!(active_s.bg, Some(Color::Blue));
+        assert_eq!(active_s.fg, Some(Color::White));
+        // Find the start of tab 2 text. " 1:active " = 10 chars,
+        // Tab 0 " 1:active " = 10 chars (cols 0-9). Separator
+        // bumps col to 11 but does NOT write a cell, so col 10
+        // retains the initial clear style (DarkGray bg). Tab 1
+        // starts writing at col 11 with inactive style.
+        let inactive_s = cell_style(&buf, 11);
+        assert_eq!(
+            inactive_s.bg,
+            Some(Color::DarkGray),
+            "inactive tab bg must be DarkGray"
+        );
+        assert_eq!(
+            inactive_s.fg,
+            Some(Color::Gray),
+            "inactive tab fg must be Gray"
+        );
+    }
+
+    /// Second tab is active: verify the highlight moves correctly.
+    #[test]
+    fn second_tab_active_highlight() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+        let mut tabs = make_tabs_with_labels(&[Some("first"), Some("second")]);
+        // Switch active to tab 1 (second tab, 0-indexed).
+        tabs.switch_to(1);
+        render_tab_bar(&mut buf, &tabs);
+        // Tab 1 (idx 0) should be inactive.
+        let tab1_style = cell_style(&buf, 1);
+        assert_eq!(
+            tab1_style.bg,
+            Some(Color::DarkGray),
+            "first tab must be inactive when second is active"
+        );
+        // Tab 2 (idx 1) starts at col 10 (" 1:first " = 9 chars + separator).
+        let tab2_style = cell_style(&buf, 10);
+        assert_eq!(
+            tab2_style.bg,
+            Some(Color::Blue),
+            "second tab must be active (Blue bg)"
+        );
+    }
+
+    /// Truncation: 3 tabs in a 20-column buffer. Only tabs that
+    /// fit are rendered; the rest are silently dropped.
+    #[test]
+    fn three_tabs_fit_in_wide_buffer() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        let tabs = make_tabs_with_labels(&[Some("a"), Some("b"), Some("c")]);
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        // " 1:a " = 5, sep = 1, " 2:b " = 5, sep = 1, " 3:c " = 5 => 17 chars.
+        // All 3 tabs fit in 20 columns.
+        assert!(
+            text.contains(" 3:c "),
+            "all 3 tabs must fit in 20 cols; got: {:?}",
+            text
+        );
+    }
+
+    /// Truncation: 3 tabs in a 12-column buffer. Tab 3 is cut off.
+    #[test]
+    fn truncation_cuts_off_later_tabs() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 1));
+        let tabs = make_tabs_with_labels(&[Some("a"), Some("b"), Some("c")]);
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        // " 1:a " = 5, sep = 1, " 2:b " = 5 => 11 chars. Tab 3
+        // would start at col 11, but " 3:c " = 5 chars needs
+        // col 11..15, and only col 11 is available (width=12).
+        // One char of tab 3's text fits.
+        assert!(
+            text.contains(" 2:b "),
+            "tab 2 must fit in 12 cols; got: {:?}",
+            text
+        );
+        // Verify the boundary column has the trailing space of tab 2,
+        // not the leading space of tab 3
+        assert_eq!(
+            buf.get(11, 0).symbol(),
+            " ",
+            "col 11 must be separator/trailing space, not tab 3 content"
+        );
+        assert!(
+            !text.contains(" 3:c "),
+            "tab 3's full text must NOT fit in 12 cols; got: {:?}",
+            text
+        );
+    }
+
+    /// Background fill: cells beyond the last tab text are
+    /// cleared with the dark-gray background (not left as
+    /// stale content from a previous frame).
+    #[test]
+    fn background_fill_after_last_tab() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+        // Pre-fill row 0 with 'X' to simulate stale content.
+        for x in 0..80 {
+            buf.get_mut(x, 0).set_symbol("X");
+        }
+        let tabs = make_tabs(1);
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        // After " 1 " (3 chars), the rest should be spaces.
+        assert!(
+            !text.contains('X'),
+            "stale content must be cleared by background fill; got: {:?}",
+            &text[..10.min(text.len())]
+        );
+        // Verify trailing cells have dark-gray background.
+        let trail_s = cell_style(&buf, 10);
+        assert_eq!(
+            trail_s.bg,
+            Some(Color::DarkGray),
+            "trailing cells must have DarkGray background"
+        );
+    }
+
+    /// Zero-width buffer: `render_tab_bar` must not panic when
+    /// the buffer has width 0. The clear loop and tab-text loop
+    /// both guard on `col < bar_width` / `x < bar_width`, so
+    /// the body is a no-op. Pins the no-panic contract for a
+    /// degenerate (zero-column) terminal.
+    #[test]
+    fn zero_width_buffer_does_not_panic() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 0, 1));
+        let tabs = make_tabs(1);
+        // Must not panic — the buffer is zero-width, all loops
+        // are no-ops.
+        render_tab_bar(&mut buf, &tabs);
+        // Buffer is still empty (zero cells).
+        assert_eq!(buf.area.width, 0);
+    }
+
+    /// Single-char buffer width: only 1 column is available.
+    /// The leading space of the first tab's text (" 1 ") fits
+    /// at col 0; the digit and trailing space are truncated.
+    /// The single cell must have the active tab's Blue bg.
+    #[test]
+    fn single_char_buffer_shows_leading_space() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let tabs = make_tabs(1);
+        render_tab_bar(&mut buf, &tabs);
+        // Only col 0 is available — the leading space of " 1 ".
+        assert_eq!(buf.get(0, 0).symbol(), " ");
+        let s = cell_style(&buf, 0);
+        assert_eq!(
+            s.bg,
+            Some(Color::Blue),
+            "single-char active tab must have Blue bg"
+        );
+        assert_eq!(
+            s.fg,
+            Some(Color::White),
+            "single-char active tab must have White fg"
+        );
+    }
+
+    /// Long label truncated at buffer edge: a label wider than
+    /// the buffer is silently cut off mid-character. The cells
+    /// that DO fit must carry the active style; trailing cells
+    /// beyond the tab text must have the DarkGray background
+    /// fill.
+    #[test]
+    fn long_label_truncated_at_buffer_edge() {
+        // Buffer is 12 cols wide. Tab text " 1:longlabel "
+        // is 14 chars — 2 chars overflow.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 1));
+        let tabs = make_tabs_with_labels(&[Some("longlabel")]);
+        render_tab_bar(&mut buf, &tabs);
+        // First 12 chars of " 1:longlabel " are " 1:longlabe".
+        let text = row_text(&buf);
+        assert!(
+            text.starts_with(" 1:longlabe"),
+            "first 12 cols must be the truncated label; got: {:?}",
+            &text[..text.len().min(14)]
+        );
+        // Col 11 (last col) is the char 'e' from "longlabe",
+        // which is part of the active tab text.
+        let s = cell_style(&buf, 11);
+        assert_eq!(
+            s.bg,
+            Some(Color::Blue),
+            "truncated label chars must still have active-tab Blue bg"
+        );
+        // The trailing space (col 13) and the "l" (col 12)
+        // don't fit, so they are absent from the buffer.
+        assert_eq!(text.len(), 12, "buffer width limits the output to 12 chars");
+    }
+
+    /// Multiple tabs with long labels: the second tab's label
+    /// is truncated by the buffer edge. The separator and
+    /// second tab's leading space must still render correctly
+    /// for the portion that fits.
+    #[test]
+    fn multi_tab_long_labels_truncated() {
+        // 15 cols. Tab 1: " 1:ab " = 6 chars (col 0-5).
+        // Separator: col 6. Tab 2: " 2:longname " starts at
+        // col 7. 15 - 7 = 8 cols for tab 2, but " 2:longname "
+        // is 12 chars, so only " 2:longn" (8 chars) fits.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 15, 1));
+        let tabs = make_tabs_with_labels(&[Some("ab"), Some("longname")]);
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        assert!(
+            text.starts_with(" 1:a"),
+            "tab 1 must appear at start; got: {:?}",
+            &text[..text.len().min(8)]
+        );
+        // Tab 2's text starts at col 7.
+        let tab2_start = cell_style(&buf, 7);
+        assert_eq!(
+            tab2_start.bg,
+            Some(Color::DarkGray),
+            "tab 2 (inactive) must have DarkGray bg"
+        );
+        // Col 14 (last col) is inside tab 2's truncated text.
+        let tab2_end = cell_style(&buf, 14);
+        assert_eq!(
+            tab2_end.bg,
+            Some(Color::DarkGray),
+            "truncated inactive tab chars must keep DarkGray bg"
+        );
+    }
+    // ----------------------------------------------------------------
+    // Multi-byte UTF-8 label tests.
+    // ----------------------------------------------------------------
+
+    /// Emoji label: earth globe emoji is 4 bytes but one
+    /// Unicode scalar value. Tab text becomes ` 1:<emoji> `.
+    /// Pins that emoji labels don't panic and the symbol is
+    /// stored correctly in the buffer cell.
+    #[test]
+    fn emoji_label_renders_without_panic() {
+        let tabs = make_tabs_with_labels(&[Some("\u{1f30d}")]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        assert!(
+            text.contains('\u{1f30d}'),
+            "emoji must appear in rendered text; got: {text:?}"
+        );
+        // Active style on the emoji cell (col 3).
+        let emoji_style = cell_style(&buf, 3);
+        assert_eq!(
+            emoji_style.bg,
+            Some(Color::Blue),
+            "emoji cell must have active tab Blue bg"
+        );
+    }
+
+    /// CJK label: Japanese kanji is 9 bytes (3 per char) but
+    /// 3 Unicode scalar values. Pins that CJK labels render
+    /// without panicking and each character occupies one cell
+    /// in the buffer.
+    #[test]
+    fn cjk_label_renders_without_panic() {
+        let tabs = make_tabs_with_labels(&[Some("\u{65e5}\u{672c}\u{8a9e}")]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        assert!(
+            text.contains('\u{65e5}'),
+            "first CJK char must appear in rendered text; got: {text:?}"
+        );
+        assert!(
+            text.contains('\u{8a9e}'),
+            "third CJK char must appear in rendered text; got: {text:?}"
+        );
+        // Style check on first CJK char (col 3).
+        let cjk_style = cell_style(&buf, 3);
+        assert_eq!(
+            cjk_style.bg,
+            Some(Color::Blue),
+            "CJK char cell must have active tab Blue bg"
+        );
+    }
+
+    /// Mixed ASCII + accented: e-acute (U+00E9) is 2 bytes
+    /// but 1 column width and 1 Unicode scalar value. Pins
+    /// that precomposed accented characters (common in
+    /// European languages) render correctly.
+    #[test]
+    fn mixed_ascii_multibyte_label_renders() {
+        let tabs = make_tabs_with_labels(&[Some("caf\u{e9}")]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        assert!(
+            text.starts_with(" 1:caf\u{e9} "),
+            "mixed ASCII+accented label must render; got: {text:?}"
+        );
+        // Style on the accented char cell (col 5).
+        let accent_style = cell_style(&buf, 5);
+        assert_eq!(
+            accent_style.bg,
+            Some(Color::Blue),
+            "accented char cell must have active tab Blue bg"
+        );
+    }
+
+    /// Multi-tab mixed UTF-8 styles: emoji active tab + CJK
+    /// inactive tab. Pins that styles are applied correctly
+    /// to multi-byte character cells across active/inactive
+    /// tabs.
+    ///
+    /// Layout: tab 0 " 1:<rocket> " (5 chars, cols 0-4),
+    /// separator at col 5, tab 1 " 2:<CJK> " (6 chars,
+    /// cols 6-11).
+    #[test]
+    fn multi_tab_mixed_utf8_styles() {
+        let tabs = make_tabs_with_labels(&[Some("\u{1f680}"), Some("\u{65e5}\u{672c}")]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        assert!(
+            text.contains('\u{1f680}'),
+            "emoji must appear in rendered text; got: {text:?}"
+        );
+        assert!(
+            text.contains('\u{65e5}'),
+            "CJK must appear in rendered text; got: {text:?}"
+        );
+        // Active tab style on emoji cell (col 3).
+        let emoji_style = cell_style(&buf, 3);
+        assert_eq!(
+            emoji_style.bg,
+            Some(Color::Blue),
+            "active tab emoji must have Blue bg"
+        );
+        // Inactive tab style on first CJK char (col 9).
+        let cjk_style = cell_style(&buf, 9);
+        assert_eq!(
+            cjk_style.bg,
+            Some(Color::DarkGray),
+            "inactive tab CJK char must have DarkGray bg"
+        );
+    }
+
+    /// Truncation with multi-byte chars: a long emoji label
+    /// that exceeds the buffer width must be truncated at the
+    /// char boundary (not byte boundary). Pins that .chars()
+    /// iteration and the col >= bar_width truncation guard
+    /// work for non-ASCII text without panicking.
+    ///
+    /// Tab text is 9 chars (" 1:" + 5 emoji + " "). Buffer
+    /// width 6: chars 0-5 fit, chars 6+ truncated.
+    #[test]
+    fn truncation_with_emoji_label() {
+        let tabs = make_tabs_with_labels(&[Some("\u{1f30d}\u{1f680}\u{1f389}\u{1f38a}\u{2728}")]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        assert!(
+            text.starts_with(" 1:"),
+            "must start with \" 1:\"; got: {text:?}"
+        );
+        // First 3 emoji fit (cols 3, 4, 5).
+        assert!(
+            text.contains('\u{1f30d}') && text.contains('\u{1f680}') && text.contains('\u{1f389}'),
+            "first 3 emoji must appear; got: {text:?}"
+        );
+        // 4th and 5th emoji are truncated.
+        assert!(
+            !text.contains('\u{1f38a}') && !text.contains('\u{2728}'),
+            "truncated emoji must not appear; got: {text:?}"
+        );
+    }
+
+    /// Inactive tab with CJK label: verifies both bg and fg
+    /// styles (DarkGray bg + Gray fg) are applied to
+    /// multi-byte character cells, matching the ASCII
+    /// inactive tab contract.
+    #[test]
+    fn inactive_tab_with_cjk_label_has_dark_gray_style() {
+        let tabs = make_tabs_with_labels(&[Some("a"), Some("\u{65e5}\u{672c}\u{8a9e}")]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
+        render_tab_bar(&mut buf, &tabs);
+        // Tab 1 " 1:a " = 5 chars + 1 separator = 6 cols.
+        // Tab 2 starts at col 6: ' ' 6, '2' 7, ':' 8, CJK 9.
+        let cjk_style = cell_style(&buf, 9);
+        assert_eq!(
+            cjk_style.bg,
+            Some(Color::DarkGray),
+            "inactive tab CJK char must have DarkGray bg"
+        );
+        assert_eq!(
+            cjk_style.fg,
+            Some(Color::Gray),
+            "inactive tab CJK char must have Gray fg"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Combining and zero-width Unicode character tests.
+    // ----------------------------------------------------------------
+
+    /// Combining character: "e" + U+0301 (COMBINING ACUTE ACCENT).
+    /// In `.chars()` iteration these are two separate scalar
+    /// values: the base letter and the combining mark. Each gets
+    /// its own cell (col += 1 per char). Pins that combining
+    /// sequences don't panic and the base letter + mark occupy
+    /// two adjacent cells.
+    ///
+    /// Tab text: " 1:e<unk> " where <unk> is U+0301 — 8 chars
+    /// (space, 1, colon, e, combining-acute, space).
+    #[test]
+    fn combining_accent_does_not_panic() {
+        // "e" + combining acute accent (U+0301)
+        let label = "e\u{0301}";
+        let tabs = make_tabs_with_labels(&[Some(label)]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        // The base 'e' is at col 3, combining mark at col 4.
+        // Both cells must have the active tab style.
+        let base_style = cell_style(&buf, 3);
+        assert_eq!(
+            base_style.bg,
+            Some(Color::Blue),
+            "base letter cell must have active tab Blue bg"
+        );
+        let combining_style = cell_style(&buf, 4);
+        assert_eq!(
+            combining_style.bg,
+            Some(Color::Blue),
+            "combining mark cell must have active tab Blue bg"
+        );
+        // The text must contain the base letter.
+        assert!(
+            text.contains('e'),
+            "rendered text must contain base letter 'e'; got: {text:?}"
+        );
+    }
+
+    /// Zero-width space (U+200B): a format character that has
+    /// no visual width but is a valid Unicode scalar value.
+    /// `.chars()` yields it as a separate char. In the buffer,
+    /// it occupies one cell (col += 1). Pins that zero-width
+    /// characters don't panic and the cell is styled.
+    #[test]
+    fn zero_width_space_does_not_panic() {
+        // Label: "a" + zero-width space + "b"
+        let label = "a\u{200b}b";
+        let tabs = make_tabs_with_labels(&[Some(label)]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        render_tab_bar(&mut buf, &tabs);
+        // Tab text: " 1:a<unk>b " = 9 chars.
+        // 'a' at col 3, ZWS at col 4, 'b' at col 5.
+        let zws_style = cell_style(&buf, 4);
+        assert_eq!(
+            zws_style.bg,
+            Some(Color::Blue),
+            "zero-width space cell must have active tab Blue bg"
+        );
+        // 'b' after the ZWS must also be styled.
+        let b_style = cell_style(&buf, 5);
+        assert_eq!(
+            b_style.bg,
+            Some(Color::Blue),
+            "char after ZWS must have active tab Blue bg"
+        );
+    }
+
+    /// Zero-width joiner (U+200D): used in emoji sequences
+    /// (e.g. family emoji). As a standalone char in a label,
+    /// it's a zero-width scalar that occupies one cell. Pins
+    /// that ZWJ doesn't panic.
+    #[test]
+    fn zero_width_joiner_in_label_does_not_panic() {
+        let label = "a\u{200d}b";
+        let tabs = make_tabs_with_labels(&[Some(label)]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        assert!(
+            text.contains('a') && text.contains('b'),
+            "base chars must appear around ZWJ; got: {text:?}"
+        );
+        // ZWJ cell at col 4 must have active tab style.
+        let zwj_style = cell_style(&buf, 4);
+        assert_eq!(
+            zwj_style.bg,
+            Some(Color::Blue),
+            "ZWJ cell must have active tab Blue bg"
+        );
+    }
+
+    /// Zero-width non-joiner (U+200C): another format character.
+    /// Pins that ZWNJ doesn't panic and occupies its own cell.
+    #[test]
+    fn zero_width_non_joiner_in_label_does_not_panic() {
+        let label = "x\u{200c}y";
+        let tabs = make_tabs_with_labels(&[Some(label)]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        assert!(
+            text.contains('x') && text.contains('y'),
+            "base chars must appear around ZWNJ; got: {text:?}"
+        );
+        // ZWNJ cell at col 4 must have active tab style.
+        let zwnj_style = cell_style(&buf, 4);
+        assert_eq!(
+            zwnj_style.bg,
+            Some(Color::Blue),
+            "ZWNJ cell must have active tab Blue bg"
+        );
+    }
+
+    /// Multiple combining marks on one base: "a" + U+0300
+    /// (grave) + U+0301 (acute) = 3 chars in `.chars()`. Each
+    /// gets its own cell. Pins that stacked combining marks
+    /// don't panic and all 3 cells are styled.
+    #[test]
+    fn stacked_combining_marks_do_not_panic() {
+        // "a" + combining grave + combining acute
+        let label = "a\u{0300}\u{0301}";
+        let tabs = make_tabs_with_labels(&[Some(label)]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        render_tab_bar(&mut buf, &tabs);
+        // Tab text: " 1:a<unk><unk> " = 8 chars.
+        // 'a' at col 3, first combining at col 4, second at col 5.
+        for col in [3u16, 4, 5] {
+            let style = cell_style(&buf, col);
+            assert_eq!(
+                style.bg,
+                Some(Color::Blue),
+                "cell at col {col} must have active tab Blue bg"
+            );
+        }
+    }
+
+    /// Mixed combining + zero-width: label with base letter,
+    /// combining mark, zero-width space, and ASCII. Pins that
+    /// a complex Unicode mix doesn't panic and all cells get
+    /// the correct style.
+    #[test]
+    fn mixed_combining_and_zero_width_does_not_panic() {
+        // "e" + combining acute + ZWS + "f"
+        let label = "e\u{0301}\u{200b}f";
+        let tabs = make_tabs_with_labels(&[Some(label)]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        render_tab_bar(&mut buf, &tabs);
+        // Tab text: " 1:e<unk><unk>f " = 10 chars.
+        // 'e' at col 3, combining at col 4, ZWS at col 5, 'f' at col 6.
+        for col in [3u16, 4, 5, 6] {
+            let style = cell_style(&buf, col);
+            assert_eq!(
+                style.bg,
+                Some(Color::Blue),
+                "cell at col {col} in mixed Unicode label must have Blue bg"
+            );
+        }
+    }
+
+    /// Combining mark on inactive tab: verifies the inactive
+    /// style (DarkGray bg) is applied to combining character
+    /// cells, not just the base letter.
+    #[test]
+    fn inactive_tab_combining_mark_has_dark_gray_bg() {
+        // Tab 1 (active): "a", Tab 2 (inactive): "e" + combining acute
+        let tabs = make_tabs_with_labels(&[Some("a"), Some("e\u{0301}")]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        render_tab_bar(&mut buf, &tabs);
+        // Tab 1 " 1:a " = 5 chars + 1 separator = 6 cols.
+        // Tab 2 starts at col 6: ' ' 6, '2' 7, ':' 8, 'e' 9, combining 10.
+        let combining_style = cell_style(&buf, 10);
+        assert_eq!(
+            combining_style.bg,
+            Some(Color::DarkGray),
+            "inactive tab combining mark must have DarkGray bg"
+        );
+    }
+
+    /// Truncation at combining sequence boundary: a label with
+    /// many combining marks that exceeds the buffer width. The
+    /// `.chars()` iteration truncates at the char boundary,
+    /// which may split a base+combining pair. Pins that this
+    /// doesn't panic.
+    #[test]
+    fn truncation_splits_combining_sequence_without_panic() {
+        // Label: 5 base+combining pairs = 10 chars.
+        // Tab text: " 1:" + 10 chars + " " = 14 chars.
+        // Buffer width 8: chars 0-7 fit.
+        let pairs: String = "e\u{0301}".repeat(5);
+        let tabs = make_tabs_with_labels(&[Some(pairs.as_str())]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 8, 1));
+        render_tab_bar(&mut buf, &tabs);
+        let text = row_text(&buf);
+        assert!(
+            text.starts_with(" 1:"),
+            "must start with ' 1:'; got: {text:?}"
         );
     }
 }

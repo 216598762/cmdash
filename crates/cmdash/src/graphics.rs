@@ -34,7 +34,7 @@ use std::io::Write;
 use cmdash_pty::{KittyGraphicCmd, PaneLayerId};
 use dashcompositor::{
     encode_passthrough_to_writer, Compositor, CpuCompositor, FrameBuffer, ImageLayer, LayerId,
-    LayerStack,
+    LayerStack, RectLayer, TextLayer,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -103,6 +103,35 @@ struct ImageEntry {
     rgba: image::RgbaImage,
 }
 
+/// Z-order base for tab bar layers. Background sits at
+/// `TAB_BAR_Z_BASE`, per-tab highlights at `+1`, text at
+/// `+2`. High enough to sit above pane image layers (which
+/// use z-order 0 by default).
+const TAB_BAR_Z_BASE: u32 = 1000;
+
+/// Tab bar colors as dashcompositor `[u8; 4]` RGBA quads.
+/// Match the ratatui text-mode colors from [`render_tab_bar`]
+/// so the pixel overlay is visually consistent with the
+/// degraded text fallback.
+const TAB_BAR_BG: [u8; 4] = [60, 60, 60, 255]; // DarkGray
+const TAB_BAR_ACTIVE_BG: [u8; 4] = [0, 0, 200, 255]; // Blue
+const TAB_BAR_ACTIVE_FG: [u8; 4] = [255, 255, 255, 255]; // White
+const TAB_BAR_INACTIVE_BG: [u8; 4] = [60, 60, 60, 255]; // DarkGray
+const TAB_BAR_INACTIVE_FG: [u8; 4] = [160, 160, 160, 255]; // Gray
+
+/// Snapshot of tab bar state passed to
+/// [`GraphicsState::update_tab_bar`] each frame. Rebuilt from
+/// [`cmdash::TabStack`] at the call site so `GraphicsState`
+/// doesn't borrow the full `TabStack`.
+pub struct TabBarData<'a> {
+    /// Per-tab labels (`None` for tabs without a label).
+    pub labels: Vec<Option<&'a str>>,
+    /// Index of the currently-active tab.
+    pub active_idx: usize,
+    /// Total tab bar width in cells (terminal columns).
+    pub bar_width_cells: u16,
+}
+
 /// Per-pane graphics state. Holds a shared
 /// [`dashcompositor::LayerStack`], per-pane image maps, and the
 /// cell-pixel metrics used for framebuffer sizing.
@@ -132,6 +161,21 @@ pub struct GraphicsState {
     /// the other would not survive that check.
     images: HashMap<(PaneLayerId, u32), ImageEntry>,
     pane_images: HashMap<PaneLayerId, Vec<u32>>,
+    /// dashcompositor `LayerId`s for the current tab bar
+    /// overlay. One background `RectLayer` + one `TextLayer`
+    /// per tab. Rebuilt every frame by [`Self::update_tab_bar`]
+    /// (old layers are removed first). Empty when no tab bar
+    /// has been rendered yet.
+    tab_bar_layers: Vec<LayerId>,
+    /// Implicit kitty-protocol detection flag. Set to `true`
+    /// when the first pane image is loaded via [`Self::push_image`],
+    /// which proves the host terminal supports the kitty
+    /// graphics protocol (nested PTY children forwarded their
+    /// kitty commands through it). Gates
+    /// [`Self::update_tab_bar`] so non-kitty terminals never
+    /// have tab bar layers pushed and never emit a full-frame
+    /// APC-G block that would produce garbled output.
+    kitty_capable: bool,
 }
 
 impl GraphicsState {
@@ -155,6 +199,8 @@ impl GraphicsState {
             cells,
             images: HashMap::new(),
             pane_images: HashMap::new(),
+            tab_bar_layers: Vec::new(),
+            kitty_capable: false,
         }
     }
 
@@ -210,6 +256,11 @@ impl GraphicsState {
             },
         );
         self.pane_images.entry(pane).or_default().push(kitty_id);
+        // First image load proves the host terminal supports
+        // the kitty graphics protocol (nested PTY children
+        // forwarded their kitty commands through it). Enables
+        // tab bar dashcompositor layers via [`Self::update_tab_bar`].
+        self.kitty_capable = true;
         lid
     }
 
@@ -285,13 +336,15 @@ impl GraphicsState {
     /// `TerminalSize::current()` heuristic, which can drift on
     /// non-TTY CI).
     pub fn render_and_write<W: Write>(&self, writer: &mut W) -> Result<(), GraphicsError> {
-        // Early-out when no images are loaded: composing an
-        // empty LayerStack still produces a full-frame APC-G
-        // block (~1 MiB at 80×24 cells) that overwrites the
-        // text body rendered by ratatui in phase 3a. Skipping
-        // the compose+encode avoids both the stdout corruption
-        // and the per-frame CPU cost.
-        if self.images.is_empty() {
+        // Early-out when no images and no tab bar layers exist:
+        // composing an empty LayerStack still produces a
+        // full-frame APC-G block (~1 MiB at 80×24 cells) that
+        // overwrites the text body rendered by ratatui in
+        // phase 3a. Skipping the compose+encode avoids both
+        // the stdout corruption and the per-frame CPU cost.
+        // When tab bar layers are present, we always compose
+        // so the kitty-native tab bar overlay is emitted.
+        if self.images.is_empty() && self.tab_bar_layers.is_empty() {
             return Ok(());
         }
         let w_px = self.cells.0 as u32 * self.metrics.cell_w;
@@ -324,6 +377,124 @@ impl GraphicsState {
                 }
             }
         }
+    }
+
+    /// Rebuild the tab bar as dashcompositor layers. Removes
+    /// any previously-pushed tab bar layers, then pushes a
+    /// background `RectLayer` (dark gray, full-width, one cell
+    /// row) and one `TextLayer` per tab (active tab highlighted
+    /// with blue bg + white bold; inactive tabs dim gray). Uses
+    /// dashcompositor's bundled fontdue rasterizer via the
+    /// `font-rasterizer` feature.
+    ///
+    /// Called once per frame from [`TickContext::run`] before
+    /// `render_and_write`. The ratatui text tab bar in phase 3a
+    /// is preserved as a degraded-mode fallback for non-kitty
+    /// terminals; the pixel overlay overwrites it on kitty-
+    /// capable hosts.
+    pub fn update_tab_bar(&mut self, data: &TabBarData) {
+        // TODO(v2): add a dirty flag or compare `data` against
+        // the previous frame's state to skip the full rebuild
+        // when nothing changed. The tab bar rarely changes (only
+        // on tab switch / new / close); v1's per-frame rebuild
+        // of ~5-7 layers is acceptable.
+        // Remove previous tab bar layers.
+        for lid in self.tab_bar_layers.drain(..) {
+            self.stack.remove(lid);
+        }
+        // Gate on kitty-capable detection: non-kitty terminals
+        // must never have tab bar layers pushed (the full-frame
+        // APC-G block would produce garbled output). On kitty
+        // terminals, the first pane image load sets this flag.
+        if !self.kitty_capable || data.bar_width_cells == 0 {
+            return;
+        }
+
+        let cw = self.metrics.cell_w;
+        let ch = self.metrics.cell_h;
+        let bar_w_px = data.bar_width_cells as u32 * cw;
+
+        // Background: dark gray full-width bar.
+        let bg = RectLayer::new(0, 0, bar_w_px, ch, TAB_BAR_BG)
+            .with_name("tab_bar_bg")
+            .with_z(TAB_BAR_Z_BASE);
+        self.tab_bar_layers.push(self.stack.push(bg));
+
+        // Per-tab highlight + text.
+        let mut col: u32 = 0;
+        for (idx, label) in data.labels.iter().enumerate() {
+            if col >= data.bar_width_cells as u32 {
+                break;
+            }
+            let is_active = idx == data.active_idx;
+            let tab_text = if let Some(l) = label.filter(|s| !s.is_empty()) {
+                format!(" {}:{} ", idx + 1, l)
+            } else {
+                format!(" {} ", idx + 1)
+            }
+            .chars()
+            .take(data.bar_width_cells as usize - col as usize)
+            .collect::<String>();
+            let tab_chars = tab_text.chars().count() as u32;
+            if tab_chars == 0 {
+                break;
+            }
+
+            // Highlight background rectangle for this tab.
+            let hl_color = if is_active {
+                TAB_BAR_ACTIVE_BG
+            } else {
+                TAB_BAR_INACTIVE_BG
+            };
+            let hl = RectLayer::new(col * cw, 0, tab_chars * cw, ch, hl_color)
+                .with_name(format!("tab_bar_tab_{idx}_bg"))
+                .with_z(TAB_BAR_Z_BASE + 1);
+            self.tab_bar_layers.push(self.stack.push(hl));
+
+            // Text layer. Starts at the same pixel x as the
+            // highlight rect (the leading space character in the
+            // tab text string provides the visual indent). y=1
+            // shifts the baseline 1px from the top of the cell
+            // row, centering a ~14px glyph in a 16px row.
+            let text_color = if is_active {
+                TAB_BAR_ACTIVE_FG
+            } else {
+                TAB_BAR_INACTIVE_FG
+            };
+            let text_x = col * cw;
+            // Guard font size underflow: ch=1 (hypothetical 1px
+            // cells) would produce -1.0, panicking fontdue.
+            let font_px = (ch as f32 - 2.0).max(4.0);
+            let tl = TextLayer::new(text_x, 1, tab_text, text_color)
+                .with_font_size(font_px)
+                .with_name(format!("tab_bar_tab_{idx}_text"))
+                .with_z(TAB_BAR_Z_BASE + 2);
+            self.tab_bar_layers.push(self.stack.push(tl));
+
+            col += tab_chars;
+            // Separator gap between tabs (1 cell).
+            if col < data.bar_width_cells as u32 && idx + 1 < data.labels.len() {
+                col += 1;
+            }
+        }
+    }
+
+    /// Remove all tab bar layers from the stack. Called when
+    /// the tab bar should no longer be rendered (e.g. when
+    /// switching to a single-tab mode).
+    pub fn clear_tab_bar(&mut self) {
+        for lid in self.tab_bar_layers.drain(..) {
+            self.stack.remove(lid);
+        }
+    }
+
+    /// Manually set the kitty-capable flag. Used by tests that
+    /// need to exercise [`Self::update_tab_bar`] without loading
+    /// a real pane image. Production callers should NOT use this;
+    /// the flag is set automatically by [`Self::push_image`].
+    #[cfg(test)]
+    pub(crate) fn set_kitty_capable(&mut self, capable: bool) {
+        self.kitty_capable = capable;
     }
 }
 
@@ -639,6 +810,190 @@ mod internal_sanity_tests {
             out.len() < 4 * 1024 * 1024,
             "non-empty-stack render output must be under 4 MiB; got {} bytes",
             out.len()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Tab-bar dashcompositor layer tests.
+    // ------------------------------------------------------------------
+
+    use super::TabBarData;
+
+    #[test]
+    fn update_tab_bar_pushes_layers() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        g.set_kitty_capable(true);
+        let data = TabBarData {
+            labels: vec![Some("active"), Some("inactive")],
+            active_idx: 0,
+            bar_width_cells: 80,
+        };
+        g.update_tab_bar(&data);
+        // 1 bg RectLayer + 2 highlight RectLayers + 2 TextLayers = 5.
+        assert_eq!(
+            g.tab_bar_layers.len(),
+            5,
+            "update_tab_bar must push 1 bg + 2 highlights + 2 text = 5 layers"
+        );
+    }
+
+    #[test]
+    fn update_tab_bar_removes_old_layers_before_pushing_new() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        g.set_kitty_capable(true);
+        let data = TabBarData {
+            labels: vec![Some("a")],
+            active_idx: 0,
+            bar_width_cells: 80,
+        };
+        g.update_tab_bar(&data);
+        let first_count = g.tab_bar_layers.len();
+        // Second call with 3 tabs should remove old layers and
+        // push new ones — total count changes.
+        let data2 = TabBarData {
+            labels: vec![Some("x"), Some("y"), Some("z")],
+            active_idx: 1,
+            bar_width_cells: 80,
+        };
+        g.update_tab_bar(&data2);
+        assert_eq!(
+            g.tab_bar_layers.len(),
+            7,
+            "second update must push 1 bg + 3 highlights + 3 text = 7 layers"
+        );
+        assert_ne!(
+            first_count,
+            g.tab_bar_layers.len(),
+            "layer count must differ between 1-tab and 3-tab configs"
+        );
+    }
+
+    #[test]
+    fn clear_tab_bar_removes_all_tab_bar_layers() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        g.set_kitty_capable(true);
+        let data = TabBarData {
+            labels: vec![Some("a"), Some("b")],
+            active_idx: 0,
+            bar_width_cells: 80,
+        };
+        g.update_tab_bar(&data);
+        assert!(!g.tab_bar_layers.is_empty());
+        g.clear_tab_bar();
+        assert!(
+            g.tab_bar_layers.is_empty(),
+            "clear_tab_bar must drain all tab bar layer ids"
+        );
+    }
+
+    #[test]
+    fn update_tab_bar_zero_width_is_noop() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        g.set_kitty_capable(true);
+        // Zero-width bar must be a no-op even when kitty_capable
+        // is true, isolating the zero-width gate from the
+        // kitty_capable gate.
+        let data = TabBarData {
+            labels: vec![Some("a")],
+            active_idx: 0,
+            bar_width_cells: 0,
+        };
+        g.update_tab_bar(&data);
+        assert!(
+            g.tab_bar_layers.is_empty(),
+            "zero-width tab bar must push no layers even when kitty_capable"
+        );
+    }
+
+    #[test]
+    fn render_and_write_emits_output_for_tab_bar_only() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        g.set_kitty_capable(true);
+        // No images loaded — render_and_write early-outs.
+        let mut out = Vec::new();
+        g.render_and_write(&mut out).expect("empty");
+        assert!(out.is_empty(), "empty state must produce zero output");
+
+        // After adding tab bar layers, render_and_write must
+        // emit APC-G output even without any pane images.
+        let data = TabBarData {
+            labels: vec![Some("tab1")],
+            active_idx: 0,
+            bar_width_cells: 80,
+        };
+        g.update_tab_bar(&data);
+        let mut out2 = Vec::new();
+        g.render_and_write(&mut out2).expect("tab bar render");
+        assert!(
+            !out2.is_empty(),
+            "tab-bar-only render must produce non-zero output (kitty APC-G)"
+        );
+        assert!(
+            out2.windows(3).any(|w| w == b"\x1b_G"),
+            "output must contain the kitty APC-G escape"
+        );
+    }
+
+    #[test]
+    fn update_tab_bar_single_tab_produces_three_layers() {
+        let mut g = GraphicsState::new(Metrics::default(), (40, 20));
+        g.set_kitty_capable(true);
+        let data = TabBarData {
+            labels: vec![None],
+            active_idx: 0,
+            bar_width_cells: 40,
+        };
+        g.update_tab_bar(&data);
+        // 1 bg + 1 highlight + 1 text = 3.
+        assert_eq!(g.tab_bar_layers.len(), 3);
+    }
+
+    #[test]
+    fn update_tab_bar_preserves_pane_image_layers() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        g.push_image(PaneLayerId(1), 1, rgba1x1());
+        // push_image sets kitty_capable automatically.
+        assert!(g.kitty_capable, "push_image must set kitty_capable");
+        assert!(g.has_image(PaneLayerId(1), 1));
+        let data = TabBarData {
+            labels: vec![Some("a")],
+            active_idx: 0,
+            bar_width_cells: 80,
+        };
+        g.update_tab_bar(&data);
+        // Pane image must survive the tab bar update.
+        assert!(
+            g.has_image(PaneLayerId(1), 1),
+            "pane image must not be removed by update_tab_bar"
+        );
+        // Tab bar layers must be present too.
+        assert!(!g.tab_bar_layers.is_empty());
+    }
+
+    /// `update_tab_bar` is a no-op when `kitty_capable` is
+    /// false. This gates tab bar dashcompositor layers on
+    /// implicit kitty-protocol detection so non-kitty terminals
+    /// never emit garbled APC-G output.
+    #[test]
+    fn update_tab_bar_noop_when_not_kitty_capable() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        // kitty_capable defaults to false (no push_image yet).
+        let data = TabBarData {
+            labels: vec![Some("a"), Some("b")],
+            active_idx: 0,
+            bar_width_cells: 80,
+        };
+        g.update_tab_bar(&data);
+        assert!(
+            g.tab_bar_layers.is_empty(),
+            "update_tab_bar must be a no-op when kitty_capable is false"
+        );
+        // After setting kitty_capable, layers are pushed.
+        g.set_kitty_capable(true);
+        g.update_tab_bar(&data);
+        assert!(
+            !g.tab_bar_layers.is_empty(),
+            "update_tab_bar must push layers when kitty_capable is true"
         );
     }
 }
