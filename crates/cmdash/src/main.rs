@@ -492,7 +492,11 @@ fn main() {
             p.display(),
         );
     }
-    info!("cmdash starting (ratatui text body + dashcompositor kitty graphics)");
+    let gfx_protocol = cmdash::GraphicsProtocol::detect();
+    info!(
+        graphics = gfx_protocol.name(),
+        "cmdash starting (ratatui text body + dashcompositor graphics)"
+    );
     if let Err(e) = run(&cli) {
         eprintln!("cmdash: fatal: {e}");
         std::process::exit(1);

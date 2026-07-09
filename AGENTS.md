@@ -184,7 +184,7 @@ own stdout — placement is fragile and pane-local. Capture, extract, route.
 | Script widgets (cmdash-protocol) | ❌ Stub only |
 | Runtime config file loading (~/.config/cmdash/) | ✅ Working (priority chain: `--config`, `$CMDASH_CONFIG_DIR`, XDG default, bundled fallback) |
 | Scrollback buffer | ✅ Working (ring buffer, PageUp/PageDown, ESC [3J clear) |
-| Sixel fallback | ⚠️ Code path exists, untested |
+| Sixel fallback | ✅ Code path exists, verified with unit tests |
 
 ## Keybinding system
 

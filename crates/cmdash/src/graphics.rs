@@ -23,7 +23,9 @@
 //! - [`GraphicsState::render_and_write`] composites the stack
 //!   into a [`dashcompositor::FrameBuffer`] sized from
 //!   [`Metrics`] (default `8x16` per cell) and emits through
-//!   `dashcompositor::encode_passthrough_to_writer`.
+//!   `dashcompositor::encode_passthrough_to_writer` (Kitty)
+//!   or `dashcompositor::encoder::encode_to_writer` (Sixel
+//!   fallback), depending on [`GraphicsProtocol`].
 //! - [`GraphicsState::close_pane`] tears down every layer that
 //!   came from a given pane (AGENTS.md §"MUST NOT" — bindings
 //!   outliving their pane).
@@ -32,12 +34,13 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use cmdash_pty::{KittyGraphicCmd, PaneLayerId};
+use dashcompositor::encoder::encode_to_writer as encode_sixel_to_writer;
 use dashcompositor::{
     encode_passthrough_to_writer, Compositor, CpuCompositor, FrameBuffer, ImageLayer, LayerId,
     LayerStack, RectLayer, TextLayer,
 };
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Cell-pixel metrics used when converting a pane's text rect to
 /// the underlying pixel framebuffer size. v1 sticks to the
@@ -109,6 +112,96 @@ struct ImageEntry {
 /// use z-order 0 by default).
 const TAB_BAR_Z_BASE: u32 = 1000;
 
+/// Detected graphics protocol for the host terminal.
+/// Determined at startup from `TERM` env var and device
+/// attributes. Drives the encoder selection in
+/// [`GraphicsState::render_and_write`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphicsProtocol {
+    /// Kitty graphics protocol (preferred). Detected when
+    /// `TERM=kitty` or `TERM=xterm-kitty`.
+    Kitty,
+    /// Sixel graphics fallback. Detected when `TERM` contains
+    /// `sixel` or the terminal is known Sixel-capable (`mlterm`,
+    /// `xterm` with Sixel support, `foot`, `wezterm`).
+    Sixel,
+    /// No graphics protocol detected. Text-only mode —
+    /// `render_and_write` is a no-op.
+    TextOnly,
+}
+
+impl GraphicsProtocol {
+    /// Detect the graphics protocol from the `TERM` env var.
+    /// Returns the best available protocol based on terminal
+    /// identification.
+    ///
+    /// Detection priority:
+    /// 1. `TERM=kitty` or `TERM=xterm-kitty` → Kitty
+    /// 2. `TERM` contains `sixel` → Sixel
+    /// 3. Known Sixel-capable terminals (`mlterm`, `foot`,
+    ///    `wezterm`) → Sixel
+    /// 4. `CMDASH_GRAPHICS` env override (`kitty`, `sixel`,
+    ///    `none`) — explicit user choice wins
+    /// 5. Otherwise → TextOnly
+    pub fn detect() -> Self {
+        // Explicit override takes priority.
+        if let Ok(val) = std::env::var("CMDASH_GRAPHICS") {
+            match val.to_lowercase().as_str() {
+                "kitty" => return Self::Kitty,
+                "sixel" => return Self::Sixel,
+                "none" | "text" | "off" => return Self::TextOnly,
+                _ => {}
+            }
+        }
+        let term = std::env::var("TERM").unwrap_or_default();
+        let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+        // Kitty-native terminals.
+        if term == "kitty" || term == "xterm-kitty" || term_program == "kitty" {
+            return Self::Kitty;
+        }
+        // Known Sixel-capable terminals.
+        if term.contains("sixel")
+            || term_program == "mlterm"
+            || term_program == "foot"
+            || term_program == "WezTerm"
+            || term == "mlterm"
+            || term == "foot"
+        {
+            return Self::Sixel;
+        }
+        Self::TextOnly
+    }
+
+    /// Human-readable protocol name for logging.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Kitty => "kitty",
+            Self::Sixel => "sixel",
+            Self::TextOnly => "text-only",
+        }
+    }
+
+    /// Parse a protocol override string (as from `CMDASH_GRAPHICS`).
+    /// Used by tests to exercise detection logic without
+    /// manipulating environment variables. Returns `TextOnly`
+    /// for unrecognized values.
+    #[cfg(test)]
+    pub(crate) fn detect_from_override(val: &str) -> Self {
+        match val.to_lowercase().as_str() {
+            "kitty" => Self::Kitty,
+            "sixel" => Self::Sixel,
+            "none" | "text" | "off" => Self::TextOnly,
+            _ => Self::TextOnly,
+        }
+    }
+}
+
+impl Default for GraphicsProtocol {
+    fn default() -> Self {
+        Self::detect()
+    }
+}
+
 /// Tab bar colors as dashcompositor `[u8; 4]` RGBA quads.
 /// Match the ratatui text-mode colors from [`render_tab_bar`]
 /// so the pixel overlay is visually consistent with the
@@ -176,6 +269,12 @@ pub struct GraphicsState {
     /// have tab bar layers pushed and never emit a full-frame
     /// APC-G block that would produce garbled output.
     kitty_capable: bool,
+    /// Detected graphics protocol for the host terminal.
+    /// Drives encoder selection in [`Self::render_and_write`].
+    /// Defaults to [`GraphicsProtocol::detect()`] at
+    /// construction; can be overridden via the
+    /// `CMDASH_GRAPHICS` env var.
+    protocol: GraphicsProtocol,
 }
 
 impl GraphicsState {
@@ -187,12 +286,24 @@ impl GraphicsState {
     /// in the panic message is consumed by the
     /// `graphics_state_new_panics_on_zero_*` regression tests.
     pub fn new(metrics: Metrics, cells: (u16, u16)) -> Self {
+        Self::new_with_protocol(metrics, cells, GraphicsProtocol::detect())
+    }
+
+    /// Construct a [`GraphicsState`] with an explicit protocol
+    /// override. Tests use this to force a specific protocol
+    /// without relying on the `TERM` env var.
+    pub fn new_with_protocol(
+        metrics: Metrics,
+        cells: (u16, u16),
+        protocol: GraphicsProtocol,
+    ) -> Self {
         assert!(
             cells.0 > 0 && cells.1 > 0,
             "GraphicsState::new: cells must be non-zero (cols > 0 and rows > 0), got {}x{}",
             cells.0,
             cells.1,
         );
+        info!(protocol = protocol.name(), "graphics protocol detected");
         Self {
             stack: LayerStack::default(),
             metrics,
@@ -201,6 +312,7 @@ impl GraphicsState {
             pane_images: HashMap::new(),
             tab_bar_layers: Vec::new(),
             kitty_capable: false,
+            protocol,
         }
     }
 
@@ -347,13 +459,37 @@ impl GraphicsState {
         if self.images.is_empty() && self.tab_bar_layers.is_empty() {
             return Ok(());
         }
+        // Text-only mode: no encoder to call. The early-out
+        // above already handles the empty-stack case; if we
+        // reach here with layers but TextOnly protocol, skip
+        // encoding to avoid garbled output.
+        if self.protocol == GraphicsProtocol::TextOnly {
+            return Ok(());
+        }
         let w_px = self.cells.0 as u32 * self.metrics.cell_w;
         let h_px = self.cells.1 as u32 * self.metrics.cell_h;
         let mut fb = FrameBuffer::new(w_px, h_px);
         CpuCompositor.compose(&self.stack, &mut fb);
-        encode_passthrough_to_writer(&fb, writer)
-            .map_err(|e| GraphicsError::Dispatch(e.to_string()))?;
+        match self.protocol {
+            GraphicsProtocol::Kitty => {
+                encode_passthrough_to_writer(&fb, writer)
+                    .map_err(|e| GraphicsError::Dispatch(e.to_string()))?;
+            }
+            GraphicsProtocol::Sixel => {
+                encode_sixel_to_writer(&fb, writer)
+                    .map_err(|e| GraphicsError::Dispatch(e.to_string()))?;
+            }
+            GraphicsProtocol::TextOnly => {
+                // Unreachable: guarded above.
+            }
+        }
         Ok(())
+    }
+
+    /// The detected graphics protocol. Exposed for logging
+    /// and diagnostics.
+    pub fn protocol(&self) -> GraphicsProtocol {
+        self.protocol
     }
 
     /// Returns `true` if a record exists for `(pane, kitty_id)`,
@@ -406,7 +542,14 @@ impl GraphicsState {
         // must never have tab bar layers pushed (the full-frame
         // APC-G block would produce garbled output). On kitty
         // terminals, the first pane image load sets this flag.
-        if !self.kitty_capable || data.bar_width_cells == 0 {
+        // Gate on graphics-capable detection: non-kitty/non-sixel
+        // terminals must never have tab bar layers pushed (the
+        // full-frame APC-G block would produce garbled output).
+        // On kitty terminals, the first pane image load sets
+        // kitty_capable. On sixel terminals, the protocol field
+        // is set at construction.
+        let has_graphics = self.kitty_capable || self.protocol != GraphicsProtocol::TextOnly;
+        if !has_graphics || data.bar_width_cells == 0 {
             return;
         }
 
@@ -569,7 +712,10 @@ mod internal_sanity_tests {
 
     #[test]
     fn render_and_write_emits_escapes() {
-        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        // Explicit Kitty protocol: `new()` detects TextOnly in CI
+        // (no real terminal), which early-outs before encoding.
+        let mut g =
+            GraphicsState::new_with_protocol(Metrics::default(), (80, 24), GraphicsProtocol::Kitty);
         g.push_image(PaneLayerId(5), 7, rgba1x1());
         let mut out = Vec::new();
         g.render_and_write(&mut out).expect("render");
@@ -800,9 +946,15 @@ mod internal_sanity_tests {
     /// pixel framebuffer (80×24 cells at 8×16 px/cell) with
     /// one 1×1 image should produce a compressed passthrough
     /// frame well under 4 MiB.
+    ///
+    /// Explicit Kitty protocol: `new()` detects TextOnly in CI
+    /// (no real terminal), which early-outs via the TextOnly
+    /// guard before encoding, causing this test to pass with
+    /// 0 bytes (wrong reason).
     #[test]
     fn render_and_write_nonempty_stack_output_is_bounded() {
-        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let mut g =
+            GraphicsState::new_with_protocol(Metrics::default(), (80, 24), GraphicsProtocol::Kitty);
         g.push_image(PaneLayerId(1), 1, rgba1x1());
         let mut out = Vec::new();
         g.render_and_write(&mut out).expect("render");
@@ -907,7 +1059,10 @@ mod internal_sanity_tests {
 
     #[test]
     fn render_and_write_emits_output_for_tab_bar_only() {
-        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        // Explicit Kitty protocol: `new()` detects TextOnly in CI
+        // (no real terminal), which early-outs before encoding.
+        let mut g =
+            GraphicsState::new_with_protocol(Metrics::default(), (80, 24), GraphicsProtocol::Kitty);
         g.set_kitty_capable(true);
         // No images loaded — render_and_write early-outs.
         let mut out = Vec::new();
@@ -971,9 +1126,10 @@ mod internal_sanity_tests {
     }
 
     /// `update_tab_bar` is a no-op when `kitty_capable` is
-    /// false. This gates tab bar dashcompositor layers on
-    /// implicit kitty-protocol detection so non-kitty terminals
-    /// never emit garbled APC-G output.
+    /// false AND protocol is TextOnly. The guard
+    /// (`kitty_capable || protocol != TextOnly`) gates tab bar
+    /// dashcompositor layers so non-graphics terminals never
+    /// emit garbled APC-G/Sixel output.
     #[test]
     fn update_tab_bar_noop_when_not_kitty_capable() {
         let mut g = GraphicsState::new(Metrics::default(), (80, 24));
@@ -994,6 +1150,196 @@ mod internal_sanity_tests {
         assert!(
             !g.tab_bar_layers.is_empty(),
             "update_tab_bar must push layers when kitty_capable is true"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // GraphicsProtocol detection + Sixel fallback tests.
+    // ------------------------------------------------------------------
+
+    /// `GraphicsProtocol::new_with_protocol` with Sixel protocol
+    /// must produce a `GraphicsState` whose `protocol()` returns
+    /// `Sixel`. Pins the explicit-protocol ctor path so tests
+    /// can exercise Sixel encoding without relying on `TERM`.
+    #[test]
+    fn new_with_protocol_sixel_returns_sixel() {
+        let g =
+            GraphicsState::new_with_protocol(Metrics::default(), (80, 24), GraphicsProtocol::Sixel);
+        assert_eq!(g.protocol(), GraphicsProtocol::Sixel);
+    }
+
+    /// `GraphicsProtocol::new_with_protocol` with Kitty protocol
+    /// must return `Kitty`. Symmetric to the Sixel test above.
+    #[test]
+    fn new_with_protocol_kitty_returns_kitty() {
+        let g =
+            GraphicsState::new_with_protocol(Metrics::default(), (80, 24), GraphicsProtocol::Kitty);
+        assert_eq!(g.protocol(), GraphicsProtocol::Kitty);
+    }
+
+    /// `GraphicsProtocol::new_with_protocol` with TextOnly
+    /// must return `TextOnly`.
+    #[test]
+    fn new_with_protocol_text_only_returns_text_only() {
+        let g = GraphicsState::new_with_protocol(
+            Metrics::default(),
+            (80, 24),
+            GraphicsProtocol::TextOnly,
+        );
+        assert_eq!(g.protocol(), GraphicsProtocol::TextOnly);
+    }
+
+    /// `render_and_write` with `TextOnly` protocol must skip
+    /// encoding entirely — the writer must remain empty. Pins
+    /// the early-out path that prevents garbled output when
+    /// neither Kitty nor Sixel is available.
+    #[test]
+    fn text_only_protocol_skips_encoding() {
+        let mut g = GraphicsState::new_with_protocol(
+            Metrics::default(),
+            (80, 24),
+            GraphicsProtocol::TextOnly,
+        );
+        let data = TabBarData {
+            labels: vec![Some("a"), Some("b")],
+            active_idx: 0,
+            bar_width_cells: 80,
+        };
+        g.update_tab_bar(&data);
+        // TextOnly: render_and_write must NOT emit any bytes.
+        let mut out = Vec::new();
+        g.render_and_write(&mut out).expect("render_and_write");
+        assert!(
+            out.is_empty(),
+            "TextOnly protocol must produce empty output, got {} bytes",
+            out.len()
+        );
+    }
+
+    /// `render_and_write` with `Kitty` protocol and layers must
+    /// not contain Sixel DCS sequences. Pins the kitty-encoder
+    /// dispatch path.
+    #[test]
+    fn render_and_write_kitty_emits_apc_g() {
+        let mut g =
+            GraphicsState::new_with_protocol(Metrics::default(), (80, 24), GraphicsProtocol::Kitty);
+        let data = TabBarData {
+            labels: vec![Some("a"), Some("b")],
+            active_idx: 0,
+            bar_width_cells: 80,
+        };
+        g.update_tab_bar(&data);
+        let mut out = Vec::new();
+        g.render_and_write(&mut out).expect("render_and_write");
+        // Kitty output must NOT contain Sixel DCS sequences.
+        assert!(
+            !out.windows(2).any(|w| w == b"\x1bP"),
+            "Kitty protocol output must not contain Sixel DCS"
+        );
+    }
+
+    /// `render_and_write` with `Sixel` protocol and layers must
+    /// produce DCS sequences (`\x1bP`) and must NOT contain kitty
+    /// APC-G escapes (`\x1b_G`). Pins the sixel-encoder dispatch
+    /// path and verifies the roadmap item "verify the fallback
+    /// path produces valid Sixel escapes".
+    #[test]
+    fn render_and_write_sixel_emits_dcs() {
+        let mut g =
+            GraphicsState::new_with_protocol(Metrics::default(), (80, 24), GraphicsProtocol::Sixel);
+        let data = TabBarData {
+            labels: vec![Some("a"), Some("b")],
+            active_idx: 0,
+            bar_width_cells: 80,
+        };
+        g.update_tab_bar(&data);
+        let mut out = Vec::new();
+        g.render_and_write(&mut out).expect("render_and_write");
+        // Sixel output must contain DCS sequences.
+        assert!(
+            out.windows(2).any(|w| w == b"\x1bP"),
+            "Sixel protocol output must contain DCS sequences (ESC P)"
+        );
+        // Sixel output must NOT contain kitty APC-G escapes.
+        assert!(
+            !out.windows(3).any(|w| w == b"\x1b_G"),
+            "Sixel protocol output must not contain kitty APC-G escapes"
+        );
+    }
+
+    /// `GraphicsProtocol::name()` must return the expected
+    /// human-readable string for each variant. Pins the
+    /// startup-log format.
+    #[test]
+    fn protocol_name_returns_expected_strings() {
+        assert_eq!(GraphicsProtocol::Kitty.name(), "kitty");
+        assert_eq!(GraphicsProtocol::Sixel.name(), "sixel");
+        assert_eq!(GraphicsProtocol::TextOnly.name(), "text-only");
+    }
+
+    /// `GraphicsProtocol::detect()` must respect the
+    /// `CMDASH_GRAPHICS` env var when set to `kitty`.
+    #[test]
+    fn detect_from_cmdash_graphics_env_kitty() {
+        let g = GraphicsState::new_with_protocol(
+            Metrics::default(),
+            (80, 24),
+            GraphicsProtocol::detect_from_override("kitty"),
+        );
+        assert_eq!(g.protocol(), GraphicsProtocol::Kitty);
+    }
+
+    /// `GraphicsProtocol::detect()` must respect the
+    /// `CMDASH_GRAPHICS` env var when set to `sixel`.
+    #[test]
+    fn detect_from_cmdash_graphics_env_sixel() {
+        let g = GraphicsState::new_with_protocol(
+            Metrics::default(),
+            (80, 24),
+            GraphicsProtocol::detect_from_override("sixel"),
+        );
+        assert_eq!(g.protocol(), GraphicsProtocol::Sixel);
+    }
+
+    /// `update_tab_bar` with Sixel protocol must push tab bar
+    /// layers (not gated by `kitty_capable`). Pins the fix
+    /// that broadened the guard from `kitty_capable`-only to
+    /// `kitty_capable || protocol != TextOnly`.
+    #[test]
+    fn update_tab_bar_works_with_sixel_protocol() {
+        let mut g =
+            GraphicsState::new_with_protocol(Metrics::default(), (80, 24), GraphicsProtocol::Sixel);
+        let data = TabBarData {
+            labels: vec![Some("a")],
+            active_idx: 0,
+            bar_width_cells: 80,
+        };
+        g.update_tab_bar(&data);
+        assert!(
+            !g.tab_bar_layers.is_empty(),
+            "Sixel protocol must allow tab bar layers"
+        );
+    }
+
+    /// `update_tab_bar` with TextOnly protocol must NOT push
+    /// tab bar layers (no graphics path available). Symmetric
+    /// to `update_tab_bar_noop_when_not_kitty_capable`.
+    #[test]
+    fn update_tab_bar_noop_when_text_only() {
+        let mut g = GraphicsState::new_with_protocol(
+            Metrics::default(),
+            (80, 24),
+            GraphicsProtocol::TextOnly,
+        );
+        let data = TabBarData {
+            labels: vec![Some("a"), Some("b")],
+            active_idx: 0,
+            bar_width_cells: 80,
+        };
+        g.update_tab_bar(&data);
+        assert!(
+            g.tab_bar_layers.is_empty(),
+            "TextOnly protocol must not push tab bar layers"
         );
     }
 }

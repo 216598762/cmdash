@@ -311,7 +311,7 @@ fn wiring_round_trip_renders_echoed_text() {
 /// exact write ordering (text first, graphics second, same fd).
 #[test]
 fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
-    use cmdash::graphics::{GraphicsState, Metrics};
+    use cmdash::graphics::{GraphicsProtocol, GraphicsState, Metrics};
     use cmdash_pty::ShellSpec;
     use std::io::Cursor;
 
@@ -388,7 +388,8 @@ fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
     // buffer. This mirrors the live binary's
     // `GraphicsState::render_and_write(&mut stdout)` call that
     // writes to the same fd after `terminal.draw()`.
-    let mut graphics = GraphicsState::new(Metrics::default(), (80, 24));
+    let mut graphics =
+        GraphicsState::new_with_protocol(Metrics::default(), (80, 24), GraphicsProtocol::Kitty);
     // Push a synthetic 1x1 image so the encoder exercises the
     // actual image-encoding path (not just the empty-framebuffer
     // passthrough). This catches regressions where the encoder
@@ -446,10 +447,11 @@ fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
 
 #[test]
 fn kitty_graphics_route_emits_escape_sequence() {
-    use cmdash::graphics::{GraphicsState, Metrics};
+    use cmdash::graphics::{GraphicsProtocol, GraphicsState, Metrics};
     use cmdash_pty::PaneLayerId;
 
-    let mut graphics = GraphicsState::new(Metrics::default(), (80, 24));
+    let mut graphics =
+        GraphicsState::new_with_protocol(Metrics::default(), (80, 24), GraphicsProtocol::Kitty);
     graphics.push_image(PaneLayerId(1), 7, image::RgbaImage::new(1, 1));
 
     let mut out = Vec::new();
@@ -474,11 +476,12 @@ fn kitty_graphics_route_emits_escape_sequence() {
 
 #[test]
 fn kitty_decode_smoke() {
-    use cmdash::graphics::{GraphicsState, Metrics};
+    use cmdash::graphics::{GraphicsProtocol, GraphicsState, Metrics};
     use cmdash_pty::{KittyGraphicCmd, PaneLayerId};
 
     let png = include_bytes!("fixtures/img1x1.png");
-    let mut graphics = GraphicsState::new(Metrics::default(), (80, 24));
+    let mut graphics =
+        GraphicsState::new_with_protocol(Metrics::default(), (80, 24), GraphicsProtocol::Kitty);
     let pane = PaneLayerId(1);
     let load = KittyGraphicCmd::Load {
         id: 7,

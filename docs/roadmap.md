@@ -79,18 +79,18 @@ when the viewport offset is > 0.
 
 ### 1.5 Sixel fallback verification
 
-**Current state:** The code path for Sixel encoding exists in
-`GraphicsState::render_and_write` via `dashcompositor`, but it has never
-been tested against a real Sixel-capable terminal.
+**Status:** ✅ Unit tests verified. Manual terminal testing pending.
 
-**Goal:** Verify the Sixel fallback works when Kitty graphics is not
-available.
+**Current state:** `GraphicsProtocol` enum (Kitty/Sixel/TextOnly) with
+`detect()` from `TERM`/`TERM_PROGRAM`/`CMDASH_GRAPHICS` env vars.
+`render_and_write` dispatches to the kitty or sixel encoder based on
+protocol, with TextOnly early-out. Startup logs the chosen protocol.
+11 unit tests verify detection, encoding dispatch, and tab bar behavior.
 
-**Steps:**
-- Add terminal capability detection (query `TERM` + device attributes).
-- Test against `xterm` with Sixel support and `mlterm`.
-- Log the chosen protocol at startup.
-- Ensure graceful degradation to text-only mode when neither is available.
+**Remaining:**
+- Manual testing against `xterm` with Sixel support and `mlterm`.
+- Device-attributes query (`ESC[c`) for runtime capability detection
+  (deferred to v2).
 
 ## Tier 2: Extensibility
 
