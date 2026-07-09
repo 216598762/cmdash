@@ -7,10 +7,10 @@
 //! human-readable `label` (the v1 tab title). `TabStack<T>` is a
 //! linear stack of Tabs plus an `active_idx` cursor; the cursor is
 //! upkept by the `TabStack::remove` / `TabStack::switch_to` /
-//! hot-path accessors so callers don't have to re-clamp `active_idx
-//! < len()` themselves.
+//! hot-path accessors so callers don't have to re-clamp `active_idx`
+//! < `len()` themselves.
 //!
-//! ## Cross-tab LayerId namespace contract
+//! ## Cross-tab `LayerId` namespace contract
 //!
 //! The cmdash `cmdash::layer_id` module's
 //! `derive_layer_id_for_tab(pane, tab_id)` packs `(tab_id << 32)
@@ -20,8 +20,8 @@
 //! `derive_layer_id_for_tab`, so two tabs with the same pre-order
 //! geometry never alias to the same `LayerId`.
 //!
-//! InPlace survivor rebinds in `TickContext::reconcile_runners`
-//! deliberately preserve the survivor's `PaneLayerId` per AGENTS.md
+//! `InPlace` survivor rebinds in `TickContext::reconcile_runners`
+//! deliberately preserve the survivor's `PaneLayerId` per `AGENTS.md`
 //! "Hard rule: one layer per instance".
 //!
 //! The tab bar is not yet rendered; it will be added once the
@@ -84,8 +84,8 @@ impl<T> Tab<T> {
 ///    a mutator; the post-condition is `<self.tabs.len()` for the
 ///    cursor after each operation.
 /// 2. After `TabStack::remove`, `active_idx` is clamped to
-///    `len() - 1` (matches AGENTS.md / cmdash-config `TabClose`
-///    rustdoc semantics: "active_tab is clamped to tabs.len() -
+///    `len() - 1` (matches `AGENTS.md` / cmdash-config `TabClose`
+///    rustdoc semantics: "`active_tab` is clamped to `tabs.len()` -
 ///    1; closing the last tab quits the binary").
 /// 3. After `TabStack::switch_to(n)`, `active_idx = n` for any
 ///    in-range `n`; out-of-range `n` is a no-op, leaving the
@@ -439,7 +439,7 @@ mod tests {
 
     /// `remove_active` of a MIDDLE tab clamps the cursor to
     /// `len() - 1` so the next active lands on the new tail
-    /// (matches AGENTS.md "active_idx clamped to len-1" wiring).
+    /// (matches `AGENTS.md` "`active_idx` clamped to len-1" wiring).
     #[test]
     fn remove_active_of_middle_tab_clamps_active_to_len_minus_one() {
         let mut ts: TabStack<u32> = TabStack::new_with_label(0, "a");
@@ -537,7 +537,7 @@ mod tests {
 
     /// `remove_active` on an already-empty stack returns `None`
     /// and leaves the stack empty. Pins the early-return guard
-    /// in `remove_active` so a double-close (e.g. TabClose
+    /// in `remove_active` so a double-close (e.g. `TabClose`
     /// dispatched twice) is a no-op rather than a panic.
     #[test]
     fn remove_active_on_empty_stack_returns_none() {
@@ -620,8 +620,8 @@ mod tests {
     // remove_active edge cases.
     // ----------------------------------------------------------------
 
-    /// Remove the FIRST tab (active_idx=0) from a 3-tab stack.
-    /// After removal, active_idx stays at 0 (the old tab 1
+    /// Remove the FIRST tab (`active_idx=0`) from a 3-tab stack.
+    /// After removal, `active_idx` stays at 0 (the old tab 1
     /// slides into position 0). Pins the non-clamping branch
     /// in `remove_active` where `active_idx < tabs.len()`
     /// post-removal.
@@ -652,8 +652,8 @@ mod tests {
         );
     }
 
-    /// Remove when active_idx=1 from a 3-tab stack (not the
-    /// tail). After removal, active_idx stays at 1 (the old
+    /// Remove when `active_idx=1` from a 3-tab stack (not the
+    /// tail). After removal, `active_idx` stays at 1 (the old
     /// tab 2 slides into position 1). Pins the
     /// `active_idx >= tabs.len()` false branch where clamping
     /// is NOT triggered.
@@ -685,7 +685,7 @@ mod tests {
 
     /// Chained removes: remove tabs one by one from a 5-tab
     /// stack, always removing the active tab (which is the
-    /// last pushed). After each remove, active_idx is clamped
+    /// last pushed). After each remove, `active_idx` is clamped
     /// to len-1. Pins the clamping invariant across a sequence
     /// of removes.
     #[test]
@@ -868,7 +868,7 @@ mod tests {
     /// 2. `is_empty() == (len() == 0)`
     /// 3. `active().is_some() == !is_empty()`
     ///
-    /// (active_mut invariant is tested separately via
+    /// (`active_mut` invariant is tested separately via
     /// `active_mut_on_empty_stack_returns_none` — cannot
     /// check from an immutable `&TabStack` ref.)
     fn assert_invariants<T: std::fmt::Debug>(ts: &TabStack<T>) {
@@ -916,7 +916,7 @@ mod tests {
     }
 
     /// Randomized invariant test: perform 2000 random operations
-    /// (push, remove_active, switch_to) on a TabStack and assert
+    /// (`push`, `remove_active`, `switch_to`) on a `TabStack` and assert
     /// invariants after every mutation. The seed is fixed for
     /// reproducibility; changing the seed explores a different
     /// operation sequence.
@@ -966,9 +966,9 @@ mod tests {
     }
 
     /// Targeted invariant test: exercise the push-then-switch
-    /// cycle. After every push, switch_to every valid index and
+    /// cycle. After every push, `switch_to` every valid index and
     /// assert invariants. This exercises the interaction between
-    /// push (which sets active to the new tail) and switch_to
+    /// `push` (which sets active to the new tail) and `switch_to`
     /// (which moves it elsewhere).
     #[test]
     fn push_then_switch_to_every_index_invariant() {
@@ -1039,9 +1039,9 @@ mod tests {
         }
     }
 
-    /// Randomized mutation + switch_to invariant: 1000 random
-    /// operations (push, remove, switch_to). When switch_to is
-    /// chosen (op==2), verifies the target matches active_idx.
+    /// Randomized mutation + `switch_to` invariant: 1000 random
+    /// operations (`push`, `remove`, `switch_to`). When `switch_to` is
+    /// chosen (op==2), verifies the target matches `active_idx`.
     /// Invariants are checked after every operation regardless
     /// of op type.
     #[test]

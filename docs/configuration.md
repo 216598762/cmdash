@@ -107,6 +107,32 @@ Parser error classes:
 > cmdash logs a `warn` and falls back to the bundled default.
 > To customize, create `~/.config/cmdash/config.kdl` and restart.
 
+### 2.1. Config hot-reload
+
+When cmdash resolves a config file path (priorities 1–3 above), it
+spawns a filesystem watcher on the file's parent directory using the
+[`notify`](https://crates.io/crates/notify) crate. When the config
+file is modified on disk:
+
+1. The watcher detects the change (500 ms debounce to coalesce
+   rapid edits).
+2. The file is re-parsed into a fresh `Config` payload.
+3. The new config is sent to the tick loop via an mpsc channel.
+4. On the next tick (Phase 0.6), the tick loop applies the changes:
+   - **Keybinds** swap immediately via a fresh `Router`.
+   - **Presets** replace the stored preset map.
+   - **Layout** — if the layout tree changed, all panes are torn
+     down and re-spawned (Wholesale reconcile). If the layout
+     is unchanged, only keybinds and presets are refreshed.
+
+> **Note:** The watcher is **not** started for the bundled fallback
+> (priority 4), since there is no file on disk to watch. Also,
+> invalid config edits are logged as warnings and ignored — the
+> previous valid config remains active until a valid edit arrives.
+
+This means you can edit your config file in one pane and see
+keybind/layout changes take effect in cmdash without restarting.
+
 ---
 
 ## 3. Top-level schema

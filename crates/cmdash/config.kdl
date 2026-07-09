@@ -1,4 +1,8 @@
 layout {
+    // To override the shell command for a pane, add `command`:
+    //   pane kind=shell label="editor" command="nvim"
+    //   pane kind=shell label="monitor" command="htop --delay=5"
+    // Omit `command` (or set it to "") to use the default login shell.
     pane kind=shell label="default"
 }
 

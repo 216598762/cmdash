@@ -177,12 +177,12 @@ own stdout — placement is fragile and pane-local. Capture, extract, route.
 | Directional focus navigation | ✅ Working |
 | ZStack overlay + focus primitives | ✅ Working |
 | Tabs (TabStack, tab actions) | ⚠️ Partially implemented (actions wired, tab bar not rendered) |
-| Configurable layouts (KDL) | ✅ Working (compile-time embedded) |
+| Configurable layouts (KDL) | ✅ Working |
 | Layout presets | ✅ Working |
 | Modifier-based keybinds | ✅ Working (Normal mode only; other modes are stubs) |
 | Native Rust widgets (cmdash-widget-sdk) | ❌ Stub only |
 | Script widgets (cmdash-protocol) | ❌ Stub only |
-| Runtime config file loading (~/.config/cmdash/) | ❌ Not implemented (compile-time `include_str!` only) |
+| Runtime config file loading (~/.config/cmdash/) | ✅ Working (priority chain: `--config`, `$CMDASH_CONFIG_DIR`, XDG default, bundled fallback) |
 | Sixel fallback | ⚠️ Code path exists, untested |
 
 ## Keybinding system
@@ -225,10 +225,17 @@ stay stable across resizes of the same tree. Max tree depth: 8.
 
 ## Config model
 
-- **v1:** config is embedded at compile time via `include_str!` from
-  `crates/cmdash/config.kdl`. Editing requires a recompile.
-- **Planned:** `~/.config/cmdash/config.kdl` runtime loading via `figment`,
-  with env-var overrides (`CMDASH_MODIFIER`, `CMDASH_CONFIG_DIR`).
+- **Runtime loading:** config is resolved at startup via a priority chain:
+  1. `--config=<path>` (CLI override)
+  2. `$CMDASH_CONFIG_DIR/config.kdl` (env override)
+  3. `~/.config/cmdash/config.kdl` (XDG default)
+  4. bundled `config.kdl` (`include_str!` fallback)
+
+  If a file path is resolved but the file is missing or unreadable,
+  cmdash logs a `warn` and falls back to the bundled default.
+- **Bundled fallback:** the compile-time `include_str!` from
+  `crates/cmdash/config.kdl` serves as the zero-config default when
+  no user config file exists.
 
 ## Plugin model — native Rust widgets (planned)
 

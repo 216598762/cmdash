@@ -1041,9 +1041,9 @@ mod tests {
 
     /// `parse_chord("M")` (single token, no dash) returns `None`.
     /// Pins the negative case: a single-token modifier alias without
-    /// a key_part must NOT slip through to `Some((Mods::alt, KeyToken::Char('M')))`.
+    /// a `key_part` must NOT slip through to `Some((Mods::alt, KeyToken::Char('M')))`.
     /// Without this pin, a future refactor that defaults the
-    /// missing key_part to the modifier string would regress.
+    /// missing `key_part` to the modifier string would regress.
     #[test]
     fn parse_chord_bare_m_returns_none() {
         assert!(parse_chord("M").is_none());

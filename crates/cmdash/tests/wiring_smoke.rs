@@ -20,13 +20,13 @@ use cmdash_pty::{PaneLayerId, ShellSpec};
 /// Blank-screen detection: a PTY that emits `hello world` via
 /// `printf` must produce visible (non-space) characters in the
 /// ratatui `TestBackend` buffer after `blit_grid` renders the
-/// snapshot. If the PTY→VTE→TextGrid→blit_grid→Buffer chain
+/// snapshot. If the `PTY→VTE→TextGrid→blit_grid→Buffer` chain
 /// breaks at ANY link, the buffer would contain only spaces and
 /// this test fails.
 ///
 /// Catches:
 /// - PTY child not producing output (spawn failure, login shell path)
-/// - VTE parser not populating TextGrid (byte routing bug)
+/// - VTE parser not populating `TextGrid` (byte routing bug)
 /// - `blit_grid` skipping all cells (blank-cell guard too broad)
 /// - ratatui `Terminal::draw` not flushing buffer to backend
 /// - Snapshot returning an empty/stale grid
@@ -104,11 +104,11 @@ fn blank_screen_detection_pty_echo_must_appear_in_buffer() {
     );
 }
 
-/// Baseline: blit_grid of an empty (all-spaces) TextGrid must
+/// Baseline: `blit_grid` of an empty (all-spaces) `TextGrid` must
 /// leave the ratatui buffer at its initial state (all spaces).
 /// This verifies the "blank screen" starting condition — before
 /// the PTY child has produced output, the buffer SHOULD be blank.
-/// If this test fails, it means blit_grid is writing spurious
+/// If this test fails, it means `blit_grid` is writing spurious
 /// content into the buffer from empty grids.
 #[test]
 fn blank_grid_baseline_buffer_stays_all_spaces() {
@@ -2119,7 +2119,7 @@ fn extract_u16_after(line: &str, field: &str) -> Option<u16> {
 ///
 /// This is the strongest test for the blank-screen bug
 /// because it exercises the exact code path the live binary
-/// uses (PaneRunner::spawn_with_graphics + the reader thread
+/// uses (`PaneRunner::spawn_with_graphics` + the reader thread
 /// in pane.rs). If this test passes but the live binary
 /// still shows blank, the issue is in the render pipeline
 /// (phase 3a/3b) or terminal initialization, NOT the PTY
@@ -2130,7 +2130,7 @@ fn extract_u16_after(line: &str, field: &str) -> Option<u16> {
 /// - Reader thread exiting immediately (silent EOF)
 /// - mpsc channel disconnecting before bytes arrive
 /// - `PaneRunner::tick()` never calling `advance()`
-/// - VTE parser not populating the TextGrid
+/// - VTE parser not populating the `TextGrid`
 /// - Snapshot returning stale/empty grid
 ///
 /// Also verifies that a `sleep 10` shell (long-lived) does
@@ -2285,7 +2285,7 @@ fn full_pipeline_pty_reader_tick_snapshot_has_content() {
 /// `ComputedLayout::compute`, derive a `ShellSpec::Command` from
 /// the config string (mirroring `shell_spec_from_command` in
 /// main.rs), spawn a real `PaneRunner`, tick it, and assert
-/// "hello" appears in the TextGrid.
+/// "hello" appears in the `TextGrid`.
 ///
 /// This is the integration-level pin for the per-pane shell
 /// command override (roadmap item 1.3). The config-parser
@@ -2409,5 +2409,123 @@ fn per_pane_command_field_echo_hello_appears_in_textgrid() {
     assert!(
         buf_hello,
         "'hello' from command='echo hello' must survive blit_grid to ratatui buffer"
+    );
+}
+
+/// Per-pane `command` with multiple arguments: `command="echo hello world"`.
+/// Extends `per_pane_command_field_echo_hello_appears_in_textgrid` to
+/// verify that `split_whitespace` correctly produces 3 argv tokens
+/// (`["echo", "hello", "world"]`) and the PTY child echoes the
+/// full multi-word output.
+///
+/// Catches regressions where:
+/// - `split_whitespace` drops trailing tokens
+/// - argv construction collapses or reorders arguments
+/// - The PTY child receives a truncated argument list
+#[test]
+fn per_pane_command_with_args_echo_hello_world_appears_in_textgrid() {
+    let source = r#"layout { pane kind=shell label="args-pane" command="echo hello world" }"#;
+    let cfg = cmdash_config::parse(source).expect("parse config with multi-arg command");
+    let root = cfg.layout.expect("layout block");
+    let area = LayoutRect {
+        x: 0,
+        y: 0,
+        w: 80,
+        h: 24,
+    };
+    let layout = ComputedLayout::compute(&root, area).expect("compute layout");
+    assert_eq!(layout.panes.len(), 1, "expected 1 leaf pane");
+    let pane = layout.panes[0].clone();
+
+    // Config-parser + layout-resolver round-trip pin.
+    assert_eq!(
+        pane.command.as_deref(),
+        Some("echo hello world"),
+        "ComputedPane.command must carry the multi-arg command= value through layout resolution"
+    );
+
+    // argv splitting must produce 3 tokens — not 2 (dropping
+    // "world") and not 1 (collapsing into a single string).
+    let cmd = pane.command.as_ref().expect("command must be Some");
+    let argv: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+    assert_eq!(
+        argv,
+        vec!["echo".to_string(), "hello".to_string(), "world".to_string()],
+        "command 'echo hello world' must split into [echo, hello, world]"
+    );
+    let shell = ShellSpec::Command { argv };
+
+    let layer_id = cmdash::derive_layer_id(&pane.id);
+    let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
+
+    // Wait for the child to start and produce output.
+    std::thread::sleep(Duration::from_millis(250));
+
+    let mut found = false;
+    for _ in 0..80 {
+        let snap = runner.tick().expect("tick");
+        'grid: for y in 0..snap.rows {
+            for x in 0..snap.cols {
+                if snap.grid.cell(x, y).ch == 'h' {
+                    let mut ok = true;
+                    for (i, ch) in "hello world".chars().enumerate() {
+                        let cx = x + i as u16;
+                        if cx >= snap.cols || snap.grid.cell(cx, y).ch != ch {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        found = true;
+                        break 'grid;
+                    }
+                }
+            }
+        }
+        if found {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        found,
+        "per-pane command='echo hello world' must produce 'hello world' in the TextGrid \
+         within 2s. If this fails, the multi-arg command either didn't survive \
+         config→layout resolution, or the PTY child received a truncated argv."
+    );
+
+    // Also verify 'hello world' survives blit_grid to a ratatui buffer.
+    let snap = runner.tick().expect("final tick");
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, pane.rect.w, pane.rect.h);
+            cmdash::render::blit_grid(&snap.grid, frame.buffer_mut(), area);
+        })
+        .expect("draw");
+    let buf = terminal.backend().buffer().clone();
+    let mut buf_found = false;
+    'buf: for y in 0..24 {
+        for x in 0..80 {
+            if buf.get(x, y).symbol() == "h" {
+                let mut ok = true;
+                for (i, ch) in "hello world".chars().enumerate() {
+                    let cx = x + i as u16;
+                    if cx >= 80 || buf.get(cx, y).symbol() != ch.to_string() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    buf_found = true;
+                    break 'buf;
+                }
+            }
+        }
+    }
+    assert!(
+        buf_found,
+        "'hello world' from command='echo hello world' must survive blit_grid to ratatui buffer"
     );
 }

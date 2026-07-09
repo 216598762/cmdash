@@ -37,7 +37,8 @@ A Rust workspace that combines:
 - a **PTY layer** — `portable-pty` + `vte` per pane producing
   text grids (`cmdash-pty`),
 - a **config surface** — KDL types + parser for keybinds,
-  modifiers, layouts (`cmdash-config` + `cmdash-keybinds`),
+  modifiers, layouts (`cmdash-config` + `cmdash-keybinds`), with
+  runtime config file loading and hot-reload via filesystem watcher,
 - a **ratatui text renderer** — per-frame cell-grid blit
   (`cmdash` binary, the integrator crate),
 - a **dashcompositor layer-stack renderer** — per-instance
@@ -88,8 +89,12 @@ Build requirements:
 ## Running cmdash
 
 ```bash
-# Default launch — no flags. Tracing writes to stdout at info level.
+# Default launch — no flags. Config loaded from ~/.config/cmdash/config.kdl
+# (falls back to bundled default). Tracing writes to stdout at info level.
 ./target/release/cmdash
+
+# Use a custom config file.
+./target/release/cmdash --config=/path/to/my-config.kdl
 
 # Capture every tracing event to a file. Stdout stays silent;
 # a stderr banner announces the launch. Trace is forced in file mode.
@@ -99,11 +104,21 @@ Build requirements:
 RUST_LOG=warn ./target/release/cmdash
 ```
 
+**Config resolution chain** (first match wins):
+1. `--config=<path>` (explicit CLI override)
+2. `$CMDASH_CONFIG_DIR/config.kdl` (env override)
+3. `~/.config/cmdash/config.kdl` (XDG default)
+4. Bundled `config.kdl` (compiled-in fallback)
+
+When a config file path is resolved (priorities 1–3), cmdash
+watches the file for changes at runtime — edits take effect
+on the next tick without restarting.
+
 The `--log=<path>` flag controls **where** tracing events land;
 `RUST_LOG` controls **what** filter applies. They're orthogonal:
 `--log=<path>` (file mode) ignores `RUST_LOG`; without it (stdout
 mode), `RUST_LOG` is honored. See
-[`docs/configuration.md` §1.4](./docs/configuration.md) for details.
+[`docs/configuration.md`](./docs/configuration.md) for details.
 
 ## Architecture (one frame)
 
@@ -113,6 +128,8 @@ The `TickContext::run` loop iterates `self.runners` once per frame:
   raw bytes to focused pane's PTY.
 - **Phase 0.5** — coalesce host resize, re-resolve layout tree,
   resize each pane.
+- **Phase 0.6** — drain config-reload channel; swap keybinds/presets;
+  rebuild panes if layout changed.
 - **Phase 1** — drain close-channel, poll exits, snapshot grids.
 - **Phase 2** — route kitty graphics events into `GraphicsState`.
 - **Phase 3a** — render text grids through ratatui.

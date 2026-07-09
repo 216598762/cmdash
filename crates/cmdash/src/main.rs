@@ -92,6 +92,7 @@ fn shell_spec_from_command(command: &Option<String>, default: &ShellSpec) -> She
     }
 }
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use notify::Watcher as _;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::Terminal;
 use tracing::{debug, info, warn};
@@ -363,6 +364,105 @@ fn read_config_text(
     }
 }
 
+/// Parsed config payload sent from the filesystem watcher
+/// thread to the main tick loop via an mpsc channel.
+struct ConfigReload {
+    keybinds: Vec<cmdash_config::Keybind>,
+    presets: BTreeMap<String, LayoutNode>,
+    layout_root: Option<LayoutNode>,
+}
+
+/// Filesystem watcher that monitors the config file's parent
+/// directory for changes and sends re-parsed configs to the
+/// main tick loop via an mpsc channel.
+struct ConfigWatcher {
+    _watcher: notify::RecommendedWatcher,
+}
+
+impl ConfigWatcher {
+    fn spawn(
+        config_path: Option<&std::path::Path>,
+    ) -> (Option<Self>, Option<Receiver<ConfigReload>>) {
+        let Some(path) = config_path else {
+            return (None, None);
+        };
+        let path = path.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watcher = match Self::start_watcher(path, tx) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(error = %e,
+                      "config watcher: failed to start; hot-reload disabled");
+                return (None, None);
+            }
+        };
+        (Some(watcher), Some(rx))
+    }
+
+    fn start_watcher(
+        path: std::path::PathBuf,
+        tx: Sender<ConfigReload>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let debounce_ms: u64 = 500;
+        let mut last_reload = std::time::Instant::now() - Duration::from_millis(debounce_ms);
+        let watcher_path = path.clone();
+        let mut watcher =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                let Ok(event) = res else { return };
+                if !matches!(event.kind, notify::EventKind::Modify(_)) {
+                    return;
+                }
+                let now = std::time::Instant::now();
+                if now.duration_since(last_reload).as_millis() < debounce_ms as u128 {
+                    return;
+                }
+                last_reload = now;
+                let text = match std::fs::read_to_string(&watcher_path) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(error = %e,
+                              path = %watcher_path.display(),
+                              "config watcher: read failed");
+                        return;
+                    }
+                };
+                let cfg = match cmdash_config::parse(&text) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(error = ?e,
+                              "config watcher: parse failed");
+                        return;
+                    }
+                };
+                info!(path = %watcher_path.display(),
+                      "config file changed; applying hot-reload");
+                let _ = tx.send(ConfigReload {
+                    keybinds: cfg.keybinds,
+                    presets: cfg.presets,
+                    layout_root: cfg.layout,
+                });
+            })?;
+        if let Some(parent) = path.parent() {
+            watcher
+                .watch(parent, notify::RecursiveMode::NonRecursive)
+                .map_err(|e| {
+                    let b: Box<dyn std::error::Error + Send + Sync> = Box::new(e);
+                    b
+                })?;
+            info!(path = %parent.display(),
+                  "config watcher: watching directory");
+        } else {
+            watcher
+                .watch(&path, notify::RecursiveMode::NonRecursive)
+                .map_err(|e| {
+                    let b: Box<dyn std::error::Error + Send + Sync> = Box::new(e);
+                    b
+                })?;
+        }
+        Ok(Self { _watcher: watcher })
+    }
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let cli = match CliArgs::parse(&argv) {
@@ -496,6 +596,9 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // binary's run-loop lifetime exactly.
 
     let bindings = Router::new(cfg.keybinds);
+    // Start the config file watcher for hot-reload.
+    let (_config_watcher, config_reload_rx) = ConfigWatcher::spawn(config_path.as_deref());
+
     // `focus` and `running` are MOVED into
     // `TickContext::new_full` below; they are never mutated
     // locally. `guard` and `ctx` stay `mut` because
@@ -523,6 +626,7 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cfg.presets,
         BTreeMap::new(),
         ShellSpec::LoginShell,
+        config_reload_rx,
     );
     ctx.run()
 }
@@ -636,7 +740,7 @@ pub(crate) struct TabState {
     pub focus: usize,
     /// Per-tab KDL layout tree.
     pub layout_root: LayoutNode,
-    /// Per-tab ZStack focus map (per the v1 `stack_focus`
+    /// Per-tab `ZStack` focus map (per the v1 `stack_focus`
     /// semantics).
     pub stack_focus: BTreeMap<cmdash_layout::PaneId, usize>,
 }
@@ -749,6 +853,8 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// `layout_root` / `stack_focus` so the v1 + tabs
     /// surfaces are coherent at construction.
     tabs: TabStack<TabState>,
+    /// Config hot-reload channel receiver.
+    config_reload_rx: Option<Receiver<ConfigReload>>,
 }
 
 /// Monotonic `LayerId` allocator for
@@ -832,6 +938,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         presets: BTreeMap<String, LayoutNode>,
         stack_focus: BTreeMap<PaneId, usize>,
         shell: ShellSpec,
+        config_reload_rx: Option<Receiver<ConfigReload>>,
     ) -> Self {
         assert!(
             focus < runners.len(),
@@ -869,6 +976,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             stack_focus,
             shell,
             tabs: TabStack::new(initial_tab),
+            config_reload_rx,
         }
     }
 
@@ -1764,8 +1872,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
 
     /// The active tab's index as `u32` for
     /// `cmdash::derive_layer_id_for_tab`. The
-    /// `reconcile_runners` InPlace path passes this as the
-    /// second arg so multi-tab LayerIds are collision-free.
+    /// `reconcile_runners` `InPlace` path passes this as the
+    /// second arg so multi-tab `LayerIds` are collision-free.
     /// For a single-tab binary this matches the v1
     /// `derive_layer_id` call sites byte-for-byte, so existing
     /// tests are unaffected. Private (no `pub`) because the
@@ -1837,6 +1945,37 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         }
     }
 
+    /// Drain the config-reload channel and apply the latest
+    /// payload. Keybinds and presets swap immediately; layout
+    /// changes trigger a Wholesale reconcile.
+    fn check_config_reload(&mut self) {
+        let rx = match self.config_reload_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+        let mut latest: Option<ConfigReload> = None;
+        while let Ok(msg) = rx.try_recv() {
+            latest = Some(msg);
+        }
+        let msg = match latest {
+            Some(m) => m,
+            None => return,
+        };
+        self.bindings = Router::new(msg.keybinds);
+        self.presets = msg.presets;
+        if let Some(new_layout) = msg.layout_root {
+            if new_layout != self.layout_root {
+                info!("config hot-reload: layout changed; rebuilding panes");
+                self.layout_root = new_layout;
+                self.reconcile_runners(ReconcileMode::Wholesale);
+            } else {
+                debug!("config hot-reload: keybinds+presets updated");
+            }
+        } else {
+            debug!("config hot-reload: keybinds+presets updated");
+        }
+    }
+
     /// Drive the AGENTS.md rendering pipeline until `running`
     /// flips `false` or every pane exits. The loop body is the
     /// same logic that lived in the prior free `tick_loop`
@@ -1871,6 +2010,9 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             if let Some((w, h)) = self.pending_resize.take() {
                 self.relayout(w, h);
             }
+
+            // Phase 0.6: config hot-reload.
+            self.check_config_reload();
 
             // Phase 1: drain the close-channel (Drop messages)
             // FIRST so their revisions are visible before phase 2/3
@@ -2528,7 +2670,7 @@ mod cli_args_tests {
 
     /// Priority 3: XDG default (~/.config/cmdash/config.kdl)
     /// is returned when no CLI override and no env var.
-    /// We can't easily clear CMDASH_CONFIG_DIR in a test
+    /// We can't easily clear `CMDASH_CONFIG_DIR` in a test
     /// (parallel tests share the process env), so we test
     /// the CLI-override path which is the priority-1 winner.
     #[test]
@@ -2638,6 +2780,110 @@ mod cli_args_tests {
                 std::mem::discriminant(&other)
             ),
         }
+    }
+
+    /// End-to-end: `--config=<path>` CLI override wires through
+    /// `CliArgs::parse` -> `resolve_config_path` ->
+    /// `read_config_text` -> `cmdash_config::parse` ->
+    /// `ComputedLayout::compute`. Writes a custom 2-pane split
+    /// config to a temp file, invokes the full resolution chain
+    /// as `cmdash::run` would, and asserts the resolved layout
+    /// has exactly 2 panes with the expected labels and split
+    /// geometry.
+    #[test]
+    fn cli_config_override_end_to_end() {
+        let dir = std::env::temp_dir().join("cmdash_cli_config_e2e_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let config_path = dir.join("config.kdl");
+        let custom_config = r#"
+            layout {
+                split axis=horizontal ratio=0.6 {
+                    pane kind=shell label="editor"
+                    pane kind=shell label="terminal"
+                }
+            }
+            keybinds {
+                bind "alt-w"  action="pane.close"
+                bind "alt-q"  action="app.close"
+            }
+        "#;
+        std::fs::write(&config_path, custom_config).expect("write temp config");
+
+        // Step 1: CliArgs::parse recognizes --config=<path>.
+        let argv = vec![
+            "cmdash".to_string(),
+            format!("--config={}", config_path.display()),
+        ];
+        let cli = CliArgs::parse(&argv).expect("parse --config flag");
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(config_path.as_path()),
+            "CliArgs must capture --config=<path>"
+        );
+
+        // Step 2: resolve_config_path returns the CLI override.
+        let (resolved_path, label) = resolve_config_path(cli.config.as_deref());
+        assert_eq!(
+            resolved_path.as_deref(),
+            Some(config_path.as_path()),
+            "resolve_config_path must return the CLI override path"
+        );
+        assert_eq!(
+            label, "--config=<path>",
+            "source label must be --config=<path>"
+        );
+
+        // Step 3: read_config_text reads the file contents.
+        let cfg_text = read_config_text(resolved_path.as_deref(), label);
+        assert!(
+            cfg_text.contains("editor"),
+            "cfg_text must contain the custom config content"
+        );
+
+        // Step 4: cmdash_config::parse parses the KDL.
+        let cfg = cmdash_config::parse(&cfg_text).expect("parse custom config");
+        let layout_root = cfg.layout.expect("custom config must have layout");
+
+        // Step 5: Verify keybinds round-trip.
+        assert_eq!(cfg.keybinds.len(), 2, "custom config must have 2 keybinds");
+
+        // Step 6: ComputedLayout::compute resolves the layout.
+        let area = cmdash_layout::Rect {
+            x: 0,
+            y: 0,
+            w: 120,
+            h: 40,
+        };
+        let layout = cmdash_layout::ComputedLayout::compute(&layout_root, area)
+            .expect("compute custom layout");
+        assert_eq!(
+            layout.panes.len(),
+            2,
+            "custom 2-pane split must resolve to 2 panes"
+        );
+        assert_eq!(
+            layout.panes[0].label.as_deref(),
+            Some("editor"),
+            "pane 0 must have label 'editor'"
+        );
+        assert_eq!(
+            layout.panes[1].label.as_deref(),
+            Some("terminal"),
+            "pane 1 must have label 'terminal'"
+        );
+        // Ratio 0.6 over 120 cols: left = 72, right = 48.
+        assert_eq!(
+            layout.panes[0].rect.w, 72,
+            "editor pane width must be 72 (60% of 120)"
+        );
+        assert_eq!(
+            layout.panes[1].rect.w, 48,
+            "terminal pane width must be 48 (40% of 120)"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
 
@@ -2862,6 +3108,7 @@ mod input_tests {
             std::collections::BTreeMap::new(),
             std::collections::BTreeMap::new(),
             shell,
+            None,
         );
         (ctx, layout_root, last_area)
     }
@@ -3138,6 +3385,7 @@ mod input_tests {
             std::collections::BTreeMap::new(),
             std::collections::BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
     }
 
@@ -3183,6 +3431,7 @@ mod input_tests {
             std::collections::BTreeMap::new(),
             std::collections::BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
     }
 
@@ -3347,6 +3596,7 @@ mod input_tests {
             std::collections::BTreeMap::new(),
             std::collections::BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
 
         // Pairing pin BEFORE relayout: each runner's id must
@@ -3502,6 +3752,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         ctx.apply_action_full(KeyAction::AppNewPane);
         // After AppNewPane on a single-leaf root: layout_root
@@ -3587,6 +3838,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         assert_eq!(ctx.focus, 0);
         ctx.apply_action_full(KeyAction::PaneFocusRight);
@@ -3670,6 +3922,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         ctx.apply_action_full(KeyAction::PaneClose);
         // After PaneClose on focus=0 of a 2-leaf Split: the
@@ -3690,7 +3943,7 @@ mod input_tests {
 
     /// Duplicate-label survivor preservation: a config with two
     /// panes sharing the same label ("dup") undergoes
-    /// `AppNewPane` on the first pane. The InPlace reconcile
+    /// `AppNewPane` on the first pane. The `InPlace` reconcile
     /// path must preserve BOTH survivors — without the
     /// `HashMap<String, Vec<PaneRunner>>` fix, the second
     /// `insert` would overwrite the first survivor, causing its
@@ -3767,6 +4020,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             shell,
+            None,
         );
         ctx.apply_action_full(KeyAction::AppNewPane);
         // After AppNewPane on focus=0 of a 2-leaf Split with
@@ -3868,6 +4122,7 @@ mod input_tests {
             presets,
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         ctx.apply_action_full(KeyAction::PanePreset("beta".to_string()));
         // After wholesale swap: 2 panes (the new preset body),
@@ -3965,6 +4220,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         ctx.apply_action_full(KeyAction::PaneStackCycle);
         // After cycling from last -> first: focus moves to
@@ -4052,6 +4308,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         ctx.apply_action_full(KeyAction::PaneStackDown);
         let focused_id = ctx.runners[ctx.focus].computed().id;
@@ -4150,6 +4407,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         // Sanity: focused runner is the LAST ZStack member.
         let pre_focus_id = ctx.runners[ctx.focus].computed().id;
@@ -4253,6 +4511,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         ctx.apply_action_full(KeyAction::PaneStackUp);
         let focused_id = ctx.runners[ctx.focus].computed().id;
@@ -4340,6 +4599,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         // Sanity: focused runner is the FIRST ZStack member.
         let pre_focus_id = ctx.runners[ctx.focus].computed().id;
@@ -4443,6 +4703,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         // Sanity: focused runner is pane "b".
         assert_eq!(
@@ -4534,6 +4795,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         // Sanity: focused runner is pane "a".
         assert_eq!(
@@ -4642,6 +4904,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         // Sanity: focused runner is the LAST ZStack member.
         let pre_focus_id = ctx.runners[ctx.focus].computed().id;
@@ -4758,6 +5021,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         // Sanity: focused runner is the FIRST ZStack member.
         let pre_focus_id = ctx.runners[ctx.focus].computed().id;
@@ -4873,6 +5137,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         // Sanity: focused runner is the ONLY ZStack member.
         let pre_focus_id = ctx.runners[ctx.focus].computed().id;
@@ -4984,6 +5249,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         // Sanity: focused runner is the ONLY ZStack member.
         let pre_focus_id = ctx.runners[ctx.focus].computed().id;
@@ -5100,6 +5366,7 @@ mod input_tests {
             std::collections::BTreeMap::new(),
             std::collections::BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         let pre_focus_id = ctx.runners[ctx.focus].computed().id;
         ctx.apply_action_full(KeyAction::PaneStackCycle);
@@ -5209,6 +5476,7 @@ mod input_tests {
             std::collections::BTreeMap::new(),
             std::collections::BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         let pre_focus_id = ctx.runners[ctx.focus].computed().id;
         assert_ne!(
@@ -5345,6 +5613,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         assert_eq!(ctx.focus, 0);
         ctx.apply_action_full(KeyAction::PaneFocusUp);
@@ -5431,6 +5700,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         assert!(ctx.running, "pre-close: binary must be running");
         assert_eq!(ctx.runners.len(), 1);
@@ -5522,6 +5792,7 @@ mod input_tests {
             presets,
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         ctx.apply_action_full(KeyAction::PanePreset("missing".to_string()));
         // After a no-op preset swap: runners.len unchanged,
@@ -5622,6 +5893,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         ctx.apply_action_full(KeyAction::PaneClose);
         // Primary pin: close_rx must echo back the dropped
@@ -5718,6 +5990,7 @@ mod input_tests {
             BTreeMap::new(),
             BTreeMap::new(),
             ShellSpec::LoginShell,
+            None,
         );
         ctx.apply_action_full(KeyAction::AppNewPane);
         // Post-AppNewPane pin: layout_root became a Split, the
@@ -6198,7 +6471,7 @@ mod tab_bar_render_tests {
     /// Long label truncated at buffer edge: a label wider than
     /// the buffer is silently cut off mid-character. The cells
     /// that DO fit must carry the active style; trailing cells
-    /// beyond the tab text must have the DarkGray background
+    /// beyond the tab text must have the `DarkGray` background
     /// fill.
     #[test]
     fn long_label_truncated_at_buffer_edge() {
@@ -6378,8 +6651,8 @@ mod tab_bar_render_tests {
 
     /// Truncation with multi-byte chars: a long emoji label
     /// that exceeds the buffer width must be truncated at the
-    /// char boundary (not byte boundary). Pins that .chars()
-    /// iteration and the col >= bar_width truncation guard
+    /// char boundary (not byte boundary). Pins that `.chars()`
+    /// iteration and the col >= `bar_width` truncation guard
     /// work for non-ASCII text without panicking.
     ///
     /// Tab text is 9 chars (" 1:" + 5 emoji + " "). Buffer
@@ -6407,7 +6680,7 @@ mod tab_bar_render_tests {
     }
 
     /// Inactive tab with CJK label: verifies both bg and fg
-    /// styles (DarkGray bg + Gray fg) are applied to
+    /// styles (`DarkGray` bg + `Gray` fg) are applied to
     /// multi-byte character cells, matching the ASCII
     /// inactive tab contract.
     #[test]
@@ -6594,7 +6867,7 @@ mod tab_bar_render_tests {
     }
 
     /// Combining mark on inactive tab: verifies the inactive
-    /// style (DarkGray bg) is applied to combining character
+    /// style (`DarkGray` bg) is applied to combining character
     /// cells, not just the base letter.
     #[test]
     fn inactive_tab_combining_mark_has_dark_gray_bg() {
@@ -6630,6 +6903,152 @@ mod tab_bar_render_tests {
         assert!(
             text.starts_with(" 1:"),
             "must start with ' 1:'; got: {text:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod config_hot_reload_tests {
+    use std::time::Duration;
+
+    /// Config hot-reload: write a config file, spawn a
+    /// `ConfigWatcher` for it, modify the file with different
+    /// keybinds, and assert the watcher's channel delivers a
+    /// `ConfigReload` with the new keybinds.
+    ///
+    /// This test exercises the full hot-reload pipeline:
+    /// file write -> notify event -> re-parse -> mpsc send ->
+    /// channel receive -> keybind assertion.
+    #[test]
+    fn config_hot_reload_detects_keybind_changes() {
+        let dir = std::env::temp_dir().join("cmdash_hot_reload_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let config_path = dir.join("config.kdl");
+
+        // Step 1: write initial config with alt-q -> app.close.
+        let initial = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-q\" action=\"app.close\"\n            }\n        ";
+        std::fs::write(&config_path, initial).expect("write initial config");
+
+        // Step 2: spawn the ConfigWatcher.
+        let (_watcher, rx_opt) = super::ConfigWatcher::spawn(Some(config_path.as_ref()));
+        let rx = rx_opt.expect("watcher must produce a receiver when path is Some");
+
+        // Give the watcher time to initialize (it watches the
+        // parent directory; the notify backend may need a tick).
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Step 3: overwrite the config with different keybinds
+        // (alt-w -> pane.close instead of alt-q -> app.close).
+        let updated = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-w\" action=\"pane.close\"\n            }\n        ";
+        std::fs::write(&config_path, updated).expect("write updated config");
+
+        // Step 4: wait for the watcher's debounce (500ms) plus
+        // margin. The channel should deliver the re-parsed
+        // config with the new keybinds.
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        // Cleanup BEFORE assertions so temp files don't leak
+        // if an assertion panics.
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&dir);
+
+        let reload = result.expect("watcher must deliver a ConfigReload within 5s");
+
+        // Step 5: assert the new keybinds round-tripped.
+        // Exactly 1 keybind (the old alt-q -> app.close is gone).
+        assert_eq!(
+            reload.keybinds.len(),
+            1,
+            "reloaded config must have exactly 1 keybind; got: {}",
+            reload.keybinds.len()
+        );
+        let kb = &reload.keybinds[0];
+        // The new keybind should be alt-w -> pane.close.
+        assert_eq!(
+            kb.action,
+            cmdash_config::KeyAction::PaneClose,
+            "reloaded action must be PaneClose; got: {:?}",
+            kb.action
+        );
+        // Verify the modifier is Alt and the key is 'w'.
+        assert!(
+            kb.mods.alt,
+            "reloaded keybind modifier must include Alt; got: {:?}",
+            kb.mods
+        );
+        assert!(
+            matches!(kb.key, cmdash_config::KeyToken::Char('w')),
+            "reloaded keybind key must be Char('w'); got: {:?}",
+            kb.key
+        );
+    }
+
+    /// Config hot-reload: modify the layout tree (single pane ->
+    /// two-pane split) and assert the watcher delivers a
+    /// `ConfigReload` whose `layout_root` resolves to 2 panes
+    /// with correct labels. This pins the layout-change payload
+    /// that `check_config_reload` compares against the active
+    /// tree to decide whether to trigger a Wholesale reconcile.
+    #[test]
+    fn config_hot_reload_detects_layout_changes() {
+        use cmdash_layout::{ComputedLayout, Rect as LayoutRect};
+
+        let dir = std::env::temp_dir().join("cmdash_hot_reload_layout_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let config_path = dir.join("config.kdl");
+
+        // Step 1: write initial config with a SINGLE pane.
+        let initial = "\n            layout {\n                pane kind=shell label=\"solo\"\n            }\n        ";
+        std::fs::write(&config_path, initial).expect("write initial config");
+
+        // Step 2: spawn the ConfigWatcher.
+        let (_watcher, rx_opt) = super::ConfigWatcher::spawn(Some(config_path.as_ref()));
+        let rx = rx_opt.expect("watcher must produce a receiver");
+
+        // Give the watcher time to initialize.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Step 3: overwrite with a TWO-PANE split layout.
+        let updated = "\n            layout {\n                split axis=horizontal ratio=0.5 {\n                    pane kind=shell label=\"left\"\n                    pane kind=shell label=\"right\"\n                }\n            }\n        ";
+        std::fs::write(&config_path, updated).expect("write updated config");
+
+        // Step 4: wait for the watcher's debounce + margin.
+        let result = rx.recv_timeout(Duration::from_secs(5));
+
+        // Cleanup BEFORE assertions.
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&dir);
+
+        let reload = result.expect("watcher must deliver a ConfigReload within 5s");
+
+        // Step 5: assert the new layout tree resolves to 2 panes.
+        let new_root = reload
+            .layout_root
+            .expect("ConfigReload must carry a layout_root");
+        let computed = ComputedLayout::compute(
+            &new_root,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 120,
+                h: 40,
+            },
+        )
+        .expect("new layout must compute successfully");
+        assert_eq!(
+            computed.panes.len(),
+            2,
+            "new layout must resolve to 2 panes; got: {}",
+            computed.panes.len()
+        );
+        assert_eq!(
+            computed.panes[0].label.as_deref(),
+            Some("left"),
+            "pane 0 label must be 'left'"
+        );
+        assert_eq!(
+            computed.panes[1].label.as_deref(),
+            Some("right"),
+            "pane 1 label must be 'right'"
         );
     }
 }
