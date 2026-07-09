@@ -93,10 +93,12 @@ mod tests {
                 LayoutNode::Pane(cmdash_config::Pane {
                     kind: PaneKind::Shell,
                     label: Some(a.into()),
+                    command: None,
                 }),
                 LayoutNode::Pane(cmdash_config::Pane {
                     kind: PaneKind::Shell,
                     label: Some(b.into()),
+                    command: None,
                 }),
             ],
         }

@@ -46,6 +46,7 @@ fn parses_canonical_fixture() {
             LayoutNode::Pane(Pane {
                 kind: PaneKind::Shell,
                 label: Some(_),
+                ..
             }) => {}
             other => panic!("expected labeled shell pane, got {other:?}"),
         }

@@ -134,6 +134,12 @@ pub struct ComputedPane {
     pub kind: PaneKind,
     /// Optional user-facing label.
     pub label: Option<String>,
+    /// Per-pane shell command override. When `Some(cmd)`, the
+    /// binary splits `cmd` by whitespace into argv and spawns
+    /// `argv[0]` with `argv[1..]` as arguments instead of the
+    /// default `$SHELL` / `/bin/sh`. `None` falls back to
+    /// `ShellSpec::LoginShell`.
+    pub command: Option<String>,
 }
 
 /// Layout-resolution errors.
@@ -395,6 +401,7 @@ fn resolve_node(
                 rect: area,
                 kind: p.kind,
                 label: p.label.clone(),
+                command: p.command.clone(),
             });
         }
         LayoutNode::Preset { .. } => {
@@ -861,6 +868,7 @@ mod internal_sanity_tests {
         LayoutNode::Pane(Pane {
             kind: PaneKind::Shell,
             label: label.map(str::to_string),
+            command: None,
         })
     }
 
@@ -920,6 +928,7 @@ mod internal_sanity_tests {
             LayoutNode::Pane(Pane {
                 kind: PaneKind::Shell,
                 label: Some("a".to_string()),
+                command: None,
             })
         );
 
@@ -1040,10 +1049,12 @@ mod internal_sanity_tests {
                 LayoutNode::Pane(Pane {
                     kind: PaneKind::Shell,
                     label: Some("a".to_string()),
+                    command: None,
                 }),
                 LayoutNode::Pane(Pane {
                     kind: PaneKind::Shell,
                     label: Some("b".to_string()),
+                    command: None,
                 }),
             ],
         };
@@ -1175,10 +1186,12 @@ mod internal_sanity_tests {
                     LayoutNode::Pane(Pane {
                         kind: PaneKind::Shell,
                         label: Some("ovl_a".to_string()),
+                        command: None,
                     }),
                     LayoutNode::Pane(Pane {
                         kind: PaneKind::Shell,
                         label: Some("ovl_b".to_string()),
+                        command: None,
                     }),
                 ],
             },

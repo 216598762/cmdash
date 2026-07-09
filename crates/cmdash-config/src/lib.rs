@@ -123,6 +123,13 @@ impl Default for Ratio {
 pub struct Pane {
     pub kind: PaneKind,
     pub label: Option<String>,
+    /// Per-pane shell command override. When `Some(argv)`, the
+    /// pane spawns `argv[0]` with `argv[1..]` as arguments instead
+    /// of the default `$SHELL` / `/bin/sh`. Parsed from KDL as
+    /// `command="htop"` or `command="htop --delay=5"`; the
+    /// string is split by whitespace into argv at spawn time.
+    /// `None` falls back to `ShellSpec::LoginShell`.
+    pub command: Option<String>,
 }
 
 /// First-release flavor of pane.
@@ -421,6 +428,7 @@ fn read_stack(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
 fn read_pane(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
     let mut kind = PaneKind::default();
     let mut label: Option<String> = None;
+    let mut command: Option<String> = None;
     for entry in n.entries() {
         let key = entry.name().map(|id| id.value());
         let raw = entry_to_string(entry);
@@ -430,10 +438,15 @@ fn read_pane(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
                 return Err(ConfigError::InvalidPaneKind(raw));
             }
             (Some("label"), _) => label = Some(raw),
+            (Some("command"), _) => command = Some(raw),
             _ => {}
         }
     }
-    Ok(LayoutNode::Pane(Pane { kind, label }))
+    Ok(LayoutNode::Pane(Pane {
+        kind,
+        label,
+        command,
+    }))
 }
 
 fn read_preset(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
@@ -1415,5 +1428,141 @@ mod tests {
             matches!(err, ConfigError::InvalidAction(_)),
             "expected InvalidAction, got: {err:?}"
         );
+    }
+
+    // ============================================================
+    // Per-pane shell command parsing tests.
+    //
+    // Pin the `command` field on `Pane` so a future contributor
+    // who accidentally drops the `command` arm from `read_pane`
+    // cannot silently regress to `command: None` for all panes.
+    // ============================================================
+
+    /// `pane kind=shell command="htop"` round-trips into
+    /// `Pane.command = Some("htop")`. Pins the per-pane shell
+    /// command parsing from roadmap item 1.3.
+    #[test]
+    fn parse_pane_command_round_trip() {
+        let src = r#"
+            layout {
+                pane kind=shell label="monitor" command="htop"
+            }
+        "#;
+        let cfg = parse(src).expect("pane with command parses");
+        let layout = cfg.layout.expect("Config.layout populated");
+        match layout {
+            LayoutNode::Pane(p) => {
+                assert_eq!(p.label, Some("monitor".to_string()));
+                assert_eq!(p.command, Some("htop".to_string()));
+            }
+            other => panic!("expected Pane, got: {:?}", other),
+        }
+    }
+
+    /// `pane kind=shell command="htop --delay=5 --color"`
+    /// preserves the full command string (whitespace included)
+    /// for the binary to split into argv at spawn time.
+    #[test]
+    fn parse_pane_command_with_args_round_trip() {
+        let src = r#"
+            layout {
+                pane kind=shell label="monitor" command="htop --delay=5 --color"
+            }
+        "#;
+        let cfg = parse(src).expect("pane with command+args parses");
+        let layout = cfg.layout.expect("Config.layout populated");
+        match layout {
+            LayoutNode::Pane(p) => {
+                assert_eq!(p.command, Some("htop --delay=5 --color".to_string()));
+            }
+            other => panic!("expected Pane, got: {:?}", other),
+        }
+    }
+
+    /// `pane kind=shell` (no `command`) yields `command: None`.
+    /// Pins the default fallback path so a future refactor
+    /// that accidentally defaults `command` to `Some("")`
+    /// instead of `None` is caught immediately.
+    #[test]
+    fn parse_pane_no_command_yields_none() {
+        let src = r#"
+            layout {
+                pane kind=shell label="default"
+            }
+        "#;
+        let cfg = parse(src).expect("pane without command parses");
+        let layout = cfg.layout.expect("Config.layout populated");
+        match layout {
+            LayoutNode::Pane(p) => {
+                assert_eq!(
+                    p.command, None,
+                    "pane without command= must yield command: None"
+                );
+            }
+            other => panic!("expected Pane, got: {:?}", other),
+        }
+    }
+
+    /// `pane kind=shell command=""` (empty string) yields
+    /// `command: Some("")`. The binary's
+    /// `shell_spec_from_command` treats `Some("")` the same
+    /// as `None` (falls back to default shell) because
+    /// `split_whitespace()` on an empty string yields zero
+    /// argv elements. This test pins the parse-time behavior
+    /// so the binary can rely on `Some("")` being reachable.
+    #[test]
+    fn parse_pane_empty_command_yields_some_empty() {
+        let src = r#"
+            layout {
+                pane kind=shell label="empty" command=""
+            }
+        "#;
+        let cfg = parse(src).expect("pane with empty command parses");
+        let layout = cfg.layout.expect("Config.layout populated");
+        match layout {
+            LayoutNode::Pane(p) => {
+                assert_eq!(
+                    p.command,
+                    Some(String::new()),
+                    "pane with command=\"\" must yield Some(\"\")"
+                );
+            }
+            other => panic!("expected Pane, got: {:?}", other),
+        }
+    }
+
+    /// Multiple panes with different commands in a split
+    /// layout. Pins that each pane independently carries its
+    /// own command override.
+    #[test]
+    fn parse_split_with_per_pane_commands() {
+        let src = r#"
+            layout {
+                split axis=horizontal ratio=0.5 {
+                    pane kind=shell label="editor" command="nvim"
+                    pane kind=shell label="monitor" command="htop"
+                }
+            }
+        "#;
+        let cfg = parse(src).expect("split with per-pane commands parses");
+        let layout = cfg.layout.expect("Config.layout populated");
+        match layout {
+            LayoutNode::Split { children, .. } => {
+                assert_eq!(children.len(), 2);
+                match &children[0] {
+                    LayoutNode::Pane(p) => {
+                        assert_eq!(p.command, Some("nvim".to_string()));
+                    }
+                    other => panic!("expected Pane, got: {:?}", other),
+                }
+                match &children[1] {
+                    LayoutNode::Pane(p) => {
+                        assert_eq!(p.command, Some("htop".to_string()));
+                    }
+                    other => panic!("expected Pane, got: {:?}", other),
+                }
+            }
+            other => panic!("expected Split, got: {:?}", other),
+        }
     }
 }
