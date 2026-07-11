@@ -187,7 +187,7 @@ presets {
 
 Enables an optional single-row status bar rendered below the tab bar
 (or above panes when `position = "top"`). When present and
-`enabled = true`, one extra terminal row is reserved for the status
+`enabled` is `#true`, one extra terminal row is reserved for the status
 bar and the layout area height is reduced accordingly.
 
 ```kdl
@@ -239,7 +239,7 @@ theme {
     tab-inactive-bg  "dark-gray"   // background of inactive tabs
     tab-inactive-fg  "gray"        // text color of inactive tabs
 
-    // Status bar (requires status_bar.enabled = true)
+    // Status bar (requires status_bar.enabled = #true)
     status-bar-bg    "dark-gray"   // background of the status bar
     status-mode-fg   "white"       // foreground of the mode indicator
     status-mode-bg   "dark-gray"   // background of the mode indicator
@@ -451,7 +451,7 @@ cmdash has a mode-based keybind router with four modes:
 in all non-Normal modes).
 
 **Displaying the current mode:** When `status_bar` is enabled with
-`show-mode true`, the status bar shows the active mode name on the
+`show-mode` is `#true`, the status bar shows the active mode name on the
 left side. In Normal mode it displays `Normal`; when you enter
 PaneResize it switches to `PaneResize`, and so on. This gives
 immediate visual feedback that a mode is active.
