@@ -1,0 +1,134 @@
+// 09-theme.kdl — Example config showcasing theme / color customization.
+//
+// The optional `theme { ... }` block lets you override the default
+// colors used for the terminal, tab bar, status bar, and widget
+// borders. Every key is optional — omitted keys keep their built-in
+// defaults (see `docs/configuration.md` §3.5 for the full table).
+//
+// Supported color formats:
+//   - Named colors: black, dark-gray, gray, white, red, green, blue,
+//     yellow, cyan, magenta
+//   - Hex RGB:       "#ff8800", "#f80"
+//   - RGB tuple:     "rgb(255,136,0)"
+//   - Indexed 256:   "i196", "indexed(196)"
+//   - Reset:         "reset" (passthrough to terminal defaults)
+//
+// Cursor styles: "block", "underline" (or "under", "u"),
+//                "bar" (or "pipe", "|")
+//
+// The theme is hot-reloadable — edit this file at runtime and the
+// new colors apply immediately (via the filesystem watcher).
+//
+// To try it: copy this file on top of `crates/cmdash/config.kdl`
+// (which the binary embeds via `include_str!`) and rebuild, or
+// point cmdash at it with `cmdash --config=examples/09-theme.kdl`.
+
+// ════════════════════════════════════════════════════════════════
+//  DARK THEME (default-inspired)
+// ════════════════════════════════════════════════════════════════
+//
+// A high-contrast dark palette suitable for low-light environments.
+// Uncomment the block below (remove the leading `//` on each line)
+// to activate.
+
+// theme {
+//     // ── Terminal defaults ──────────────────────────────
+//     default-fg      "white"
+//     default-bg      "black"
+//     cursor-style    "block"
+//
+//     // ── Tab bar ────────────────────────────────────────
+//     tab-bar-bg         "dark-gray"
+//     tab-active-bg      "#4488ff"
+//     tab-active-fg      "white"
+//     tab-inactive-bg    "dark-gray"
+//     tab-inactive-fg    "gray"
+//
+//     // ── Status bar ─────────────────────────────────────
+//     status-bar-bg        "dark-gray"
+//     status-mode-fg       "white"
+//     status-mode-bg       "#4488ff"
+//     status-clock-fg      "gray"
+//     status-pane-title-fg "gray"
+//
+//     // ── Widget / border colors ─────────────────────────
+//     border-color    "dark-gray"
+//     error-color     "red"
+// }
+
+// ════════════════════════════════════════════════════════════════
+//  LIGHT THEME
+// ════════════════════════════════════════════════════════════════
+//
+// A clean light palette for bright environments or terminals with
+// a light background. Uncomment this block (and comment out the
+// dark theme above) to activate.
+
+theme {
+    // ── Terminal defaults ──────────────────────────────
+    default-fg      "black"
+    default-bg      "white"
+    cursor-style    "bar"
+
+    // ── Tab bar ────────────────────────────────────────
+    tab-bar-bg         "gray"
+    tab-active-bg      "blue"
+    tab-active-fg      "white"
+    tab-inactive-bg    "gray"
+    tab-inactive-fg    "black"
+
+    // ── Status bar ─────────────────────────────────────
+    status-bar-bg        "gray"
+    status-mode-fg       "white"
+    status-mode-bg       "blue"
+    status-clock-fg      "black"
+    status-pane-title-fg "black"
+
+    // ── Widget / border colors ─────────────────────────
+    border-color    "gray"
+    error-color     "red"
+}
+
+status_bar {
+    enabled     #true
+    position    "bottom"
+    show-clock  #true
+    show-pane-title #true
+    show-mode   #true
+}
+
+// ════════════════════════════════════════════════════════════════
+//  MINIMAL THEME (only override what you care about)
+// ════════════════════════════════════════════════════════════════
+//
+// You don't have to specify every key. Here's a minimal example
+// that just tweaks the tab bar active color and the error color
+// while keeping everything else at its built-in default:
+//
+// theme {
+//     tab-active-bg   "#ff6600"
+//     error-color     "#ff0000"
+// }
+
+// ── Layout & keybinds (unchanged from other examples) ─────────
+
+layout {
+    split axis=horizontal ratio=0.5 {
+        pane kind=shell label="left"
+        pane kind=shell label="right"
+    }
+}
+
+
+
+keybinds {
+    bind "alt-w"  action="pane.close"
+    bind "alt-q"  action="app.close"
+    bind "ctrl-a" action="app.new-pane"
+    bind "M-t"    action="tab.new"
+    bind "M-w"    action="tab.close"
+    bind "M-1"    action="tab.switch.1"
+    bind "M-2"    action="tab.switch.2"
+    bind "M-3"    action="tab.switch.3"
+    bind "M-r"    action="pane.resize.enter"
+}

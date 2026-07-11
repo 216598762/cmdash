@@ -86,8 +86,8 @@ layer, never leaking into its neighbors.
 | `cmdash-layout`        | layout tree: Split / Stack / ZStack / Pane / Preset      |
 | `cmdash-keybinds`      | modifier-aware key router, modes, actions                |
 | `cmdash-pty`           | `portable-pty` + `vte` → text grid, kitty-graphics split |
-| `cmdash-widget-sdk`    | c-ABI trait for dynamic widgets (`CmdashWidget`) — stub  |
-| `cmdash-protocol`      | line-delimited script-widget frame protocol spec — stub  |
+| `cmdash-widget-sdk`    | c-ABI trait for dynamic widgets (`CmdashWidget`)         |
+| `cmdash-protocol`      | line-delimited script-widget frame protocol spec          |
 
 ### Render loop (one frame)
 
@@ -163,8 +163,9 @@ own stdout — placement is fragile and pane-local. Capture, extract, route.
 - `crossterm` — terminal I/O (events, raw mode, alternate screen).
 - `image` — PNG decode for kitty graphics payloads.
 - `tracing` + `tracing-subscriber` — structured logging.
-- `libloading` — hot-load widget `.so` / `.dll` files at runtime (planned).
+- `libloading` — hot-load widget `.so` / `.dll` files at runtime.
 - `serde` / `serde_json` — internal messages (planned).
+- `notify` — filesystem watcher for config hot-reload.
 - `anyhow` / `thiserror` at crate seams.
 
 ## Feature status
@@ -180,9 +181,12 @@ own stdout — placement is fragile and pane-local. Capture, extract, route.
 | Tabs (TabStack, tab actions + tab bar rendering) | ✅ Working |
 | Configurable layouts (KDL) | ✅ Working |
 | Layout presets | ✅ Working |
-| Modifier-based keybinds | ✅ Working (Normal mode only; other modes are stubs) |
-| Native Rust widgets (cmdash-widget-sdk) | ❌ Stub only |
-| Script widgets (cmdash-protocol) | ❌ Stub only |
+| Modifier-based keybinds | ✅ Working (all 4 modes routed: Normal, PaneResize, TabSwitch, PresetPick) |
+| Status bar | ✅ Working (optional, configurable, hot-reloadable) |
+| Mouse support | ✅ Working (click-to-focus, Alt+drag resize, scroll, PTY forwarding) |
+| Theme / color customization | ✅ Working (15 color keys, cursor-style, hot-reloadable, wired to script widgets) |
+| Native Rust widgets (cmdash-widget-sdk) | ✅ Working (c-ABI trait, libloading, export macro) |
+| Script widgets (cmdash-protocol) | ✅ Working (line-delimited frame protocol, spawn/render) |
 | Runtime config file loading (~/.config/cmdash/) | ✅ Working (priority chain: `--config`, `$CMDASH_CONFIG_DIR`, XDG default, bundled fallback) |
 | Scrollback buffer | ✅ Working (ring buffer, PageUp/PageDown, ESC [3J clear) |
 | Sixel fallback | ✅ Code path exists, verified with unit tests |
@@ -191,11 +195,15 @@ own stdout — placement is fragile and pane-local. Capture, extract, route.
 
 - One global **modifier** (`alt` by default, config-overridable to
   `ctrl`, `super`, or `shift`).
-- **Modes:** `Normal`, `PaneResize`, `TabSwitch`, `PresetPick` — v1
-  only routes `Normal`; others are enum stubs for future work.
-- **Actions:** enum-driven (`KeyAction`), 15 variants covering pane
+- **Modes:** `Normal`, `PaneResize`, `TabSwitch`, `PresetPick` —
+  all four modes are routed. `Normal` handles global bindings;
+  `PaneResize` routes arrow keys for split-ratio adjustment;
+  `TabSwitch` routes number keys 1–9 for tab switching;
+  `PresetPick` routes number keys for preset selection. Escape
+  exits any non-Normal mode.
+- **Actions:** enum-driven (`KeyAction`), 28 variants covering pane
   management, focus navigation, ZStack cycling, preset swapping, tab
-  management, and app close. 18 variants total.
+  management, mode entry/exit, and app close.
 
 KDL binding example:
 
@@ -225,6 +233,36 @@ Resolved each frame into a tree of `(PaneId, Rect)`. `PaneId` is derived
 from pre-order leaf index + child-index path; deterministic so layer IDs
 stay stable across resizes of the same tree. Max tree depth: 8.
 
+## Status bar
+
+Optional single-row status bar rendered below the tab bar (or above
+panes when `position = "top"`). Configurable via KDL:
+
+```kdl
+status_bar {
+    enabled     #true
+    position    "bottom"
+    show-clock  #true
+    show-pane-title #true
+    show-mode   #true
+}
+```
+
+When enabled, one extra terminal row is reserved and the layout area
+is reduced by that amount. The status bar is hot-reloadable — editing
+the config at runtime enables/disables the bar immediately.
+
+## Mouse support
+
+- **Click-to-focus**: clicking a pane focuses it.
+- **Alt+drag resize**: Alt+click on a pane and drag to resize its
+  parent split's ratio.
+- **Scroll-wheel forwarding**: scroll events are forwarded to the
+  focused pane's PTY.
+- **SGR extended mouse**: mouse events are encoded as SGR sequences
+  and forwarded to the focused pane's PTY for TUI apps that support
+  mouse input.
+
 ## Config model
 
 - **Runtime loading:** config is resolved at startup via a priority chain:
@@ -238,34 +276,52 @@ stay stable across resizes of the same tree. Max tree depth: 8.
 - **Bundled fallback:** the compile-time `include_str!` from
   `crates/cmdash/config.kdl` serves as the zero-config default when
   no user config file exists.
+- **Theme / color customization:** an optional `theme { ... }` top-level
+  KDL block lets users customize 15 color keys (terminal fg/bg,
+  cursor style, tab bar, status bar, widget borders, error color)
+  and a cursor-style enum (`block`, `underline`, `bar`). Colors
+  accept named values, hex `#RRGGBB`, `rgb(R,G,B)`, indexed
+  `iN`/`indexed(N)`, or `reset`. The theme is hot-reloadable: editing
+  the config at runtime applies new colors immediately. Script widget
+  borders receive the theme at spawn time via `ScriptWidget::set_theme`.
+  See `docs/configuration.md` §3.5 for the full key reference.
 
-## Plugin model — native Rust widgets (planned)
+## Plugin model — native Rust widgets
 
-`cmdash-widget-sdk` will expose a c-ABI-safe trait:
+`cmdash-widget-sdk` exposes a c-ABI-safe trait:
 
 ```rust
-pub trait CmdashWidget: Send + Sync {
-    fn new() -> Self where Self: Sized;
-    fn on_event(&mut self, evt: WidgetEvent);
+pub trait CmdashWidget: Send {
+    fn name(&self) -> &str;
     fn render(&mut self, area: Rect, frame: &mut ratatui::Frame);
+    fn on_event(&mut self, event: &WidgetEvent) {}
 }
 ```
 
+The `cmdash_widget_export!` macro generates the `cmdash_widget_create`
+C-ABI entry point. ABI version is pinned via `CMDASH_WIDGET_ABI_VERSION`.
+
 User flow: `cargo new --lib my-widget` → set `crate-type = ["cdylib"]` →
-add `cmdash-widget-sdk` dep → export `cmdash_widget_create` → drop `.so`
-into `~/.config/cmdash/widgets/<name>/` → reference from layout.
+add `cmdash-widget-sdk` dep → `cmdash_widget_export!(MyWidget)` →
+drop `.so` into `~/.config/cmdash/widgets/<name>/` → reference from
+layout via `pane kind=widget ref_name="<name>"`.
 
 Two instances of the same widget are two layers, two `PaneId`s, two
 loaded copies. Hot-reload is out of scope for v1.
 
-## Script-as-widget protocol (planned)
+## Script-as-widget protocol
 
 Spawn a child with piped `stdin`/`stdout`. Line-delimited, versioned:
 
 cmdash → script: `FRAME width=80 height=24 gen=42` / `KEY key=h mod=alt` /
-`RESIZE w=80 h=24` / `MOUSE x=10 y=5 kind=press btn=left`
+`RESIZE width=80 height=24` / `MOUSE x=10 y=5 kind=press btn=left` /
+`FOCUS gained|lost`
 
 script → cmdash: `FRAME width=80 height=24` + ANSI text body.
+
+Implemented in `crates/cmdash/src/script_widget.rs`. The `ScriptWidget`
+struct wraps a child process, spawns a reader thread, and implements
+`CmdashWidget` so it plugs into the same render path as native widgets.
 
 v1 = line+ANSI only. Pixel-bitmap frame mode is a future goal.
 

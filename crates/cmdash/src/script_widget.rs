@@ -24,11 +24,14 @@ use std::thread::{self, JoinHandle};
 use cmdash_protocol::{FrameResponse, HostMsg};
 use cmdash_widget_sdk::{CmdashWidget, KeyCode, WidgetEvent};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use tracing::{debug, warn};
+
+/// Re-export the theme type for convenience.
+type Theme = cmdash_config::Theme;
 
 /// A [`CmdashWidget`] backed by an external script process that speaks
 /// the [`cmdash_protocol`] wire format.
@@ -52,6 +55,9 @@ pub struct ScriptWidget {
     /// Last area sent in a FRAME request. Used to skip redundant
     /// requests when the area hasn't changed.
     last_area: (u16, u16),
+    /// Theme for border and error colors. Defaults to
+    /// `Theme::default()` if not set via [`Self::set_theme`].
+    theme: Theme,
 }
 
 impl ScriptWidget {
@@ -98,6 +104,7 @@ impl ScriptWidget {
             last_frame: FrameResponse::default(),
             name,
             last_area: (0, 0),
+            theme: Theme::default(),
         })
     }
 
@@ -115,6 +122,11 @@ impl ScriptWidget {
             latest = Some(frame);
         }
         latest
+    }
+
+    /// Update the theme used for border and error colors.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 }
 
@@ -197,7 +209,7 @@ impl CmdashWidget for ScriptWidget {
             };
             if let Err(e) = self.send_msg(&msg) {
                 warn!(error = %e, name = %self.name, "script: failed to send FRAME");
-                render_error(area, frame, &self.name, "script process error");
+                render_error(area, frame, &self.name, "script process error", &self.theme);
                 return;
             }
         }
@@ -212,7 +224,7 @@ impl CmdashWidget for ScriptWidget {
             // If the script exited successfully and we have content,
             // show the last frame with an 'exited' indicator.
             if exit_status.success() && !self.last_frame.lines.is_empty() {
-                let border_style = Style::default().fg(Color::DarkGray);
+                let border_style = Style::default().fg(self.theme.border_color());
                 let block = Block::default()
                     .title(format!(" {} [exited] ", self.name))
                     .borders(Borders::ALL)
@@ -235,13 +247,14 @@ impl CmdashWidget for ScriptWidget {
                     frame,
                     &self.name,
                     &format!("script exited: {exit_status}"),
+                    &self.theme,
                 );
             }
             return;
         }
 
         // 3. Render the ANSI text lines into the ratatui frame.
-        let border_style = Style::default().fg(Color::DarkGray);
+        let border_style = Style::default().fg(self.theme.border_color());
         let block = Block::default()
             .title(format!(" {} ", self.name))
             .borders(Borders::ALL)
@@ -258,7 +271,7 @@ impl CmdashWidget for ScriptWidget {
             // Script hasn't responded yet — show a placeholder.
             let waiting = Paragraph::new(Span::styled(
                 "waiting for script...",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(self.theme.border_color()),
             ));
             frame.render_widget(waiting, inner);
             return;
@@ -350,17 +363,25 @@ impl Drop for ScriptWidget {
 }
 
 /// Render an error message inside a bordered block.
-fn render_error(area: Rect, frame: &mut Frame, title: &str, message: &str) {
+/// Uses the theme's `error_color` for the border and text.
+fn render_error(
+    area: Rect,
+    frame: &mut Frame,
+    title: &str,
+    message: &str,
+    theme: &Theme,
+) {
+    let err_color = theme.error_color();
     let block = Block::default()
         .title(format!(" {title} "))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red));
+        .border_style(Style::default().fg(err_color));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width > 0 && inner.height > 0 {
         let msg = Paragraph::new(Span::styled(
             message,
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(err_color).add_modifier(Modifier::BOLD),
         ));
         frame.render_widget(msg, inner);
     }

@@ -437,13 +437,6 @@ fn resize_ratio_clamped_at_minimum() {
     }"#;
     let cfg = cmdash_config::parse(source).expect("parse config");
     let mut layout_root = cfg.layout.expect("layout block");
-    let area = LayoutRect {
-        x: 0,
-        y: 0,
-        w: 80,
-        h: 24,
-    };
-
     // Start at ratio 5, then press Left 5 times (for child 0 of
     // the inner Split at tree path [0]).
     let mut ratio: u8 = 5;

@@ -50,6 +50,9 @@ use std::collections::BTreeMap;
 
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
+pub mod theme;
+pub use theme::{parse_color, Theme};
+
 use thiserror::Error;
 
 /// Top-level cmdash configuration document.
@@ -81,6 +84,9 @@ pub struct Config {
     /// row is reserved at the configured position and the bar is
     /// rendered in phase 3a after pane blits.
     pub status_bar: Option<Bar>,
+    /// Optional theme configuration. When `None`, the hardcoded
+    /// default colors are used.
+    pub theme: Option<Theme>,
 }
 
 /// Configuration for the optional status bar.
@@ -362,8 +368,12 @@ pub enum ConfigError {
     InvalidAction(String),
     #[error("invalid status_bar: {0}")]
     InvalidStatusBar(String),
+    #[error("invalid theme: {0}")]
+    InvalidTheme(String),
     #[error("`split` must have exactly 2 children; got {0}")]
     SplitChildCount(usize),
+    #[error("duplicate `theme` block")]
+    DuplicateTheme,
 }
 
 /// A non-fatal syntax hint surfaced by the pre-scan validator.
@@ -518,6 +528,16 @@ fn parse_into(source: &str, errors: &mut Vec<ConfigError>) -> Config {
                 }
                 match read_status_bar(n) {
                     Ok(bar) => cfg.status_bar = Some(bar),
+                    Err(e) => errors.push(e),
+                }
+            }
+            "theme" => {
+                if cfg.theme.is_some() {
+                    errors.push(ConfigError::DuplicateTheme);
+                    continue;
+                }
+                match read_theme(n) {
+                    Ok(t) => cfg.theme = Some(t),
                     Err(e) => errors.push(e),
                 }
             }
@@ -786,6 +806,87 @@ fn read_status_bar(n: &KdlNode) -> Result<Bar, ConfigError> {
     }
     Ok(bar)
 }
+
+/// Parse a top-level `theme { ... }` block.
+///
+/// Recognized keys:
+/// - Terminal defaults: `default-fg`, `default-bg`, `cursor-style`
+/// - Tab bar: `tab-bar-bg`, `tab-active-bg`, `tab-active-fg`,
+///   `tab-inactive-bg`, `tab-inactive-fg`
+/// - Status bar: `status-bar-bg`, `status-mode-fg`, `status-mode-bg`,
+///   `status-clock-fg`, `status-pane-title-fg`
+/// - Widget/border: `border-color`, `error-color`
+///
+/// Color values are parsed by [`theme::parse_color`].
+/// `cursor-style` accepts `"block"`, `"underline"`, or `"bar"`.
+fn read_theme(n: &KdlNode) -> Result<Theme, ConfigError> {
+    let mut theme = Theme::default();
+    if let Some(c) = n.children() {
+        for child in c.nodes() {
+            let val = child
+                .entries()
+                .first()
+                .and_then(|e| e.value().as_string())
+                .unwrap_or("");
+            match child.name().value() {
+                "cursor-style" => {
+                    let cursor = theme::CursorStyle::parse(val).ok_or_else(|| {
+                        ConfigError::InvalidTheme(format!(
+                            "invalid cursor style `{val}`; expected block, underline, or bar"
+                        ))
+                    })?;
+                    theme.cursor_style = Some(cursor);
+                }
+                key @ (
+                    "default-fg"
+                    | "default-bg"
+                    | "tab-bar-bg"
+                    | "tab-active-bg"
+                    | "tab-active-fg"
+                    | "tab-inactive-bg"
+                    | "tab-inactive-fg"
+                    | "status-bar-bg"
+                    | "status-mode-fg"
+                    | "status-mode-bg"
+                    | "status-clock-fg"
+                    | "status-pane-title-fg"
+                    | "border-color"
+                    | "error-color"
+                ) => {
+                    let color = theme::parse_color(val).ok_or_else(|| {
+                        ConfigError::InvalidTheme(format!(
+                            "invalid color value `{val}` for key `{key}`"
+                        ))
+                    })?;
+                    match key {
+                        "default-fg" => theme.default_fg = Some(color),
+                        "default-bg" => theme.default_bg = Some(color),
+                        "tab-bar-bg" => theme.tab_bar_bg = Some(color),
+                        "tab-active-bg" => theme.tab_active_bg = Some(color),
+                        "tab-active-fg" => theme.tab_active_fg = Some(color),
+                        "tab-inactive-bg" => theme.tab_inactive_bg = Some(color),
+                        "tab-inactive-fg" => theme.tab_inactive_fg = Some(color),
+                        "status-bar-bg" => theme.status_bar_bg = Some(color),
+                        "status-mode-fg" => theme.status_mode_fg = Some(color),
+                        "status-mode-bg" => theme.status_mode_bg = Some(color),
+                        "status-clock-fg" => theme.status_clock_fg = Some(color),
+                        "status-pane-title-fg" => theme.status_pane_title_fg = Some(color),
+                        "border-color" => theme.border_color = Some(color),
+                        "error-color" => theme.error_color = Some(color),
+                        _ => unreachable!(),
+                    }
+                }
+                other => {
+                    return Err(ConfigError::InvalidTheme(format!(
+                        "unknown key `{other}` in theme block"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(theme)
+}
+
 
 fn read_keybind(n: &KdlNode) -> Result<Keybind, ConfigError> {
     let mut chord_str: Option<String> = None;

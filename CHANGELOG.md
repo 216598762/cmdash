@@ -24,8 +24,12 @@ The workspace has 7 crates:
   Preset) with deterministic PaneId stability.
 - `cmdash-pty` — `portable-pty` + `vte` text grid with kitty-graphics
   interception (APC pre-scan state machine).
-- `cmdash-widget-sdk` — c-ABI widget trait (stub).
-- `cmdash-protocol` — script-widget frame protocol (stub).
+- `cmdash-widget-sdk` — c-ABI widget trait with `CmdashWidget` trait,
+  `WidgetEvent` enum, `cmdash_widget_export!` macro, and runtime
+  loading via `libloading`.
+- `cmdash-protocol` — line-delimited script-widget frame protocol with
+  `HostMsg` serialization, `FrameResponse` parsing, and `ScriptWidget`
+  adapter implementing `CmdashWidget`.
 
 ### Added
 
@@ -41,9 +45,14 @@ The workspace has 7 crates:
   `adjacent_pane` for directional focus).
 - **Config surface** (`cmdash-config`): KDL parser using `kdl-rs`
   (chosen over `knus` for full spec coverage). Three top-level blocks:
-  `layout`, `keybinds`, `presets`. 15 `KeyAction` variants.
-- **Keybind router** (`cmdash-keybinds`): press-only dispatch,
-  `Normal` mode routed (other modes are stubs).
+  `layout`, `keybinds`, `presets`, `status_bar`. 28 `KeyAction`
+  variants covering pane management, focus navigation, ZStack cycling,
+  preset swapping, tab management, mode entry/exit, and app close.
+- **Keybind router** (`cmdash-keybinds`): press-only dispatch with
+  all four modes routed: `Normal` (global bindings), `PaneResize`
+  (arrow keys for split-ratio adjustment), `TabSwitch` (number keys
+  1–9), `PresetPick` (number keys for preset selection). Escape exits
+  any non-Normal mode.
 - **Render pipeline** (`cmdash` binary): per-frame tick loop with
   phase 0–3b architecture. ratatui text body + dashcompositor kitty
   graphics. `GraphicsState` owns the `LayerStack` with per-pane image
@@ -56,31 +65,46 @@ The workspace has 7 crates:
   re-resolves the layout tree and per-pane calls `PaneRunner::resize`
   with the full rect (preserving Split-derived origins).
 - **Tab management**: `TabStack<TabState>` with `TabNew`, `TabClose`,
-  `TabSwitch(n)` actions. Tab bar rendering is not yet implemented.
+  `TabSwitch(n)` actions. Tab bar rendered as ratatui text fallback
+  (phase 3a) and dashcompositor pixel overlay (phase 3b).
 - **CLI**: `--log=<path>` launch argument for file-based tracing
   (TRACE level forced in file mode; `RUST_LOG` honored in stdout mode).
 - **Project docs**: `README.md`, `LICENSE` (MIT), `AGENTS.md`,
   `docs/configuration.md`, `docs/roadmap.md`.
 - **Example configs**: `examples/01-minimal.kdl` through
   `examples/04-four-pane-tiled.kdl`.
+- **Widget SDK** (`cmdash-widget-sdk`): c-ABI-safe `CmdashWidget`
+  trait with `WidgetEvent` enum (Key, Resize, FocusGained, FocusLost),
+  `cmdash_widget_export!` macro for C-ABI entry point generation,
+  `widget_into_raw`/`widget_from_raw` for FFI, and ABI version pinning.
+  Runtime loading via `libloading` from `~/.config/cmdash/widgets/`.
+- **Script widget protocol** (`cmdash-protocol`): line-delimited wire
+  format with `HostMsg` enum (Frame, Key, Resize, Mouse, Focus) and
+  `FrameResponse` parsing. `ScriptWidget` adapter spawns child processes
+  with piped stdin/stdout and implements `CmdashWidget`.
+- **Status bar** (`cmdash` binary): optional single-row status bar
+  configurable via KDL `status_bar { ... }` block. Shows keybind mode,
+  focused pane title, and clock. Hot-reloadable.
+- **Mouse support**: click-to-focus, Alt+drag split resize, scroll-wheel
+  forwarding, SGR extended mouse sequence forwarding to focused pane's
+  PTY.
+- **Runtime config file loading**: config resolved via priority chain
+  (`--config` → `$CMDASH_CONFIG_DIR` → XDG default → bundled fallback)
+  with filesystem watcher for hot-reload.
+- **Scrollback buffer**: ring-buffer scrollback in `TextGrid` with
+  PageUp/PageDown navigation and `ESC[3J` clear.
+- **Sixel fallback**: `GraphicsProtocol` enum with `detect()` from
+  `TERM`/`TERM_PROGRAM`/`CMDASH_GRAPHICS` env vars and DA1 device-
+  attributes query for runtime detection. Verified with unit tests.
 - **GPG signing wrapper** for TTY-less hosts:
   `scripts/gpg-cmdash-wrapper.sh` + `just gpg-setup` recipe.
 
 ### Known limitations
 
-- **Config is compile-time embedded** (`include_str!`). Runtime config
-  file loading (`~/.config/cmdash/config.kdl`) is not yet implemented.
 - **One ignored test** in `cmdash-pty`: the cat-echo round-trip test
   is `#[ignore]`'d due to `portable-pty 0.9` not exposing
   `SlavePty::as_raw_fd()`. Will be resolved when `portable-pty` ships
   a compatible version.
-- **Widget SDK and script protocol are stubs.** No native widget
-  loading or script widget spawning is implemented.
-- **Tab bar is not rendered.** Tab actions work but there's no visual
-  indicator.
-- **Only `Normal` mode is routed** in the keybind router. Other modes
-  (`PaneResize`, `TabSwitch`, `PresetPick`) are enum stubs.
-- **Sixel fallback is untested.** The code path exists but has not
-  been verified against a real Sixel-capable terminal.
-- **No scrollback buffer.** `TextGrid` is fixed-size; content that
-  scrolls past the bottom is lost.
+- **Sixel manual testing pending.** Unit tests verify encoding; manual
+  testing against real Sixel-capable terminals (xterm, mlterm, foot)
+  is recommended.

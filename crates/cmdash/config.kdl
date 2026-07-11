@@ -39,3 +39,33 @@ keybinds {
     bind "M-r"    action="pane.resize.enter"
     bind "M-p"    action="preset.pick.enter"
 }
+
+// Theme customization. Uncomment and edit to override the default
+// color scheme. All fields are optional — only specify what you
+// want to change. See docs/configuration.md §3.5 for the full
+// list of recognized keys, valid color formats, and defaults.
+//
+// theme {
+//     // Terminal defaults
+//     default-fg       "white"       // foreground for terminal body
+//     default-bg       "black"       // background for terminal body
+//     cursor-style     "block"       // "block" | "underline" | "bar"
+//
+//     // Tab bar
+//     tab-bar-bg       "dark-gray"   // background of the tab bar strip
+//     tab-active-bg    "blue"        // background of the active tab
+//     tab-active-fg    "white"       // text color of the active tab
+//     tab-inactive-bg  "dark-gray"   // background of inactive tabs
+//     tab-inactive-fg  "gray"        // text color of inactive tabs
+//
+//     // Status bar (requires status_bar.enabled = #true)
+//     status-bar-bg    "dark-gray"   // background of the status bar
+//     status-mode-fg   "white"       // foreground of the mode indicator
+//     status-mode-bg   "dark-gray"   // background of the mode indicator
+//     status-clock-fg  "gray"        // foreground of the clock
+//     status-pane-title-fg "gray"    // foreground of the pane title
+//
+//     // Widget / border colors
+//     border-color     "dark-gray"   // default border for widgets
+//     error-color      "red"         // color for error messages
+// }

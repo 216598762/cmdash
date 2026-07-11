@@ -21,11 +21,11 @@ layout {
 // at the configured position (top or bottom) and the status bar
 // is rendered in phase 3a after pane blits.
 status_bar {
-    enabled    true
-    position   "bottom"   // or "top"
-    show-clock true       // show HH:MM in the right corner
-    show-pane-title true  // show the focused pane's label
-    show-mode  true       // show the current keybind mode (Normal, PaneResize, etc.)
+    enabled     #true
+    position    "bottom"   // or "top"
+    show-clock  #true       // show HH:MM in the right corner
+    show-pane-title #true   // show the focused pane's label
+    show-mode   #true       // show the current keybind mode (Normal, PaneResize, etc.)
 }
 
 keybinds {

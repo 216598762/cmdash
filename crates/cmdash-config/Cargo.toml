@@ -10,4 +10,5 @@ repository.workspace = true
 
 [dependencies]
 kdl = "6.3.4"
+ratatui = "0.25"
 thiserror = "2.0.18"

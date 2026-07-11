@@ -7,7 +7,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 /// Render the status bar into `buf` at the given `area`.
@@ -25,6 +25,7 @@ use ratatui::text::{Line, Span};
 /// * `show_clock` — whether to display the current time.
 /// * `show_pane_title` — whether to display the pane title.
 /// * `show_mode` — whether to display the current mode.
+#[allow(clippy::too_many_arguments)]
 pub fn render_status_bar(
     buf: &mut Buffer,
     area: Rect,
@@ -33,6 +34,7 @@ pub fn render_status_bar(
     show_clock: bool,
     show_pane_title: bool,
     show_mode: bool,
+    theme: &cmdash_config::Theme,
 ) {
     let width = area.width as usize;
 
@@ -41,7 +43,7 @@ pub fn render_status_bar(
     if show_mode {
         left_spans.push(Span::styled(
             format!(" {mode}"),
-            Style::default().fg(Color::White).bg(Color::DarkGray),
+            Style::default().fg(theme.status_mode_fg()).bg(theme.status_mode_bg()),
         ));
     }
     if show_pane_title {
@@ -49,7 +51,7 @@ pub fn render_status_bar(
             if !title.is_empty() {
                 left_spans.push(Span::styled(
                     format!(" {title}"),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(theme.status_pane_title_fg()),
                 ));
             }
         }
@@ -81,7 +83,7 @@ pub fn render_status_bar(
     if !right_text.is_empty() {
         spans.push(Span::styled(
             format!("{right_text} "),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme.status_clock_fg()),
         ));
     }
 
@@ -101,7 +103,7 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 let area = Rect::new(0, 4, 80, 1);
-                render_status_bar(buf, area, "Normal", None, false, false, true);
+                render_status_bar(buf, area, "Normal", None, false, false, true, &cmdash_config::Theme::default());
             })
             .unwrap();
     }
@@ -114,7 +116,7 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 let area = Rect::new(0, 0, 80, 1);
-                render_status_bar(buf, area, "Normal", None, false, false, true);
+                render_status_bar(buf, area, "Normal", None, false, false, true, &cmdash_config::Theme::default());
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -135,7 +137,7 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 let area = Rect::new(0, 0, 80, 1);
-                render_status_bar(buf, area, "Normal", None, false, false, false);
+                render_status_bar(buf, area, "Normal", None, false, false, false, &cmdash_config::Theme::default());
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -156,7 +158,7 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 let area = Rect::new(0, 0, 80, 1);
-                render_status_bar(buf, area, "Normal", Some("editor"), false, true, true);
+                render_status_bar(buf, area, "Normal", Some("editor"), false, true, true, &cmdash_config::Theme::default());
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -177,7 +179,7 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 let area = Rect::new(0, 0, 80, 1);
-                render_status_bar(buf, area, "Normal", Some("editor"), false, false, true);
+                render_status_bar(buf, area, "Normal", Some("editor"), false, false, true, &cmdash_config::Theme::default());
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -198,7 +200,7 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 let area = Rect::new(0, 0, 80, 1);
-                render_status_bar(buf, area, "Normal", None, true, false, true);
+                render_status_bar(buf, area, "Normal", None, true, false, true, &cmdash_config::Theme::default());
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();

@@ -9,8 +9,8 @@ user-facing companion to the architectural rules in
 
 > **TL;DR.** cmdash is a single Rust binary. Configuration is
 > loaded at runtime from a KDL file, falling back to a bundled
-> default. The KDL schema is small — four top-level blocks
-> (`layout` / `keybinds` / `presets` / `status_bar`) — and the
+> default. The KDL schema is small — five top-level blocks
+> (`layout` / `keybinds` / `presets` / `status_bar` / `theme`) — and the
 > runtime mutation toolbox is built around a five-variant layout-tree
 > grammar (`split` / `stack` / `zstack` / `pane` / `preset`).
 
@@ -141,7 +141,7 @@ keybind/layout changes take effect in cmdash without restarting.
 
 ## 3. Top-level schema
 
-A cmdash config has **four** valid top-level KDL nodes:
+A cmdash config has **five** valid top-level KDL nodes:
 
 | Top-level | Required? | Purpose |
 |-----------|-----------|---------|
@@ -149,6 +149,7 @@ A cmdash config has **four** valid top-level KDL nodes:
 | `keybinds { ... }` | optional | `bind "<chord>" action="<action>"` lines. |
 | `presets { ... }` | optional | Named layout bodies for `pane.preset.<name>`. |
 | `status_bar { ... }` | optional | Enable/configure the status bar. |
+| `theme { ... }` | optional | Customize colors and cursor style. |
 
 ### 3.1. Inside `layout { ... }`
 
@@ -191,21 +192,24 @@ bar and the layout area height is reduced accordingly.
 
 ```kdl
 status_bar {
-    enabled    true       // required to show the bar
-    position   "bottom"   // "top" or "bottom" (default: "bottom")
-    show-clock true       // show HH:MM in the right corner
-    show-pane-title true  // show the focused pane's label
-    show-mode  true       // show the current keybind mode
+    enabled     #true       // required to show the bar
+    position    "bottom"    // "top" or "bottom" (default: "bottom")
+    show-clock  #true       // show HH:MM in the right corner
+    show-pane-title #true   // show the focused pane's label
+    show-mode   #true       // show the current keybind mode
 }
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Must be `true` for the status bar to render. |
+| `enabled` | bool | `false` | Must be `#true` for the status bar to render. |
 | `position` | string | `"bottom"` | `"top"` renders below the tab bar; `"bottom"` renders at the last row. |
 | `show-clock` | bool | `true` | Display the current time (HH:MM, UTC). |
 | `show-pane-title` | bool | `true` | Display the focused pane's `label` (if set). |
 | `show-mode` | bool | `true` | Display the current keybind mode name. |
+
+> **Note:** Boolean values in KDL use `#true`/`#false` syntax (KDL v2).
+> Bare `true`/`false` are not valid.
 
 When `status_bar` is omitted entirely, no status bar is rendered and
 the layout uses the full terminal height (minus the tab bar).
@@ -213,6 +217,84 @@ the layout uses the full terminal height (minus the tab bar).
 The status bar is **hot-reloadable**: editing the `status_bar` block
 in your config file at runtime will enable/disable the bar and
 recalculate the layout area immediately (no restart required).
+
+### 3.5. Inside `theme { ... }`
+
+Customizes the color scheme for the tab bar, status bar, widget
+borders, and error messages. All fields are optional — when omitted,
+the built-in default color is used. This allows partial themes: only
+specify the colors you want to override.
+
+```kdl
+theme {
+    // Terminal defaults
+    default-fg       "white"       // foreground for terminal body
+    default-bg       "black"       // background for terminal body
+    cursor-style     "block"       // "block" | "underline" | "bar"
+
+    // Tab bar
+    tab-bar-bg       "dark-gray"   // background of the tab bar strip
+    tab-active-bg    "blue"        // background of the active tab
+    tab-active-fg    "white"       // text color of the active tab
+    tab-inactive-bg  "dark-gray"   // background of inactive tabs
+    tab-inactive-fg  "gray"        // text color of inactive tabs
+
+    // Status bar (requires status_bar.enabled = true)
+    status-bar-bg    "dark-gray"   // background of the status bar
+    status-mode-fg   "white"       // foreground of the mode indicator
+    status-mode-bg   "dark-gray"   // background of the mode indicator
+    status-clock-fg  "gray"        // foreground of the clock
+    status-pane-title-fg "gray"    // foreground of the pane title
+
+    // Widget / border colors
+    border-color     "dark-gray"   // default border for widgets
+    error-color      "red"         // color for error messages
+}
+```
+
+#### Recognized keys
+
+| Key | Category | Default | Description |
+|-----|----------|---------|-------------|
+| `default-fg` | terminal | `white` | Default foreground color for the terminal body. |
+| `default-bg` | terminal | `black` | Default background color for the terminal body. |
+| `cursor-style` | terminal | `block` | Cursor shape: `block`, `underline`, or `bar`. |
+| `tab-bar-bg` | tab bar | `dark-gray` | Background of the tab bar strip. |
+| `tab-active-bg` | tab bar | `blue` | Background of the active tab. |
+| `tab-active-fg` | tab bar | `white` | Text color of the active tab. |
+| `tab-inactive-bg` | tab bar | `dark-gray` | Background of inactive tabs. |
+| `tab-inactive-fg` | tab bar | `gray` | Text color of inactive tabs. |
+| `status-bar-bg` | status bar | `dark-gray` | Background of the status bar row. |
+| `status-mode-fg` | status bar | `white` | Foreground of the mode indicator text. |
+| `status-mode-bg` | status bar | `dark-gray` | Background of the mode indicator. |
+| `status-clock-fg` | status bar | `gray` | Foreground of the clock display. |
+| `status-pane-title-fg` | status bar | `gray` | Foreground of the pane title display. |
+| `border-color` | widget | `dark-gray` | Default border color for widgets and bordered blocks. |
+| `error-color` | widget | `red` | Color for error messages and error borders. |
+
+#### Valid color formats
+
+Color values accept any of the following formats (case-insensitive):
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| **Named** | `"red"`, `"dark-gray"`, `"white"` | 12 standard names (see below). |
+| **Hex RGB** | `"#FF8040"`, `"#f0f"` | 6-digit or 3-digit hex (`#RGB` expands each nibble × 17). |
+| **rgb()** | `"rgb(255, 128, 64)"` | Comma-separated R, G, B (0–255). |
+| **Indexed** | `"i5"`, `"indexed(5)"` | ANSI-256 palette index (0–255). |
+| **reset** | `"reset"` | Passthrough to terminal defaults (background becomes black in RGBA helpers). |
+
+**Named colors:**
+`black`, `dark-gray` (or `darkgray`/`dark_gray`), `gray` (or `grey`),
+`white`, `red`, `green`, `blue`, `yellow`, `cyan`, `magenta`, `reset`.
+
+**`cursor-style` values:**
+`block` (solid block), `underline` (or `under`/`u`), `bar` (or `pipe`/`|`).
+
+> **Note:** The `theme` block is **hot-reloadable**. Editing it in your
+> config file at runtime applies the new colors immediately — no restart
+> required. If a color value is invalid, cmdash logs a warning and the field
+> falls back to its built-in default.
 
 ---
 

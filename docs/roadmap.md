@@ -171,18 +171,12 @@ bar renders at the bottom of the screen as its own layer.
 **Steps:**
 - Add a `status_bar { ... }` block to the KDL config schema:
 ```kdl
-status_bar enabled=true position="bottom" show_clock=true show_pane_title=true show_mode=true
-```
-
-Or as a block for readability:
-
-```kdl
 status_bar {
-    enabled=true
-    position="bottom"  // or "top"
-    show_clock=true
-    show_pane_title=true
-    show_mode=true
+    enabled     #true
+    position    "bottom"    // or "top"
+    show-clock  #true
+    show-pane-title #true
+    show-mode   #true
 }
 ```
 - Parse `status_bar` in `cmdash_config::parse` into a `StatusBar` struct.
@@ -242,15 +236,30 @@ mouse events are not routed to panes or used for focus/resize.
 
 ### 3.3 Theme / color customization
 
-**Current state:** No theming support. Colors come from the PTY child's
-SGR sequences.
+**Status:** ✅ Working.
 
-**Goal:** Allow users to define a color theme in KDL config.
+**Current state:** `cmdash_config::Theme` provides 15 configurable color
+keys (default fg/bg, cursor style, tab bar, status bar, widget/border
+colors) parsed from an optional `theme { ... }` KDL block. All keys are
+optional — omitted keys keep their built-in defaults. Color formats
+include named colors, hex RGB (`"#ff8800"`), RGB tuples
+(`"rgb(255,136,0)"`), indexed 256 (`"i196"`), and `"reset"`. Cursor
+style supports `"block"`, `"underline"`, and `"bar"` (with aliases).
 
-**Steps:**
-- Add a `theme { ... }` block to the KDL config schema.
-- Define theme properties: default fg/bg, cursor style, border color.
-- Apply theme colors in `blit_grid` as defaults.
+**Implementation:**
+- `Theme` struct with 15 `Option<Color>` fields in `cmdash-config/src/theme.rs`.
+- `parse_color()` for named/hex/rgb/indexed/reset color formats.
+- `read_theme()` KDL walker in `cmdash-config/src/lib.rs`.
+- Hot-reload support via the existing config file watcher.
+- `ScriptWidget::set_theme()` wires theme colors to script widget borders.
+- `render_tab_bar()` and `render_status_bar()` accept `&Theme`.
+- `docs/configuration.md` §3.5 documents all recognized keys.
+- `examples/09-theme.kdl` showcases dark/light theme examples.
+- Commented-out `theme { ... }` block in bundled `config.kdl`.
+
+**Remaining:**
+- Apply theme colors to remaining hardcoded palette entries (e.g.
+  native widget borders beyond script widgets).
 
 ### 3.4 Clipboard integration
 

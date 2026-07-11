@@ -392,6 +392,7 @@ struct ConfigReload {
     presets: BTreeMap<String, LayoutNode>,
     layout_root: Option<LayoutNode>,
     status_bar: Option<cmdash_config::Bar>,
+    theme: Option<cmdash_config::Theme>,
 }
 
 /// Filesystem watcher that monitors the config file's parent
@@ -465,6 +466,7 @@ impl ConfigWatcher {
                     presets: cfg.presets,
                     layout_root: cfg.layout,
                     status_bar: cfg.status_bar,
+                    theme: cfg.theme,
                 });
             })?;
         if let Some(parent) = path.parent() {
@@ -651,7 +653,8 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             PaneKind::Script => {
                 let cmd = pane.command.as_deref().unwrap_or("");
                 match cmdash::script_widget::ScriptWidget::spawn(cmd, pane.label.as_deref()) {
-                    Ok(widget) => {
+                    Ok(mut widget) => {
+                        widget.set_theme(cfg.theme.clone().unwrap_or_default());
                         runners.push(PaneRunner::spawn_widget(
                             pane.clone(),
                             layer_id,
@@ -742,6 +745,7 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     ctx.widget_factories = widget_factories;
     ctx.status_bar = cfg.status_bar;
+    ctx.theme = cfg.theme.unwrap_or_default();
     ctx.run()
 }
 
@@ -1081,6 +1085,9 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// bar is rendered. When `Some(Bar)`, a single row is reserved
     /// and the status bar is rendered in phase 3a.
     status_bar: Option<cmdash_config::Bar>,
+    /// Optional theme configuration. When `None`, hardcoded default
+    /// colors are used for the tab bar, status bar, and widget borders.
+    theme: cmdash_config::Theme,
     /// Loaded widget libraries keyed by widget `ref_name`. Populated
     /// by [`load_widgets`] at startup; used by [`Self::reconcile_runners`]
     /// when spawning `PaneKind::Widget` panes.
@@ -1209,6 +1216,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             tabs: TabStack::new(initial_tab),
             config_reload_rx,
             status_bar: None,
+            theme: cmdash_config::Theme::default(),
             widget_factories: std::collections::HashMap::new(),
         }
     }
@@ -2525,7 +2533,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                         let cmd = pane.command.as_deref().unwrap_or("");
                         match cmdash::script_widget::ScriptWidget::spawn(cmd, pane.label.as_deref())
                         {
-                            Ok(widget) => {
+                            Ok(mut widget) => {
+                                widget.set_theme(self.theme.clone());
                                 new_runners.push(PaneRunner::spawn_widget(
                                     pane.clone(),
                                     layer_id,
@@ -2666,6 +2675,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         self.bindings = Router::new(msg.keybinds);
         self.presets = msg.presets;
         self.status_bar = msg.status_bar;
+        self.theme = msg.theme.unwrap_or_default();
         // Trigger relayout when status bar enable/disable changes chrome height.
         let w = self.last_area.w;
         let h = self.last_area.h;
@@ -2800,7 +2810,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                             blit_cursor(&snap.grid, buf, area);
                         }
                     }
-                    render_tab_bar(buf, &self.tabs);
+                    render_tab_bar(buf, &self.tabs, &self.theme);
                     // Status bar rendering (Phase 3a).
                     if let Some(ref sb) = self.status_bar {
                         if sb.enabled {
@@ -2834,7 +2844,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                                 pane_title,
                                 sb.show_clock,
                                 sb.show_pane_title,
-                                sb.show_mode,
+                                sb.show_mode, &self.theme,
                             );
                         }
                     }
@@ -2897,13 +2907,13 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
 /// highlighted with a blue background + white bold text;
 /// inactive tabs use a dim dark-gray style. Tabs that don't
 /// fit within `buf.area.width` are silently truncated.
-fn render_tab_bar(buf: &mut ratatui::buffer::Buffer, tabs: &TabStack<TabState>) {
+fn render_tab_bar(buf: &mut ratatui::buffer::Buffer, tabs: &TabStack<TabState>, theme: &cmdash_config::Theme) {
     let bar_width = buf.area.width as usize;
     // Clear the tab bar row.
     for x in 0..bar_width {
         let cell = buf.get_mut(x as u16, 0);
         cell.set_symbol(" ");
-        cell.set_style(Style::default().bg(Color::DarkGray).fg(Color::Gray));
+        cell.set_style(Style::default().bg(theme.tab_bar_bg()).fg(theme.tab_inactive_fg()));
     }
     let mut col: usize = 0;
     for (idx, tab) in tabs.iter().enumerate() {
@@ -2923,7 +2933,7 @@ fn render_tab_bar(buf: &mut ratatui::buffer::Buffer, tabs: &TabStack<TabState>) 
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().bg(Color::DarkGray).fg(Color::Gray)
+            Style::default().bg(theme.tab_inactive_bg()).fg(theme.tab_inactive_fg())
         };
         for ch in tab_text.chars() {
             if col >= bar_width {
@@ -6991,7 +7001,7 @@ mod tab_bar_render_tests {
     fn single_tab_no_label() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
         let tabs = make_tabs(1);
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         assert!(
             text.starts_with(" 1 "),
@@ -7013,7 +7023,7 @@ mod tab_bar_render_tests {
     fn single_tab_with_label() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
         let tabs = make_tabs_with_labels(&[Some("main")]);
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         assert!(
             text.starts_with(" 1:main "),
@@ -7027,7 +7037,7 @@ mod tab_bar_render_tests {
     fn empty_label_filtered_to_no_colon() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
         let tabs = make_tabs_with_labels(&[Some("")]);
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         assert!(
             text.starts_with(" 1 "),
@@ -7046,7 +7056,7 @@ mod tab_bar_render_tests {
     fn multi_tab_ordering_and_separator() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
         let tabs = make_tabs_with_labels(&[Some("a"), Some("b"), Some("c")]);
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         // " 1:a " + " " + " 2:b " + " " + " 3:c "
         assert!(
@@ -7062,7 +7072,7 @@ mod tab_bar_render_tests {
     fn active_highlight_vs_inactive() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
         let tabs = make_tabs_with_labels(&[Some("active"), Some("inactive")]);
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         // Active tab cell (column 1, inside ' 1:active ').
         let active_s = cell_style(&buf, 1);
         assert_eq!(active_s.bg, Some(Color::Blue));
@@ -7092,7 +7102,7 @@ mod tab_bar_render_tests {
         let mut tabs = make_tabs_with_labels(&[Some("first"), Some("second")]);
         // Switch active to tab 1 (second tab, 0-indexed).
         tabs.switch_to(1);
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         // Tab 1 (idx 0) should be inactive.
         let tab1_style = cell_style(&buf, 1);
         assert_eq!(
@@ -7115,7 +7125,7 @@ mod tab_bar_render_tests {
     fn three_tabs_fit_in_wide_buffer() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
         let tabs = make_tabs_with_labels(&[Some("a"), Some("b"), Some("c")]);
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         // " 1:a " = 5, sep = 1, " 2:b " = 5, sep = 1, " 3:c " = 5 => 17 chars.
         // All 3 tabs fit in 20 columns.
@@ -7131,7 +7141,7 @@ mod tab_bar_render_tests {
     fn truncation_cuts_off_later_tabs() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 12, 1));
         let tabs = make_tabs_with_labels(&[Some("a"), Some("b"), Some("c")]);
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         // " 1:a " = 5, sep = 1, " 2:b " = 5 => 11 chars. Tab 3
         // would start at col 11, but " 3:c " = 5 chars needs
@@ -7167,7 +7177,7 @@ mod tab_bar_render_tests {
             buf.get_mut(x, 0).set_symbol("X");
         }
         let tabs = make_tabs(1);
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         // After " 1 " (3 chars), the rest should be spaces.
         assert!(
@@ -7195,7 +7205,7 @@ mod tab_bar_render_tests {
         let tabs = make_tabs(1);
         // Must not panic — the buffer is zero-width, all loops
         // are no-ops.
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         // Buffer is still empty (zero cells).
         assert_eq!(buf.area.width, 0);
     }
@@ -7208,7 +7218,7 @@ mod tab_bar_render_tests {
     fn single_char_buffer_shows_leading_space() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
         let tabs = make_tabs(1);
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         // Only col 0 is available — the leading space of " 1 ".
         assert_eq!(buf.get(0, 0).symbol(), " ");
         let s = cell_style(&buf, 0);
@@ -7235,7 +7245,7 @@ mod tab_bar_render_tests {
         // is 14 chars — 2 chars overflow.
         let mut buf = Buffer::empty(Rect::new(0, 0, 12, 1));
         let tabs = make_tabs_with_labels(&[Some("longlabel")]);
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         // First 12 chars of " 1:longlabel " are " 1:longlabe".
         let text = row_text(&buf);
         assert!(
@@ -7268,7 +7278,7 @@ mod tab_bar_render_tests {
         // is 12 chars, so only " 2:longn" (8 chars) fits.
         let mut buf = Buffer::empty(Rect::new(0, 0, 15, 1));
         let tabs = make_tabs_with_labels(&[Some("ab"), Some("longname")]);
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         assert!(
             text.starts_with(" 1:a"),
@@ -7302,7 +7312,7 @@ mod tab_bar_render_tests {
     fn emoji_label_renders_without_panic() {
         let tabs = make_tabs_with_labels(&[Some("\u{1f30d}")]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         assert!(
             text.contains('\u{1f30d}'),
@@ -7325,7 +7335,7 @@ mod tab_bar_render_tests {
     fn cjk_label_renders_without_panic() {
         let tabs = make_tabs_with_labels(&[Some("\u{65e5}\u{672c}\u{8a9e}")]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         assert!(
             text.contains('\u{65e5}'),
@@ -7352,7 +7362,7 @@ mod tab_bar_render_tests {
     fn mixed_ascii_multibyte_label_renders() {
         let tabs = make_tabs_with_labels(&[Some("caf\u{e9}")]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         assert!(
             text.starts_with(" 1:caf\u{e9} "),
@@ -7379,7 +7389,7 @@ mod tab_bar_render_tests {
     fn multi_tab_mixed_utf8_styles() {
         let tabs = make_tabs_with_labels(&[Some("\u{1f680}"), Some("\u{65e5}\u{672c}")]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         assert!(
             text.contains('\u{1f680}'),
@@ -7417,7 +7427,7 @@ mod tab_bar_render_tests {
     fn truncation_with_emoji_label() {
         let tabs = make_tabs_with_labels(&[Some("\u{1f30d}\u{1f680}\u{1f389}\u{1f38a}\u{2728}")]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         assert!(
             text.starts_with(" 1:"),
@@ -7443,7 +7453,7 @@ mod tab_bar_render_tests {
     fn inactive_tab_with_cjk_label_has_dark_gray_style() {
         let tabs = make_tabs_with_labels(&[Some("a"), Some("\u{65e5}\u{672c}\u{8a9e}")]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         // Tab 1 " 1:a " = 5 chars + 1 separator = 6 cols.
         // Tab 2 starts at col 6: ' ' 6, '2' 7, ':' 8, CJK 9.
         let cjk_style = cell_style(&buf, 9);
@@ -7478,7 +7488,7 @@ mod tab_bar_render_tests {
         let label = "e\u{0301}";
         let tabs = make_tabs_with_labels(&[Some(label)]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         // The base 'e' is at col 3, combining mark at col 4.
         // Both cells must have the active tab style.
@@ -7512,7 +7522,7 @@ mod tab_bar_render_tests {
         let label = "a\u{200b}b";
         let tabs = make_tabs_with_labels(&[Some(label)]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         // Tab text: " 1:a<unk>b " = 9 chars.
         // 'a' at col 3, ZWS at col 4, 'b' at col 5.
         let zws_style = cell_style(&buf, 4);
@@ -7539,7 +7549,7 @@ mod tab_bar_render_tests {
         let label = "a\u{200d}b";
         let tabs = make_tabs_with_labels(&[Some(label)]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         assert!(
             text.contains('a') && text.contains('b'),
@@ -7561,7 +7571,7 @@ mod tab_bar_render_tests {
         let label = "x\u{200c}y";
         let tabs = make_tabs_with_labels(&[Some(label)]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         assert!(
             text.contains('x') && text.contains('y'),
@@ -7586,7 +7596,7 @@ mod tab_bar_render_tests {
         let label = "a\u{0300}\u{0301}";
         let tabs = make_tabs_with_labels(&[Some(label)]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         // Tab text: " 1:a<unk><unk> " = 8 chars.
         // 'a' at col 3, first combining at col 4, second at col 5.
         for col in [3u16, 4, 5] {
@@ -7609,7 +7619,7 @@ mod tab_bar_render_tests {
         let label = "e\u{0301}\u{200b}f";
         let tabs = make_tabs_with_labels(&[Some(label)]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         // Tab text: " 1:e<unk><unk>f " = 10 chars.
         // 'e' at col 3, combining at col 4, ZWS at col 5, 'f' at col 6.
         for col in [3u16, 4, 5, 6] {
@@ -7630,7 +7640,7 @@ mod tab_bar_render_tests {
         // Tab 1 (active): "a", Tab 2 (inactive): "e" + combining acute
         let tabs = make_tabs_with_labels(&[Some("a"), Some("e\u{0301}")]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         // Tab 1 " 1:a " = 5 chars + 1 separator = 6 cols.
         // Tab 2 starts at col 6: ' ' 6, '2' 7, ':' 8, 'e' 9, combining 10.
         let combining_style = cell_style(&buf, 10);
@@ -7654,7 +7664,7 @@ mod tab_bar_render_tests {
         let pairs: String = "e\u{0301}".repeat(5);
         let tabs = make_tabs_with_labels(&[Some(pairs.as_str())]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 8, 1));
-        render_tab_bar(&mut buf, &tabs);
+        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
         let text = row_text(&buf);
         assert!(
             text.starts_with(" 1:"),
