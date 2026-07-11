@@ -287,30 +287,47 @@ terminal disconnect and can be reattached later.
 
 ### 3.6 Configuration validation and error reporting
 
-**Current state:** Config parse errors are returned as `ConfigError`
-variants with messages, but there's no validation of semantic
-correctness (e.g., referencing a preset that doesn't exist, binding the
-same chord twice).
+**Status:** ✅ Working.
 
-**Goal:** Validate config at load time with clear error messages.
+**Current state:** `parse_with_validation()` and `validate()` perform
+semantic validation after parsing. Duplicate chord detection warns
+with last-wins semantics. Preset reference validation catches
+`pane.preset.<name>` keybinds referencing undefined presets. Layout
+tree depth is validated against `MAX_TREE_DEPTH` (8) — hard error
+in `parse_with_validation()`, warning in `validate()`. The 2-child
+`split` limit is enforced at parse time by `read_split()`. The
+`format_error_with_context()` helper pretty-prints errors with
+file labels and best-effort source line display.
 
-**Steps:**
-- Check for duplicate chord bindings (warn, last-wins).
-- Validate preset references in `pane.preset.<name>` against the
-  `presets` map.
-- Enforce binary `split` node's 2-child limit at parse time (the parser
-  currently collects all children into a `Vec` without rejecting a
-  3+ child split).
-- Validate layout tree depth against `MAX_TREE_DEPTH`.
-- Pretty-print errors with file:line context (when reading from file).
+**Implementation:**
+- `ConfigWarning` enum: `DuplicateChord`, `MissingPresetRef`,
+  `TreeTooDeep`.
+- `ConfigError::TreeTooDeep(depth, max)` for hard depth violations.
+- `parse_with_validation()` returns `(Result<Config, ConfigError>,
+  Vec<ConfigWarning>)`.
+- `validate()` standalone post-parse check.
+- `format_error_with_context(err, source, file_label)` for
+  pretty-printed error display.
+- Duplicate chord detection via `HashSet` with `Hash` derives on
+  `Modifiers`/`KeyToken`/`KeyName`.
+- Binary wiring: both startup parse and config watcher use
+  `parse_with_validation`; warnings logged via `tracing::warn!`.
+
+**Remaining:**
+- Source-line-aware error display (caret pointer) — currently
+  best-effort substring match; full column tracking needs KDL span
+  integration.
 
 ## Testing priorities
 
 - **Integration tests for tab operations** — TabNew/TabClose/TabSwitch
   through the full `TickContext` with real PTY children.
-- **Widget loading test** — load a test cdylib, verify render output.
-- **Script protocol round-trip** — spawn a script, send frame, verify
-  reply.
+- **Widget loading test** — ✅ Complete. `widget_sdk_integration.rs`
+  tests cdylib loading via libloading, CmdashWidget trait with MockWidget,
+  FFI round-trip, zero-area handling, offset rendering, and object safety.
+- **Script protocol round-trip** — ✅ Complete. `script_widget_integration.rs`
+  tests spawn/lifecycle, frame protocol round-trip, event forwarding
+  (KEY/RESIZE/FOCUS), repeated renders, and immediate-exit handling.
 - **Config file loading test** — load from `~/.config/cmdash/`, verify
   overrides.
 - **Sixel encoding smoke test** — verify the fallback path produces
