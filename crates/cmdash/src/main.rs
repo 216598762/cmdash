@@ -53,8 +53,8 @@ use cmdash::render::{blit_cursor, blit_grid};
 // field on [`TickContext`] resolves.
 use cmdash::TabStack;
 use cmdash_config::{
-    parse as parse_config, KeyAction, LayoutNode, Pane as CfgPane, PaneKind, Ratio as CfgRatio,
-    SplitAxis as CfgSplitAxis,
+    format_errors_with_context, parse_collect, KeyAction, LayoutNode, Pane as CfgPane, PaneKind,
+    Ratio as CfgRatio, SplitAxis as CfgSplitAxis,
 };
 use cmdash_keybinds::Router;
 use cmdash_layout::{
@@ -91,11 +91,24 @@ fn shell_spec_from_command(command: &Option<String>, default: &ShellSpec) -> She
         None => default.clone(),
     }
 }
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use notify::Watcher as _;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::Terminal;
 use tracing::{debug, info, warn};
+
+/// Loaded widget library and its C-ABI create function.
+/// The `Library` is kept alive so the function pointer remains valid.
+struct LoadedWidget {
+    _library: libloading::Library,
+    create: unsafe extern "C" fn(u32) -> *mut std::ffi::c_void,
+}
+
+/// Map of widget `ref_name` to loaded library + create function.
+type WidgetFactories = std::collections::HashMap<String, LoadedWidget>;
 
 /// Number of terminal rows reserved for the tab bar at the top of
 /// the screen. The layout area's height is reduced by this amount
@@ -104,6 +117,13 @@ use tracing::{debug, info, warn};
 /// When only 1 row of terminal height is available, panes are
 /// skipped entirely (the tab bar alone fills the screen).
 const TAB_BAR_HEIGHT: u16 = 1;
+
+/// Number of terminal rows reserved for the status bar. The status
+/// bar is optional — when disabled (the default), this constant
+/// contributes 0 rows to the layout offset. When enabled, the
+/// layout area's height is reduced by this amount and the status
+/// bar is rendered in phase 3a after pane blits.
+const STATUS_BAR_HEIGHT: u16 = 1;
 
 /// Command-line arguments parsed at binary entry. v1 ships
 /// `--log=<path>`, `--config=<path>`, and `--help`.
@@ -371,6 +391,7 @@ struct ConfigReload {
     keybinds: Vec<cmdash_config::Keybind>,
     presets: BTreeMap<String, LayoutNode>,
     layout_root: Option<LayoutNode>,
+    status_bar: Option<cmdash_config::Bar>,
 }
 
 /// Filesystem watcher that monitors the config file's parent
@@ -427,20 +448,23 @@ impl ConfigWatcher {
                         return;
                     }
                 };
-                let cfg = match cmdash_config::parse(&text) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!(error = ?e,
-                              "config watcher: parse failed");
-                        return;
+                let (cfg, parse_errors) = parse_collect(&text);
+                if !parse_errors.is_empty() {
+                    let file_label = watcher_path.display().to_string();
+                    let formatted =
+                        format_errors_with_context(&parse_errors, &text, Some(&file_label));
+                    for line in formatted.lines() {
+                        warn!(%line, "config watcher: parse error");
                     }
-                };
+                    return;
+                }
                 info!(path = %watcher_path.display(),
                       "config file changed; applying hot-reload");
                 let _ = tx.send(ConfigReload {
                     keybinds: cfg.keybinds,
                     presets: cfg.presets,
                     layout_root: cfg.layout,
+                    status_bar: cfg.status_bar,
                 });
             })?;
         if let Some(parent) = path.parent() {
@@ -506,7 +530,15 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     let (config_path, source_label) = resolve_config_path(cli.config.as_deref());
     let cfg_text = read_config_text(config_path.as_deref(), source_label);
-    let cfg = parse_config(&cfg_text)?;
+    let (cfg, parse_errors) = parse_collect(&cfg_text);
+    if !parse_errors.is_empty() {
+        let file_label = config_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<config>".into());
+        let formatted = format_errors_with_context(&parse_errors, &cfg_text, Some(&file_label));
+        return Err(formatted.into());
+    }
     // Move `cfg.layout` out of `cfg` (Option<LayoutNode>) so the
     // layout tree can be moved into `TickContext::new` at the
     // bottom of this function and reused on every host-driven
@@ -553,11 +585,23 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
     };
+    // Compute the total rows reserved for chrome (tab bar +
+    // optional status bar). When the status bar is enabled at
+    // the top it sits directly below the tab bar; when at the
+    // bottom it sits at the last row. Either way, the layout
+    // area is reduced by the combined chrome height.
+    let status_bar_enabled = cfg.status_bar.as_ref().is_some_and(|sb| sb.enabled);
+    let chrome_height = TAB_BAR_HEIGHT
+        + if status_bar_enabled {
+            STATUS_BAR_HEIGHT
+        } else {
+            0
+        };
     let layout_area = LayoutRect {
         x: 0,
         y: 0,
         w: total.w,
-        h: total.h.saturating_sub(TAB_BAR_HEIGHT),
+        h: total.h.saturating_sub(chrome_height),
     };
     let layout = ComputedLayout::compute(&layout_root, layout_area)?;
     info!(
@@ -565,6 +609,7 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cols = layout_area.w,
         rows = layout_area.h,
         tab_bar = TAB_BAR_HEIGHT,
+        status_bar = status_bar_enabled,
         "layout resolved"
     );
 
@@ -577,13 +622,55 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (close_tx, close_rx): (Sender<cmdash_pty::PaneLayerId>, _) = std::sync::mpsc::channel();
 
     let mut runners: Vec<PaneRunner> = Vec::with_capacity(layout.panes.len());
+    // Load widget factories before spawning panes so widget panes
+    // can be instantiated immediately.
+    let widget_factories = load_widgets();
     for pane in &layout.panes {
         let layer_id = cmdash::derive_layer_id(&pane.id);
         let tx: PaneCloseTx = close_tx.clone();
-        let shell = shell_spec_from_command(&pane.command, &ShellSpec::LoginShell);
-        match PaneRunner::spawn_with_graphics(pane.clone(), layer_id, shell, Some(tx)) {
-            Ok(r) => runners.push(r),
-            Err(e) => warn!(error = %e, ?layer_id, "failed to spawn pane"),
+        match &pane.kind {
+            PaneKind::Widget { ref_name } => {
+                if let Some(factory) = widget_factories.get(ref_name) {
+                    let raw =
+                        unsafe { (factory.create)(cmdash_widget_sdk::CMDASH_WIDGET_ABI_VERSION) };
+                    if raw.is_null() {
+                        warn!(name = %ref_name, "widget create returned null (ABI mismatch?)");
+                    } else {
+                        let widget = unsafe { cmdash_widget_sdk::widget_from_raw(raw) };
+                        runners.push(PaneRunner::spawn_widget(
+                            pane.clone(),
+                            layer_id,
+                            widget,
+                            Some(tx),
+                        ));
+                    }
+                } else {
+                    warn!(name = %ref_name, "widget not found in ~/.config/cmdash/widgets/");
+                }
+            }
+            PaneKind::Script => {
+                let cmd = pane.command.as_deref().unwrap_or("");
+                match cmdash::script_widget::ScriptWidget::spawn(cmd, pane.label.as_deref()) {
+                    Ok(widget) => {
+                        runners.push(PaneRunner::spawn_widget(
+                            pane.clone(),
+                            layer_id,
+                            Box::new(widget),
+                            Some(tx),
+                        ));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, command = %cmd, "failed to spawn script widget");
+                    }
+                }
+            }
+            PaneKind::Shell => {
+                let shell = shell_spec_from_command(&pane.command, &ShellSpec::LoginShell);
+                match PaneRunner::spawn_with_graphics(pane.clone(), layer_id, shell, Some(tx)) {
+                    Ok(r) => runners.push(r),
+                    Err(e) => warn!(error = %e, ?layer_id, "failed to spawn pane"),
+                }
+            }
         }
     }
     if runners.is_empty() {
@@ -653,6 +740,8 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ShellSpec::LoginShell,
         config_reload_rx,
     );
+    ctx.widget_factories = widget_factories;
+    ctx.status_bar = cfg.status_bar;
     ctx.run()
 }
 
@@ -718,6 +807,86 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Scan `~/.config/cmdash/widgets/<name>/` for shared libraries
+/// and load each one via `libloading`. Returns a map of widget name
+/// to loaded library + create function. Failures are logged and
+/// skipped so a missing widget doesn't prevent cmdash from starting.
+fn load_widgets() -> WidgetFactories {
+    use std::ffi::c_void;
+    let mut factories = WidgetFactories::new();
+    let widget_dir = match std::env::var_os("HOME") {
+        Some(home) => std::path::PathBuf::from(home)
+            .join(".config")
+            .join("cmdash")
+            .join("widgets"),
+        None => return factories,
+    };
+    if !widget_dir.is_dir() {
+        debug!(path = %widget_dir.display(), "widget directory not found; no widgets loaded");
+        return factories;
+    }
+    let entries = match std::fs::read_dir(&widget_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(error = %e, path = %widget_dir.display(), "cannot read widget directory");
+            return factories;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // Find the first .so / .dll / .dylib in the subdirectory.
+        let lib_ext = if cfg!(target_os = "macos") {
+            "dylib"
+        } else if cfg!(target_os = "windows") {
+            "dll"
+        } else {
+            "so"
+        };
+        let lib_path = match std::fs::read_dir(&path) {
+            Ok(rd) => rd
+                .flatten()
+                .find(|e| e.path().extension().is_some_and(|ext| ext == lib_ext))
+                .map(|e| e.path()),
+            Err(_) => None,
+        };
+        let Some(lib_path) = lib_path else {
+            debug!(name, path = %path.display(), "no shared library found in widget directory");
+            continue;
+        };
+        let lib = match unsafe { libloading::Library::new(&lib_path) } {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(error = %e, name, path = %lib_path.display(), "failed to load widget library");
+                continue;
+            }
+        };
+        let create_fn: unsafe extern "C" fn(u32) -> *mut c_void =
+            match unsafe { lib.get(b"cmdash_widget_create") } {
+                Ok(sym) => *sym,
+                Err(e) => {
+                    warn!(error = %e, name, "widget missing cmdash_widget_create symbol");
+                    continue;
+                }
+            };
+        info!(name, path = %lib_path.display(), "widget loaded");
+        factories.insert(
+            name,
+            LoadedWidget {
+                _library: lib,
+                create: create_fn,
+            },
+        );
+    }
+    factories
+}
+
 /// Per-tab payload carried by every [`Tab<T>`] in the
 /// `cmdash::main::TickContext::tabs: TabStack<TabState>` stack.
 ///
@@ -768,6 +937,32 @@ pub(crate) struct TabState {
     /// Per-tab `ZStack` focus map (per the v1 `stack_focus`
     /// semantics).
     pub stack_focus: BTreeMap<cmdash_layout::PaneId, usize>,
+}
+
+/// Active drag-to-resize state for Alt+drag on split panes.
+///
+/// Tracks the initial mouse position, the Split node being
+/// resized, and the ratio at the start of the drag so each
+/// Drag event can compute the delta and update the tree.
+struct DragState {
+    /// Tree path (child indices from root) to the Split node
+    /// whose ratio is being adjusted. Fixed-size array backed
+    /// by MAX_TREE_DEPTH (8).
+    split_path: [u16; 8],
+    /// Number of valid elements in `split_path`.
+    split_path_len: u8,
+    /// Initial mouse column (for Horizontal splits) or row
+    /// (for Vertical splits) at drag start.
+    start_pos: u16,
+    /// Ratio of the Split node at drag start.
+    initial_ratio: u8,
+    /// The Split's axis — determines which mouse coord maps
+    /// to the ratio.
+    axis: cmdash_config::SplitAxis,
+    /// Total cells along the Split axis (parent rect width for
+    /// Horizontal, height for Vertical). Used to convert pixel
+    /// deltas to percentage changes.
+    total_cells: u16,
 }
 
 /// Pivot struct for one tick of the AGENTS.md rendering pipeline.
@@ -864,6 +1059,8 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// (`LoginShell`) — `cmdash::run` wires the constant. A future
     /// per-pane shell override slots in here.
     shell: ShellSpec,
+    /// Active drag-to-resize state (Alt+drag on any pane).
+    drag_state: Option<DragState>,
     /// Per-tab payload stack. The v1 singular `runners` /
     /// `focus` / `layout_root` / `stack_focus` fields above
     /// are unaffected by the tab-axis actions; the call sites
@@ -880,6 +1077,14 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     tabs: TabStack<TabState>,
     /// Config hot-reload channel receiver.
     config_reload_rx: Option<Receiver<ConfigReload>>,
+    /// Optional status bar configuration. When `None`, no status
+    /// bar is rendered. When `Some(Bar)`, a single row is reserved
+    /// and the status bar is rendered in phase 3a.
+    status_bar: Option<cmdash_config::Bar>,
+    /// Loaded widget libraries keyed by widget `ref_name`. Populated
+    /// by [`load_widgets`] at startup; used by [`Self::reconcile_runners`]
+    /// when spawning `PaneKind::Widget` panes.
+    widget_factories: WidgetFactories,
 }
 
 /// Monotonic `LayerId` allocator for
@@ -1000,8 +1205,11 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             presets,
             stack_focus,
             shell,
+            drag_state: None,
             tabs: TabStack::new(initial_tab),
             config_reload_rx,
+            status_bar: None,
+            widget_factories: std::collections::HashMap::new(),
         }
     }
 
@@ -1067,11 +1275,17 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             );
             return;
         }
+        let chrome_height = TAB_BAR_HEIGHT
+            + if self.status_bar.as_ref().is_some_and(|sb| sb.enabled) {
+                STATUS_BAR_HEIGHT
+            } else {
+                0
+            };
         let layout_area = LayoutRect {
             x: 0,
             y: 0,
             w,
-            h: h.saturating_sub(TAB_BAR_HEIGHT),
+            h: h.saturating_sub(chrome_height),
         };
         let layout = match ComputedLayout::compute(&self.layout_root, layout_area) {
             Ok(l) => l,
@@ -1164,6 +1378,24 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             KeyAction::TabNew => self.create_new_tab(),
             KeyAction::TabClose => self.close_active_tab(),
             KeyAction::TabSwitch(n) => self.switch_to_tab(n),
+            // Mode entry/exit actions.
+            KeyAction::EnterPaneResize => {
+                self.bindings.set_mode(cmdash_keybinds::Mode::PaneResize);
+            }
+            KeyAction::EnterTabSwitch => {
+                self.bindings.set_mode(cmdash_keybinds::Mode::TabSwitch);
+            }
+            KeyAction::EnterPresetPick => {
+                self.bindings.set_mode(cmdash_keybinds::Mode::PresetPick);
+            }
+            KeyAction::ModeExit => {
+                self.bindings.set_mode(cmdash_keybinds::Mode::Normal);
+            }
+            // Pane resize actions (active in PaneResize mode).
+            KeyAction::PaneResizeUp => self.pane_resize_by_direction(Direction::Up),
+            KeyAction::PaneResizeDown => self.pane_resize_by_direction(Direction::Down),
+            KeyAction::PaneResizeLeft => self.pane_resize_by_direction(Direction::Left),
+            KeyAction::PaneResizeRight => self.pane_resize_by_direction(Direction::Right),
         }
     }
 
@@ -1270,10 +1502,15 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             self.pending_resize = Some((*w, *h));
             return;
         }
+        // Mouse events: click-to-focus, Alt+drag resize, PTY forwarding.
+        if let Event::Mouse(mouse) = evt {
+            self.handle_mouse_event(mouse);
+            return;
+        }
         let Event::Key(KeyEvent {
             code,
             kind,
-            modifiers: _,
+            modifiers,
             ..
         }) = evt
         else {
@@ -1327,7 +1564,38 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             return;
         };
         if let Some(runner) = self.runners.get_mut(self.focus) {
-            if let Err(e) = runner.write_input(&bytes) {
+            if runner.is_widget() {
+                // Forward key event to the widget instead of the PTY.
+                if let Some(widget) = runner.widget.as_mut() {
+                    let widget_code = match code {
+                        KeyCode::Char(c) => cmdash_widget_sdk::KeyCode::Char(*c),
+                        KeyCode::Enter => cmdash_widget_sdk::KeyCode::Enter,
+                        KeyCode::Esc => cmdash_widget_sdk::KeyCode::Esc,
+                        KeyCode::Backspace => cmdash_widget_sdk::KeyCode::Backspace,
+                        KeyCode::Tab => cmdash_widget_sdk::KeyCode::Tab,
+                        KeyCode::Up => cmdash_widget_sdk::KeyCode::Up,
+                        KeyCode::Down => cmdash_widget_sdk::KeyCode::Down,
+                        KeyCode::Left => cmdash_widget_sdk::KeyCode::Left,
+                        KeyCode::Right => cmdash_widget_sdk::KeyCode::Right,
+                        KeyCode::Home => cmdash_widget_sdk::KeyCode::Home,
+                        KeyCode::End => cmdash_widget_sdk::KeyCode::End,
+                        KeyCode::PageUp => cmdash_widget_sdk::KeyCode::PageUp,
+                        KeyCode::PageDown => cmdash_widget_sdk::KeyCode::PageDown,
+                        KeyCode::F(n) => cmdash_widget_sdk::KeyCode::F(*n),
+                        _ => return,
+                    };
+                    let widget_evt = cmdash_widget_sdk::WidgetEvent::Key {
+                        code: widget_code,
+                        modifiers: cmdash_widget_sdk::KeyModifiers {
+                            ctrl: modifiers.contains(crossterm::event::KeyModifiers::CONTROL),
+                            shift: modifiers.contains(crossterm::event::KeyModifiers::SHIFT),
+                            alt: modifiers.contains(crossterm::event::KeyModifiers::ALT),
+                            super_: false,
+                        },
+                    };
+                    widget.on_event(&widget_evt);
+                }
+            } else if let Err(e) = runner.write_input(&bytes) {
                 debug!(
                     error = ?e,
                     layer_id = ?runner.layer_id(),
@@ -1343,6 +1611,323 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// (max perpendicular overlap → min distance → min
     /// `pre_order`); swap `self.focus` to the matching
     /// runner's Vec index. No-op if no neighbour exists.
+    /// Dispatch a crossterm mouse event. Handles click-to-focus,
+    /// Alt+drag split resize, scroll, and mouse forwarding to the
+    /// focused pane's PTY.
+    fn handle_mouse_event(&mut self, mouse: &MouseEvent) {
+        let tab_bar_offset = TAB_BAR_HEIGHT;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if mouse.modifiers.contains(KeyModifiers::ALT) {
+                    self.start_drag_resize(mouse, tab_bar_offset);
+                } else {
+                    self.focus_by_click(mouse.column, mouse.row, tab_bar_offset);
+                    // Forward press to the newly-focused pane's PTY.
+                    self.forward_mouse_to_pty(mouse, tab_bar_offset);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.drag_state.is_some() {
+                    self.update_drag_resize(mouse, tab_bar_offset);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.drag_state = None;
+                self.forward_mouse_to_pty(mouse, tab_bar_offset);
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.forward_mouse_to_pty(mouse, tab_bar_offset);
+            }
+            _ => {
+                self.forward_mouse_to_pty(mouse, tab_bar_offset);
+            }
+        }
+    }
+
+    /// Click-to-focus: find the pane whose rect contains the click
+    /// position and swap `self.focus` to that index.
+    fn focus_by_click(&mut self, col: u16, row: u16, tab_bar_offset: u16) {
+        if self.runners.is_empty() {
+            return;
+        }
+        let layout_area = LayoutRect {
+            x: 0,
+            y: 0,
+            w: self.last_area.w,
+            h: self.last_area.h,
+        };
+        let layout = match ComputedLayout::compute(&self.layout_root, layout_area) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        // Adjust for tab bar: the layout is rendered starting at
+        // row `tab_bar_offset`, so a click at terminal row `row`
+        // maps to layout row `row - tab_bar_offset`.
+        let layout_row = row.saturating_sub(tab_bar_offset);
+        for (idx, pane) in layout.panes.iter().enumerate() {
+            if pane.rect.x <= col
+                && col < pane.rect.x.saturating_add(pane.rect.w)
+                && pane.rect.y <= layout_row
+                && layout_row < pane.rect.y.saturating_add(pane.rect.h)
+            {
+                self.focus = idx;
+                return;
+            }
+        }
+    }
+
+    /// Begin an Alt+drag resize. Find the closest enclosing Split
+    /// for the clicked pane and record the initial drag state.
+    fn start_drag_resize(&mut self, mouse: &MouseEvent, tab_bar_offset: u16) {
+        if self.runners.is_empty() {
+            return;
+        }
+        let layout_area = LayoutRect {
+            x: 0,
+            y: 0,
+            w: self.last_area.w,
+            h: self.last_area.h,
+        };
+        let layout = match ComputedLayout::compute(&self.layout_root, layout_area) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let layout_row = mouse.row.saturating_sub(tab_bar_offset);
+        // Find which pane was clicked.
+        let clicked_pane_idx = layout.panes.iter().position(|p| {
+            p.rect.x <= mouse.column
+                && mouse.column < p.rect.x.saturating_add(p.rect.w)
+                && p.rect.y <= layout_row
+                && layout_row < p.rect.y.saturating_add(p.rect.h)
+        });
+        let Some(pane_idx) = clicked_pane_idx else {
+            return;
+        };
+        self.focus = pane_idx;
+        // Walk the layout tree to find the nearest enclosing Split.
+        // The pane's resolver path gives us the tree location; the
+        // parent of the leaf is the Split we want to resize.
+        let pane_id = layout.panes[pane_idx].id;
+        let tree_path = pane_id.path();
+        // path[0] is the resolver seed (always 0); tree path is
+        // path[1..]. The Split is the parent of the leaf, so we
+        // take tree_path[..tree_path.len()-1] to get the Split's
+        // path.
+        if tree_path.len() <= 1 {
+            return; // leaf is the root — no parent Split.
+        }
+        // Build the path to the parent Split (skip resolver seed,
+        // drop the leaf index). Use fixed-size array.
+        let raw_path = &tree_path[1..tree_path.len() - 1];
+        // Navigate to the Split node to read its axis and ratio.
+        // Borrow and pattern-match directly — no clone needed.
+        let mut node = &self.layout_root;
+        for &idx in raw_path {
+            match node {
+                LayoutNode::Split { children, .. } => {
+                    node = children.get(idx as usize).unwrap();
+                }
+                LayoutNode::Stack { panes } | LayoutNode::ZStack { panes } => {
+                    node = panes.get(idx as usize).unwrap();
+                }
+                _ => return,
+            }
+        }
+        if let LayoutNode::Split { axis, ratio, .. } = node {
+            let total_cells = match axis {
+                cmdash_config::SplitAxis::Horizontal => self.last_area.w,
+                cmdash_config::SplitAxis::Vertical => self.last_area.h,
+            };
+            let start_pos = match axis {
+                cmdash_config::SplitAxis::Horizontal => mouse.column,
+                cmdash_config::SplitAxis::Vertical => layout_row,
+            };
+            let mut path_arr = [0u16; 8];
+            let path_len = raw_path.len().min(8);
+            path_arr[..path_len].copy_from_slice(&raw_path[..path_len]);
+            self.drag_state = Some(DragState {
+                split_path: path_arr,
+                split_path_len: path_len as u8,
+                start_pos,
+                initial_ratio: ratio.0,
+                axis: *axis,
+                total_cells,
+            });
+        }
+    }
+
+    /// Continue an Alt+drag resize: compute the delta from the
+    /// initial position and update the Split's ratio.
+    fn update_drag_resize(&mut self, mouse: &MouseEvent, tab_bar_offset: u16) {
+        // Extract data from drag_state before any &mut self borrows
+        // to avoid borrow-checker conflicts with relayout().
+        let (split_path, split_path_len, start_pos, initial_ratio, axis, total_cells) = {
+            let Some(ref drag) = self.drag_state else {
+                return;
+            };
+            (
+                drag.split_path,
+                drag.split_path_len,
+                drag.start_pos,
+                drag.initial_ratio,
+                drag.axis,
+                drag.total_cells,
+            )
+        };
+        let layout_row = mouse.row.saturating_sub(tab_bar_offset);
+        let current_pos = match axis {
+            cmdash_config::SplitAxis::Horizontal => mouse.column,
+            cmdash_config::SplitAxis::Vertical => layout_row,
+        };
+        let delta = current_pos as i32 - start_pos as i32;
+        // Convert cell delta to percentage change.
+        let pct_delta = if total_cells > 0 {
+            (delta * 100 / total_cells as i32) as i16
+        } else {
+            0
+        };
+        let new_ratio = (initial_ratio as i16 + pct_delta).clamp(1, 99) as u8;
+        let path_slice = &split_path[..split_path_len as usize];
+        if let Err(e) = cmdash_layout::update_split_ratio(
+            &mut self.layout_root,
+            path_slice,
+            cmdash_config::Ratio(new_ratio),
+        ) {
+            warn!(error = ?e, "drag resize: update_split_ratio failed");
+        }
+        // Trigger relayout with the current area.
+        let w = self.last_area.w;
+        let h = self.last_area.h;
+        self.relayout(w, h);
+    }
+
+    /// Forward a mouse event to the focused pane's PTY as an SGR
+    /// extended mouse sequence. The child must have enabled mouse
+    /// tracking (e.g. `\x1b[?1006h`) for the bytes to be useful;
+    /// apps that haven't opted in simply ignore the bytes.
+    fn forward_mouse_to_pty(&mut self, mouse: &MouseEvent, tab_bar_offset: u16) {
+        if self.focus >= self.runners.len() {
+            return;
+        }
+        let layout_row = mouse.row.saturating_sub(tab_bar_offset);
+        // Encode button: SGR format.
+        let button: u8 = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => 0,
+            MouseEventKind::Down(MouseButton::Middle) => 1,
+            MouseEventKind::Down(MouseButton::Right) => 2,
+            MouseEventKind::Up(MouseButton::Left) => 0,
+            MouseEventKind::Up(MouseButton::Middle) => 1,
+            MouseEventKind::Up(MouseButton::Right) => 2,
+            MouseEventKind::Drag(MouseButton::Left) => 32,
+            MouseEventKind::Drag(MouseButton::Middle) => 33,
+            MouseEventKind::Drag(MouseButton::Right) => 34,
+            MouseEventKind::ScrollUp => 64,
+            MouseEventKind::ScrollDown => 65,
+            _ => return,
+        };
+        let mut modifiers: u8 = 0;
+        if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+            modifiers |= 4;
+        }
+        if mouse.modifiers.contains(KeyModifiers::ALT) {
+            modifiers |= 8;
+        }
+        if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+            modifiers |= 16;
+        }
+        let btn = button | modifiers;
+        let suffix = if matches!(mouse.kind, MouseEventKind::Up(..)) {
+            'm'
+        } else {
+            'M'
+        };
+        let seq = format!(
+            "\x1b[<{};{};{}{suffix}",
+            btn,
+            mouse.column + 1,
+            layout_row + 1
+        );
+        if let Some(runner) = self.runners.get_mut(self.focus) {
+            let _ = runner.write_input(seq.as_bytes());
+        }
+    }
+
+    /// Find the parent Split of the focused pane and return
+    /// `(split_path, axis, current_ratio, child_index)`. Returns
+    /// `None` if the focused pane has no parent Split.
+    fn parent_split_of_focused(&self) -> Option<(Vec<u16>, cmdash_config::SplitAxis, u8, usize)> {
+        if self.runners.is_empty() {
+            return None;
+        }
+        let focused_id = self.runners[self.focus].computed().id;
+        let tree_path = focused_id.path();
+        if tree_path.len() <= 1 {
+            return None; // leaf is the root.
+        }
+        let parent_path: Vec<u16> = tree_path[1..tree_path.len() - 1].to_vec();
+        let child_idx = *tree_path.last().unwrap_or(&0) as usize;
+        let mut node = &self.layout_root;
+        for &idx in &parent_path {
+            match node {
+                LayoutNode::Split { children, .. } => {
+                    node = children.get(idx as usize)?;
+                }
+                LayoutNode::Stack { panes } | LayoutNode::ZStack { panes } => {
+                    node = panes.get(idx as usize)?;
+                }
+                _ => return None,
+            }
+        }
+        match node {
+            LayoutNode::Split { axis, ratio, .. } => Some((parent_path, *axis, ratio.0, child_idx)),
+            _ => None,
+        }
+    }
+
+    /// Resize the focused pane's parent split in the given direction.
+    /// Finds the enclosing Split via the focused pane's resolver path,
+    /// computes the new ratio (±2% per arrow press), and triggers
+    /// relayout. No-op if the focused pane has no parent Split or if
+    /// the direction doesn't match the Split's axis.
+    fn pane_resize_by_direction(&mut self, dir: Direction) {
+        let Some((parent_path, axis, current_ratio, child_idx)) = self.parent_split_of_focused()
+        else {
+            return;
+        };
+        // Only resize if the direction matches the Split's axis.
+        if !matches!(
+            (axis, dir),
+            (
+                cmdash_config::SplitAxis::Horizontal,
+                Direction::Left | Direction::Right
+            ) | (
+                cmdash_config::SplitAxis::Vertical,
+                Direction::Up | Direction::Down
+            )
+        ) {
+            return;
+        }
+        // Compute new ratio: ±2% per arrow press.
+        let delta: i16 = match (axis, dir) {
+            (cmdash_config::SplitAxis::Horizontal, Direction::Right) => 2,
+            (cmdash_config::SplitAxis::Horizontal, Direction::Left) => -2,
+            (cmdash_config::SplitAxis::Vertical, Direction::Down) => 2,
+            (cmdash_config::SplitAxis::Vertical, Direction::Up) => -2,
+            _ => unreachable!(),
+        };
+        // If focused pane is child 1, flip the direction.
+        let adjusted_delta = if child_idx == 1 { -delta } else { delta };
+        let new_ratio = (current_ratio as i16 + adjusted_delta).clamp(1, 99) as u8;
+        let _ = cmdash_layout::update_split_ratio(
+            &mut self.layout_root,
+            &parent_path,
+            cmdash_config::Ratio(new_ratio),
+        );
+        let w = self.last_area.w;
+        let h = self.last_area.h;
+        self.relayout(w, h);
+    }
+
     fn focus_by_direction(&mut self, dir: Direction) {
         if self.runners.is_empty() {
             return;
@@ -1915,15 +2500,66 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                     cmdash::derive_layer_id_for_tab(&pane.id, self.active_tab_idx_u32())
                 };
                 let tx: PaneCloseTx = self.close_tx.clone();
-                let shell = shell_spec_from_command(&pane.command, &self.shell);
-                match PaneRunner::spawn_with_graphics(pane.clone(), layer_id, shell, Some(tx)) {
-                    Ok(r) => new_runners.push(r),
-                    Err(e) => {
-                        warn!(
-                            error = ?e,
-                            ?layer_id,
-                            "reconcile: spawn failed"
-                        );
+                match &pane.kind {
+                    PaneKind::Widget { ref_name } => {
+                        if let Some(factory) = self.widget_factories.get(ref_name) {
+                            let raw = unsafe {
+                                (factory.create)(cmdash_widget_sdk::CMDASH_WIDGET_ABI_VERSION)
+                            };
+                            if raw.is_null() {
+                                warn!(name = %ref_name, "reconcile: widget create returned null");
+                            } else {
+                                let widget = unsafe { cmdash_widget_sdk::widget_from_raw(raw) };
+                                new_runners.push(PaneRunner::spawn_widget(
+                                    pane.clone(),
+                                    layer_id,
+                                    widget,
+                                    Some(tx),
+                                ));
+                            }
+                        } else {
+                            warn!(name = %ref_name, "reconcile: widget not found");
+                        }
+                    }
+                    PaneKind::Script => {
+                        let cmd = pane.command.as_deref().unwrap_or("");
+                        match cmdash::script_widget::ScriptWidget::spawn(cmd, pane.label.as_deref())
+                        {
+                            Ok(widget) => {
+                                new_runners.push(PaneRunner::spawn_widget(
+                                    pane.clone(),
+                                    layer_id,
+                                    Box::new(widget),
+                                    Some(tx),
+                                ));
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    command = %cmd,
+                                    ?layer_id,
+                                    "reconcile: script spawn failed"
+                                );
+                            }
+                        }
+                    }
+                    PaneKind::Shell => {
+                        let shell = shell_spec_from_command(&pane.command, &self.shell);
+                        match PaneRunner::spawn_with_graphics(
+                            pane.clone(),
+                            layer_id,
+                            shell,
+                            Some(tx),
+                        ) {
+                            Ok(r) => new_runners.push(r),
+                            Err(e) => {
+                                warn!(
+                                    error = ?e,
+                                    ?layer_id,
+                                    "reconcile: spawn failed"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -2029,6 +2665,11 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         };
         self.bindings = Router::new(msg.keybinds);
         self.presets = msg.presets;
+        self.status_bar = msg.status_bar;
+        // Trigger relayout when status bar enable/disable changes chrome height.
+        let w = self.last_area.w;
+        let h = self.last_area.h;
+        self.relayout(w, h);
         if let Some(new_layout) = msg.layout_root {
             if new_layout != self.layout_root {
                 info!("config hot-reload: layout changed; rebuilding panes");
@@ -2098,7 +2739,14 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                         all_exited = false;
                     }
                 }
-                snapshots.push(Some(runner.tick()?));
+                // Widget panes have no PTY to poll — skip tick()
+                // and push None so the render loop handles them via
+                // widget.render() instead of blit_grid.
+                if runner.is_widget() {
+                    snapshots.push(None);
+                } else {
+                    snapshots.push(Some(runner.tick()?));
+                }
             }
 
             // Phase 2: route events -> graphics. Kitty graphics
@@ -2127,44 +2775,86 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             let focus_idx_dbg = self.focus();
             self.terminal.draw(|frame| {
                 debug!(focus_idx = focus_idx_dbg, "rendering frame");
-                let buf = frame.buffer_mut();
-                for (runner, snap) in self.runners.iter().zip(snapshots.iter()) {
-                    // Visual-state proof: emit a structured
-                    // `blitting pane` line carrying the
-                    // `(layer_id, rect.w, rect.h)` triple so
-                    // the wiring_smoke live-binary integration
-                    // test can parse the `--log=<path>` file
-                    // and verify `rect_width(child_0) /
-                    // rect_width(parent) \u2248 0.5` after
-                    // `AppNewPane` (a deterministic
-                    // Horizontal-50 split per
-                    // [`Self::split_focused_for_new_pane`]).
-                    // Fires once per frame per pane, so the
-                    // accumulated log yields a chronologically
-                    // ordered window of pre- and post-split
-                    // `(layer_id, rect.w)` triples. Privacy:
-                    // only numeric rect dims are emitted; no
-                    // keystroke text or pane content reaches
-                    // the log via this hook.
-                    let computed_rect = runner.computed().rect;
-                    debug!(
-                        layer_id = ?runner.layer_id(),
-                        rect.w = computed_rect.w,
-                        rect.h = computed_rect.h,
-                        "blitting pane"
-                    );
-                    let area = ratatui::layout::Rect::new(
-                        runner.computed().rect.x,
-                        runner.computed().rect.y + TAB_BAR_HEIGHT,
-                        runner.computed().rect.w,
-                        runner.computed().rect.h,
-                    );
-                    if let Some(snap) = snap {
-                        blit_grid(&snap.grid, buf, area);
-                        blit_cursor(&snap.grid, buf, area);
+                // Pass 1: shell panes — blit PTY grids into the
+                // ratatui buffer. Widget panes are skipped here
+                // (their snapshots are None) and rendered in
+                // pass 2 via widget.render().
+                {
+                    let buf = frame.buffer_mut();
+                    for (runner, snap) in self.runners.iter().zip(snapshots.iter()) {
+                        let computed_rect = runner.computed().rect;
+                        debug!(
+                            layer_id = ?runner.layer_id(),
+                            rect.w = computed_rect.w,
+                            rect.h = computed_rect.h,
+                            "blitting pane"
+                        );
+                        let area = ratatui::layout::Rect::new(
+                            computed_rect.x,
+                            computed_rect.y + TAB_BAR_HEIGHT,
+                            computed_rect.w,
+                            computed_rect.h,
+                        );
+                        if let Some(snap) = snap {
+                            blit_grid(&snap.grid, buf, area);
+                            blit_cursor(&snap.grid, buf, area);
+                        }
+                    }
+                    render_tab_bar(buf, &self.tabs);
+                    // Status bar rendering (Phase 3a).
+                    if let Some(ref sb) = self.status_bar {
+                        if sb.enabled {
+                            let total_h = self.last_area.h + TAB_BAR_HEIGHT;
+                            let sb_y = match sb.position {
+                                cmdash_config::BarPosition::Top => TAB_BAR_HEIGHT,
+                                cmdash_config::BarPosition::Bottom => {
+                                    total_h.saturating_sub(STATUS_BAR_HEIGHT)
+                                }
+                            };
+                            let sb_area = ratatui::layout::Rect::new(
+                                0,
+                                sb_y,
+                                self.last_area.w,
+                                STATUS_BAR_HEIGHT,
+                            );
+                            let mode_name = match self.bindings.mode() {
+                                cmdash_keybinds::Mode::Normal => "Normal",
+                                cmdash_keybinds::Mode::PaneResize => "Resize",
+                                cmdash_keybinds::Mode::TabSwitch => "TabSwitch",
+                                cmdash_keybinds::Mode::PresetPick => "PresetPick",
+                            };
+                            let pane_title = self
+                                .runners
+                                .get(self.focus)
+                                .and_then(|r| r.computed().label.as_deref());
+                            cmdash::status_bar::render_status_bar(
+                                buf,
+                                sb_area,
+                                mode_name,
+                                pane_title,
+                                sb.show_clock,
+                                sb.show_pane_title,
+                                sb.show_mode,
+                            );
+                        }
                     }
                 }
-                render_tab_bar(buf, &self.tabs);
+                // Pass 2: widget panes — call widget.render()
+                // with the full Frame. The buf borrow from pass
+                // 1 has been dropped (inner block ended), so
+                // frame is available for direct widget rendering.
+                for runner in self.runners.iter_mut() {
+                    let computed_rect = runner.computed().rect;
+                    if let Some(widget) = runner.widget.as_mut() {
+                        let area = ratatui::layout::Rect::new(
+                            computed_rect.x,
+                            computed_rect.y + TAB_BAR_HEIGHT,
+                            computed_rect.w,
+                            computed_rect.h,
+                        );
+                        widget.render(area, frame);
+                    }
+                }
             })?;
 
             // Phase 3b: emit dashcompositor kitty graphics through

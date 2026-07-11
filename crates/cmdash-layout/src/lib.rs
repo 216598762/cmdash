@@ -169,6 +169,9 @@ pub enum LayoutError {
     /// Tree depth exceeded [`MAX_TREE_DEPTH`].
     #[error("layout tree too deep ({0} levels); max 8")]
     TreeTooDeep(usize),
+    /// A tree-path lookup failed (empty path or index out of bounds).
+    #[error("invalid layout path: index {0} out of bounds or empty path")]
+    InvalidPath(u16),
 }
 
 /// Direction enum for [`adjacent_pane`]. Lives in
@@ -399,7 +402,7 @@ fn resolve_node(
             out.push(ComputedPane {
                 id,
                 rect: area,
-                kind: p.kind,
+                kind: p.kind.clone(),
                 label: p.label.clone(),
                 command: p.command.clone(),
             });
@@ -643,6 +646,30 @@ fn clone_child(
     }
     .ok_or(LayoutError::SplitChildCount { got: idx })?;
     Ok(slot.clone())
+}
+
+/// Update the ratio of a [`LayoutNode::Split`] node at `path` in
+/// the layout tree. The path is a sequence of child indices starting
+/// from the root. The ratio is clamped to `1..=99` to avoid zero-area
+/// children. Returns `Ok(())` on success, or [`LayoutError`] if the
+/// path is invalid or the target is not a Split.
+pub fn update_split_ratio(
+    root: &mut LayoutNode,
+    path: &[u16],
+    new_ratio: Ratio,
+) -> Result<(), LayoutError> {
+    if path.is_empty() {
+        return Err(LayoutError::InvalidPath(0));
+    }
+    let node =
+        walk_mut(root, path).map_err(|_| LayoutError::InvalidPath(*path.last().unwrap_or(&0)))?;
+    match node {
+        LayoutNode::Split { ratio, .. } => {
+            *ratio = Ratio(new_ratio.0.clamp(1, 99));
+            Ok(())
+        }
+        _ => Err(LayoutError::InvalidPath(*path.last().unwrap_or(&0))),
+    }
 }
 
 /// Replace `parent_path -> idx` with `new_child` in-place.

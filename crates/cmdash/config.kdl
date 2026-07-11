@@ -11,12 +11,18 @@ layout {
 // `ctrl-a` splits the focused pane (app.new-pane).
 //
 // Tab keybinds: `M-t` new tab, `M-w` close tab, `M-1`..`M-9` switch
-// to tab N. Users wanting non-default keybinds can extend the binds
-// in their own config (once runtime config loading is implemented).
+// to tab N.
+//
+// Mode keybinds: `M-r` enters PaneResize mode (arrow keys resize
+// the focused pane's split; Escape exits). `M-p` enters PresetPick
+// mode (number keys select presets; Escape exits).
 keybinds {
+    // Pane management
     bind "alt-w"  action="pane.close"
     bind "alt-q"  action="app.close"
     bind "ctrl-a" action="app.new-pane"
+    
+    // Tab management
     bind "M-t"    action="tab.new"
     bind "M-w"    action="tab.close"
     bind "M-1"    action="tab.switch.1"
@@ -28,4 +34,8 @@ keybinds {
     bind "M-7"    action="tab.switch.7"
     bind "M-8"    action="tab.switch.8"
     bind "M-9"    action="tab.switch.9"
+    
+    // Mode entry (Escape exits any non-Normal mode)
+    bind "M-r"    action="pane.resize.enter"
+    bind "M-p"    action="preset.pick.enter"
 }

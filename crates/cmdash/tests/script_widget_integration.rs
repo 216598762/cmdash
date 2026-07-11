@@ -30,10 +30,7 @@ fn test_script_path() -> Option<String> {
     if script.exists() {
         Some(script.display().to_string())
     } else {
-        eprintln!(
-            "SKIPPED: test script fixture not found at {:?}",
-            script
-        );
+        eprintln!("SKIPPED: test script fixture not found at {:?}", script);
         None
     }
 }
@@ -85,8 +82,7 @@ fn script_widget_default_name() {
         None => return,
     };
     let cmd = format!("bash {script_path}");
-    let widget =
-        ScriptWidget::spawn(&cmd, None).expect("spawn must succeed");
+    let widget = ScriptWidget::spawn(&cmd, None).expect("spawn must succeed");
     assert_eq!(widget.name(), "script");
 }
 
@@ -214,9 +210,7 @@ fn script_widget_renders_expected_marker_text() {
                     let mut ok = true;
                     for (i, ch) in expected.chars().enumerate() {
                         let cx = x + i as u16;
-                        if cx >= buf.area.width
-                            || buf.get(cx, y).symbol() != ch.to_string()
-                        {
+                        if cx >= buf.area.width || buf.get(cx, y).symbol() != ch.to_string() {
                             ok = false;
                             break;
                         }
@@ -279,9 +273,7 @@ fn script_widget_border_title_matches_name() {
                 let mut ok = true;
                 for (i, ch) in expected.chars().enumerate() {
                     let cx = x + i as u16;
-                    if cx >= buf.area.width
-                        || buf.get(cx, y).symbol() != ch.to_string()
-                    {
+                    if cx >= buf.area.width || buf.get(cx, y).symbol() != ch.to_string() {
                         ok = false;
                         break;
                     }
@@ -530,9 +522,7 @@ fn script_widget_renders_at_offset() {
 #[test]
 fn script_widget_handles_immediate_exit() {
     // Use `true` (resolved from $PATH) which exits immediately with success.
-    let mut widget =
-        ScriptWidget::spawn("true", Some("immediate-exit"))
-            .expect("spawn true");
+    let mut widget = ScriptWidget::spawn("true", Some("immediate-exit")).expect("spawn true");
 
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).expect("terminal");

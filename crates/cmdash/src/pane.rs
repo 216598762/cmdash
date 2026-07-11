@@ -44,6 +44,7 @@ use std::thread;
 
 use cmdash_layout::{ComputedPane, Rect as LayoutRect};
 use cmdash_pty::{PaneLayerId, PanePty, PaneReader, PaneTerminalState, PtyError, ShellSpec};
+use cmdash_widget_sdk::CmdashWidget;
 
 /// Re-export the pty-operations trait so downstream callers
 /// (e.g., future external test harnesses or alternative backend
@@ -95,18 +96,20 @@ pub enum RunnerError {
 pub struct PaneRunner {
     /// Source pane description (rect, kind, label).
     computed: ComputedPane,
-    /// Trait-object PTY backend. Stored as `Option<Box<...>>` so
-    /// the manual `Clone` impl can return a shell with `pty: None`
-    /// (the source keeps its pty; the clone has no runtime
-    /// backend). Production runners always have `pty: Some(_)`
-    /// after `spawn_with_graphics`; `None` is the clone-shell case.
+    /// Stored layer ID. For shell panes this mirrors
+    /// `pty.layer_id()`; for widget panes it is the sole
+    /// source. Stored directly so `layer_id()` works
+    /// without a PTY.
+    stored_layer_id: PaneLayerId,
+    /// Trait-object PTY backend. `None` for widget panes and
+    /// clone-shells.
     pty: Option<Box<dyn PanePtyOps + Send>>,
+    /// Dynamically-loaded widget instance. `Some` for widget
+    /// panes; `None` for shell panes. Public so the render loop
+    /// can call `widget.render()` and `widget.on_event()`.
+    pub widget: Option<Box<dyn CmdashWidget>>,
     bytes_rx: Receiver<Vec<u8>>,
     reader_thread: Option<thread::JoinHandle<()>>,
-    /// Optional close-channel sender. When `Some`, `Drop` sends
-    /// `self.pty.layer_id()` into it so the main loop's
-    /// `GraphicsState` can revoke the pane's dashcompositor
-    /// layers on the next tick (AGENTS.md §"Hard rule").
     close_tx: Option<PaneCloseTx>,
 }
 
@@ -130,7 +133,9 @@ impl Clone for PaneRunner {
         let (_tx, bytes_rx) = channel::<Vec<u8>>();
         Self {
             computed: self.computed.clone(),
+            stored_layer_id: self.stored_layer_id,
             pty: None,
+            widget: None,
             bytes_rx,
             reader_thread: None,
             close_tx: self.close_tx.clone(),
@@ -153,12 +158,24 @@ impl std::fmt::Debug for PaneRunner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PaneRunner")
             .field("computed", &self.computed)
+            .field("stored_layer_id", &self.stored_layer_id)
             .field(
                 "pty",
                 &format_args!(
                     "{}",
                     if self.pty.is_some() {
                         "<dyn PanePtyOps+Send>"
+                    } else {
+                        "<empty>"
+                    },
+                ),
+            )
+            .field(
+                "widget",
+                &format_args!(
+                    "{}",
+                    if self.widget.is_some() {
+                        "<dyn CmdashWidget>"
                     } else {
                         "<empty>"
                     },
@@ -249,7 +266,9 @@ impl PaneRunner {
             .expect("spawn reader thread");
         Ok(Self {
             computed,
+            stored_layer_id: layer_id,
             pty: Some(Box::new(pty)),
+            widget: None,
             bytes_rx: rx,
             reader_thread: Some(reader_thread),
             close_tx,
@@ -272,12 +291,13 @@ impl PaneRunner {
         Ok(pty.snapshot())
     }
 
-    /// Non-blocking exit poll.
+    /// Non-blocking exit poll. Widget panes never exit.
     pub fn try_wait_exit(&mut self) -> Result<Option<i32>, PtyError> {
-        self.pty
-            .as_mut()
-            .expect("PaneRunner::try_wait_exit: pty is None")
-            .try_wait()
+        if let Some(pty) = self.pty.as_mut() {
+            pty.try_wait()
+        } else {
+            Ok(None)
+        }
     }
 
     /// Resize the PTY and overwrite the cached [`ComputedPane`]
@@ -299,20 +319,20 @@ impl PaneRunner {
     /// value keeps the previous last-good state — pane state
     /// mutates atomically, not in halves).
     pub fn resize(&mut self, rect: LayoutRect) -> Result<(), PtyError> {
-        self.pty
-            .as_mut()
-            .expect("PaneRunner::resize: pty is None")
-            .resize(rect.w, rect.h)?;
+        if let Some(pty) = self.pty.as_mut() {
+            pty.resize(rect.w, rect.h)?;
+        }
         self.computed.rect = rect;
         Ok(())
     }
 
-    /// Forward input bytes to the child.
+    /// Forward input bytes to the child PTY. No-op for widget panes.
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<usize, PtyError> {
-        self.pty
-            .as_mut()
-            .expect("PaneRunner::write_input: pty is None")
-            .write(bytes)
+        if let Some(pty) = self.pty.as_mut() {
+            pty.write(bytes)
+        } else {
+            Ok(0)
+        }
     }
 
     /// Read-only accessor; transparent pass-through to the spawn-
@@ -354,42 +374,71 @@ impl PaneRunner {
     }
 
     pub fn layer_id(&self) -> PaneLayerId {
-        self.pty
-            .as_ref()
-            .expect("PaneRunner::layer_id: pty is None")
-            .layer_id()
+        self.stored_layer_id
+    }
+
+    /// Returns `true` if this runner backs a widget pane (no PTY).
+    pub fn is_widget(&self) -> bool {
+        self.widget.is_some()
     }
 
     /// Move the scrollback viewport up by `n` rows.
     pub fn scrollback_up(&mut self, n: usize) {
-        self.pty
-            .as_mut()
-            .expect("PaneRunner::scrollback_up: pty is None")
-            .scrollback_up(n);
+        if let Some(pty) = self.pty.as_mut() {
+            pty.scrollback_up(n);
+        }
     }
 
-    /// Move the scrollback viewport down by `n` rows.
+    /// Move the scrollback viewport down by `n` rows. No-op for
+    /// widget panes.
     pub fn scrollback_down(&mut self, n: usize) {
-        self.pty
-            .as_mut()
-            .expect("PaneRunner::scrollback_down: pty is None")
-            .scrollback_down(n);
+        if let Some(pty) = self.pty.as_mut() {
+            pty.scrollback_down(n);
+        }
     }
 
-    /// Reset the scrollback viewport to live view.
+    /// Reset the scrollback viewport to live view. No-op for
+    /// widget panes.
     pub fn scrollback_reset(&mut self) {
-        self.pty
-            .as_mut()
-            .expect("PaneRunner::scrollback_reset: pty is None")
-            .scrollback_reset();
+        if let Some(pty) = self.pty.as_mut() {
+            pty.scrollback_reset();
+        }
     }
 
     /// Returns `true` when the user is viewing scrollback history.
+    /// Widget panes always return `false`.
     pub fn in_scrollback(&self) -> bool {
-        self.pty
-            .as_ref()
-            .expect("PaneRunner::in_scrollback: pty is None")
-            .in_scrollback()
+        self.pty.as_ref().is_some_and(|pty| pty.in_scrollback())
+    }
+
+    /// Test-only ctor that injects a [`PanePtyOps`] trait object
+    /// WITHOUT spawning a real PTY reader thread. Used by the
+    /// `#[cfg(test)] mod internal_sanity_tests` block below to
+    /// pin resize-ordering invariants that real-PTY tests can't
+    /// reach deterministically. Production paths still go
+    /// through [`PaneRunner::spawn_with_graphics`].
+    ///
+    /// Lives inside [`impl PaneRunner`] (not as a free fn) so the
+    /// test call site `PaneRunner::with_pty_for_test(...)`
+    /// resolves via the standard associated-fn syntax.
+    /// Construct a `PaneRunner` backed by a widget (no PTY).
+    /// Used by `reconcile_runners` for `PaneKind::Widget` panes.
+    pub fn spawn_widget(
+        computed: ComputedPane,
+        layer_id: PaneLayerId,
+        widget: Box<dyn CmdashWidget>,
+        close_tx: Option<PaneCloseTx>,
+    ) -> Self {
+        let (_tx, rx) = channel::<Vec<u8>>();
+        Self {
+            computed,
+            stored_layer_id: layer_id,
+            pty: None,
+            widget: Some(widget),
+            bytes_rx: rx,
+            reader_thread: None,
+            close_tx,
+        }
     }
 
     /// Test-only ctor that injects a [`PanePtyOps`] trait object
@@ -405,23 +454,16 @@ impl PaneRunner {
     #[cfg(test)]
     pub(crate) fn with_pty_for_test(
         computed: ComputedPane,
-        // `layer_id` is unused here: the StubPty passed in
-        // encapsulates its own `PaneLayerId` internally. Kept in
-        // the signature (parallel to `spawn_with_graphics`) so
-        // test invocations pattern-match the production-ctor shape.
         #[allow(unused)] layer_id: PaneLayerId,
         pty: Box<dyn PanePtyOps + Send>,
         close_tx: Option<PaneCloseTx>,
     ) -> Self {
-        // No real reader thread: tests that exercise this ctor
-        // only care about `resize` / `computed().rect` invariants
-        // and don't need byte feeding. Integration paths still go
-        // through `spawn_with_graphics` (with a real PanePty +
-        // thread).
         let (_tx, rx) = channel::<Vec<u8>>();
         Self {
             computed,
+            stored_layer_id: layer_id,
             pty: Some(pty),
+            widget: None,
             bytes_rx: rx,
             reader_thread: None,
             close_tx,
@@ -433,40 +475,29 @@ impl Drop for PaneRunner {
     fn drop(&mut self) {
         // Best-effort: kill the child before joining the reader so
         // the reader sees EOF promptly instead of an indefinite
-        // hang. The child is reachable via `&mut self.pty` since
-        // `self.pty` is still in scope. `Option::take()` so a
-        // clone-shell (`pty: None`) is a no-op (the source's
-        // pty is unaffected; the clone has no pty to kill).
+        // hang.
         if let Some(pty) = self.pty.as_mut() {
             if let Err(e) = pty.kill() {
-                debug!(error = ?e, layer_id = ?pty.layer_id(), "kill on drop");
+                debug!(error = ?e, layer_id = ?self.stored_layer_id, "kill on drop");
             }
         }
         // AGENTS.md §"Hard rule: one layer per instance" -- the
         // PaneLayerId binding ends at pane close. Notify the main
         // loop so its next tick can call
-        // `GraphicsState::close_pane`. We swallow a closed-channel
-        // error (binary already exited) which is benign.
-        // Skipped for clone-shells (pty: None) since the source
-        // runner's `Drop` is the authoritative emitter of the
-        // close-channel message.
+        // `GraphicsState::close_pane`.
         //
         // **Ordering: send BEFORE joining the reader thread.** If
         // `kill()` failed and the child keeps the PTY master open,
         // the reader thread's `read()` blocks indefinitely and
         // `handle.join()` hangs — the close notification would
         // never reach `GraphicsState`, stranding the
-        // dashcompositor layer. Sending first guarantees the
-        // main loop's next tick can revoke the `LayerId` even
-        // if `join()` never returns.
-        if let (Some(tx), Some(pty)) = (self.close_tx.as_ref(), self.pty.as_ref()) {
-            if let Err(e) = tx.send(pty.layer_id()) {
-                debug!(error = ?e, layer_id = ?pty.layer_id(),
+        // dashcompositor layer.
+        if let Some(tx) = self.close_tx.as_ref() {
+            if let Err(e) = tx.send(self.stored_layer_id) {
+                debug!(error = ?e, layer_id = ?self.stored_layer_id,
                        "close_tx send on drop failed (receiver gone?)");
             }
         }
-        // Join the reader thread AFTER the close_tx send so a
-        // hang on join doesn't strand the close notification.
         if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
         }
@@ -784,6 +815,8 @@ mod internal_sanity_tests {
             bytes_rx: dummy_rx,
             reader_thread: Some(blocking_thread),
             close_tx: Some(close_tx),
+            stored_layer_id: layer_id,
+            widget: None,
         };
         // Drop on a separate thread so the test thread can check
         // close_rx without hanging on the blocking join().

@@ -36,7 +36,9 @@
 //! layout {
 //!   split axis=horizontal|vertical ratio=<n> { ... }
 //!   stack { pane* }
-//!   pane kind=shell [label="..."]
+//!   pane kind=shell [label="..."] [command="..."]
+//!   pane kind=widget ref-name="<name>" [label="..."]
+//!   pane kind=script command="<cmd>" [label="..."]
 //!   preset "name" | preset name="..."
 //! }
 //! keybinds {
@@ -74,6 +76,56 @@ pub struct Config {
     /// [`parse`] from a top-level `presets { … }` block; an empty
     /// map means no presets are defined.
     pub presets: BTreeMap<String, LayoutNode>,
+    /// Optional status bar configuration. When `None`, no status
+    /// bar is rendered (the default). When `Some(Bar)`, a single
+    /// row is reserved at the configured position and the bar is
+    /// rendered in phase 3a after pane blits.
+    pub status_bar: Option<Bar>,
+}
+
+/// Configuration for the optional status bar.
+///
+/// Parsed from a top-level `status_bar { ... }` block in the
+/// KDL config. When present and `enabled = true`, a single row
+/// is reserved at the configured position (top or bottom) and
+/// the status bar is rendered in phase 3a.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bar {
+    /// Whether the status bar is enabled. Defaults to `false`
+    /// when the block is present but `enabled` is omitted.
+    pub enabled: bool,
+    /// Position of the status bar. `Top` renders above panes
+    /// (below the tab bar); `Bottom` renders below panes.
+    pub position: BarPosition,
+    /// Show the current time (HH:MM format).
+    pub show_clock: bool,
+    /// Show the focused pane's label (if set).
+    pub show_pane_title: bool,
+    /// Show the active keybind mode (Normal, PaneResize, etc.).
+    pub show_mode: bool,
+}
+
+impl Default for Bar {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            position: BarPosition::Bottom,
+            show_clock: true,
+            show_pane_title: true,
+            show_mode: true,
+        }
+    }
+}
+
+/// Position of the status bar on screen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BarPosition {
+    /// Render the status bar at the top of the screen, below
+    /// the tab bar.
+    Top,
+    /// Render the status bar at the bottom of the screen.
+    #[default]
+    Bottom,
 }
 
 /// A node in the layout tree.
@@ -132,11 +184,21 @@ pub struct Pane {
     pub command: Option<String>,
 }
 
-/// First-release flavor of pane.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Flavor of pane. `Widget` carries a `ref_name` that maps to
+/// a dynamically-loaded cdylib in `~/.config/cmdash/widgets/<ref_name>/`.
+/// `Script` carries a command string that is spawned as a child
+/// process speaking the [`cmdash_protocol`] wire format.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum PaneKind {
     #[default]
     Shell,
+    /// `kind=widget ref-name="<name>"` — loaded via `libloading`
+    /// at startup from `~/.config/cmdash/widgets/<ref_name>/`.
+    Widget { ref_name: String },
+    /// `kind=script command="<cmd>"` — spawned as a child process
+    /// with piped stdin/stdout speaking the line-delimited frame
+    /// protocol. The command is stored in [`Pane::command`].
+    Script,
 }
 
 /// A keybind line: `bind "<chord>" action="<action>"`.
@@ -248,6 +310,21 @@ pub enum KeyAction {
     /// `tab.switch.<n>` (n in 1..=9) -- switch focus to the
     /// nth tab; the M-1..M-9 default keybinds.
     TabSwitch(usize),
+    /// Enter PaneResize mode. Arrow keys will resize the focused
+    /// pane's parent split until Escape is pressed.
+    EnterPaneResize,
+    /// Enter TabSwitch mode. Number keys 1-9 switch tabs.
+    EnterTabSwitch,
+    /// Enter PresetPick mode. Number keys select presets.
+    EnterPresetPick,
+    /// Exit the current mode back to Normal.
+    ModeExit,
+    /// Resize the focused pane's split in a direction.
+    /// Used while in PaneResize mode.
+    PaneResizeUp,
+    PaneResizeDown,
+    PaneResizeLeft,
+    PaneResizeRight,
 }
 
 /// A cmdash config error.
@@ -267,6 +344,8 @@ pub enum ConfigError {
     DuplicateLayout,
     #[error("duplicate `presets` block")]
     DuplicatePresets,
+    #[error("duplicate `status_bar` block")]
+    DuplicateStatusBar,
     #[error("`presets` may only contain `preset`, got `{0}`")]
     UnexpectedPresetsChild(String),
     #[error("duplicate preset name `{0}`")]
@@ -281,74 +360,173 @@ pub enum ConfigError {
     InvalidChord(String),
     #[error("invalid action: {0}")]
     InvalidAction(String),
+    #[error("invalid status_bar: {0}")]
+    InvalidStatusBar(String),
     #[error("`split` must have exactly 2 children; got {0}")]
     SplitChildCount(usize),
 }
 
+/// A non-fatal syntax hint surfaced by the pre-scan validator.
+/// These are advisory — the KDL parser may still succeed — but
+/// flagging them early gives users actionable feedback before
+/// the opaque "KDL syntax error" message from kdl-rs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigWarning {
+    /// Possible unclosed brace, missing value after `=`,
+    /// empty block, or trailing comma.
+    SyntaxHint { line: usize, message: String },
+}
+
+impl std::fmt::Display for ConfigWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigWarning::SyntaxHint { line, message } => {
+                write!(f, "line {line}: {message}")
+            }
+        }
+    }
+}
+
 /// Parse a cmdash configuration from raw KDL source.
 pub fn parse(source: &str) -> Result<Config, ConfigError> {
-    let doc: KdlDocument = source
-        .parse()
-        .map_err(|e: kdl::KdlError| ConfigError::Kdl(e.to_string()))?;
+    let mut errors = Vec::new();
+    let cfg = parse_into(source, &mut errors);
+    match errors.into_iter().next() {
+        Some(e) => Err(e),
+        None => Ok(cfg),
+    }
+}
+
+/// Parse a cmdash configuration, collecting errors instead of
+/// short-circuiting on the first one. Returns the partially-parsed
+/// config (populated fields for successful top-level nodes) alongside
+/// the list of errors encountered. Used by the config hot-reload
+/// watcher so a single bad node doesn't prevent other nodes from
+/// being loaded.
+pub fn parse_collect(source: &str) -> (Config, Vec<ConfigError>) {
+    let mut errors = Vec::new();
+    let cfg = parse_into(source, &mut errors);
+    (cfg, errors)
+}
+
+/// Shared walker: populates a [`Config`] from KDL source,
+/// pushing any errors into `errors` instead of returning them.
+/// Both [`parse`] and [`parse_collect`] delegate here so the
+/// top-level node dispatch stays in one place.
+fn parse_into(source: &str, errors: &mut Vec<ConfigError>) -> Config {
+    let doc: KdlDocument = match source.parse() {
+        Ok(d) => d,
+        Err(e) => {
+            errors.push(ConfigError::Kdl(e.to_string()));
+            return Config::default();
+        }
+    };
     let mut cfg = Config::default();
     for n in doc.nodes() {
         let name = n.name().value();
         match name {
             "layout" => {
                 if cfg.layout.is_some() {
-                    return Err(ConfigError::DuplicateLayout);
+                    errors.push(ConfigError::DuplicateLayout);
+                    continue;
                 }
-                // The outer `layout { ... }` is a single-node container.
-                // Descend into its first (and only) child, which is the
-                // actual root LayoutNode.
-                let children = n.children().ok_or_else(|| {
-                    ConfigError::UnknownLayoutNode("layout block must contain a LayoutNode".into())
-                })?;
+                let children = match n.children() {
+                    Some(c) => c,
+                    None => {
+                        errors.push(ConfigError::UnknownLayoutNode(
+                            "layout block must contain a LayoutNode".into(),
+                        ));
+                        continue;
+                    }
+                };
                 let kids = children.nodes();
-                let first = kids.first().ok_or_else(|| {
-                    ConfigError::UnknownLayoutNode("layout block must contain a LayoutNode".into())
-                })?;
+                let first = match kids.first() {
+                    Some(f) => f,
+                    None => {
+                        errors.push(ConfigError::UnknownLayoutNode(
+                            "layout block must contain a LayoutNode".into(),
+                        ));
+                        continue;
+                    }
+                };
                 if kids.len() > 1 {
-                    return Err(ConfigError::UnknownLayoutNode(
+                    errors.push(ConfigError::UnknownLayoutNode(
                         "layout block may contain exactly one LayoutNode".into(),
                     ));
+                    continue;
                 }
-                cfg.layout = Some(read_layout(first)?);
+                match read_layout(first) {
+                    Ok(node) => cfg.layout = Some(node),
+                    Err(e) => errors.push(e),
+                }
             }
             "keybinds" => {
                 if let Some(c) = n.children() {
                     for k in c.nodes() {
                         if k.name().value() != "bind" {
-                            return Err(ConfigError::UnexpectedKindbindChild(
+                            errors.push(ConfigError::UnexpectedKindbindChild(
                                 k.name().value().to_string(),
                             ));
+                            continue;
                         }
-                        cfg.keybinds.push(read_keybind(k)?);
+                        match read_keybind(k) {
+                            Ok(kb) => cfg.keybinds.push(kb),
+                            Err(e) => errors.push(e),
+                        }
                     }
                 }
             }
             "presets" => {
                 if !cfg.presets.is_empty() {
-                    return Err(ConfigError::DuplicatePresets);
+                    errors.push(ConfigError::DuplicatePresets);
+                    continue;
                 }
-                let c = n.children().ok_or(ConfigError::EmptyChildren("presets"))?;
+                let c = match n.children() {
+                    Some(c) => c,
+                    None => {
+                        errors.push(ConfigError::EmptyChildren("presets"));
+                        continue;
+                    }
+                };
                 for k in c.nodes() {
                     if k.name().value() != "preset" {
-                        return Err(ConfigError::UnexpectedPresetsChild(
+                        errors.push(ConfigError::UnexpectedPresetsChild(
                             k.name().value().to_string(),
                         ));
+                        continue;
                     }
-                    let (name, body) = read_named_preset(k)?;
-                    if cfg.presets.contains_key(&name) {
-                        return Err(ConfigError::DuplicatePreset(name));
+                    match read_named_preset(k) {
+                        Ok((name, body)) => {
+                            use std::collections::btree_map::Entry;
+                            match cfg.presets.entry(name) {
+                                Entry::Vacant(e) => {
+                                    e.insert(body);
+                                }
+                                Entry::Occupied(e) => {
+                                    errors.push(ConfigError::DuplicatePreset(e.key().clone()));
+                                }
+                            }
+                        }
+                        Err(e) => errors.push(e),
                     }
-                    cfg.presets.insert(name, body);
                 }
             }
-            other => return Err(ConfigError::UnknownTopLevel(other.into())),
+            "status_bar" => {
+                if cfg.status_bar.is_some() {
+                    errors.push(ConfigError::DuplicateStatusBar);
+                    continue;
+                }
+                match read_status_bar(n) {
+                    Ok(bar) => cfg.status_bar = Some(bar),
+                    Err(e) => errors.push(e),
+                }
+            }
+            other => {
+                errors.push(ConfigError::UnknownTopLevel(other.into()));
+            }
         }
     }
-    Ok(cfg)
+    cfg
 }
 
 fn read_layout(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
@@ -426,22 +604,42 @@ fn read_stack(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
 }
 
 fn read_pane(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
-    let mut kind = PaneKind::default();
+    let mut kind_is_widget = false;
+    let mut kind_is_script = false;
+    let mut ref_name: Option<String> = None;
     let mut label: Option<String> = None;
     let mut command: Option<String> = None;
     for entry in n.entries() {
         let key = entry.name().map(|id| id.value());
         let raw = entry_to_string(entry);
         match (key, raw.as_str()) {
-            (Some("kind"), "shell") => kind = PaneKind::Shell,
+            (Some("kind"), "shell") => {}
+            (Some("kind"), "widget") => kind_is_widget = true,
+            (Some("kind"), "script") => kind_is_script = true,
             (Some("kind"), _) if !raw.is_empty() => {
                 return Err(ConfigError::InvalidPaneKind(raw));
             }
+            (Some("ref-name"), _) => ref_name = Some(raw),
             (Some("label"), _) => label = Some(raw),
             (Some("command"), _) => command = Some(raw),
             _ => {}
         }
     }
+    let kind = if kind_is_widget {
+        let rn = ref_name.ok_or_else(|| {
+            ConfigError::InvalidPaneKind("widget kind requires `ref-name` attribute".into())
+        })?;
+        PaneKind::Widget { ref_name: rn }
+    } else if kind_is_script {
+        if command.is_none() {
+            return Err(ConfigError::InvalidPaneKind(
+                "script kind requires `command` attribute".into(),
+            ));
+        }
+        PaneKind::Script
+    } else {
+        PaneKind::Shell
+    };
     Ok(LayoutNode::Pane(Pane {
         kind,
         label,
@@ -519,6 +717,74 @@ fn read_named_preset(n: &KdlNode) -> Result<(String, LayoutNode), ConfigError> {
     }
     let body = read_layout(first)?;
     Ok((name, body))
+}
+
+/// Parse a top-level `status_bar { ... }` block.
+///
+/// Recognized keys:
+/// - `enabled` (bool, default `false`)
+/// - `position` (string: `"top"` or `"bottom"`, default `"bottom"`)
+/// - `show-clock` (bool, default `true`)
+/// - `show-pane-title` (bool, default `true`)
+/// - `show-mode` (bool, default `true`)
+fn read_status_bar(n: &KdlNode) -> Result<Bar, ConfigError> {
+    let mut bar = Bar::default();
+    if let Some(c) = n.children() {
+        for child in c.nodes() {
+            match child.name().value() {
+                "enabled" => {
+                    bar.enabled = child
+                        .entries()
+                        .first()
+                        .and_then(|e| e.value().as_bool())
+                        .unwrap_or(true);
+                }
+                "position" => {
+                    let val = child
+                        .entries()
+                        .first()
+                        .map(entry_to_string)
+                        .unwrap_or_default();
+                    match val.as_str() {
+                        "top" => bar.position = BarPosition::Top,
+                        "bottom" => bar.position = BarPosition::Bottom,
+                        other => {
+                            return Err(ConfigError::InvalidStatusBar(format!(
+                                "unknown position `{other}`; expected \"top\" or \"bottom\""
+                            )));
+                        }
+                    }
+                }
+                "show-clock" => {
+                    bar.show_clock = child
+                        .entries()
+                        .first()
+                        .and_then(|e| e.value().as_bool())
+                        .unwrap_or(true);
+                }
+                "show-pane-title" => {
+                    bar.show_pane_title = child
+                        .entries()
+                        .first()
+                        .and_then(|e| e.value().as_bool())
+                        .unwrap_or(true);
+                }
+                "show-mode" => {
+                    bar.show_mode = child
+                        .entries()
+                        .first()
+                        .and_then(|e| e.value().as_bool())
+                        .unwrap_or(true);
+                }
+                other => {
+                    return Err(ConfigError::InvalidStatusBar(format!(
+                        "unknown key `{other}` in status_bar block"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(bar)
 }
 
 fn read_keybind(n: &KdlNode) -> Result<Keybind, ConfigError> {
@@ -640,6 +906,16 @@ fn parse_action(s: &str) -> Option<KeyAction> {
         "pane.stack.up" => Some(KeyAction::PaneStackUp),
         "pane.stack.left" => Some(KeyAction::PaneStackLeft),
         "pane.stack.right" => Some(KeyAction::PaneStackRight),
+        // Mode entry actions.
+        "pane.resize.enter" => Some(KeyAction::EnterPaneResize),
+        "tab.switch.enter" => Some(KeyAction::EnterTabSwitch),
+        "preset.pick.enter" => Some(KeyAction::EnterPresetPick),
+        "mode.exit" => Some(KeyAction::ModeExit),
+        // Pane resize actions (used inside PaneResize mode).
+        "pane.resize.up" => Some(KeyAction::PaneResizeUp),
+        "pane.resize.down" => Some(KeyAction::PaneResizeDown),
+        "pane.resize.left" => Some(KeyAction::PaneResizeLeft),
+        "pane.resize.right" => Some(KeyAction::PaneResizeRight),
         // `pane.preset` (bare, no name suffix) is rejected so a
         // missing name surfaces as `InvalidAction` at config-parse
         // time rather than as a runtime no-op — mirrors the
@@ -721,6 +997,314 @@ fn action_tab_switch_hint(s: &str) -> String {
     } else {
         String::new()
     }
+}
+
+/// Format config errors with source-context caret lines.
+///
+/// Each error is rendered with the error message followed by
+/// the offending source line and a caret pointing to the
+/// approximate column. Line numbers are extracted from the
+/// error message text where possible (kdl-rs embeds
+/// `line:col-line:col` spans in its syntax-error messages).
+/// For non-KDL errors (which lack positional info) the
+/// function falls back to showing no context line.
+pub fn format_errors_with_context(
+    errors: &[ConfigError],
+    source: &str,
+    file_label: Option<&str>,
+) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out = String::new();
+    for (i, err) in errors.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if let Some(label) = file_label {
+            out.push_str(&format!("{label}: "));
+        }
+        let msg = err.to_string();
+        out.push_str(&msg);
+        // Try to extract a line number from the error message.
+        // kdl-rs syntax errors contain spans like "3:5-3:10" or
+        // "3:5" in the message body.
+        if let Some((line_num, col)) = extract_line_col_from_msg(&msg) {
+            let line_idx = line_num.saturating_sub(1); // 1-based → 0-based
+            if line_idx < lines.len() {
+                out.push('\n');
+                out.push_str(&format!("  {}:\n", line_num));
+                out.push_str(&format!("  {}\n", lines[line_idx]));
+                // Caret underline.
+                let col_start = col;
+                out.push_str(&format!("  {}^", " ".repeat(col_start)));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Attempt to extract a `(line, col)` pair from a KDL error
+/// message string. kdl-rs embeds spans in the form
+/// `N:M-N:M` or `N:M` where `N` is the 1-based line number
+/// and `M` is the 1-based column. Returns `None` if no
+/// span is found.
+fn extract_line_col_from_msg(msg: &str) -> Option<(usize, usize)> {
+    // Look for a pattern like "3:5" or "3:5-3:10" in the message.
+    for token in msg.split_whitespace() {
+        // Try "N:M-N:M" first.
+        if let Some(rest) = token.strip_prefix(char::is_numeric) {
+            // rest starts after first digit(s) of line number.
+            if rest.starts_with(':') {
+                // Find the col after ':'
+                if let Some(col_part) = rest.strip_prefix(':') {
+                    // col_part should start with digits.
+                    let col_str: String = col_part
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if !col_str.is_empty() {
+                        let line_str: String = token.chars().take_while(|c| *c != ':').collect();
+                        if let (Ok(line), Ok(col)) =
+                            (line_str.parse::<usize>(), col_str.parse::<usize>())
+                        {
+                            return Some((line, col));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: scan character-by-character for "digit+:digit+".
+    let chars: Vec<char> = msg.chars().collect();
+    for w in 0..chars.len() {
+        if chars[w].is_ascii_digit() {
+            // Collect line digits.
+            let mut line_digits = String::new();
+            let mut j = w;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                line_digits.push(chars[j]);
+                j += 1;
+            }
+            // Expect ':'
+            if j < chars.len() && chars[j] == ':' {
+                j += 1;
+                // Collect col digits.
+                let mut col_digits = String::new();
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    col_digits.push(chars[j]);
+                    j += 1;
+                }
+                if !line_digits.is_empty() && !col_digits.is_empty() {
+                    if let (Ok(line), Ok(col)) =
+                        (line_digits.parse::<usize>(), col_digits.parse::<usize>())
+                    {
+                        return Some((line, col));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Lightweight pre-scan of KDL source for common syntax mistakes.
+///
+/// Runs a character-by-character scan BEFORE the full KDL parse to
+/// surface advisory [`ConfigWarning::SyntaxHint`]s for issues the kdl-rs parser
+/// either silently accepts or produces opaque error messages for.
+///
+/// Checks performed:
+/// - Unmatched `{` or `}` (brace depth)
+/// - Missing value after `=` (e.g. `split axis=` with no value)
+/// - Empty blocks `{ }` with no children
+/// - Trailing commas at end of a line
+pub fn pre_scan_kdl(source: &str) -> Vec<ConfigWarning> {
+    let mut hints = Vec::new();
+    let mut brace_depth: i32 = 0;
+    let mut in_string = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut prev_nonws: char = '\0';
+    let mut line_number: usize = 1;
+
+    let chars: Vec<char> = source.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let c = chars[i];
+
+        // Track line numbers.
+        if c == '\n' {
+            line_number += 1;
+            if !in_block_comment {
+                in_line_comment = false;
+            }
+            prev_nonws = '\0';
+            i += 1;
+            continue;
+        }
+
+        // Inside a line comment — skip to end of line.
+        if in_line_comment {
+            i += 1;
+            continue;
+        }
+
+        // Inside a block comment — scan for `*/`.
+        if in_block_comment {
+            if c == '*' && i + 1 < len && chars[i + 1] == '/' {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Inside a quoted string — skip to closing quote.
+        if in_string {
+            if c == '\\' && i + 1 < len {
+                i += 2; // skip escaped char
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Start of a line comment.
+        if c == '/' && i + 1 < len && chars[i + 1] == '/' {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+
+        // Start of a block comment.
+        if c == '/' && i + 1 < len && chars[i + 1] == '*' {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+
+        // Start of a string.
+        if c == '"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+
+        // Brace tracking.
+        if c == '{' {
+            brace_depth += 1;
+            // Empty block check: peek ahead for `}` (ignoring
+            // whitespace, `//` line comments, and `/* */` block
+            // comments). A block containing only comments is NOT
+            // flagged as empty because the comment is meaningful
+            // content.
+            let mut j = i + 1;
+            let mut saw_comment = false;
+            loop {
+                // Skip whitespace.
+                while j < len && chars[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                // Skip `//` line comments (to end of line).
+                if j + 1 < len && chars[j] == '/' && chars[j + 1] == '/' {
+                    saw_comment = true;
+                    j += 2;
+                    while j < len && chars[j] != '\n' {
+                        j += 1;
+                    }
+                    continue;
+                }
+                // Skip `/* */` block comments.
+                if j + 1 < len && chars[j] == '/' && chars[j + 1] == '*' {
+                    saw_comment = true;
+                    j += 2;
+                    while j + 1 < len {
+                        if chars[j] == '*' && chars[j + 1] == '/' {
+                            j += 2;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+            if !saw_comment && j < len && chars[j] == '}' {
+                hints.push(ConfigWarning::SyntaxHint {
+                    line: line_number,
+                    message: "empty block `{ }` has no children".into(),
+                });
+            }
+        } else if c == '}' {
+            brace_depth -= 1;
+            if brace_depth < 0 {
+                hints.push(ConfigWarning::SyntaxHint {
+                    line: line_number,
+                    message: "extra closing brace `}` without matching `{`".into(),
+                });
+            }
+        }
+
+        // Missing value after `=`: if `=` is followed by whitespace
+        // then `{` or end-of-thing, flag it.
+        if c == '=' {
+            let mut j = i + 1;
+            while j < len && chars[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < len && (chars[j] == '{' || chars[j] == '}') {
+                hints.push(ConfigWarning::SyntaxHint {
+                    line: line_number,
+                    message: "missing value after `=`".into(),
+                });
+            }
+        }
+
+        // Trailing comma: if this line ends with `,` after
+        // non-whitespace content, flag it.
+        if c == ',' && prev_nonws != '\0' {
+            // Check if this is the last non-whitespace on the line.
+            let mut j = i + 1;
+            let mut trailing = true;
+            while j < len {
+                if chars[j] == '\n' {
+                    break;
+                }
+                if !chars[j].is_ascii_whitespace() {
+                    trailing = false;
+                    break;
+                }
+                j += 1;
+            }
+            if trailing {
+                hints.push(ConfigWarning::SyntaxHint {
+                    line: line_number,
+                    message: "trailing comma".into(),
+                });
+            }
+        }
+
+        if !c.is_ascii_whitespace() {
+            prev_nonws = c;
+        }
+        i += 1;
+    }
+
+    // Unclosed brace: depth > 0 at end of input.
+    if brace_depth > 0 {
+        hints.push(ConfigWarning::SyntaxHint {
+            line: line_number,
+            message: format!("unclosed block: {brace_depth} unclosed brace(s) at end of input"),
+        });
+    }
+
+    hints
 }
 
 // ===========================================================================
@@ -1558,6 +2142,685 @@ mod tests {
                 match &children[1] {
                     LayoutNode::Pane(p) => {
                         assert_eq!(p.command, Some("htop".to_string()));
+                    }
+                    other => panic!("expected Pane, got: {:?}", other),
+                }
+            }
+            other => panic!("expected Split, got: {:?}", other),
+        }
+    }
+
+    // ============================================================
+    // §3.8 Pre-scan validator tests.
+    // ============================================================
+
+    /// Unclosed brace detected by pre-scan.
+    #[test]
+    fn pre_scan_unclosed_brace() {
+        let hints = pre_scan_kdl("layout { split {");
+        assert!(
+            hints.iter().any(|h| matches!(h,
+                ConfigWarning::SyntaxHint { ref message, .. }
+                if message.contains("unclosed")
+            )),
+            "must detect unclosed brace; got: {hints:?}"
+        );
+    }
+
+    /// Extra close brace detected by pre-scan.
+    #[test]
+    fn pre_scan_extra_close_brace() {
+        let hints = pre_scan_kdl("layout { pane kind=shell } }");
+        assert!(
+            hints.iter().any(|h| matches!(h,
+                ConfigWarning::SyntaxHint { ref message, .. }
+                if message.contains("extra closing brace")
+            )),
+            "must detect extra close brace; got: {hints:?}"
+        );
+    }
+
+    /// Missing value after `=` detected by pre-scan.
+    #[test]
+    fn pre_scan_missing_value_after_equals() {
+        let hints = pre_scan_kdl("split axis= {");
+        assert!(
+            hints.iter().any(|h| matches!(h,
+                ConfigWarning::SyntaxHint { ref message, .. }
+                if message.contains("missing value after")
+            )),
+            "must detect missing value after =; got: {hints:?}"
+        );
+    }
+
+    /// Empty block detected by pre-scan.
+    #[test]
+    fn pre_scan_empty_block() {
+        let hints = pre_scan_kdl("layout { } ");
+        assert!(
+            hints.iter().any(|h| matches!(h,
+                ConfigWarning::SyntaxHint { ref message, .. }
+                if message.contains("empty block")
+            )),
+            "must detect empty block; got: {hints:?}"
+        );
+    }
+
+    /// Trailing comma detected by pre-scan.
+    #[test]
+    fn pre_scan_trailing_comma() {
+        let src = "bind \"alt-w\" action=\"pane.close\",\n";
+        let hints = pre_scan_kdl(src);
+        assert!(
+            hints.iter().any(|h| matches!(h,
+                ConfigWarning::SyntaxHint { ref message, .. }
+                if message.contains("trailing comma")
+            )),
+            "must detect trailing comma; got: {hints:?}"
+        );
+    }
+
+    /// Valid KDL produces no hints.
+    #[test]
+    fn pre_scan_valid_kdl_no_hints() {
+        let src = r#"
+            layout {
+                split axis=horizontal ratio=0.5 {
+                    pane kind=shell label="a"
+                    pane kind=shell label="b"
+                }
+            }
+        "#;
+        let hints = pre_scan_kdl(src);
+        assert!(
+            hints.is_empty(),
+            "valid KDL must produce no hints; got: {hints:?}"
+        );
+    }
+
+    /// Empty source produces no hints.
+    #[test]
+    fn pre_scan_empty_source_no_hints() {
+        let hints = pre_scan_kdl("");
+        assert!(hints.is_empty());
+    }
+
+    /// Line numbers are correct in hints.
+    #[test]
+    fn pre_scan_hint_reports_correct_line() {
+        let src2 = "line1\nkey= {\n";
+        let hints = pre_scan_kdl(src2);
+        assert!(
+            hints
+                .iter()
+                .any(|h| matches!(h, ConfigWarning::SyntaxHint { line: 2, .. })),
+            "hints should report line 2 for issues on line 2; got: {hints:?}"
+        );
+    }
+
+    /// Strings containing braces do not false-positive.
+    #[test]
+    fn pre_scan_braces_in_strings_ignored() {
+        let src = r#"layout { pane kind=shell label="{foo}" }"#;
+        let hints = pre_scan_kdl(src);
+        let brace_hints: Vec<_> = hints
+            .iter()
+            .filter(|h| {
+                matches!(h,
+                    ConfigWarning::SyntaxHint { ref message, .. }
+                    if message.contains("brace") || message.contains("unclosed")
+                )
+            })
+            .collect();
+        assert!(
+            brace_hints.is_empty(),
+            "braces inside strings must not trigger hints; got: {brace_hints:?}"
+        );
+    }
+
+    /// `ConfigWarning::SyntaxHint` Display impl includes line number.
+    #[test]
+    fn syntax_hint_display_includes_line() {
+        let hint = ConfigWarning::SyntaxHint {
+            line: 42,
+            message: "test message".into(),
+        };
+        let s = format!("{hint}");
+        assert!(
+            s.contains("42"),
+            "Display must include line number; got: {s}"
+        );
+        assert!(
+            s.contains("test message"),
+            "Display must include message; got: {s}"
+        );
+    }
+
+    /// A block containing only a `//` line comment is NOT
+    /// flagged as empty. Pins the fix for the false-positive
+    /// where `node { // placeholder }` was incorrectly
+    /// detected as an empty block.
+    #[test]
+    fn pre_scan_commented_block_not_flagged_as_empty() {
+        let src = "node { // placeholder
+}
+";
+        let hints = pre_scan_kdl(src);
+        let empty_hints: Vec<_> = hints
+            .iter()
+            .filter(|h| {
+                matches!(h,
+                    ConfigWarning::SyntaxHint { ref message, .. }
+                    if message.contains("empty block")
+                )
+            })
+            .collect();
+        assert!(
+            empty_hints.is_empty(),
+            "commented block must not be flagged empty; got: {empty_hints:?}"
+        );
+    }
+
+    /// A block containing only a `/* */` block comment is NOT
+    /// flagged as empty. Pins the fix that added block-comment
+    /// peek support to the empty block check.
+    #[test]
+    fn pre_scan_block_comment_not_flagged_as_empty() {
+        let src = "node { /* placeholder */ }
+";
+        let hints = pre_scan_kdl(src);
+        let empty_hints: Vec<_> = hints
+            .iter()
+            .filter(|h| {
+                matches!(h,
+                    ConfigWarning::SyntaxHint { ref message, .. }
+                    if message.contains("empty block")
+                )
+            })
+            .collect();
+        assert!(
+            empty_hints.is_empty(),
+            "block-comment block must not be flagged empty; got: {empty_hints:?}"
+        );
+    }
+
+    /// A block containing only a `/* */` block comment
+    /// spanning multiple lines is NOT flagged as empty.
+    #[test]
+    fn pre_scan_multiline_block_comment_not_flagged_as_empty() {
+        let src = "node { /* line one
+   line two */
+}
+";
+        let hints = pre_scan_kdl(src);
+        let empty_hints: Vec<_> = hints
+            .iter()
+            .filter(|h| {
+                matches!(h,
+                    ConfigWarning::SyntaxHint { ref message, .. }
+                    if message.contains("empty block")
+                )
+            })
+            .collect();
+        assert!(
+            empty_hints.is_empty(),
+            "multiline block-comment block must not be flagged empty; got: {empty_hints:?}"
+        );
+    }
+
+    /// Block comment containing `{` does not inflate brace
+    /// depth. Without `in_block_comment` tracking in the main
+    /// scan body, the unbalanced `{` inside `/* ... */` would
+    /// increment `brace_depth` and produce a false "unclosed
+    /// brace" hint.
+    #[test]
+    fn pre_scan_block_comment_brace_not_tracked() {
+        // Unbalanced `{` inside block comment: without tracking,
+        // brace_depth would reach 2 and never return to 0.
+        let src = "layout { /* { */ pane kind=shell }\n";
+        let hints = pre_scan_kdl(src);
+        let brace_hints: Vec<_> = hints
+            .iter()
+            .filter(|h| {
+                matches!(h,
+                    ConfigWarning::SyntaxHint { ref message, .. }
+                    if message.contains("brace") || message.contains("unclosed")
+                )
+            })
+            .collect();
+        assert!(
+            brace_hints.is_empty(),
+            "braces inside block comments must not trigger hints; got: {brace_hints:?}"
+        );
+    }
+
+    /// Block comment containing `}` does not deflate brace
+    /// depth. The symmetric case to the `{` test above.
+    #[test]
+    fn pre_scan_block_comment_close_brace_not_tracked() {
+        let src = "layout { pane kind=shell /* } */ }\n";
+        let hints = pre_scan_kdl(src);
+        let brace_hints: Vec<_> = hints
+            .iter()
+            .filter(|h| {
+                matches!(h,
+                    ConfigWarning::SyntaxHint { ref message, .. }
+                    if message.contains("brace") || message.contains("unclosed")
+                )
+            })
+            .collect();
+        assert!(
+            brace_hints.is_empty(),
+            "close brace inside block comment must not trigger hints; got: {brace_hints:?}"
+        );
+    }
+    /// Block comment containing `=` does not trigger the
+    /// "missing value after `=`" check. Without block comment
+    /// tracking, `=` inside `/* ... */` followed by `}` would
+    /// produce a false hint because the `=` check looks at
+    /// the next non-whitespace char after `=` (which would be
+    /// the `}` from `*/` if block comment chars were processed).
+    #[test]
+    fn pre_scan_block_comment_equals_not_tracked() {
+        // `=` INSIDE block comment: without tracking, the `=`
+        // check would see `}` as the next non-whitespace char
+        // (from `*/}`) and flag "missing value after `=`".
+        let src = "split /* axis=} */horizontal {\n    pane kind=shell\n    pane kind=shell\n}\n";
+        let hints = pre_scan_kdl(src);
+        let eq_hints: Vec<_> = hints
+            .iter()
+            .filter(|h| {
+                matches!(h,
+                    ConfigWarning::SyntaxHint { ref message, .. }
+                    if message.contains("missing value after")
+                )
+            })
+            .collect();
+        assert!(
+            eq_hints.is_empty(),
+            "= inside block comment must not trigger hint; got: {eq_hints:?}"
+        );
+    }
+
+    /// Unclosed `/*` at EOF does not produce spurious hints
+    /// (the block comment consumes the rest of the input
+    /// without triggering brace or `=` false positives).
+    #[test]
+    fn pre_scan_unclosed_block_comment_at_eof_no_spurious_hints() {
+        let src = "layout { pane kind=shell /* unclosed\n";
+        let hints = pre_scan_kdl(src);
+        // Should only get the unclosed brace hint (depth=1),
+        // NOT a false "missing value" or "extra brace".
+        let false_positives: Vec<_> = hints
+            .iter()
+            .filter(|h| {
+                matches!(h,
+                    ConfigWarning::SyntaxHint { ref message, .. }
+                    if message.contains("missing value") || message.contains("extra closing")
+                )
+            })
+            .collect();
+        assert!(
+            false_positives.is_empty(),
+            "unclosed block comment must not produce false-positive hints; got: {false_positives:?}"
+        );
+    }
+
+    // ============================================================
+    // §3.9 extract_line_col_from_msg and format_errors_with_context tests.
+    // ============================================================
+
+    /// KDL syntax error with span "3:5-3:10" extracts (3, 5).
+    #[test]
+    fn extract_line_col_from_kdl_span() {
+        let msg = "cmdash config: KDL syntax error:
+3:5-3:10 expected value, got `}`";
+        let result = extract_line_col_from_msg(msg);
+        assert_eq!(result, Some((3, 5)));
+    }
+
+    /// Single-position span "2:0" extracts (2, 0).
+    #[test]
+    fn extract_line_col_from_single_pos() {
+        let msg = "error at 2:0";
+        let result = extract_line_col_from_msg(msg);
+        assert_eq!(result, Some((2, 0)));
+    }
+
+    /// No span info returns None.
+    #[test]
+    fn extract_line_col_no_span_returns_none() {
+        let msg = "duplicate `layout` block";
+        let result = extract_line_col_from_msg(msg);
+        assert_eq!(result, None);
+    }
+
+    /// Empty string returns None.
+    #[test]
+    fn extract_line_col_empty_returns_none() {
+        assert_eq!(extract_line_col_from_msg(""), None);
+    }
+
+    /// format_errors_with_context shows correct source line
+    /// for a KDL error with positional info.
+    #[test]
+    fn format_errors_shows_correct_source_line() {
+        let src = "line one
+line two
+line three
+";
+        let err = ConfigError::Kdl("1:5-1:5 expected value".into());
+        let formatted = format_errors_with_context(&[err], src, None);
+        // Should contain the error message, line number, and source line.
+        assert!(
+            formatted.contains("line one"),
+            "must show the source line; got: {formatted}"
+        );
+        assert!(
+            formatted.contains("1:"),
+            "must show the line number; got: {formatted}"
+        );
+        assert!(
+            formatted.contains("^"),
+            "must include a caret; got: {formatted}"
+        );
+    }
+
+    /// format_errors_with_context skips context for non-KDL
+    /// errors that have no positional info.
+    #[test]
+    fn format_errors_no_context_for_semantic_error() {
+        let src = "line one
+line two
+";
+        let err = ConfigError::DuplicateLayout;
+        let formatted = format_errors_with_context(&[err], src, None);
+        assert!(
+            formatted.contains("duplicate `layout` block"),
+            "must show the error message; got: {formatted}"
+        );
+        // Should NOT show a source line or caret.
+        assert!(
+            !formatted.contains("line one"),
+            "must not show source line for semantic error; got: {formatted}"
+        );
+    }
+
+    /// format_errors_with_context prepends file_label.
+    #[test]
+    fn format_errors_prepends_file_label() {
+        let src = "bad
+";
+        let err = ConfigError::Kdl("1:0-1:0 error".into());
+        let formatted = format_errors_with_context(&[err], src, Some("config.kdl"));
+        assert!(
+            formatted.starts_with("config.kdl: "),
+            "must prepend file label; got: {formatted}"
+        );
+    }
+
+    /// Multiple errors are separated by blank lines and each
+    /// gets its own source context when available.
+    #[test]
+    fn format_errors_multiple_errors_each_get_context() {
+        let src = "line one
+line two
+line three
+";
+        let errors = vec![
+            ConfigError::Kdl("1:0-1:0 syntax error".into()),
+            ConfigError::Kdl("3:2-3:2 another error".into()),
+        ];
+        let formatted = format_errors_with_context(&errors, src, None);
+        // Both source lines must appear.
+        assert!(
+            formatted.contains("line one"),
+            "must show first source line; got: {formatted}"
+        );
+        assert!(
+            formatted.contains("line three"),
+            "must show third source line; got: {formatted}"
+        );
+        // Errors separated by blank line.
+        let parts: Vec<&str> = formatted
+            .split(
+                "
+
+",
+            )
+            .collect();
+        assert!(
+            parts.len() >= 2,
+            "must have at least 2 error blocks separated by blank line; got: {formatted}"
+        );
+    }
+
+    /// Errors on different lines show their respective source
+    /// lines, not always line 1.
+    #[test]
+    fn format_errors_different_lines_show_correct_source() {
+        let src = "aaa
+bbb
+ccc
+";
+        let errors = vec![
+            ConfigError::Kdl("2:1-2:1 middle error".into()),
+            ConfigError::Kdl("3:0-3:0 last error".into()),
+        ];
+        let formatted = format_errors_with_context(&errors, src, None);
+        assert!(
+            formatted.contains("bbb"),
+            "first error should show line 2 source; got: {formatted}"
+        );
+        assert!(
+            formatted.contains("ccc"),
+            "second error should show line 3 source; got: {formatted}"
+        );
+        // Must NOT show line 1.
+        assert!(
+            !formatted.contains("aaa"),
+            "must not show unrelated line 1; got: {formatted}"
+        );
+    }
+
+    /// Mix of KDL errors (with spans) and semantic errors
+    /// (without spans) — KDL ones get context, semantic ones don't.
+    #[test]
+    fn format_errors_mixed_kdl_and_semantic() {
+        let src = "line one
+line two
+";
+        let errors = vec![
+            ConfigError::Kdl("1:3-1:3 bad token".into()),
+            ConfigError::DuplicateLayout,
+            ConfigError::Kdl("2:0-2:0 another".into()),
+        ];
+        let formatted = format_errors_with_context(&errors, src, None);
+        // KDL errors get source lines.
+        assert!(
+            formatted.contains("line one"),
+            "first KDL error must show its source line; got: {formatted}"
+        );
+        assert!(
+            formatted.contains("line two"),
+            "third error must show its source line; got: {formatted}"
+        );
+        // Semantic error in between does not show source.
+        let dup_idx = formatted.find("duplicate `layout` block").unwrap();
+        let near = &formatted[dup_idx..dup_idx + 80];
+        assert!(
+            !near.contains("line one") && !near.contains("line two"),
+            "semantic error must not show source line; got: {near}"
+        );
+    }
+
+    /// An empty error list produces an empty string with no
+    /// trailing newline or blank lines.
+    #[test]
+    fn format_errors_empty_list_returns_empty() {
+        let src = "valid config\n";
+        let formatted = format_errors_with_context(&[], src, None);
+        assert!(
+            formatted.is_empty(),
+            "empty error list must produce empty string; got: {formatted:?}"
+        );
+    }
+
+    // ============================================================
+    // § Widget pane kind parsing tests.
+    //
+    // Pin the `kind=widget ref-name="..."` round-trip so a future
+    // contributor who drops the widget arm from `read_pane` cannot
+    // silently regress to `PaneKind::Shell` for widget panes.
+    // ============================================================
+
+    /// `pane kind=widget ref-name="widget-clock"` round-trips into
+    /// `PaneKind::Widget { ref_name: "widget-clock" }`.
+    #[test]
+    fn parse_pane_widget_kind_round_trip() {
+        let src = r#"
+            layout {
+                pane kind=widget ref-name="widget-clock" label="clock"
+            }
+        "#;
+        let cfg = parse(src).expect("widget pane parses");
+        let layout = cfg.layout.expect("Config.layout populated");
+        match layout {
+            LayoutNode::Pane(p) => {
+                assert_eq!(p.label, Some("clock".to_string()));
+                assert_eq!(p.command, None);
+                match &p.kind {
+                    PaneKind::Widget { ref_name } => {
+                        assert_eq!(ref_name, "widget-clock");
+                    }
+                    other => panic!("expected Widget kind, got: {:?}", other),
+                }
+            }
+            other => panic!("expected Pane, got: {:?}", other),
+        }
+    }
+
+    /// `pane kind=widget` without `ref-name` is rejected.
+    #[test]
+    fn parse_pane_widget_kind_missing_ref_name_returns_err() {
+        let src = r#"
+            layout {
+                pane kind=widget label="broken"
+            }
+        "#;
+        let err = parse(src).expect_err("widget without ref-name must error");
+        assert!(
+            matches!(err, ConfigError::InvalidPaneKind(ref s) if s.contains("ref-name")),
+            "expected InvalidPaneKind mentioning ref-name; got: {err:?}"
+        );
+    }
+
+    /// Widget pane in a split layout round-trips correctly.
+    #[test]
+    fn parse_split_with_widget_and_shell_panes() {
+        let src = r#"
+            layout {
+                split axis=horizontal ratio=0.3 {
+                    pane kind=widget ref-name="widget-clock" label="clock"
+                    pane kind=shell label="shell"
+                }
+            }
+        "#;
+        let cfg = parse(src).expect("split with widget parses");
+        let layout = cfg.layout.expect("Config.layout populated");
+        match layout {
+            LayoutNode::Split { children, .. } => {
+                assert_eq!(children.len(), 2);
+                match &children[0] {
+                    LayoutNode::Pane(p) => match &p.kind {
+                        PaneKind::Widget { ref_name } => {
+                            assert_eq!(ref_name, "widget-clock");
+                        }
+                        other => panic!("expected Widget kind, got: {:?}", other),
+                    },
+                    other => panic!("expected Pane, got: {:?}", other),
+                }
+                match &children[1] {
+                    LayoutNode::Pane(p) => {
+                        assert!(matches!(p.kind, PaneKind::Shell));
+                    }
+                    other => panic!("expected Pane, got: {:?}", other),
+                }
+            }
+            other => panic!("expected Split, got: {:?}", other),
+        }
+    }
+
+    // ============================================================
+    // § Script pane kind parsing tests.
+    //
+    // Pin the `kind=script command="..."` round-trip so a future
+    // contributor who drops the script arm from `read_pane` cannot
+    // silently regress to `PaneKind::Shell` for script panes.
+    // ============================================================
+
+    /// `pane kind=script command="python3 foo.py"` round-trips into
+    /// `PaneKind::Script` with `Pane.command = Some("python3 foo.py")`.
+    #[test]
+    fn parse_pane_script_kind_round_trip() {
+        let src = r#"
+            layout {
+                pane kind=script command="python3 foo.py" label="my-script"
+            }
+        "#;
+        let cfg = parse(src).expect("script pane parses");
+        let layout = cfg.layout.expect("Config.layout populated");
+        match layout {
+            LayoutNode::Pane(p) => {
+                assert_eq!(p.label, Some("my-script".to_string()));
+                assert_eq!(p.command, Some("python3 foo.py".to_string()));
+                assert!(matches!(p.kind, PaneKind::Script));
+            }
+            other => panic!("expected Pane, got: {:?}", other),
+        }
+    }
+
+    /// `pane kind=script` without `command` is rejected.
+    #[test]
+    fn parse_pane_script_kind_missing_command_returns_err() {
+        let src = r#"
+            layout {
+                pane kind=script label="broken"
+            }
+        "#;
+        let err = parse(src).expect_err("script without command must error");
+        assert!(
+            matches!(err, ConfigError::InvalidPaneKind(ref s) if s.contains("command")),
+            "expected InvalidPaneKind mentioning command; got: {err:?}"
+        );
+    }
+
+    /// Script pane in a split layout with shell pane round-trips.
+    #[test]
+    fn parse_split_with_script_and_shell_panes() {
+        let src = r#"
+            layout {
+                split axis=horizontal ratio=0.3 {
+                    pane kind=script command="python3 widget.py" label="widget"
+                    pane kind=shell label="shell"
+                }
+            }
+        "#;
+        let cfg = parse(src).expect("split with script parses");
+        let layout = cfg.layout.expect("Config.layout populated");
+        match layout {
+            LayoutNode::Split { children, .. } => {
+                assert_eq!(children.len(), 2);
+                match &children[0] {
+                    LayoutNode::Pane(p) => {
+                        assert!(matches!(p.kind, PaneKind::Script));
+                        assert_eq!(p.command, Some("python3 widget.py".to_string()));
+                    }
+                    other => panic!("expected Pane, got: {:?}", other),
+                }
+                match &children[1] {
+                    LayoutNode::Pane(p) => {
+                        assert!(matches!(p.kind, PaneKind::Shell));
                     }
                     other => panic!("expected Pane, got: {:?}", other),
                 }

@@ -13,6 +13,8 @@ pub mod graphics;
 pub mod layer_id;
 pub mod pane;
 pub mod render;
+pub mod script_widget;
+pub mod status_bar;
 pub mod tabs;
 
 pub use graphics::{GraphicsError, GraphicsProtocol, GraphicsState, Metrics, TabBarData};

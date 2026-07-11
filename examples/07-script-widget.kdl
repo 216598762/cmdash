@@ -1,0 +1,28 @@
+// 07-script-widget.kdl — Example config demonstrating the script widget protocol.
+// Spawns an external script that speaks the line-delimited frame protocol.
+//
+// Prerequisites:
+//   1. Python 3 must be installed
+//   2. Run: cmdash --config=examples/07-script-widget.kdl
+//
+// The script widget occupies the left 30% of the screen; a shell pane
+// fills the remaining 70%. Focus navigation (Alt-arrow) switches
+// between them.
+//
+// Any executable that speaks the frame protocol can be used:
+//   pane kind=script command="python3 my_widget.py" label="my-widget"
+//   pane kind=script command="./my_widget.sh"       label="shell-widget"
+
+layout {
+    split axis=horizontal ratio=0.3 {
+        pane kind=script command="python3 examples/widgets/uptime.py" label="uptime"
+        pane kind=shell label="shell"
+    }
+}
+
+keybinds {
+    bind "alt-w"  action="pane.close"
+    bind "alt-q"  action="app.close"
+    bind "alt-left"  action="pane.focus.left"
+    bind "alt-right" action="pane.focus.right"
+}

@@ -9,10 +9,10 @@ user-facing companion to the architectural rules in
 
 > **TL;DR.** cmdash is a single Rust binary. Configuration is
 > loaded at runtime from a KDL file, falling back to a bundled
-> default. The KDL schema is small — three top-level blocks
-> (`layout` / `keybinds` / `presets`) — and the runtime mutation
-> toolbox is built around a five-variant layout-tree grammar
-> (`split` / `stack` / `zstack` / `pane` / `preset`).
+> default. The KDL schema is small — four top-level blocks
+> (`layout` / `keybinds` / `presets` / `status_bar`) — and the
+> runtime mutation toolbox is built around a five-variant layout-tree
+> grammar (`split` / `stack` / `zstack` / `pane` / `preset`).
 
 ---
 
@@ -121,9 +121,13 @@ file is modified on disk:
 4. On the next tick (Phase 0.6), the tick loop applies the changes:
    - **Keybinds** swap immediately via a fresh `Router`.
    - **Presets** replace the stored preset map.
+   - **Status bar** — `status_bar` config is updated and
+     `relayout()` is called so the layout area recalculates
+     immediately (chrome height changes take effect).
    - **Layout** — if the layout tree changed, all panes are torn
      down and re-spawned (Wholesale reconcile). If the layout
-     is unchanged, only keybinds and presets are refreshed.
+     is unchanged, only keybinds, presets, and status bar are
+     refreshed.
 
 > **Note:** The watcher is **not** started for the bundled fallback
 > (priority 4), since there is no file on disk to watch. Also,
@@ -137,13 +141,14 @@ keybind/layout changes take effect in cmdash without restarting.
 
 ## 3. Top-level schema
 
-A cmdash config has **exactly three** valid top-level KDL nodes:
+A cmdash config has **four** valid top-level KDL nodes:
 
 | Top-level | Required? | Purpose |
 |-----------|-----------|---------|
 | `layout { ... }` | recommended | The active layout tree. |
 | `keybinds { ... }` | optional | `bind "<chord>" action="<action>"` lines. |
 | `presets { ... }` | optional | Named layout bodies for `pane.preset.<name>`. |
+| `status_bar { ... }` | optional | Enable/configure the status bar. |
 
 ### 3.1. Inside `layout { ... }`
 
@@ -176,6 +181,38 @@ presets {
     }
 }
 ```
+
+### 3.4. Inside `status_bar { ... }`
+
+Enables an optional single-row status bar rendered below the tab bar
+(or above panes when `position = "top"`). When present and
+`enabled = true`, one extra terminal row is reserved for the status
+bar and the layout area height is reduced accordingly.
+
+```kdl
+status_bar {
+    enabled    true       // required to show the bar
+    position   "bottom"   // "top" or "bottom" (default: "bottom")
+    show-clock true       // show HH:MM in the right corner
+    show-pane-title true  // show the focused pane's label
+    show-mode  true       // show the current keybind mode
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Must be `true` for the status bar to render. |
+| `position` | string | `"bottom"` | `"top"` renders below the tab bar; `"bottom"` renders at the last row. |
+| `show-clock` | bool | `true` | Display the current time (HH:MM, UTC). |
+| `show-pane-title` | bool | `true` | Display the focused pane's `label` (if set). |
+| `show-mode` | bool | `true` | Display the current keybind mode name. |
+
+When `status_bar` is omitted entirely, no status bar is rendered and
+the layout uses the full terminal height (minus the tab bar).
+
+The status bar is **hot-reloadable**: editing the `status_bar` block
+in your config file at runtime will enable/disable the bar and
+recalculate the layout area immediately (no restart required).
 
 ---
 
@@ -296,6 +333,11 @@ Valid **`<key>`** tokens: single character, named key (`enter`,
 | `tab.new` | Create a new empty tab and switch to it. |
 | `tab.close` | Close the active tab. Closing last tab quits. |
 | `tab.switch.<n>` (n=1..=9) | Switch to the nth tab. |
+| `pane.resize.enter` | Enter PaneResize mode. See §5.4. |
+| `tab.switch.enter` | Enter TabSwitch mode. See §5.4. |
+| `preset.pick.enter` | Enter PresetPick mode. See §5.4. |
+| `mode.exit` | Return to Normal mode from any non-Normal mode. |
+| `pane.resize.up` / `.down` / `.left` / `.right` | Resize focused pane's split ±2% (PaneResize mode only). See §5.4. |
 
 > **Pitfall #4 — Unknown action strings are rejected** as
 > `InvalidAction(<string>)` at config parse time.
@@ -308,6 +350,52 @@ Valid **`<key>`** tokens: single character, named key (`enter`,
   (`remove_leaf`), survivor keeps its `LayerId`.
 - **`pane.preset.<name>`** — drops all runners, swaps layout tree,
   spawns fresh runners with fresh `LayerId`s.
+
+### 5.4. Keybind modes
+
+cmdash has a mode-based keybind router with four modes:
+
+| Mode | Description |
+|------|-------------|
+| **Normal** | Default mode. All `keybinds { ... }` bindings are active. |
+| **PaneResize** | Arrow keys resize the focused pane's parent split (±2% per press). |
+| **TabSwitch** | Number keys 1–9 switch tabs. |
+| **PresetPick** | Number keys select layout presets. |
+
+**Entering a mode:** Press the configured keybind
+(e.g. `M-r` for `pane.resize.enter`, `M-p` for `preset.pick.enter`).
+
+**Exiting a mode:** Press **Escape** (hardcoded in the router — works
+in all non-Normal modes).
+
+**Displaying the current mode:** When `status_bar` is enabled with
+`show-mode true`, the status bar shows the active mode name on the
+left side. In Normal mode it displays `Normal`; when you enter
+PaneResize it switches to `PaneResize`, and so on. This gives
+immediate visual feedback that a mode is active.
+
+**Mode-specific actions (active only while the mode is active):**
+
+| Action string | Mode | Behaviour |
+|---------------|------|-----------|
+| `pane.resize.enter` | Normal → PaneResize | Enter PaneResize mode. |
+| `pane.resize.up` / `.down` / `.left` / `.right` | PaneResize | Resize the focused pane's parent split ±2%. |
+| `tab.switch.enter` | Normal → TabSwitch | Enter TabSwitch mode. |
+| `preset.pick.enter` | Normal → PresetPick | Enter PresetPick mode. |
+| `mode.exit` | any non-Normal | Return to Normal mode (also triggered by Escape). |
+
+**Default mode-entry keybinds (in the bundled `config.kdl`):**
+
+```kdl
+keybinds {
+    bind "M-r"  action="pane.resize.enter"   // Alt-R → PaneResize
+    bind "M-p"  action="preset.pick.enter"   // Alt-P → PresetPick
+}
+```
+
+**Unmatched keys in non-Normal modes** fall through to the focused
+pane's PTY, so you can still type normally while in PaneResize or
+PresetPick mode — only the explicitly bound keys are intercepted.
 
 ---
 

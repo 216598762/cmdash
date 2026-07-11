@@ -74,13 +74,11 @@ fn load_widget_clock_cdylib_and_create_widget() {
         .expect("widget-clock cdylib not found; build with: cargo build -p widget-clock");
 
     unsafe {
-        let lib = libloading::Library::new(&lib_path)
-            .expect("failed to load widget-clock cdylib");
+        let lib = libloading::Library::new(&lib_path).expect("failed to load widget-clock cdylib");
 
         // Look up the C-ABI create function.
-        let create_fn: libloading::Symbol<
-            unsafe extern "C" fn(u32) -> *mut c_void,
-        > = lib.get(b"cmdash_widget_create")
+        let create_fn: libloading::Symbol<unsafe extern "C" fn(u32) -> *mut c_void> = lib
+            .get(b"cmdash_widget_create")
             .expect("widget-clock must export cmdash_widget_create");
 
         // Call with matching ABI version → should return non-null.
@@ -130,16 +128,13 @@ fn load_widget_clock_cdylib_and_create_widget() {
 #[test]
 #[ignore = "widget-clock cdylib not built; run: cargo build -p widget-clock"]
 fn widget_clock_rejects_mismatched_abi_version() {
-    let lib_path = find_widget_clock_lib()
-        .expect("widget-clock cdylib not found");
+    let lib_path = find_widget_clock_lib().expect("widget-clock cdylib not found");
 
     unsafe {
-        let lib = libloading::Library::new(&lib_path)
-            .expect("failed to load widget-clock cdylib");
+        let lib = libloading::Library::new(&lib_path).expect("failed to load widget-clock cdylib");
 
-        let create_fn: libloading::Symbol<
-            unsafe extern "C" fn(u32) -> *mut c_void,
-        > = lib.get(b"cmdash_widget_create")
+        let create_fn: libloading::Symbol<unsafe extern "C" fn(u32) -> *mut c_void> = lib
+            .get(b"cmdash_widget_create")
             .expect("widget-clock must export cmdash_widget_create");
 
         // Call with a deliberately wrong ABI version.
@@ -175,9 +170,7 @@ impl CmdashWidget for MockWidget {
         self.last_area = Some((area.width, area.height));
 
         use ratatui::widgets::{Block, Borders, Paragraph};
-        let block = Block::default()
-            .title("Mock Widget")
-            .borders(Borders::ALL);
+        let block = Block::default().title("Mock Widget").borders(Borders::ALL);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.width > 0 && inner.height > 0 {
@@ -326,9 +319,7 @@ fn mock_widget_renders_visible_content() {
                 let mut ok = true;
                 for (i, ch) in expected.chars().enumerate() {
                     let cx = x + i as u16;
-                    if cx >= buf.area.width
-                        || buf.get(cx, y).symbol() != ch.to_string()
-                    {
+                    if cx >= buf.area.width || buf.get(cx, y).symbol() != ch.to_string() {
                         ok = false;
                         break;
                     }
@@ -420,9 +411,7 @@ fn widget_renders_at_offset_position() {
                 let mut ok = true;
                 for (i, ch) in expected.chars().enumerate() {
                     let cx = x + i as u16;
-                    if cx >= buf.area.width
-                        || buf.get(cx, y).symbol() != ch.to_string()
-                    {
+                    if cx >= buf.area.width || buf.get(cx, y).symbol() != ch.to_string() {
                         ok = false;
                         break;
                     }

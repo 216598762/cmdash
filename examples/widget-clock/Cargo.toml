@@ -1,0 +1,13 @@
+[package]
+name = "widget-clock"
+version = "0.1.0"
+edition = "2021"
+description = "Example cmdash widget: a real-time clock display. Validates the full widget loading pipeline end-to-end."
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cmdash-widget-sdk = { path = "../../crates/cmdash-widget-sdk" }
+ratatui = "0.25"

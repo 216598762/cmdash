@@ -8,6 +8,7 @@ members = [
     "crates/cmdash-pty",
     "crates/cmdash-widget-sdk",
     "crates/cmdash-protocol",
+    "examples/widget-clock",
 ]
 
 [workspace.package]

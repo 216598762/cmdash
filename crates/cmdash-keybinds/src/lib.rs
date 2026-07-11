@@ -17,13 +17,15 @@
 //!   v1 has tens of keybinds; v2 will switch to a `HashMap` for
 //!   scale.
 
+use std::collections::HashMap;
+
 use cmdash_config::{KeyAction, KeyName, KeyToken, Keybind, Modifiers};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
 /// One of the four key-router modes. v1 only routes [`Mode::Normal`];
 /// the other variants exist so v2 can extend without churning
 /// call sites or kernel Aurora-0 struct fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Mode {
     #[default]
     Normal,
@@ -35,16 +37,75 @@ pub enum Mode {
 /// Hold the parsed keybind table plus the current mode. Built
 /// once at startup from [`cmdash_config::Config::keybinds`] and
 /// shared by reference across the main loop.
+///
+/// # Mode routing
+///
+/// In [`Mode::Normal`], the full `keybinds` table is searched.
+/// When a non-Normal mode is active (`PaneResize`, `TabSwitch`,
+/// `PresetPick`), mode-specific keybinds are searched first;
+/// if none match, `Escape` is intercepted to return to Normal,
+/// and all other keys fall through as `None` (forwarded to the
+/// focused pane's PTY).
 #[derive(Debug, Clone)]
 pub struct Router {
+    /// Global keybinds active in all modes (including Normal).
     keybinds: Vec<Keybind>,
+    /// Per-mode keybind overrides. A mode entry here means those
+    /// keybinds shadow the global table while that mode is active.
+    mode_keybinds: HashMap<Mode, Vec<Keybind>>,
+    /// Current routing mode.
     mode: Mode,
 }
 
 impl Router {
     pub fn new(keybinds: Vec<Keybind>) -> Self {
+        let mut mode_keybinds = HashMap::new();
+        // --- PaneResize mode defaults ---
+        // Arrow keys resize the focused pane's parent split.
+        mode_keybinds.insert(
+            Mode::PaneResize,
+            vec![
+                Keybind {
+                    mods: Modifiers::default(),
+                    key: KeyToken::Named(KeyName::Up),
+                    action: KeyAction::PaneResizeUp,
+                },
+                Keybind {
+                    mods: Modifiers::default(),
+                    key: KeyToken::Named(KeyName::Down),
+                    action: KeyAction::PaneResizeDown,
+                },
+                Keybind {
+                    mods: Modifiers::default(),
+                    key: KeyToken::Named(KeyName::Left),
+                    action: KeyAction::PaneResizeLeft,
+                },
+                Keybind {
+                    mods: Modifiers::default(),
+                    key: KeyToken::Named(KeyName::Right),
+                    action: KeyAction::PaneResizeRight,
+                },
+            ],
+        );
+        // --- TabSwitch mode defaults ---
+        // Number keys 1-9 switch to the corresponding tab.
+        let mut tab_switch_binds = Vec::new();
+        for n in 1..=9u8 {
+            tab_switch_binds.push(Keybind {
+                mods: Modifiers::default(),
+                key: KeyToken::Char((b'0' + n) as char),
+                action: KeyAction::TabSwitch(n as usize),
+            });
+        }
+        mode_keybinds.insert(Mode::TabSwitch, tab_switch_binds);
+        // --- PresetPick mode defaults ---
+        // Number keys 1-9 select the Nth preset (by insertion order).
+        // The main loop wires these at startup based on actual preset names.
+        // For now, register empty; main.rs calls set_mode_keybinds after
+        // loading presets.
         Self {
             keybinds,
+            mode_keybinds,
             mode: Mode::Normal,
         }
     }
@@ -55,6 +116,12 @@ impl Router {
 
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
+    }
+
+    /// Register mode-specific keybinds. These shadow the global
+    /// table while the given mode is active.
+    pub fn set_mode_keybinds(&mut self, mode: Mode, keybinds: Vec<Keybind>) {
+        self.mode_keybinds.insert(mode, keybinds);
     }
 
     /// Pure-data lookup: maps `(mods, key)` to a [`KeyAction`],
@@ -70,8 +137,29 @@ impl Router {
         })
     }
 
+    /// Mode-aware lookup: searches mode-specific keybinds first,
+    /// then falls back to the global table.
+    fn lookup_mode_aware(&self, mods: Modifiers, key: KeyToken) -> Option<&KeyAction> {
+        if self.mode != Mode::Normal {
+            if let Some(action) = self
+                .mode_keybinds
+                .get(&self.mode)?
+                .iter()
+                .find(|kb| kb.mods == mods && kb.key == key)
+                .map(|kb| &kb.action)
+            {
+                return Some(action);
+            }
+        }
+        self.lookup(mods, key)
+    }
+
     /// Crossterm-aware dispatch: only fires on Press; ignores
     /// FocusGained/Lost/Resize/Mouse by returning `None`.
+    ///
+    /// In non-Normal modes, `Escape` always returns
+    /// [`KeyAction::ModeExit`]. Other unmatched keys fall through
+    /// as `None` (forwarded to the focused pane's PTY).
     pub fn dispatch_crossterm(&self, ev: &Event) -> Option<KeyAction> {
         let Event::Key(KeyEvent {
             code,
@@ -87,7 +175,14 @@ impl Router {
         }
         let token = from_key_code(*code)?;
         let m = from_key_modifiers(*modifiers);
-        self.lookup(m, token).cloned()
+        // In non-Normal modes, Escape always exits the mode.
+        if self.mode != Mode::Normal
+            && token == KeyToken::Named(KeyName::Escape)
+            && m == Modifiers::default()
+        {
+            return Some(KeyAction::ModeExit);
+        }
+        self.lookup_mode_aware(m, token).cloned()
     }
 }
 

@@ -1,0 +1,53 @@
+// 08-status-bar.kdl — Example config with an enabled status bar.
+//
+// The status bar is a single row at the bottom of the screen that
+// displays the current keybind mode (Normal, PaneResize, PresetPick,
+// TabSwitch), the focused pane's label, and the current time (HH:MM).
+//
+// Enter PaneResize mode with M-r, exit with Escape.
+// Enter PresetPick mode with M-p, exit with Escape.
+//
+// To try it: copy this file on top of `crates/cmdash/config.kdl`
+// (which the binary embeds via `include_str!`) and rebuild.
+
+layout {
+    split axis=horizontal ratio=0.5 {
+        pane kind=shell label="left"
+        pane kind=shell label="right"
+    }
+}
+
+// Enable the status bar. When enabled, a single row is reserved
+// at the configured position (top or bottom) and the status bar
+// is rendered in phase 3a after pane blits.
+status_bar {
+    enabled    true
+    position   "bottom"   // or "top"
+    show-clock true       // show HH:MM in the right corner
+    show-pane-title true  // show the focused pane's label
+    show-mode  true       // show the current keybind mode (Normal, PaneResize, etc.)
+}
+
+keybinds {
+    // Pane management
+    bind "alt-w"  action="pane.close"
+    bind "alt-q"  action="app.close"
+    bind "ctrl-a" action="app.new-pane"
+
+    // Tab management
+    bind "M-t"    action="tab.new"
+    bind "M-w"    action="tab.close"
+    bind "M-1"    action="tab.switch.1"
+    bind "M-2"    action="tab.switch.2"
+    bind "M-3"    action="tab.switch.3"
+    bind "M-4"    action="tab.switch.4"
+    bind "M-5"    action="tab.switch.5"
+    bind "M-6"    action="tab.switch.6"
+    bind "M-7"    action="tab.switch.7"
+    bind "M-8"    action="tab.switch.8"
+    bind "M-9"    action="tab.switch.9"
+
+    // Mode entry (Escape exits any non-Normal mode)
+    bind "M-r"    action="pane.resize.enter"
+    bind "M-p"    action="preset.pick.enter"
+}
