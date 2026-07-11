@@ -237,6 +237,12 @@ impl<T> TabStack<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layer_id::derive_layer_id_for_tab;
+    use cmdash_config::{
+        LayoutNode, PaneKind, Ratio as CfgRatio, SplitAxis as CfgSplitAxis,
+    };
+    use cmdash_layout::{ComputedLayout, PaneId, Rect};
+    use cmdash_pty::PaneLayerId;
     // ----------------------------------------------------------------
     // Tab<T> tests.
     // ----------------------------------------------------------------
@@ -1077,5 +1083,218 @@ mod tests {
             }
             assert_invariants(&ts);
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Cross-tab LayerId namespace contract tests.
+    //
+    // Per AGENTS.md §"Tabs" and tabs.rs module docs: every fresh
+    // pane spawn in a tab MUST pass the tab's
+    // `TabStack::active_idx()` (cast to `u32`) into
+    // `derive_layer_id_for_tab`, so two tabs with the same
+    // pre-order geometry never alias to the same `LayerId`.
+    //
+    // These tests exercise the contract through the `TabStack` API
+    // to pin that `active_idx` → `tab_id` casting produces
+    // collision-free `LayerId` values across tabs.
+    // ----------------------------------------------------------------
+
+    /// Same `PaneId` (pre_order=0) on two different tab indices
+    /// (via `TabStack::active_idx`) produces distinct `LayerId`s.
+    /// This is the fundamental cross-tab namespace invariant and
+    /// exercises the production contract: every fresh pane spawn
+    /// in a tab passes `active_idx() as u32` into
+    /// `derive_layer_id_for_tab`.
+    #[test]
+    fn cross_tab_same_pane_different_tab_indices_distinct_layer_ids() {
+        let mut ts: TabStack<u32> = TabStack::new(0);
+        ts.push(1);
+        // Stack: [tab0, tab1], active = 1.
+
+        let pane = PaneId::default(); // pre_order = 0
+
+        // Derive LayerIds via the production contract: active_idx() as u32.
+        ts.switch_to(0);
+        let id_tab0 = derive_layer_id_for_tab(&pane, ts.active_idx() as u32);
+        ts.switch_to(1);
+        let id_tab1 = derive_layer_id_for_tab(&pane, ts.active_idx() as u32);
+
+        assert_ne!(
+            id_tab0, id_tab1,
+            "same PaneId on different tabs (via active_idx) must produce distinct LayerIds"
+        );
+    }
+
+    /// Collision sweep: for 100 tab indices, the same `PaneId`
+    /// must produce 100 distinct `LayerId` values. This catches
+    /// packing bugs where the high-32-bit tab_id field bleeds
+    /// into the low-32-bit pre_order field (e.g. missing shift,
+    /// wrong mask).
+    #[test]
+    fn cross_tab_collision_sweep_100_tabs_same_pane() {
+        let pane = PaneId::default(); // pre_order = 0
+        let mut seen = std::collections::HashSet::new();
+        for tab_id in 0u32..100 {
+            let layer_id = derive_layer_id_for_tab(&pane, tab_id);
+            assert!(
+                seen.insert(layer_id),
+                "LayerId collision at tab_id={tab_id}: {layer_id:?} already in set"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            100,
+            "100 distinct tab_ids must yield 100 distinct LayerIds"
+        );
+    }
+
+    /// Full matrix: M tab_ids × N panes must all produce distinct
+    /// `LayerId` values. The packing `(tab_id << 32) | pre_order`
+    /// means each (tab_id, pre_order) pair maps to a unique u64;
+    /// this test verifies no two cells in the matrix alias.
+    #[test]
+    fn cross_tab_full_matrix_no_collision() {
+        // Build a 3-pane layout to get 3 distinct pre_order values.
+        let layout_root = LayoutNode::Split {
+            axis: CfgSplitAxis::Horizontal,
+            ratio: CfgRatio(50),
+            children: vec![
+                LayoutNode::Split {
+                    axis: CfgSplitAxis::Vertical,
+                    ratio: CfgRatio(50),
+                    children: vec![
+                        LayoutNode::Pane(cmdash_config::Pane {
+                            kind: PaneKind::Shell,
+                            label: Some("a".into()),
+                            command: None,
+                        }),
+                        LayoutNode::Pane(cmdash_config::Pane {
+                            kind: PaneKind::Shell,
+                            label: Some("b".into()),
+                            command: None,
+                        }),
+                    ],
+                },
+                LayoutNode::Pane(cmdash_config::Pane {
+                    kind: PaneKind::Shell,
+                    label: Some("c".into()),
+                    command: None,
+                }),
+            ],
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
+        let layout = ComputedLayout::compute(&layout_root, area).expect("compute 3-pane layout");
+        assert_eq!(layout.panes.len(), 3, "fixture must produce 3 leaf panes");
+
+        let pre_orders: Vec<u32> = layout.panes.iter().map(|p| p.id.pre_order()).collect();
+        // Verify the fixture gives us 3 distinct pre_order values.
+        let distinct_pre_orders: std::collections::HashSet<u32> =
+            pre_orders.iter().copied().collect();
+        assert_eq!(
+            distinct_pre_orders.len(),
+            3,
+            "3 panes must have 3 distinct pre_orders"
+        );
+
+        // 10 tab_ids × 3 panes = 30 unique (tab_id, pre_order) pairs.
+        let num_tabs = 10u32;
+        let mut seen = std::collections::HashSet::new();
+        for tab_id in 0..num_tabs {
+            for pane in &layout.panes {
+                let layer_id = derive_layer_id_for_tab(&pane.id, tab_id);
+                assert!(
+                    seen.insert(layer_id),
+                    "collision at (tab_id={tab_id}, pre_order={}) -> {layer_id:?}",
+                    pane.id.pre_order()
+                );
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            (num_tabs as usize) * 3,
+            "full matrix must produce (num_tabs × num_panes) distinct LayerIds"
+        );
+    }
+
+    /// Packing math verification: `derive_layer_id_for_tab` must
+    /// pack `(tab_id << 32) | pre_order` exactly. This catches
+    /// off-by-one shifts, endianness bugs, or sign-extension
+    /// issues in the u64 packing.
+    #[test]
+    fn cross_tab_packing_math_exact() {
+        let pane = PaneId::default(); // pre_order = 0
+                                      // (tab_id=0, pre_order=0) → raw = 0x0000_0000_0000_0000
+        let id0 = derive_layer_id_for_tab(&pane, 0);
+        assert_eq!(id0, PaneLayerId(0), "(0, 0) must pack to 0");
+
+        // (tab_id=1, pre_order=0) → raw = 0x0000_0001_0000_0000
+        let id1 = derive_layer_id_for_tab(&pane, 1);
+        assert_eq!(id1, PaneLayerId(1u64 << 32), "(1, 0) must pack to 1 << 32");
+
+        // (tab_id=0, pre_order=42) — need a pane with pre_order=42.
+        // We can't easily get pre_order=42 without a 42-leaf tree,
+        // but we CAN verify the high-bit boundary: tab_id=0x7FFF_FFFF
+        // (u32::MAX >> 1) is the largest safe tab_id.
+        let id_max_tab = derive_layer_id_for_tab(&pane, u32::MAX >> 1);
+        let expected_max = ((u32::MAX >> 1) as u64) << 32;
+        assert_eq!(
+            id_max_tab,
+            PaneLayerId(expected_max),
+            "largest safe tab_id must pack correctly into high 32 bits"
+        );
+    }
+
+    /// TabStack lifecycle + LayerId contract: push/remove/switch
+    /// operations must not corrupt the tab_id → LayerId mapping.
+    /// After a push-remove-switch cycle, the surviving tab's
+    /// LayerId derivation must still be collision-free.
+    #[test]
+    fn cross_tab_lifecycle_preserves_layer_id_contract() {
+        let mut ts: TabStack<u32> = TabStack::new(0);
+        ts.push(1);
+        ts.push(2);
+        // Stack: [0, 1, 2], active = 2.
+
+        let pane = PaneId::default();
+
+        // Switch to tab 0 first, then derive its LayerId.
+        ts.switch_to(0);
+        let id_tab0 = derive_layer_id_for_tab(&pane, ts.active_idx() as u32);
+        // Switch away and back — LayerId must not change.
+        ts.switch_to(2);
+        ts.switch_to(0);
+        let id_tab0_recheck = derive_layer_id_for_tab(&pane, ts.active_idx() as u32);
+        assert_eq!(
+            id_tab0, id_tab0_recheck,
+            "switch away and back must not change LayerId for same (pane, tab)"
+        );
+
+        // Remove tab 1 (middle). Stack: [0, 2].
+        ts.switch_to(1);
+        ts.remove_active();
+        // Tab 2 is now at index 1.
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts.active_idx(), 1);
+
+        // Tab 0's LayerId derivation must be unaffected.
+        ts.switch_to(0);
+        let id_tab0_post = derive_layer_id_for_tab(&pane, ts.active_idx() as u32);
+        assert_eq!(
+            id_tab0, id_tab0_post,
+            "removing a sibling tab must not change tab0's LayerId"
+        );
+
+        // Tab 2 (now at index 1) must still be distinct from tab 0.
+        ts.switch_to(1);
+        let id_tab2 = derive_layer_id_for_tab(&pane, ts.active_idx() as u32);
+        assert_ne!(
+            id_tab0, id_tab2,
+            "tab0 and tab2 LayerIds must remain distinct after lifecycle mutations"
+        );
     }
 }
