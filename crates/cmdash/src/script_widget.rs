@@ -18,8 +18,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::{self, JoinHandle};
+
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use cmdash_protocol::{FrameResponse, HostMsg};
 use cmdash_widget_sdk::{CmdashWidget, KeyCode, WidgetEvent};
@@ -40,11 +40,11 @@ pub struct ScriptWidget {
     child: Child,
     /// Buffered writer to the child's stdin.
     stdin: std::io::BufWriter<std::process::ChildStdin>,
-    /// Receiver of frames from the reader thread. Non-blocking via
-    /// [`mpsc::Receiver::try_recv`].
-    frame_rx: Receiver<FrameResponse>,
-    /// Handle to the reader thread; joined on [`Drop`].
-    reader_handle: Option<JoinHandle<()>>,
+    /// Receiver of frames from the reader task. Non-blocking via
+    /// [`UnboundedReceiver::try_recv`].
+    frame_rx: UnboundedReceiver<FrameResponse>,
+    /// Handle to the reader task; aborted on [`Drop`].
+    reader_task: Option<tokio::task::JoinHandle<()>>,
     /// Monotonically increasing frame generation counter.
     gen: u64,
     /// Last successfully received frame. Rendered when no fresh frame
@@ -85,12 +85,10 @@ impl ScriptWidget {
         let stdin = child.stdin.take().ok_or("script has no stdin")?;
         let stdout = child.stdout.take().ok_or("script has no stdout")?;
 
-        let (frame_tx, frame_rx) = mpsc::channel::<FrameResponse>();
+        let (frame_tx, frame_rx) = unbounded_channel::<FrameResponse>();
 
-        let reader_handle = thread::Builder::new()
-            .name("cmdash-script-reader".into())
-            .spawn(move || reader_loop(BufReader::new(stdout), frame_tx))
-            .expect("spawn script reader thread");
+        let reader_task =
+            tokio::task::spawn_blocking(move || reader_loop(BufReader::new(stdout), frame_tx));
 
         let name = label.unwrap_or("script").to_string();
         debug!(command, name, "script widget spawned");
@@ -99,7 +97,7 @@ impl ScriptWidget {
             child,
             stdin: std::io::BufWriter::new(stdin),
             frame_rx,
-            reader_handle: Some(reader_handle),
+            reader_task: Some(reader_task),
             gen: 0,
             last_frame: FrameResponse::default(),
             name,
@@ -137,7 +135,10 @@ impl ScriptWidget {
 /// ANSI text lines. The reader detects FRAME headers to delimit
 /// frames. A `pending` buffer avoids losing a FRAME header that
 /// was consumed by `read_line` in the inner loop.
-fn reader_loop(mut stdout: BufReader<std::process::ChildStdout>, frame_tx: Sender<FrameResponse>) {
+fn reader_loop(
+    mut stdout: BufReader<std::process::ChildStdout>,
+    frame_tx: UnboundedSender<FrameResponse>,
+) {
     let mut line = String::new();
     // When the inner loop breaks because it saw a FRAME header,
     // that header has already been consumed by `read_line` into
@@ -353,24 +354,18 @@ impl CmdashWidget for ScriptWidget {
 
 impl Drop for ScriptWidget {
     fn drop(&mut self) {
-        // Best-effort kill before joining the reader so the reader
+        // Best-effort kill before aborting the reader so the reader
         // sees EOF promptly.
         let _ = self.child.kill();
-        if let Some(handle) = self.reader_handle.take() {
-            let _ = handle.join();
+        if let Some(handle) = self.reader_task.take() {
+            handle.abort();
         }
     }
 }
 
 /// Render an error message inside a bordered block.
 /// Uses the theme's `error_color` for the border and text.
-fn render_error(
-    area: Rect,
-    frame: &mut Frame,
-    title: &str,
-    message: &str,
-    theme: &Theme,
-) {
+fn render_error(area: Rect, frame: &mut Frame, title: &str, message: &str, theme: &Theme) {
     let err_color = theme.error_color();
     let block = Block::default()
         .title(format!(" {title} "))

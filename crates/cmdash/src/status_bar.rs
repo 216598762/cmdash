@@ -43,7 +43,9 @@ pub fn render_status_bar(
     if show_mode {
         left_spans.push(Span::styled(
             format!(" {mode}"),
-            Style::default().fg(theme.status_mode_fg()).bg(theme.status_mode_bg()),
+            Style::default()
+                .fg(theme.status_mode_fg())
+                .bg(theme.status_mode_bg()),
         ));
     }
     if show_pane_title {
@@ -103,7 +105,16 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 let area = Rect::new(0, 4, 80, 1);
-                render_status_bar(buf, area, "Normal", None, false, false, true, &cmdash_config::Theme::default());
+                render_status_bar(
+                    buf,
+                    area,
+                    "Normal",
+                    None,
+                    false,
+                    false,
+                    true,
+                    &cmdash_config::Theme::default(),
+                );
             })
             .unwrap();
     }
@@ -116,7 +127,16 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 let area = Rect::new(0, 0, 80, 1);
-                render_status_bar(buf, area, "Normal", None, false, false, true, &cmdash_config::Theme::default());
+                render_status_bar(
+                    buf,
+                    area,
+                    "Normal",
+                    None,
+                    false,
+                    false,
+                    true,
+                    &cmdash_config::Theme::default(),
+                );
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -137,7 +157,16 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 let area = Rect::new(0, 0, 80, 1);
-                render_status_bar(buf, area, "Normal", None, false, false, false, &cmdash_config::Theme::default());
+                render_status_bar(
+                    buf,
+                    area,
+                    "Normal",
+                    None,
+                    false,
+                    false,
+                    false,
+                    &cmdash_config::Theme::default(),
+                );
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -158,7 +187,16 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 let area = Rect::new(0, 0, 80, 1);
-                render_status_bar(buf, area, "Normal", Some("editor"), false, true, true, &cmdash_config::Theme::default());
+                render_status_bar(
+                    buf,
+                    area,
+                    "Normal",
+                    Some("editor"),
+                    false,
+                    true,
+                    true,
+                    &cmdash_config::Theme::default(),
+                );
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -179,7 +217,16 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 let area = Rect::new(0, 0, 80, 1);
-                render_status_bar(buf, area, "Normal", Some("editor"), false, false, true, &cmdash_config::Theme::default());
+                render_status_bar(
+                    buf,
+                    area,
+                    "Normal",
+                    Some("editor"),
+                    false,
+                    false,
+                    true,
+                    &cmdash_config::Theme::default(),
+                );
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -200,7 +247,16 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 let area = Rect::new(0, 0, 80, 1);
-                render_status_bar(buf, area, "Normal", None, true, false, true, &cmdash_config::Theme::default());
+                render_status_bar(
+                    buf,
+                    area,
+                    "Normal",
+                    None,
+                    true,
+                    false,
+                    true,
+                    &cmdash_config::Theme::default(),
+                );
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();

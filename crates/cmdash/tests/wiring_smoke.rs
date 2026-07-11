@@ -30,8 +30,8 @@ use cmdash_pty::{PaneLayerId, ShellSpec};
 /// - `blit_grid` skipping all cells (blank-cell guard too broad)
 /// - ratatui `Terminal::draw` not flushing buffer to backend
 /// - Snapshot returning an empty/stale grid
-#[test]
-fn blank_screen_detection_pty_echo_must_appear_in_buffer() {
+#[tokio::test]
+async fn blank_screen_detection_pty_echo_must_appear_in_buffer() {
     let source = r#"layout { pane kind=shell label="blank-test" }"#;
     let cfg = cmdash_config::parse(source).expect("parse config");
     let root = cfg.layout.expect("layout block");
@@ -53,7 +53,7 @@ fn blank_screen_detection_pty_echo_must_appear_in_buffer() {
         ],
     };
     let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
-    std::thread::sleep(Duration::from_millis(250));
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut snap = None;
     for _ in 0..80 {
@@ -74,7 +74,7 @@ fn blank_screen_detection_pty_echo_must_appear_in_buffer() {
             snap = Some(s);
             break;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let snap = snap.expect("PTY must produce visible content in TextGrid within 2s");
 
@@ -110,8 +110,8 @@ fn blank_screen_detection_pty_echo_must_appear_in_buffer() {
 /// the PTY child has produced output, the buffer SHOULD be blank.
 /// If this test fails, it means `blit_grid` is writing spurious
 /// content into the buffer from empty grids.
-#[test]
-fn blank_grid_baseline_buffer_stays_all_spaces() {
+#[tokio::test]
+async fn blank_grid_baseline_buffer_stays_all_spaces() {
     let grid = cmdash_pty::TextGrid::new(80, 24);
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
@@ -140,8 +140,8 @@ fn blank_grid_baseline_buffer_stays_all_spaces() {
 /// - Shell producing only escape sequences that VTE drops
 /// - Shell clearing the screen (ESC[2J) without writing content
 ///   afterward
-#[test]
-fn shell_startup_produces_visible_content_in_textgrid() {
+#[tokio::test]
+async fn shell_startup_produces_visible_content_in_textgrid() {
     let source = r#"layout { pane kind=shell label="shell-startup" }"#;
     let cfg = cmdash_config::parse(source).expect("parse config");
     let root = cfg.layout.expect("layout block");
@@ -164,7 +164,7 @@ fn shell_startup_produces_visible_content_in_textgrid() {
         ],
     };
     let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
-    std::thread::sleep(Duration::from_millis(250));
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut found_marker = false;
     for _ in 0..80 {
@@ -194,7 +194,7 @@ fn shell_startup_produces_visible_content_in_textgrid() {
         if found_marker {
             break;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(
         found_marker,
@@ -204,8 +204,8 @@ fn shell_startup_produces_visible_content_in_textgrid() {
     );
 }
 
-#[test]
-fn wiring_round_trip_renders_echoed_text() {
+#[tokio::test]
+async fn wiring_round_trip_renders_echoed_text() {
     let source = r#"layout { pane kind=shell label="wiring" }"#;
     let cfg = cmdash_config::parse(source).expect("parse config");
     let root = cfg.layout.expect("layout block");
@@ -234,7 +234,7 @@ fn wiring_round_trip_renders_echoed_text() {
     // Allow the child to start. Sleep once up-front lets the
     // reader thread accumulate some bytes; subsequent ticks are
     // bounded by `try_wait` + short sleeps.
-    std::thread::sleep(Duration::from_millis(250));
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut last_snap = None;
     let mut found_in_grid = false;
@@ -260,7 +260,7 @@ fn wiring_round_trip_renders_echoed_text() {
         if found_in_grid {
             break;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let snap = last_snap.expect("at least one snapshot");
     assert!(
@@ -309,8 +309,8 @@ fn wiring_round_trip_renders_echoed_text() {
 /// byte buffer, and verify the text characters from phase 3a
 /// survive in the combined stream. This mirrors the live binary's
 /// exact write ordering (text first, graphics second, same fd).
-#[test]
-fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
+#[tokio::test]
+async fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
     use cmdash::graphics::{GraphicsProtocol, GraphicsState, Metrics};
     use cmdash_pty::ShellSpec;
     use std::io::Cursor;
@@ -337,7 +337,7 @@ fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
         ],
     };
     let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
-    std::thread::sleep(Duration::from_millis(250));
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut snap = None;
     for _ in 0..80 {
@@ -358,7 +358,7 @@ fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
             snap = Some(s);
             break;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let snap = snap.expect("PTY must produce VISIBLE_TEXT within 2s");
 
@@ -445,8 +445,8 @@ fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
 // on a real PTY child or a hand-crafted PNG byte fixture.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn kitty_graphics_route_emits_escape_sequence() {
+#[tokio::test]
+async fn kitty_graphics_route_emits_escape_sequence() {
     use cmdash::graphics::{GraphicsProtocol, GraphicsState, Metrics};
     use cmdash_pty::PaneLayerId;
 
@@ -474,8 +474,8 @@ fn kitty_graphics_route_emits_escape_sequence() {
 // `examples/gen_fixture.rs` if the test ever regresses.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn kitty_decode_smoke() {
+#[tokio::test]
+async fn kitty_decode_smoke() {
     use cmdash::graphics::{GraphicsProtocol, GraphicsState, Metrics};
     use cmdash_pty::{KittyGraphicCmd, PaneLayerId};
 
@@ -514,8 +514,8 @@ fn kitty_decode_smoke() {
 //   fresh, not incremental).
 // --------------------------------------------------------------------------
 
-#[test]
-fn pane_runner_resize_refreshes_computed_rect() {
+#[tokio::test]
+async fn pane_runner_resize_refreshes_computed_rect() {
     let source = r#"layout { pane kind=shell label="resize-regression" }"#;
     let cfg = cmdash_config::parse(source).expect("parse config");
     let root = cfg.layout.expect("layout block");
@@ -635,8 +635,8 @@ fn pane_runner_resize_refreshes_computed_rect() {
 // assert. Sibling-pane orthogonality: A must not mutate when B
 // is resized.
 // ----------------------------------------------------------------------
-#[test]
-fn pane_runner_resize_preserves_split_origin_in_layout_engine_path() {
+#[tokio::test]
+async fn pane_runner_resize_preserves_split_origin_in_layout_engine_path() {
     let source = r#"layout {
         split axis=horizontal ratio=0.6 {
             pane kind=shell label="split-a"
@@ -748,8 +748,8 @@ fn pane_runner_resize_preserves_split_origin_in_layout_engine_path() {
 // constructs a ratatui `Terminal` without writing to stdout so
 // no real TTY is needed for the test environment.
 // ----------------------------------------------------------------------
-#[test]
-fn relayout_drives_per_pane_resize_via_real_pty() {
+#[tokio::test]
+async fn relayout_drives_per_pane_resize_via_real_pty() {
     use cmdash_layout::Rect as LayoutRect;
 
     let source = r#"layout {
@@ -761,7 +761,8 @@ fn relayout_drives_per_pane_resize_via_real_pty() {
     let cfg = cmdash_config::parse(source).expect("parse split config");
     let layout_root = cfg.layout.clone().expect("layout block");
 
-    let (close_tx, _close_rx): (cmdash::pane::PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, _close_rx): (cmdash::pane::PaneCloseTx, _) =
+        tokio::sync::mpsc::unbounded_channel();
     let shell_a = ShellSpec::Command {
         argv: vec!["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
     };
@@ -913,8 +914,8 @@ fn relayout_drives_per_pane_resize_via_real_pty() {
 /// preservation invariant (Hard rule: no `LayerId` rebinding) is
 /// pinned through the public `layer_id()` accessor + the resolver
 /// `pre_order` field.
-#[test]
-fn app_new_pane_splits_focused_leaf_in_real_pty_tree() {
+#[tokio::test]
+async fn app_new_pane_splits_focused_leaf_in_real_pty_tree() {
     let source = r#"layout { pane kind=shell label="original" }"#;
     let cfg = cmdash_config::parse(source).expect("parse");
     let original_root = cfg.layout.clone().expect("layout block");
@@ -932,7 +933,7 @@ fn app_new_pane_splits_focused_leaf_in_real_pty_tree() {
     let original_pre_order = original_pane.id.pre_order();
     let original_layer_id = cmdash::derive_layer_id(&original_pane.id);
 
-    let (close_tx, close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, mut close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
     let shell = ShellSpec::Command {
         argv: vec!["sleep".to_string(), "10".to_string()],
     };
@@ -1072,8 +1073,8 @@ fn app_new_pane_splits_focused_leaf_in_real_pty_tree() {
 /// Pin: `cmdash_layout::adjacent_pane` + `PaneRunner::computed().id`
 /// drives the resolution; the integration test verifies the public
 /// algorithm without reaching into bin-only `TickContext`.
-#[test]
-fn pane_focus_directional_moves_focus_via_adjacent_pane_in_real_pty_tree() {
+#[tokio::test]
+async fn pane_focus_directional_moves_focus_via_adjacent_pane_in_real_pty_tree() {
     // 2-pane Horizontal split (column math per AGENTS.md
     // SplitAxis::Horizontal trapdoor): child 0 (left) at (x:0,
     // w:40), child 1 (right) at (x:40, w:40).
@@ -1119,7 +1120,7 @@ fn pane_focus_directional_moves_focus_via_adjacent_pane_in_real_pty_tree() {
         "fixture invariant: split child B at (40, 0, 40, 24)"
     );
 
-    let (close_tx, _close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, _close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
     let shell = ShellSpec::Command {
         argv: vec!["sleep".to_string(), "10".to_string()],
     };
@@ -1203,8 +1204,8 @@ fn pane_focus_directional_moves_focus_via_adjacent_pane_in_real_pty_tree() {
 /// `reconcile_runners` `InPlace` on the survivor (label-keyed), rebind
 /// its `PaneId`, preserve its `PaneLayerId` per Hard rule. Verify
 /// through the public `close_rx`, `layer_id()`, `computed()` surfaces.
-#[test]
-fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
+#[tokio::test]
+async fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
     let source = r#"layout {
         split axis=horizontal ratio=0.5 {
             pane kind=shell label="kept"
@@ -1225,7 +1226,7 @@ fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
     let pane_closing = initial_layout.panes[1].clone();
     let id_kept_pre = pane_kept.id;
 
-    let (close_tx, close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, mut close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
     let shell = ShellSpec::Command {
         argv: vec!["sleep".to_string(), "10".to_string()],
     };
@@ -1339,8 +1340,8 @@ fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
 /// fires `close_tx`), wholesale-set `layout_root` to the named preset
 /// body, spawn fresh runners for each post-layout pane. Verify the
 /// preset body's label/shape surfaces end-to-end.
-#[test]
-fn pane_preset_swap_layout_via_real_pty_wholesale_spawn() {
+#[tokio::test]
+async fn pane_preset_swap_layout_via_real_pty_wholesale_spawn() {
     // Two-name fixture: an initial 1-pane tree + a "two-pane"
     // preset body that's a Horizontal Split. The PanePreset action
     // wholesale-swaps the active layout_root; reconcile_runners is
@@ -1377,7 +1378,7 @@ fn pane_preset_swap_layout_via_real_pty_wholesale_spawn() {
     let initial_pane = pre_layout.panes[0].clone();
     let initial_layer = cmdash::derive_layer_id(&initial_pane.id);
 
-    let (close_tx, _close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, _close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
     let shell = ShellSpec::Command {
         argv: vec!["sleep".to_string(), "10".to_string()],
     };
@@ -1497,23 +1498,11 @@ fn pane_preset_swap_layout_via_real_pty_wholesale_spawn() {
 // loop (1.5 s max) instead of a blind sleep so the assertion
 // has a representative tail of post-Ctrl-a frames.
 //
-// History: this test was originally `#[ignore]`-gated because
-// the pre/post ring hashes matched (byte-identical emission),
-// indicating the Ctrl-a byte never reached
-// `TickContext::handle_event_full`. The preserved TRACE log
-// showed cmdash kept rendering frames at ~50 ms cadence throughout
-// the post-Ctrl-a window with `focus_idx` permanently pinned at
-// 0 — cmdash was NOT crashed, the byte just never became a
-// routed key event. The root cause was
-// `event::poll(Duration::from_millis(0))` in
-// [`TickContext::input_phase_full`] starving the mio readiness
-// check against the PTY fd on Unix. Lifting the poll dwell to 1 ms
-// (negligible vs. the 33 ms tick cadence, ~3% per-frame budget) so
-// the OS forces a fresh readiness probe against the PTY buffer
-// every input phase; combined with the RAII CleanupGuard pattern
-// below (which preserves cmdash's TRACE log on failure), this test
-// is the wire-level witness that Ctrl-a → AppNewPane → 2-pane
-// re-render is observed end-to-end through real PTY children.
+// The input path is async: crossterm events are read in a
+// `tokio::task::spawn_blocking` task and forwarded to the main
+// `tokio::select!` loop. Combined with the RAII CleanupGuard
+// below, this test witnesses Ctrl-a → AppNewPane → 2-pane
+// re-render end-to-end through real PTY children.
 // ===========================================================================
 
 /// RAII guard that wraps the live-binary test's PTY master,
@@ -1586,8 +1575,8 @@ impl Drop for CleanupGuard {
     }
 }
 
-#[test]
-fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
+#[tokio::test]
+async fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::collections::VecDeque;
     use std::io::{Read, Write};
@@ -1668,7 +1657,7 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     // Initial boot settle: enter alt-screen, render the first
     // 1-pane frame, start the tick loop. 500 ms is generous
     // for a binary that ticks at ~30 Hz.
-    std::thread::sleep(Duration::from_millis(BOOT_SETTLE_MS));
+    tokio::time::sleep(Duration::from_millis(BOOT_SETTLE_MS)).await;
 
     let pre_snapshot: Vec<u8> = ring
         .lock()
@@ -1718,7 +1707,7 @@ fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     // bytes, not just a single first-frame snapshot.
     let mut final_snapshot: Vec<u8> = Vec::new();
     for _ in 0..POLL_ATTEMPTS {
-        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
         let snapshot: Vec<u8> = ring
             .lock()
             .expect("ring mutex poisoned")
@@ -2140,8 +2129,8 @@ fn extract_u16_after(line: &str, field: &str) -> Option<u16> {
 /// produce content (catches the case where a fast-exit child
 /// like `/bin/true` races the assertion surface, which would
 /// produce a false-positive pass on a broken pipeline).
-#[test]
-fn full_pipeline_pty_reader_tick_snapshot_has_content() {
+#[tokio::test]
+async fn full_pipeline_pty_reader_tick_snapshot_has_content() {
     let source = r#"layout { pane kind=shell label="pipeline" }"#;
     let cfg = cmdash_config::parse(source).expect("parse config");
     let root = cfg.layout.expect("layout block");
@@ -2165,12 +2154,12 @@ fn full_pipeline_pty_reader_tick_snapshot_has_content() {
             "printf 'PIPELINE_MARKER'; sleep 10; exit 0".to_string(),
         ],
     };
-    let close_tx: PaneCloseTx = std::sync::mpsc::channel().0;
+    let close_tx: PaneCloseTx = tokio::sync::mpsc::unbounded_channel().0;
     let mut runner = PaneRunner::spawn_with_graphics(pane.clone(), layer_id, shell, Some(close_tx))
         .expect("spawn_with_graphics must succeed");
 
     // Wait for the child to start and produce output.
-    std::thread::sleep(Duration::from_millis(250));
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     // Tick the runner repeatedly until we see non-blank cells
     // in the TextGrid snapshot. Each tick drains bytes_rx and
@@ -2220,7 +2209,7 @@ fn full_pipeline_pty_reader_tick_snapshot_has_content() {
         if found_marker {
             break;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
     // The TextGrid MUST have non-blank content. If this
@@ -2303,8 +2292,8 @@ fn full_pipeline_pty_reader_tick_snapshot_has_content() {
 /// - `command` field is dropped during layout resolution
 /// - `ShellSpec::Command` argv splitting is wrong
 /// - The PTY child doesn't actually run the command
-#[test]
-fn per_pane_command_field_echo_hello_appears_in_textgrid() {
+#[tokio::test]
+async fn per_pane_command_field_echo_hello_appears_in_textgrid() {
     let source = r#"layout { pane kind=shell label="echo-pane" command="echo hello" }"#;
     let cfg = cmdash_config::parse(source).expect("parse config with command field");
     let root = cfg.layout.expect("layout block");
@@ -2344,7 +2333,7 @@ fn per_pane_command_field_echo_hello_appears_in_textgrid() {
     let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
 
     // Wait for the child to start and produce output.
-    std::thread::sleep(Duration::from_millis(250));
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut found_hello = false;
     for _ in 0..80 {
@@ -2370,7 +2359,7 @@ fn per_pane_command_field_echo_hello_appears_in_textgrid() {
         if found_hello {
             break;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(
         found_hello,
@@ -2425,8 +2414,8 @@ fn per_pane_command_field_echo_hello_appears_in_textgrid() {
 /// - `split_whitespace` drops trailing tokens
 /// - argv construction collapses or reorders arguments
 /// - The PTY child receives a truncated argument list
-#[test]
-fn per_pane_command_with_args_echo_hello_world_appears_in_textgrid() {
+#[tokio::test]
+async fn per_pane_command_with_args_echo_hello_world_appears_in_textgrid() {
     let source = r#"layout { pane kind=shell label="args-pane" command="echo hello world" }"#;
     let cfg = cmdash_config::parse(source).expect("parse config with multi-arg command");
     let root = cfg.layout.expect("layout block");
@@ -2462,7 +2451,7 @@ fn per_pane_command_with_args_echo_hello_world_appears_in_textgrid() {
     let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
 
     // Wait for the child to start and produce output.
-    std::thread::sleep(Duration::from_millis(250));
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut found = false;
     for _ in 0..80 {
@@ -2488,7 +2477,7 @@ fn per_pane_command_with_args_echo_hello_world_appears_in_textgrid() {
         if found {
             break;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(
         found,
@@ -2549,8 +2538,8 @@ fn per_pane_command_with_args_echo_hello_world_appears_in_textgrid() {
 /// the scrollback buffer holds the shell prompt +
 /// `SCROLL_001..SCROLL_026` (27+ rows). `SCROLL_001` is therefore
 /// well inside scrollback, not on the live grid.
-#[test]
-fn scrollback_round_trip_renders_scrolled_off_content() {
+#[tokio::test]
+async fn scrollback_round_trip_renders_scrolled_off_content() {
     // 50 numbered lines + sleep + exit. On a 24-row grid,
     // lines 1–26+ get scrolled off into scrollback after all
     // lines are printed, guaranteeing SCROLL_001 is in
@@ -2576,7 +2565,7 @@ fn scrollback_round_trip_renders_scrolled_off_content() {
     let shell = ShellSpec::Command {
         argv: vec!["sh".to_string(), "-c".to_string(), command],
     };
-    let (close_tx, _close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, _close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
     let mut runner = PaneRunner::spawn_with_graphics(pane.clone(), layer_id, shell, Some(close_tx))
         .expect("spawn runner");
 
@@ -2587,7 +2576,7 @@ fn scrollback_round_trip_renders_scrolled_off_content() {
     // buffer is populated before we inspect it.
     let mut snap = None;
     for _ in 0..200 {
-        std::thread::sleep(Duration::from_millis(25));
+        tokio::time::sleep(Duration::from_millis(25)).await;
         let s = runner.tick().expect("tick");
         if s.grid.scrollback_len() >= 1 {
             snap = Some(s);

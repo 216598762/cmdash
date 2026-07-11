@@ -990,16 +990,14 @@ mod internal_sanity_tests {
     /// the pane's `PaneLayerId` onto the close channel, and (2) the
     /// message contains the same id the binary will resolve through
     /// its tick loop's drain.
-    #[test]
-    fn drop_pane_runner_sends_close_to_channel() {
+    #[tokio::test]
+    async fn drop_pane_runner_sends_close_to_channel() {
         use crate::pane::{PaneCloseTx, PaneRunner};
         use cmdash_config::parse as parse_config;
         use cmdash_layout::{ComputedLayout, Rect as LayoutRect};
         use cmdash_pty::ShellSpec;
-        use std::sync::mpsc;
-
         let mut graphics = GraphicsState::new(Metrics::default(), (80, 24));
-        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+        let (close_tx, mut close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let pane_id = PaneLayerId(99);
 
         // Pre-populate one image layer for the pane.

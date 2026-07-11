@@ -1,6 +1,6 @@
 //! Per-pane runner: owns a [`cmdash_pty::PanePty`] and a dedicated
 //! thread that drains the master-side reader and forwards bytes
-//! over a `std::sync::mpsc::Sender<Vec<u8>>` to the binary's main
+//! over a `tokio::sync::mpsc::UnboundedSender<Vec<u8>>` to the binary's main
 //! tick loop.
 //!
 //! AGENTS.md §"Rendering pipeline" step 2 prescribes the cell body
@@ -39,12 +39,11 @@
 //! dependencies".
 
 use std::io::Read;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::thread;
 
 use cmdash_layout::{ComputedPane, Rect as LayoutRect};
 use cmdash_pty::{PaneLayerId, PanePty, PaneReader, PaneTerminalState, PtyError, ShellSpec};
 use cmdash_widget_sdk::CmdashWidget;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 /// Re-export the pty-operations trait so downstream callers
 /// (e.g., future external test harnesses or alternative backend
@@ -61,7 +60,7 @@ use tracing::{debug, warn};
 /// Back-channel used by the binary to wire `PaneRunner::Drop`
 /// into `GraphicsState::close_pane`. v1 only needs the sender;
 /// the receiver is owned by the main loop's `tick_loop`.
-pub type PaneCloseTx = Sender<PaneLayerId>;
+pub type PaneCloseTx = UnboundedSender<PaneLayerId>;
 
 /// Reader-side error.
 #[derive(Debug, Error)]
@@ -87,7 +86,7 @@ pub enum RunnerError {
 /// `TabState: Clone` (the `Tab<T>: Clone` derive in `crate::tabs`
 /// requires it), and `TabState` carries a `runners: Vec<PaneRunner>`
 /// field. The manual `Clone` impl below returns a "shell" with
-/// `pty: None` and `reader_thread: None` so the v1 field's runners
+/// `pty: None` and `reader_task: None` so the v1 field's runners
 /// (the real ones) stay intact while the `TabState`'s runners are
 /// decorative shells — `TabState.runners` is never used at runtime
 /// (the v1 field's runners are authoritative, and tab mutations
@@ -108,19 +107,19 @@ pub struct PaneRunner {
     /// panes; `None` for shell panes. Public so the render loop
     /// can call `widget.render()` and `widget.on_event()`.
     pub widget: Option<Box<dyn CmdashWidget>>,
-    bytes_rx: Receiver<Vec<u8>>,
-    reader_thread: Option<thread::JoinHandle<()>>,
+    bytes_rx: UnboundedReceiver<Vec<u8>>,
+    reader_task: Option<tokio::task::JoinHandle<()>>,
     close_tx: Option<PaneCloseTx>,
 }
 
 // Manual `Clone` impl: the trait object field `pty: Box<dyn ...>`
 // is not `Clone` by default. The clone is a "shell" with
-// `pty: None` + `reader_thread: None` -- the source keeps both
-// pty and reader thread, so the v1 field's `runners` Vec
+// `pty: None` + `reader_task: None` -- the source keeps both
+// pty and reader task, so the v1 field's `runners` Vec
 // (the authoritative real runners for v1 code paths) stays
 // intact after `runners.clone()` for the `TabState` mirror.
 // The clone's `bytes_rx` is a FRESH dummy channel (the
-// original is `std::sync::mpsc::Receiver` which is NOT
+// original is `tokio::sync::mpsc::UnboundedReceiver` which is NOT
 // `Clone`); the dummy's sender is dropped on creation, so
 // the clone's `tick()` will see a disconnected channel and
 // skip the drain loop. The clone is a decorative shell for
@@ -130,14 +129,14 @@ pub struct PaneRunner {
 // `close_tx.clone()` IS valid (Sender: Clone).
 impl Clone for PaneRunner {
     fn clone(&self) -> Self {
-        let (_tx, bytes_rx) = channel::<Vec<u8>>();
+        let (_tx, bytes_rx) = unbounded_channel::<Vec<u8>>();
         Self {
             computed: self.computed.clone(),
             stored_layer_id: self.stored_layer_id,
             pty: None,
             widget: None,
             bytes_rx,
-            reader_thread: None,
+            reader_task: None,
             close_tx: self.close_tx.clone(),
         }
     }
@@ -149,9 +148,8 @@ impl Clone for PaneRunner {
 // sentinel prints `<dyn PanePtyOps+Send or <empty>>` so the
 // presence/absence of the pty is observable without forcing
 // the trait to require `Debug` (which would cascade into
-// `MasterPty: Debug` and the test stub). `bytes_rx` /
-// `reader_thread` / `close_tx` are opaque runtime resources
-// -- they print as `<rx>` / `<thread handle or None>` /
+// `MasterPty: Debug` and the test stub). `bytes_rx` /            // `reader_task` / `close_tx` are opaque runtime resources
+// -- they print as `<rx>` / `<task handle or None>` /
 // `<tx or None>`. `computed` is a plain [`ComputedPane`] so
 // its `Debug` delegate runs normally.
 impl std::fmt::Debug for PaneRunner {
@@ -183,11 +181,11 @@ impl std::fmt::Debug for PaneRunner {
             )
             .field("bytes_rx", &format_args!("<rx>"))
             .field(
-                "reader_thread",
+                "reader_task",
                 &format_args!(
                     "{}",
-                    if self.reader_thread.is_some() {
-                        "<thread handle>"
+                    if self.reader_task.is_some() {
+                        "<task handle>"
                     } else {
                         "<None>"
                     },
@@ -211,7 +209,7 @@ impl std::fmt::Debug for PaneRunner {
 // Manual `PartialEq` + `Eq` impls: two `PaneRunner`s are
 // "equal" iff they reference the same LOGICAL pane
 // (i.e. share a [`cmdash_layout::PaneId`]). The
-// `pty` / `bytes_rx` / `reader_thread` / `close_tx` fields
+// `pty` / `bytes_rx` / `reader_task` / `close_tx` fields
 // are transient RUNTIME state (a clone-shell has `pty: None`
 // while the source has `pty: Some(_)`, but they're the same
 // logical pane -- comparing the source against its clone
@@ -259,18 +257,15 @@ impl PaneRunner {
     ) -> Result<Self, RunnerError> {
         let (pty, reader) = PanePty::spawn(shell, computed.rect.w, computed.rect.h, layer_id)
             .map_err(RunnerError::Spawn)?;
-        let (tx, rx) = channel::<Vec<u8>>();
-        let reader_thread = thread::Builder::new()
-            .name(format!("cmdash-pane-{}", layer_id.0))
-            .spawn(move || run_reader(reader, tx))
-            .expect("spawn reader thread");
+        let (tx, rx) = unbounded_channel::<Vec<u8>>();
+        let reader_task = tokio::task::spawn_blocking(move || run_reader(reader, tx));
         Ok(Self {
             computed,
             stored_layer_id: layer_id,
             pty: Some(Box::new(pty)),
             widget: None,
             bytes_rx: rx,
-            reader_thread: Some(reader_thread),
+            reader_task: Some(reader_task),
             close_tx,
         })
     }
@@ -429,14 +424,14 @@ impl PaneRunner {
         widget: Box<dyn CmdashWidget>,
         close_tx: Option<PaneCloseTx>,
     ) -> Self {
-        let (_tx, rx) = channel::<Vec<u8>>();
+        let (_tx, rx) = unbounded_channel::<Vec<u8>>();
         Self {
             computed,
             stored_layer_id: layer_id,
             pty: None,
             widget: Some(widget),
             bytes_rx: rx,
-            reader_thread: None,
+            reader_task: None,
             close_tx,
         }
     }
@@ -458,14 +453,14 @@ impl PaneRunner {
         pty: Box<dyn PanePtyOps + Send>,
         close_tx: Option<PaneCloseTx>,
     ) -> Self {
-        let (_tx, rx) = channel::<Vec<u8>>();
+        let (_tx, rx) = unbounded_channel::<Vec<u8>>();
         Self {
             computed,
             stored_layer_id: layer_id,
             pty: Some(pty),
             widget: None,
             bytes_rx: rx,
-            reader_thread: None,
+            reader_task: None,
             close_tx,
         }
     }
@@ -498,13 +493,13 @@ impl Drop for PaneRunner {
                        "close_tx send on drop failed (receiver gone?)");
             }
         }
-        if let Some(handle) = self.reader_thread.take() {
-            let _ = handle.join();
+        if let Some(handle) = self.reader_task.take() {
+            handle.abort();
         }
     }
 }
 
-fn run_reader(mut reader: PaneReader, tx: std::sync::mpsc::Sender<Vec<u8>>) {
+fn run_reader(mut reader: PaneReader, tx: UnboundedSender<Vec<u8>>) {
     let mut buf = [0u8; 4096];
     let mut total_bytes: usize = 0;
     let mut read_count: u64 = 0;
@@ -753,15 +748,15 @@ mod internal_sanity_tests {
     }
 
     /// Smoke test: `Drop` sends the `PaneLayerId` into the
-    /// close channel. Uses `StubPty` with `reader_thread: None`
-    /// so `join()` is a no-op. Pins the basic close-channel
+    /// close channel. Uses `StubPty` with `reader_task: None`
+    /// so abort is a no-op. Pins the basic close-channel
     /// contract — that `close_tx.send()` fires at all during
     /// `Drop`.
-    #[test]
-    fn drop_sends_close_tx_on_drop() {
+    #[tokio::test]
+    async fn drop_sends_close_tx_on_drop() {
         let computed = make_test_pane();
         let layer_id = PaneLayerId(42);
-        let (close_tx, close_rx) = std::sync::mpsc::channel::<PaneLayerId>();
+        let (close_tx, mut close_rx) = unbounded_channel::<PaneLayerId>();
         let stub = StubPty::new(layer_id);
         let runner =
             PaneRunner::with_pty_for_test(computed, layer_id, Box::new(stub), Some(close_tx));
@@ -780,64 +775,54 @@ mod internal_sanity_tests {
     }
 
     /// Ordering test: `close_tx.send()` fires BEFORE
-    /// `handle.join()`. Without this ordering, a `kill()` failure
-    /// that leaves the reader thread blocked on `read()` would
-    /// hang `join()` and the close notification would never reach
+    /// the reader task is aborted. Without this ordering, a `kill()` failure
+    /// that leaves the reader task blocked on `read()` would
+    /// stall cleanup and the close notification would never reach
     /// `GraphicsState`, stranding the dashcompositor layer.
     ///
     /// This test constructs a `PaneRunner` with a real blocking
-    /// reader thread (blocks on a channel `recv` that never
-    /// fires), then drops the runner on a separate thread. If the
-    /// ordering is "send before join", `close_rx` receives the
-    /// `PaneLayerId` promptly even though `join()` is stuck. If
-    /// the ordering were "join before send", `close_rx` would
-    /// time out because `join()` hangs forever.
-    #[test]
-    fn drop_sends_close_tx_before_joining_blocking_reader_thread() {
-        use std::time::Duration;
+    /// reader task (blocks on a channel `recv` that never
+    /// fires), then drops the runner. If the
+    /// ordering is "send before abort", `close_rx` receives the
+    /// `PaneLayerId` promptly.
+    #[tokio::test]
+    async fn drop_sends_close_tx_before_aborting_blocking_reader_task() {
+        use tokio::time::Duration;
         let computed = make_test_pane();
         let layer_id = PaneLayerId(99);
-        let (close_tx, close_rx) = std::sync::mpsc::channel::<PaneLayerId>();
-        // Spawn a reader thread that blocks forever on a channel
+        let (close_tx, mut close_rx) = unbounded_channel::<PaneLayerId>();
+        // Spawn a reader task that blocks forever on a channel
         // recv — simulates a hung reader (kill() failed, child
         // keeps PTY master open, read() never returns EOF).
-        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
-        let blocking_thread = thread::spawn(move || {
-            let _ = block_rx.recv();
+        let (block_tx, mut block_rx) = unbounded_channel::<()>();
+        let blocking_task = tokio::task::spawn_blocking(move || {
+            let _ = block_rx.try_recv();
         });
         // Construct PaneRunner directly (same-module private
-        // field access) with the blocking thread + real close_tx.
-        let (_dummy_tx, dummy_rx) = channel::<Vec<u8>>();
+        // field access) with the blocking task + real close_tx.
+        let (_dummy_tx, dummy_rx) = unbounded_channel::<Vec<u8>>();
         let stub = StubPty::new(layer_id);
         let runner = PaneRunner {
             computed,
             pty: Some(Box::new(stub)),
             bytes_rx: dummy_rx,
-            reader_thread: Some(blocking_thread),
+            reader_task: Some(blocking_task),
             close_tx: Some(close_tx),
             stored_layer_id: layer_id,
             widget: None,
         };
-        // Drop on a separate thread so the test thread can check
-        // close_rx without hanging on the blocking join().
-        let drop_handle = thread::spawn(move || {
-            drop(runner);
-        });
-        // If ordering is correct (send before join), this
-        // succeeds within milliseconds. If ordering is wrong
-        // (join before send), this times out at 2s because
-        // join() hangs on the blocking reader thread.
-        let result = close_rx.recv_timeout(Duration::from_secs(2));
+        // Drop and check close_rx. If ordering is correct (send before abort), this
+        // succeeds within milliseconds.
+        drop(runner);
+        let result = tokio::time::timeout(Duration::from_secs(2), close_rx.recv()).await;
         assert!(
             result.is_ok(),
-            "close_tx must be sent BEFORE join(); if join() hangs, \
+            "close_tx must be sent BEFORE abort(); if abort hangs, \
              the close notification is stranded. Got: {:?}",
             result
         );
-        assert_eq!(result.unwrap(), layer_id);
-        // Unblock the reader thread so the drop_handle thread can
-        // complete (join() returns) and the test doesn't leak.
+        assert_eq!(result.unwrap().unwrap(), layer_id);
+        // Unblock the reader task so any lingering task can complete.
         let _ = block_tx.send(());
-        let _ = drop_handle.join();
     }
 }

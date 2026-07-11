@@ -39,8 +39,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
+
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use cmdash::graphics::{GraphicsState, Metrics};
 use cmdash::pane::{PaneCloseTx, PaneRunner};
@@ -405,12 +406,12 @@ struct ConfigWatcher {
 impl ConfigWatcher {
     fn spawn(
         config_path: Option<&std::path::Path>,
-    ) -> (Option<Self>, Option<Receiver<ConfigReload>>) {
+    ) -> (Option<Self>, Option<UnboundedReceiver<ConfigReload>>) {
         let Some(path) = config_path else {
             return (None, None);
         };
         let path = path.to_path_buf();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = unbounded_channel();
         let watcher = match Self::start_watcher(path, tx) {
             Ok(w) => w,
             Err(e) => {
@@ -424,7 +425,7 @@ impl ConfigWatcher {
 
     fn start_watcher(
         path: std::path::PathBuf,
-        tx: Sender<ConfigReload>,
+        tx: UnboundedSender<ConfigReload>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let debounce_ms: u64 = 500;
         let mut last_reload = std::time::Instant::now() - Duration::from_millis(debounce_ms);
@@ -490,7 +491,8 @@ impl ConfigWatcher {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let cli = match CliArgs::parse(&argv) {
         Ok(c) => c,
@@ -518,13 +520,13 @@ fn main() {
             p.display(),
         );
     }
-    if let Err(e) = run(&cli) {
+    if let Err(e) = run(&cli).await {
         eprintln!("cmdash: fatal: {e}");
         std::process::exit(1);
     }
 }
 
-fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut gfx_protocol = cmdash::GraphicsProtocol::detect();
     info!(
         graphics = gfx_protocol.name(),
@@ -621,7 +623,7 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Vec<PaneRunner> drops before `graphics` (reverse
     // declaration order), so Drop-driven sends land on a live
     // receiver owned by `close_rx`.
-    let (close_tx, close_rx): (Sender<cmdash_pty::PaneLayerId>, _) = std::sync::mpsc::channel();
+    let (close_tx, close_rx) = unbounded_channel::<cmdash_pty::PaneLayerId>();
 
     let mut runners: Vec<PaneRunner> = Vec::with_capacity(layout.panes.len());
     // Load widget factories before spawning panes so widget panes
@@ -746,7 +748,7 @@ fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ctx.widget_factories = widget_factories;
     ctx.status_bar = cfg.status_bar;
     ctx.theme = cfg.theme.unwrap_or_default();
-    ctx.run()
+    ctx.run().await
 }
 
 /// Concrete backend alias used by [`TerminalGuard`] and the
@@ -1001,9 +1003,9 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     focus: usize,
     /// Set to `false` by an action handler to quit the loop.
     running: bool,
-    /// MPSC receiver of `PaneRunner::Drop` close notifications;
+    /// Unbounded MPSC receiver of `PaneRunner::Drop` close notifications;
     /// drained at the start of phase 1.
-    close_rx: Receiver<cmdash_pty::PaneLayerId>,
+    close_rx: UnboundedReceiver<cmdash_pty::PaneLayerId>,
     /// dashcompositor layer book-keeping (phase 1 revoke +
     /// phase 2/3b update).
     graphics: GraphicsState,
@@ -1028,7 +1030,7 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// resize signals naturally coalesce — only the LATEST
     /// (cols, rows) reaches [`Self::relayout`] this tick.
     pending_resize: Option<(u16, u16)>,
-    /// Owned clone of the binary's paired `PaneCloseTx`. Retained
+    /// Owned clone of the binary's paired close sender. Retained
     /// so the runtime mutation paths (`AppNewPane` reconciliation,
     /// `PanePreset` rebuild) can wire fresh `PaneRunner`s into
     /// the SAME close-channel as the initial-frame spawn, preserving
@@ -1036,7 +1038,7 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// AGENTS.md §"Hard rule: one layer per instance" (`a` `LayerId` is
     /// bound to a pane instance for the instance's whole lifetime
     /// and is NEVER re-bound to a different pane).
-    close_tx: PaneCloseTx,
+    close_tx: UnboundedSender<cmdash_pty::PaneLayerId>,
     /// Last non-zero cell-grid area against which `relayout`
     /// succeeded. Used as the resolution target for runtime
     /// mutations (`AppNewPane`, `PaneClose`, `PanePreset`) when
@@ -1080,7 +1082,7 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// surfaces are coherent at construction.
     tabs: TabStack<TabState>,
     /// Config hot-reload channel receiver.
-    config_reload_rx: Option<Receiver<ConfigReload>>,
+    config_reload_rx: Option<UnboundedReceiver<ConfigReload>>,
     /// Optional status bar configuration. When `None`, no status
     /// bar is rendered. When `Some(Bar)`, a single row is reserved
     /// and the status bar is rendered in phase 3a.
@@ -1142,6 +1144,14 @@ pub(crate) enum ReconcileMode {
     Wholesale,
 }
 
+/// Snapshot collection + exit-status result returned by
+/// [`TickContext::tick_runners`]. Bundled into a struct to keep
+/// the return type readable and clippy-friendly.
+struct RunnerTickResult {
+    snapshots: Vec<Option<cmdash_pty::PaneTerminalState>>,
+    all_exited: bool,
+}
+
 impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// Construct a [`TickContext`] from all 14 per-frame
     /// building blocks, including the runtime-mutation hooks
@@ -1164,8 +1174,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         bindings: Router,
         focus: usize,
         running: bool,
-        close_tx: PaneCloseTx,
-        close_rx: Receiver<cmdash_pty::PaneLayerId>,
+        close_tx: UnboundedSender<cmdash_pty::PaneLayerId>,
+        close_rx: UnboundedReceiver<cmdash_pty::PaneLayerId>,
         graphics: GraphicsState,
         terminal: &'a mut Terminal<B>,
         tick: Duration,
@@ -1175,7 +1185,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         presets: BTreeMap<String, LayoutNode>,
         stack_focus: BTreeMap<PaneId, usize>,
         shell: ShellSpec,
-        config_reload_rx: Option<Receiver<ConfigReload>>,
+        config_reload_rx: Option<UnboundedReceiver<ConfigReload>>,
     ) -> Self {
         assert!(
             focus < runners.len(),
@@ -1405,75 +1415,6 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             KeyAction::PaneResizeLeft => self.pane_resize_by_direction(Direction::Left),
             KeyAction::PaneResizeRight => self.pane_resize_by_direction(Direction::Right),
         }
-    }
-
-    /// Phase 0 of the AGENTS.md rendering pipeline, full
-    /// version. Drains crossterm events and routes each one
-    /// through [`Self::handle_event_full`]. Non-blocking with
-    /// a 1ms minimum dwell: `event::poll(Duration::from_millis(1))`.
-    /// A sub-millisecond `poll(0)` was wrong on Unix PTYs
-    /// whose mio readiness state was not re-armed between
-    /// frames; crossterm/mio's readiness check returned false
-    /// before the underlying kernel buffer was re-queried, so
-    /// keypress bytes sat unconsumed in the PTY slave until
-    /// the next frame's poll ran (the live-binary
-    /// `app_new_pane_via_ctrl_a_keypress_in_live_binary`
-    /// integration test surfaced this with pre/post
-    /// identical FNV-1a hashes on the binary's stdout when
-    /// `Ctrl-a` was written to the PTY master). 1ms is
-    /// negligible against the 33ms tick cadence (~3% of the
-    /// per-frame budget) and cheap to amortize.
-    pub fn input_phase_full(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Observability hook: log the tick_loop's poll state at
-        // INIT and after each successful `event::poll`, so a
-        // future run of the live-binary AppNewPane integration
-        // test (which injects `Ctrl-a` over the PTY master) can
-        // directly see whether the byte reached the poll loop.
-        // With the 1ms dwell in place, a `Ctrl-a` byte
-        // submitted between ticks round-trips through
-        // `event::poll(time_budget) -> event::read() ->
-        // handle_event_full` within ONE tick; the corresponding
-        // debug line jumps `poll_count: 0 -> 1` and the
-        // `handle_event_full` line below surfaces the matching
-        // `Key` event. If the line stays at `poll_count: 0` for
-        // the entire test window, the byte never reached the
-        // poll loop (a PTY-routing regression). Debug level --
-        // the file-only subscriber under `--log=<path>` outputs
-        // it; default launches stay quiet at INFO level.
-        let time_budget = Duration::from_millis(1);
-        let mut poll_count: u32 = 0;
-        // The INIT log line fires once per input_phase_full call
-        // (~30 ticks/sec at the 33 ms cadence), so on a totally
-        // idle session it's ~18 lines/sec of pure idle noise in
-        // a routine `--log=<path>` file capture. Gate it on the
-        // `CMDASH_DEBUG_POLL` env var (any non-empty value
-        // counts as on) so a default launch's file log stays
-        // focused on real event activity; a polling-readiness
-        // investigation can opt in with
-        // `CMDASH_DEBUG_POLL=1 cmdash --log=...`. The per-poll
-        // log line further down (inside the `while` body) is
-        // bounded by real event rate -- one log per drained
-        // event -- so it stays always-on.
-        let debug_poll_trace = match std::env::var_os("CMDASH_DEBUG_POLL") {
-            Some(v) => !v.is_empty(),
-            None => false,
-        };
-        if debug_poll_trace {
-            debug!(
-                "tick_loop event poll N={} time_budget={:?}",
-                poll_count, time_budget
-            );
-        }
-        while event::poll(time_budget)? {
-            poll_count += 1;
-            debug!(
-                "tick_loop event poll N={} time_budget={:?}",
-                poll_count, time_budget
-            );
-            let evt = event::read()?;
-            self.handle_event_full(&evt);
-        }
-        Ok(())
     }
 
     pub fn handle_event_full(&mut self, evt: &Event) {
@@ -2659,19 +2600,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// Drain the config-reload channel and apply the latest
     /// payload. Keybinds and presets swap immediately; layout
     /// changes trigger a Wholesale reconcile.
-    fn check_config_reload(&mut self) {
-        let rx = match self.config_reload_rx.as_ref() {
-            Some(rx) => rx,
-            None => return,
-        };
-        let mut latest: Option<ConfigReload> = None;
-        while let Ok(msg) = rx.try_recv() {
-            latest = Some(msg);
-        }
-        let msg = match latest {
-            Some(m) => m,
-            None => return,
-        };
+    fn apply_config_reload(&mut self, msg: ConfigReload) {
         self.bindings = Router::new(msg.keybinds);
         self.presets = msg.presets;
         self.status_bar = msg.status_bar;
@@ -2697,223 +2626,355 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// flips `false` or every pane exits. The loop body is the
     /// same logic that lived in the prior free `tick_loop`
     /// function; bundling it on this struct lets `cmdash::run`
-    /// invoke it as a one-shot `ctx.run()`. Phase 0 input is
-    /// routed through [`Self::input_phase_full`] so the
-    /// carry-forward arms reach the live binary.
-    pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        loop {
-            // Phase 0: drain input events via the FULL action
-            // handler (v1 arms + AppNewPane + PaneFocus{Direction}
-            // + PanePreset). Non-blocking with a 1ms minimum dwell;
-            // see [`Self::input_phase_full`] rustdoc for the rationale
-            // (a `poll(0)` swallowed Ctrl-a on Unix PTYs in the
-            // the AppNewPane live-binary integration test).
-            // Each Press event is routed through
-            // [`Self::handle_event_full`] which dispatches via
-            // [`Self::apply_action_full`], OR forwarded as bytes
-            // to the focused pane. The carry-forward UX reaches
-            // the user through this path.
-            self.input_phase_full()?;
-            if !self.running {
-                return Ok(());
-            }
-
-            // Phase 0.5: host SIGWINCH coalescer. Drains the
-            // resize slot queued during phase 0 and runs
-            // `relayout(...)` BEFORE phase 1's drain, so a
-            // resize signal that arrived mid-tick produces a
-            // fresh per-pane rect in `self.runners[i].computed()` by
-            // the time phase 3a reads it.
-            if let Some((w, h)) = self.pending_resize.take() {
-                self.relayout(w, h);
-            }
-
-            // Phase 0.6: config hot-reload.
-            self.check_config_reload();
-
-            // Phase 1: drain the close-channel (Drop messages)
-            // FIRST so their revisions are visible before phase 2/3
-            // in the same tick. Then poll exits + tick + snapshot.
-            while let Ok(id) = self.close_rx.try_recv() {
-                self.graphics.close_pane(id);
-            }
-            let mut snapshots: Vec<Option<cmdash_pty::PaneTerminalState>> =
-                Vec::with_capacity(self.runners.len());
-            let mut all_exited = true;
-            for runner in self.runners.iter_mut() {
-                match runner.try_wait_exit()? {
-                    Some(_code) => {
-                        debug!(layer_id = ?runner.layer_id(), "pane exited");
-                    }
-                    None => {
-                        all_exited = false;
+    /// invoke it as a one-shot `ctx.run().await`.
+    ///
+    /// v2 uses a `tokio::select!` loop. Crossterm's blocking
+    /// `event::read` is isolated in a `tokio::task::spawn_blocking`
+    /// task that forwards events over an unbounded channel. The
+    /// main loop awaits that channel, the pane close channel, the
+    /// config reload channel, and a `tokio::time::Interval` tick.
+    /// Rendering and runner ticking remain synchronous inside the
+    /// tick branch, preserving the single-threaded pipeline
+    /// invariant required by `GraphicsState` and the borrowed
+    /// `Terminal`.
+    pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Spawn the crossterm input reader off the async runtime.
+        // `event::read` blocks, so it runs in spawn_blocking and
+        // forwards events over an unbounded channel. The task exits
+        // when the main loop drops `input_rx` (on return).
+        let (input_tx, input_rx) = unbounded_channel::<Event>();
+        tokio::task::spawn_blocking(move || loop {
+            match event::read() {
+                Ok(evt) => {
+                    if input_tx.send(evt).is_err() {
+                        break;
                     }
                 }
-                // Widget panes have no PTY to poll — skip tick()
-                // and push None so the render loop handles them via
-                // widget.render() instead of blit_grid.
-                if runner.is_widget() {
-                    snapshots.push(None);
-                } else {
-                    snapshots.push(Some(runner.tick()?));
+                Err(e) => {
+                    warn!(error = %e, "crossterm input reader error");
+                    break;
                 }
             }
+        });
 
-            // Phase 2: route events -> graphics. Kitty graphics
-            // emitted by a nested PTY are pushed onto the per-pane
-            // image map; everything else is logged. Failures
-            // log + continue (a busted image must not bring the
-            // multiplexer down).
-            for (runner, snap) in self.runners.iter().zip(snapshots.iter()) {
-                if let Some(snap) = snap {
-                    for ev in &snap.pending_events {
-                        if let PaneEvent::KittyGraphic { cmd } = ev {
-                            self.graphics.apply_kitty_event(runner.layer_id(), cmd);
+        self.run_loop(input_rx).await
+    }
+
+    /// Core event loop used by both production and tests.
+    /// Tests pass a custom `input_rx` to exercise channel-close
+    /// branches without a real terminal.
+    pub(crate) async fn run_loop(
+        &mut self,
+        mut input_rx: UnboundedReceiver<Event>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut tick_interval = tokio::time::interval(self.tick);
+
+        while self.running {
+            tokio::select! {
+                // Phase 0: crossterm input event.
+                evt = input_rx.recv() => {
+                    match evt {
+                        Some(evt) => {
+                            self.handle_event_full(&evt);
+                            if let Event::Resize(w, h) = evt {
+                                self.pending_resize = Some((w, h));
+                            }
+                        }
+                        None => {
+                            warn!("crossterm input channel closed; exiting event loop");
+                            break;
                         }
                     }
                 }
-            }
 
-            // Phase 3a: render the cell body through ratatui.
-            // Capture the focused index BEFORE drawing so the
-            // debug! can fire from inside the draw closure
-            // body without forcing a borrow conflict with the
-            // mutable `&mut self.terminal` reborrow taken by
-            // `terminal.draw`. The accessor `pub const fn focus`
-            // is therefore called on the hot path and no longer
-            // needs `#[allow(dead_code)]`.
-            let focus_idx_dbg = self.focus();
-            self.terminal.draw(|frame| {
-                debug!(focus_idx = focus_idx_dbg, "rendering frame");
-                // Pass 1: shell panes — blit PTY grids into the
-                // ratatui buffer. Widget panes are skipped here
-                // (their snapshots are None) and rendered in
-                // pass 2 via widget.render().
-                {
-                    let buf = frame.buffer_mut();
-                    for (runner, snap) in self.runners.iter().zip(snapshots.iter()) {
-                        let computed_rect = runner.computed().rect;
-                        debug!(
-                            layer_id = ?runner.layer_id(),
-                            rect.w = computed_rect.w,
-                            rect.h = computed_rect.h,
-                            "blitting pane"
-                        );
-                        let area = ratatui::layout::Rect::new(
-                            computed_rect.x,
-                            computed_rect.y + TAB_BAR_HEIGHT,
-                            computed_rect.w,
-                            computed_rect.h,
-                        );
-                        if let Some(snap) = snap {
-                            blit_grid(&snap.grid, buf, area);
-                            blit_cursor(&snap.grid, buf, area);
-                        }
-                    }
-                    render_tab_bar(buf, &self.tabs, &self.theme);
-                    // Status bar rendering (Phase 3a).
-                    if let Some(ref sb) = self.status_bar {
-                        if sb.enabled {
-                            let total_h = self.last_area.h + TAB_BAR_HEIGHT;
-                            let sb_y = match sb.position {
-                                cmdash_config::BarPosition::Top => TAB_BAR_HEIGHT,
-                                cmdash_config::BarPosition::Bottom => {
-                                    total_h.saturating_sub(STATUS_BAR_HEIGHT)
-                                }
-                            };
-                            let sb_area = ratatui::layout::Rect::new(
-                                0,
-                                sb_y,
-                                self.last_area.w,
-                                STATUS_BAR_HEIGHT,
-                            );
-                            let mode_name = match self.bindings.mode() {
-                                cmdash_keybinds::Mode::Normal => "Normal",
-                                cmdash_keybinds::Mode::PaneResize => "Resize",
-                                cmdash_keybinds::Mode::TabSwitch => "TabSwitch",
-                                cmdash_keybinds::Mode::PresetPick => "PresetPick",
-                            };
-                            let pane_title = self
-                                .runners
-                                .get(self.focus)
-                                .and_then(|r| r.computed().label.as_deref());
-                            cmdash::status_bar::render_status_bar(
-                                buf,
-                                sb_area,
-                                mode_name,
-                                pane_title,
-                                sb.show_clock,
-                                sb.show_pane_title,
-                                sb.show_mode, &self.theme,
-                            );
+                // Phase 1: pane close notifications from Drop.
+                id = self.close_rx.recv() => {
+                    match id {
+                        Some(id) => self.graphics.close_pane(id),
+                        None => {
+                            // All senders dropped; no more close
+                            // notifications can arrive. Keep running
+                            // so the remaining panes stay rendered.
                         }
                     }
                 }
-                // Pass 2: widget panes — call widget.render()
-                // with the full Frame. The buf borrow from pass
-                // 1 has been dropped (inner block ended), so
-                // frame is available for direct widget rendering.
-                for runner in self.runners.iter_mut() {
-                    let computed_rect = runner.computed().rect;
-                    if let Some(widget) = runner.widget.as_mut() {
-                        let area = ratatui::layout::Rect::new(
-                            computed_rect.x,
-                            computed_rect.y + TAB_BAR_HEIGHT,
-                            computed_rect.w,
-                            computed_rect.h,
-                        );
-                        widget.render(area, frame);
+
+                // Phase 0.6: config hot-reload.
+                msg = async {
+                    match self.config_reload_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match msg {
+                        Some(msg) => self.apply_config_reload(msg),
+                        None => {
+                            warn!("config reload channel closed; disabling hot-reload");
+                            self.config_reload_rx = None;
+                        }
                     }
                 }
-            })?;
 
-            // Phase 3b: emit dashcompositor kitty graphics through
-            // a fresh stdout handle. The terminal's own backend
-            // already finished writing row-bearing text; kitty
-            // escapes overlay on kitty-capable hosts and degrade
-            // gracefully elsewhere. AGENTS.md §"Rendering
-            // pipeline" step 6 prescribes this exact path.
-            //
-            // Before compositing, rebuild the tab bar as
-            // dashcompositor layers (RectLayer background +
-            // TextLayer per tab via fontdue). The ratatui
-            // text tab bar from phase 3a is preserved as a
-            // degraded-mode fallback; the pixel overlay
-            // overwrites it on kitty-capable hosts.
-            let tab_bar_data = cmdash::graphics::TabBarData {
-                labels: self.tabs.iter().map(|t| t.label.as_deref()).collect(),
-                active_idx: self.tabs.active_idx(),
-                bar_width_cells: self.graphics.cells().0,
-            };
-            self.graphics.update_tab_bar(&tab_bar_data);
-            let mut stdout = std::io::stdout();
-            if let Err(e) = self.graphics.render_and_write(&mut stdout) {
-                warn!(error = %e, "graphics emit failed");
+                // Phase 2/3: periodic tick + render.
+                _ = tick_interval.tick() => {
+                    self.tick_and_render()?;
+                }
             }
+        }
 
-            if all_exited {
-                return Ok(());
-            }
-            std::thread::sleep(self.tick);
+        Ok(())
+    }
+
+    /// Single iteration of the synchronous tick/render pipeline.
+    /// Kept as a separate method so the async `run` loop stays
+    /// readable and so the render logic remains testable.
+    /// Phase 0.5: host SIGWINCH coalescer. Drains the resize slot
+    /// queued during phase 0 and runs `relayout(...)` BEFORE the
+    /// close-channel drain, so a resize signal that arrived mid-tick
+    /// produces a fresh per-pane rect by the time rendering reads it.
+    fn process_pending_resize(&mut self) {
+        if let Some((w, h)) = self.pending_resize.take() {
+            self.relayout(w, h);
         }
     }
+
+    /// Phase 1 (part 1): drain the close-channel (Drop messages)
+    /// FIRST so their revisions are visible before phase 2/3 in the
+    /// same tick.
+    fn drain_close_channel(&mut self) {
+        while let Ok(id) = self.close_rx.try_recv() {
+            self.graphics.close_pane(id);
+        }
+    }
+
+    /// Phase 1 (part 2): poll exits and tick runners.
+    /// Returns the collected snapshots and a flag indicating whether
+    /// all panes have exited.
+    fn tick_runners(
+        &mut self,
+    ) -> Result<RunnerTickResult, Box<dyn std::error::Error + Send + Sync>> {
+        let mut snapshots: Vec<Option<cmdash_pty::PaneTerminalState>> =
+            Vec::with_capacity(self.runners.len());
+        let mut all_exited = true;
+        for runner in self.runners.iter_mut() {
+            match runner.try_wait_exit()? {
+                Some(_code) => {
+                    debug!(layer_id = ?runner.layer_id(), "pane exited");
+                }
+                None => {
+                    all_exited = false;
+                }
+            }
+            // Widget panes have no PTY to poll — skip tick()
+            // and push None so the render loop handles them via
+            // widget.render() instead of blit_grid.
+            if runner.is_widget() {
+                snapshots.push(None);
+            } else {
+                snapshots.push(Some(runner.tick()?));
+            }
+        }
+        Ok(RunnerTickResult {
+            snapshots,
+            all_exited,
+        })
+    }
+
+    /// Phase 2: route pending events -> graphics. Kitty graphics
+    /// emitted by a nested PTY are pushed onto the per-pane image map;
+    /// everything else is logged. Failures log + continue (a busted
+    /// image must not bring the multiplexer down).
+    fn route_graphics_events(&mut self, snapshots: &[Option<cmdash_pty::PaneTerminalState>]) {
+        for (runner, snap) in self.runners.iter().zip(snapshots.iter()) {
+            if let Some(snap) = snap {
+                for ev in &snap.pending_events {
+                    if let PaneEvent::KittyGraphic { cmd } = ev {
+                        self.graphics.apply_kitty_event(runner.layer_id(), cmd);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Phase 3a: draw the cell body (PTY grids, tab bar,
+    /// status bar, and widgets) into the ratatui terminal
+    /// buffer. Kept separate from [`Self::emit_graphics`]
+    /// so tests can inspect the text buffer without
+    /// exercising the dashcompositor graphics path.
+    fn render_cell_body(
+        &mut self,
+        snapshots: &[Option<cmdash_pty::PaneTerminalState>],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Capture the focused index BEFORE drawing so the
+        // debug! can fire from inside the draw closure
+        // body without forcing a borrow conflict with the
+        // mutable `&mut self.terminal` reborrow taken by
+        // `terminal.draw`. The accessor `pub const fn focus`
+        // is therefore called on the hot path and no longer
+        // needs `#[allow(dead_code)]`.
+        let focus_idx_dbg = self.focus();
+        self.terminal.draw(|frame| {
+            debug!(focus_idx = focus_idx_dbg, "rendering frame");
+            // Pass 1: shell panes — blit PTY grids into the
+            // ratatui buffer. Widget panes are skipped here
+            // (their snapshots are None) and rendered in
+            // pass 2 via widget.render().
+            {
+                let buf = frame.buffer_mut();
+                for (runner, snap) in self.runners.iter().zip(snapshots.iter()) {
+                    let computed_rect = runner.computed().rect;
+                    debug!(
+                        layer_id = ?runner.layer_id(),
+                        rect.w = computed_rect.w,
+                        rect.h = computed_rect.h,
+                        "blitting pane"
+                    );
+                    let area = ratatui::layout::Rect::new(
+                        computed_rect.x,
+                        computed_rect.y + TAB_BAR_HEIGHT,
+                        computed_rect.w,
+                        computed_rect.h,
+                    );
+                    if let Some(snap) = snap {
+                        blit_grid(&snap.grid, buf, area);
+                        blit_cursor(&snap.grid, buf, area);
+                    }
+                }
+                render_tab_bar(buf, &self.tabs, &self.theme);
+                // Status bar rendering (Phase 3a).
+                if let Some(ref sb) = self.status_bar {
+                    if sb.enabled {
+                        let total_h = self.last_area.h + TAB_BAR_HEIGHT;
+                        let sb_y = match sb.position {
+                            cmdash_config::BarPosition::Top => TAB_BAR_HEIGHT,
+                            cmdash_config::BarPosition::Bottom => {
+                                total_h.saturating_sub(STATUS_BAR_HEIGHT)
+                            }
+                        };
+                        let sb_area = ratatui::layout::Rect::new(
+                            0,
+                            sb_y,
+                            self.last_area.w,
+                            STATUS_BAR_HEIGHT,
+                        );
+                        let mode_name = match self.bindings.mode() {
+                            cmdash_keybinds::Mode::Normal => "Normal",
+                            cmdash_keybinds::Mode::PaneResize => "Resize",
+                            cmdash_keybinds::Mode::TabSwitch => "TabSwitch",
+                            cmdash_keybinds::Mode::PresetPick => "PresetPick",
+                        };
+                        let pane_title = self
+                            .runners
+                            .get(self.focus)
+                            .and_then(|r| r.computed().label.as_deref());
+                        cmdash::status_bar::render_status_bar(
+                            buf,
+                            sb_area,
+                            mode_name,
+                            pane_title,
+                            sb.show_clock,
+                            sb.show_pane_title,
+                            sb.show_mode,
+                            &self.theme,
+                        );
+                    }
+                }
+            }
+            // Pass 2: widget panes — call widget.render()
+            // with the full Frame. The buf borrow from pass
+            // 1 has been dropped (inner block ended), so
+            // frame is available for direct widget rendering.
+            for runner in self.runners.iter_mut() {
+                let computed_rect = runner.computed().rect;
+                if let Some(widget) = runner.widget.as_mut() {
+                    let area = ratatui::layout::Rect::new(
+                        computed_rect.x,
+                        computed_rect.y + TAB_BAR_HEIGHT,
+                        computed_rect.w,
+                        computed_rect.h,
+                    );
+                    widget.render(area, frame);
+                }
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Phase 3b: emit dashcompositor kitty graphics through
+    /// a fresh stdout handle. The terminal's own backend
+    /// already finished writing row-bearing text; kitty
+    /// escapes overlay on kitty-capable hosts and degrade
+    /// gracefully elsewhere. AGENTS.md §"Rendering
+    /// pipeline" step 6 prescribes this exact path.
+    ///
+    /// Before compositing, rebuild the tab bar as
+    /// dashcompositor layers (RectLayer background +
+    /// TextLayer per tab via fontdue). The ratatui
+    /// text tab bar from phase 3a is preserved as a
+    /// degraded-mode fallback; the pixel overlay
+    /// overwrites it on kitty-capable hosts.
+    fn emit_graphics(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tab_bar_data = cmdash::graphics::TabBarData {
+            labels: self.tabs.iter().map(|t| t.label.as_deref()).collect(),
+            active_idx: self.tabs.active_idx(),
+            bar_width_cells: self.graphics.cells().0,
+        };
+        self.graphics.update_tab_bar(&tab_bar_data);
+        let mut stdout = std::io::stdout();
+        if let Err(e) = self.graphics.render_and_write(&mut stdout) {
+            warn!(error = %e, "graphics emit failed");
+        }
+        Ok(())
+    }
+
+    /// Orchestrator: draw the cell body, then emit the
+    /// dashcompositor graphics overlay. Kept thin so tests
+    /// can call [`Self::render_cell_body`] and
+    /// [`Self::emit_graphics`] independently.
+    fn render_frame(
+        &mut self,
+        snapshots: &[Option<cmdash_pty::PaneTerminalState>],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.render_cell_body(snapshots)?;
+        self.emit_graphics()?;
+        Ok(())
+    }
+
+    pub(crate) fn tick_and_render(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.process_pending_resize();
+        self.drain_close_channel();
+        let RunnerTickResult {
+            snapshots,
+            all_exited,
+        } = self.tick_runners()?;
+        self.route_graphics_events(&snapshots);
+        self.render_frame(&snapshots)?;
+
+        if all_exited {
+            self.running = false;
+        }
+
+        Ok(())
+    }
 }
-/// Render the tab bar into row 0 of `buf`. Extracted from
-/// [`TickContext::run`] so the rendering logic is testable
-/// against [`ratatui::backend::TestBackend`] without needing
-/// the full tick-loop machinery.
-///
-/// Tab labels show ` N:label ` or ` N `; the active tab is
-/// highlighted with a blue background + white bold text;
-/// inactive tabs use a dim dark-gray style. Tabs that don't
-/// fit within `buf.area.width` are silently truncated.
-fn render_tab_bar(buf: &mut ratatui::buffer::Buffer, tabs: &TabStack<TabState>, theme: &cmdash_config::Theme) {
+
+fn render_tab_bar(
+    buf: &mut ratatui::buffer::Buffer,
+    tabs: &TabStack<TabState>,
+    theme: &cmdash_config::Theme,
+) {
     let bar_width = buf.area.width as usize;
     // Clear the tab bar row.
     for x in 0..bar_width {
         let cell = buf.get_mut(x as u16, 0);
         cell.set_symbol(" ");
-        cell.set_style(Style::default().bg(theme.tab_bar_bg()).fg(theme.tab_inactive_fg()));
+        cell.set_style(
+            Style::default()
+                .bg(theme.tab_bar_bg())
+                .fg(theme.tab_inactive_fg()),
+        );
     }
     let mut col: usize = 0;
     for (idx, tab) in tabs.iter().enumerate() {
@@ -2933,7 +2994,9 @@ fn render_tab_bar(buf: &mut ratatui::buffer::Buffer, tabs: &TabStack<TabState>, 
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().bg(theme.tab_inactive_bg()).fg(theme.tab_inactive_fg())
+            Style::default()
+                .bg(theme.tab_inactive_bg())
+                .fg(theme.tab_inactive_fg())
         };
         for ch in tab_text.chars() {
             if col >= bar_width {
@@ -3063,8 +3126,8 @@ mod redacted_event_debug_tests {
     /// redaction so a future crossterm upgrade that changes
     /// the `KeyEvent` field order doesn't silently leak
     /// printable text into `--log=<path>`.
-    #[test]
-    fn char_key_event_redacts_printable_char() {
+    #[tokio::test]
+    async fn char_key_event_redacts_printable_char() {
         let evt = Event::Key(KeyEvent {
             code: KeyCode::Char('Z'),
             modifiers: KeyModifiers::CONTROL,
@@ -3091,8 +3154,8 @@ mod redacted_event_debug_tests {
     /// to `Paste(<redacted>)`. Pins the reviewer-feedback catch
     /// that clipboard paste events carry typed passwords / API
     /// keys verbatim.
-    #[test]
-    fn paste_event_redacts_content() {
+    #[tokio::test]
+    async fn paste_event_redacts_content() {
         let evt = Event::Paste("secret-password".into());
         let s = redacted_event_debug(&evt);
         assert!(
@@ -3110,8 +3173,8 @@ mod redacted_event_debug_tests {
     /// `{:?}` escape is forwarded without redaction. Pins the
     /// "KEPT (full Debug escape)" contract for non-printable
     /// key codes.
-    #[test]
-    fn non_char_key_event_passes_through_unredacted() {
+    #[tokio::test]
+    async fn non_char_key_event_passes_through_unredacted() {
         let evt = Event::Key(KeyEvent {
             code: KeyCode::Up,
             modifiers: KeyModifiers::NONE,
@@ -3131,8 +3194,8 @@ mod redacted_event_debug_tests {
 
     /// `Event::Resize` event carries only geometry — no printable
     /// text — so it passes through unredacted.
-    #[test]
-    fn resize_event_passes_through_unredacted() {
+    #[tokio::test]
+    async fn resize_event_passes_through_unredacted() {
         let evt = Event::Resize(132, 50);
         let s = redacted_event_debug(&evt);
         assert!(
@@ -3155,8 +3218,8 @@ mod cli_args_tests {
     /// No `--log` token at all: the field stays `None`. The
     /// production launch shape (default stdout subscriber at
     /// INFO level).
-    #[test]
-    fn parse_log_absent_returns_none() {
+    #[tokio::test]
+    async fn parse_log_absent_returns_none() {
         let argv = vec![arg("cmdash")];
         let cli = CliArgs::parse(&argv).expect("parse");
         assert!(cli.log.is_none(), "--log absence must yield None");
@@ -3165,8 +3228,8 @@ mod cli_args_tests {
     /// `--log=/tmp/x.log` is the basic happy path with an
     /// absolute path; resolves relative vs. absolute via
     /// standard `PathBuf` semantics (no rewrite).
-    #[test]
-    fn parse_log_equals_path_is_some() {
+    #[tokio::test]
+    async fn parse_log_equals_path_is_some() {
         let argv = vec![arg("cmdash"), arg("--log=/tmp/x.log")];
         let cli = CliArgs::parse(&argv).expect("parse");
         assert_eq!(
@@ -3179,8 +3242,8 @@ mod cli_args_tests {
     /// `--log=<relative>` preserves the relative segment
     /// verbatim; CWD resolution happens at `OpenOptions::open`
     /// time, not at parse time.
-    #[test]
-    fn parse_log_relative_path_is_some() {
+    #[tokio::test]
+    async fn parse_log_relative_path_is_some() {
         let argv = vec![arg("cmdash"), arg("--log=debug.log")];
         let cli = CliArgs::parse(&argv).expect("parse");
         assert_eq!(
@@ -3193,8 +3256,8 @@ mod cli_args_tests {
     /// `--log=` (empty value) is REJECTED: an empty `PathBuf`
     /// silently trips Rust's "no such file" error downstream
     /// instead of surfacing a clear upfront message.
-    #[test]
-    fn parse_log_empty_value_errors() {
+    #[tokio::test]
+    async fn parse_log_empty_value_errors() {
         let argv = vec![arg("cmdash"), arg("--log=")];
         let err = CliArgs::parse(&argv).expect_err("--log= with empty value must error");
         assert!(
@@ -3205,8 +3268,8 @@ mod cli_args_tests {
 
     /// Bare `--log` (no `=<path>`) is REJECTED: ambiguous
     /// between "no log" and "missing value".
-    #[test]
-    fn parse_log_bare_no_equals_errors() {
+    #[tokio::test]
+    async fn parse_log_bare_no_equals_errors() {
         let argv = vec![arg("cmdash"), arg("--log")];
         let err = CliArgs::parse(&argv).expect_err("bare --log must error");
         assert!(
@@ -3219,8 +3282,8 @@ mod cli_args_tests {
     /// Pin the "first wins" semantic so launch scripts that
     /// accidentally pass two `--log=X --log=Y` don't quietly
     /// retarget the file path mid-run.
-    #[test]
-    fn parse_log_first_wins() {
+    #[tokio::test]
+    async fn parse_log_first_wins() {
         let argv = vec![
             arg("cmdash"),
             arg("--log=/tmp/a.log"),
@@ -3239,8 +3302,8 @@ mod cli_args_tests {
     /// flag additions don't break existing launch scripts.
     /// The PARSE SUCCEEDS and the already-set `--log` is
     /// preserved through the unrecognized token.
-    #[test]
-    fn parse_unknown_flag_after_log_is_ignored() {
+    #[tokio::test]
+    async fn parse_unknown_flag_after_log_is_ignored() {
         let argv = vec![
             arg("cmdash"),
             arg("--log=/tmp/x"),
@@ -3258,8 +3321,8 @@ mod cli_args_tests {
     /// Unknown `--flag` alone (no --log) still parses
     /// successfully. Forward-compat hedge: a launcher that adds
     /// a flag in cmdash v2 must NOT break v1 launch scripts.
-    #[test]
-    fn parse_unknown_flag_alone_is_ignored() {
+    #[tokio::test]
+    async fn parse_unknown_flag_alone_is_ignored() {
         let argv = vec![arg("cmdash"), arg("--future-flag")];
         let cli = CliArgs::parse(&argv).expect("parse must succeed");
         assert!(cli.log.is_none());
@@ -3268,8 +3331,8 @@ mod cli_args_tests {
     /// Lone `--log` (no `=<path>`) errors BEFORE scanning
     /// subsequent flags — pin: parser reads left-to-right and
     /// aborts at the first failing token.
-    #[test]
-    fn parse_log_bare_aborts_before_subsequent_flags() {
+    #[tokio::test]
+    async fn parse_log_bare_aborts_before_subsequent_flags() {
         let argv = vec![arg("cmdash"), arg("--log"), arg("--future-flag")];
         let err = CliArgs::parse(&argv).expect_err("lone --log must abort");
         assert!(
@@ -3282,8 +3345,8 @@ mod cli_args_tests {
     /// `argv.iter().skip(1)` which yields nothing; the result is
     /// `Ok(Self { log: None })`. Pin this shape in case a future
     /// refactor accidentally panics on `skip(1)` of an empty slice.
-    #[test]
-    fn parse_empty_argv_returns_none() {
+    #[tokio::test]
+    async fn parse_empty_argv_returns_none() {
         let argv: Vec<String> = vec![];
         let cli = CliArgs::parse(&argv).expect("parse");
         assert!(
@@ -3299,8 +3362,8 @@ mod cli_args_tests {
     /// --log does NOT abort when a valid first exists; only when
     /// the FIRST --log is itself empty/bare does the parse error
     /// out.
-    #[test]
-    fn parse_log_valid_then_empty_keeps_first() {
+    #[tokio::test]
+    async fn parse_log_valid_then_empty_keeps_first() {
         let argv = vec![arg("cmdash"), arg("--log=/tmp/foo.log"), arg("--log=")];
         let cli = CliArgs::parse(&argv).expect(
             "valid --log=/foo then invalid --log= must keep the first \
@@ -3318,8 +3381,8 @@ mod cli_args_tests {
     // ==========================================================
 
     /// `--config=/tmp/custom.kdl` is the basic happy path.
-    #[test]
-    fn parse_config_equals_path_is_some() {
+    #[tokio::test]
+    async fn parse_config_equals_path_is_some() {
         let argv = vec![arg("cmdash"), arg("--config=/tmp/custom.kdl")];
         let cli = CliArgs::parse(&argv).expect("parse");
         assert_eq!(
@@ -3330,8 +3393,8 @@ mod cli_args_tests {
     }
 
     /// `--config=` (empty value) is REJECTED.
-    #[test]
-    fn parse_config_empty_value_errors() {
+    #[tokio::test]
+    async fn parse_config_empty_value_errors() {
         let argv = vec![arg("cmdash"), arg("--config=")];
         let err = CliArgs::parse(&argv).expect_err("--config= with empty value must error");
         assert!(
@@ -3341,8 +3404,8 @@ mod cli_args_tests {
     }
 
     /// Bare `--config` (no `=<path>`) is REJECTED.
-    #[test]
-    fn parse_config_bare_no_equals_errors() {
+    #[tokio::test]
+    async fn parse_config_bare_no_equals_errors() {
         let argv = vec![arg("cmdash"), arg("--config")];
         let err = CliArgs::parse(&argv).expect_err("bare --config must error");
         assert!(
@@ -3352,8 +3415,8 @@ mod cli_args_tests {
     }
 
     /// First `--config=<path>` wins; subsequent ones warn-and-ignore.
-    #[test]
-    fn parse_config_first_wins() {
+    #[tokio::test]
+    async fn parse_config_first_wins() {
         let argv = vec![
             arg("cmdash"),
             arg("--config=/tmp/a.kdl"),
@@ -3368,16 +3431,16 @@ mod cli_args_tests {
     }
 
     /// `--config` absent: the field stays `None`.
-    #[test]
-    fn parse_config_absent_returns_none() {
+    #[tokio::test]
+    async fn parse_config_absent_returns_none() {
         let argv = vec![arg("cmdash")];
         let cli = CliArgs::parse(&argv).expect("parse");
         assert!(cli.config.is_none(), "--config absence must yield None");
     }
 
     /// Both `--log` and `--config` can be set independently.
-    #[test]
-    fn parse_log_and_config_both_set() {
+    #[tokio::test]
+    async fn parse_log_and_config_both_set() {
         let argv = vec![
             arg("cmdash"),
             arg("--log=/tmp/debug.log"),
@@ -3399,16 +3462,16 @@ mod cli_args_tests {
     // ==========================================================
 
     /// `--help` returns the HELP sentinel.
-    #[test]
-    fn parse_help_returns_help_sentinel() {
+    #[tokio::test]
+    async fn parse_help_returns_help_sentinel() {
         let argv = vec![arg("cmdash"), arg("--help")];
         let err = CliArgs::parse(&argv).expect_err("--help must return HELP sentinel");
         assert_eq!(err, "HELP", "--help must return the HELP sentinel");
     }
 
     /// `-h` returns the HELP sentinel.
-    #[test]
-    fn parse_h_returns_help_sentinel() {
+    #[tokio::test]
+    async fn parse_h_returns_help_sentinel() {
         let argv = vec![arg("cmdash"), arg("-h")];
         let err = CliArgs::parse(&argv).expect_err("-h must return HELP sentinel");
         assert_eq!(err, "HELP", "-h must return the HELP sentinel");
@@ -3423,8 +3486,8 @@ mod cli_args_tests {
     // ==========================================================
 
     /// Priority 1: explicit CLI override wins over everything.
-    #[test]
-    fn resolve_config_path_cli_override_wins() {
+    #[tokio::test]
+    async fn resolve_config_path_cli_override_wins() {
         let explicit = Some(std::path::Path::new("/tmp/explicit.kdl"));
         let (path, label) = resolve_config_path(explicit);
         assert_eq!(
@@ -3439,8 +3502,8 @@ mod cli_args_tests {
     /// We can't easily clear `CMDASH_CONFIG_DIR` in a test
     /// (parallel tests share the process env), so we test
     /// the CLI-override path which is the priority-1 winner.
-    #[test]
-    fn resolve_config_path_xdg_default_shape() {
+    #[tokio::test]
+    async fn resolve_config_path_xdg_default_shape() {
         // With no CLI override, the result should be
         // Some(<path>) with the XDG default shape, unless
         // CMDASH_CONFIG_DIR is set (which may happen in CI).
@@ -3466,8 +3529,8 @@ mod cli_args_tests {
     /// temp file with a two-pane split (distinct from the bundled
     /// single-pane default) so we can confirm the file-sourced
     /// text is actually being parsed.
-    #[test]
-    fn config_file_loading_end_to_end() {
+    #[tokio::test]
+    async fn config_file_loading_end_to_end() {
         use std::io::Write;
         let dir = std::env::temp_dir().join("cmdash_config_test");
         let _ = std::fs::create_dir_all(&dir);
@@ -3521,8 +3584,8 @@ mod cli_args_tests {
     /// back to the bundled default (single-pane layout). Confirms
     /// that `read_config_text` returns valid KDL when the resolved
     /// path doesn't exist on disk.
-    #[test]
-    fn config_file_missing_falls_back_to_bundled() {
+    #[tokio::test]
+    async fn config_file_missing_falls_back_to_bundled() {
         let nonexistent = std::path::PathBuf::from("/tmp/cmdash_nonexistent_config.kdl");
         let _ = std::fs::remove_file(&nonexistent); // ensure it doesn't exist
 
@@ -3556,8 +3619,8 @@ mod cli_args_tests {
     /// as `cmdash::run` would, and asserts the resolved layout
     /// has exactly 2 panes with the expected labels and split
     /// geometry.
-    #[test]
-    fn cli_config_override_end_to_end() {
+    #[tokio::test]
+    async fn cli_config_override_end_to_end() {
         let dir = std::env::temp_dir().join("cmdash_cli_config_e2e_test");
         let _ = std::fs::create_dir_all(&dir);
         let config_path = dir.join("config.kdl");
@@ -3695,7 +3758,6 @@ mod input_tests {
     use cmdash_keybinds::Router;
     use cmdash_layout::{ComputedLayout, Rect as LayoutRect};
     use cmdash_pty::{PaneLayerId, ShellSpec};
-    use std::sync::mpsc;
 
     /// Spawn a single `PaneRunner` wired to a close-channel and
     /// using `/bin/true` (fast-exit child) so `Drop::drop`
@@ -3840,7 +3902,7 @@ mod input_tests {
         let layout_root = cfg.layout.expect("setup_fixture_ctx: layout block");
         let layout =
             ComputedLayout::compute(&layout_root, last_area).expect("setup_fixture_ctx: compute");
-        let (close_tx, close_rx) = mpsc::channel();
+        let (close_tx, close_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut runners: Vec<PaneRunner> = Vec::with_capacity(layout.panes.len());
         for pane in &layout.panes {
             let tx_clone = close_tx.clone();
@@ -3890,8 +3952,8 @@ mod input_tests {
     /// removed in this atom; test and production now share the
     /// same dispatch + reconcile surface end-to-end (AGENTS.md
     /// Phase 2 dual-location contract).
-    #[test]
-    fn ctrl_w_pane_close_pops_focused_runner_and_routes_close_message() {
+    #[tokio::test]
+    async fn ctrl_w_pane_close_pops_focused_runner_and_routes_close_message() {
         // Split layout_root with 2 leaves so the focused
         // pane's resolver path_len >= 2 (closing a direct
         // child of `layout_root` triggers the v2
@@ -3990,8 +4052,8 @@ mod input_tests {
     /// `self.runners.clear()` and `self.running = false`). The
     /// free-fn `handle_event` form is gone in v2; the only
     /// live dispatch site is `TickContext::handle_event_full`.
-    #[test]
-    fn pane_close_last_pane_quits_binary() {
+    #[tokio::test]
+    async fn pane_close_last_pane_quits_binary() {
         let source = r#"layout { pane kind=shell label="only" }"#;
         let last_area = LayoutRect {
             x: 0,
@@ -4043,8 +4105,8 @@ mod input_tests {
     /// production `TickContext::handle_event_full` path
     /// with a 3-pane Split layout (a on top, b+c on the
     /// bottom nested split), focusing the tail pane (c).
-    #[test]
-    fn pane_close_clamps_focus_when_tail_removed() {
+    #[tokio::test]
+    async fn pane_close_clamps_focus_when_tail_removed() {
         let source = r#"layout {
             split axis=vertical ratio=0.5 {
                 pane kind=shell label="a"
@@ -4120,12 +4182,12 @@ mod input_tests {
     /// Migrated to `TickContext::new_full` (was `new`);
     /// the focus-bound panic invariant is enforced at the
     /// 14-arg ctor.
-    #[test]
+    #[tokio::test]
     #[should_panic(expected = "focus")]
-    fn tick_context_new_full_panics_when_focus_out_of_bounds() {
+    async fn tick_context_new_full_panics_when_focus_out_of_bounds() {
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
-        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel::<cmdash_pty::PaneLayerId>();
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let bindings = Router::new(vec![]);
         let graphics =
             cmdash::graphics::GraphicsState::new(cmdash::graphics::Metrics::default(), (80, 24));
@@ -4165,10 +4227,10 @@ mod input_tests {
     /// `PaneLayerId` independent of layout-pre-order numbering.
     /// Migrated to `TickContext::new_full` for the same reason
     /// as the empty-Vec companion.
-    #[test]
+    #[tokio::test]
     #[should_panic(expected = "focus")]
-    fn tick_context_new_full_panics_when_focus_equals_non_zero_len() {
-        let (close_tx, close_rx) = mpsc::channel::<cmdash_pty::PaneLayerId>();
+    async fn tick_context_new_full_panics_when_focus_equals_non_zero_len() {
+        let (close_tx, close_rx) = tokio::sync::mpsc::unbounded_channel();
         let r0 = make_runner_with_id("a", PaneLayerId(1), close_tx.clone());
         let r1 = make_runner_with_id("b", PaneLayerId(2), close_tx.clone());
         let bindings = Router::new(vec![]);
@@ -4213,8 +4275,8 @@ mod input_tests {
     /// dims. Migrated from the prior free-fn form so the
     /// test exercises the same dispatch that production
     /// drives.
-    #[test]
-    fn handle_event_resize_event_arms_pending_resize() {
+    #[tokio::test]
+    async fn handle_event_resize_event_arms_pending_resize() {
         let source = r#"layout { pane kind=shell label="resize-anchor" }"#;
         let last_area = LayoutRect {
             x: 0,
@@ -4274,8 +4336,8 @@ mod input_tests {
     /// PTY children; this lib unit-test pins the deterministic
     /// `for_id` `and` `for_cells` invariants without depending on a
     /// real PTY round-trip.
-    #[test]
-    fn relayout_emits_resize_per_pane_when_host_signals_resize() {
+    #[tokio::test]
+    async fn relayout_emits_resize_per_pane_when_host_signals_resize() {
         let source = r#"layout {
             split axis=horizontal ratio=0.6 {
                 pane kind=shell label="split-a"
@@ -4302,7 +4364,7 @@ mod input_tests {
         // bug was invisible to `cargo test -p cmdash --lib`
         // because `input_tests` lives in the binary crate;
         // only `cargo test --workspace` exercises it.
-        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let initial_layout = ComputedLayout::compute(
             &layout_root,
             LayoutRect {
@@ -4469,9 +4531,9 @@ mod input_tests {
     /// 2. The original focused pane's `LayerId` is stable per
     /// AGENTS.md Hard rule (a `LayerId` is bound to a pane
     /// instance for its whole lifetime and is NOT re-bound).
-    #[test]
-    fn app_new_pane_splits_focused_leaf_and_spawns_runner() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn app_new_pane_splits_focused_leaf_and_spawns_runner() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -4503,7 +4565,7 @@ mod input_tests {
             0,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -4546,9 +4608,9 @@ mod input_tests {
     /// pressing Right again on the rightmost is a no-op
     /// (no neighbour); Left from the rightmost returns to the
     /// leftmost.
-    #[test]
-    fn pane_focus_right_resolves_to_adjacent_pane_via_rect_proximity() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_focus_right_resolves_to_adjacent_pane_via_rect_proximity() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -4589,7 +4651,7 @@ mod input_tests {
             0,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -4629,9 +4691,9 @@ mod input_tests {
     /// collapses the Split into child 1; `reconcile_runners`
     /// rebuilds `Vec<PaneRunner>` against the post-rebalance
     /// tree with the survivor's `LayerId` intact.
-    #[test]
-    fn pane_close_rebalance_collapses_split_to_one_leaf() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_close_rebalance_collapses_split_to_one_leaf() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -4673,7 +4735,7 @@ mod input_tests {
             0,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -4716,9 +4778,9 @@ mod input_tests {
     /// `Drop` to fire spuriously and the second same-labeled
     /// pane to get a fresh spawn instead of inheriting the
     /// survivor. Pins the duplicate-label collision fix.
-    #[test]
-    fn reconcile_inplace_preserves_both_survivors_with_duplicate_labels() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn reconcile_inplace_preserves_both_survivors_with_duplicate_labels() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -4776,7 +4838,7 @@ mod input_tests {
             0,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -4821,9 +4883,9 @@ mod input_tests {
     /// tree has fresh `LayerIds` per pane. Pin: distinct fresh
     /// `LayerIds` per pane, AND the `original` `LayerId` does NOT
     /// appear in the post-state Vec.
-    #[test]
-    fn pane_preset_swaps_layout_root_and_reconciles_runners() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_preset_swaps_layout_root_and_reconciles_runners() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -4873,7 +4935,7 @@ mod input_tests {
             0,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -4920,9 +4982,9 @@ mod input_tests {
     /// must wrap it to the FIRST member. Pins the
     /// "within-ZStack rotatation" half of the Phase 4
     /// contract.
-    #[test]
-    fn pane_stack_cycle_wraps_around_zstack_focus() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_stack_cycle_wraps_around_zstack_focus() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -4971,7 +5033,7 @@ mod input_tests {
             2,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -5006,10 +5068,10 @@ mod input_tests {
     /// advances to the next member in declaration order
     /// (no wrap; no geometric handoff). The handoff case
     /// is covered separately by
-    #[test]
+    #[tokio::test]
     /// `pane_stack_down_at_top_hands_off_to_pane_below`.
-    fn pane_stack_down_within_stack_advances_to_next_member() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    async fn pane_stack_down_within_stack_advances_to_next_member() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -5059,7 +5121,7 @@ mod input_tests {
             0,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -5097,11 +5159,11 @@ mod input_tests {
     /// occupies the top half (y=0..12), the below-pane
     /// occupies the bottom half (y=12..24). Focus the
     /// LAST member of the `ZStack` ("top") and press
-    #[test]
+    #[tokio::test]
     /// `PaneStackDown`; focus must hand off to "below"
     /// (path [0, 1]).
-    fn pane_stack_down_at_top_hands_off_to_pane_below() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    async fn pane_stack_down_at_top_hands_off_to_pane_below() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -5158,7 +5220,7 @@ mod input_tests {
             1,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -5210,9 +5272,9 @@ mod input_tests {
         );
     }
 
-    #[test]
-    fn pane_stack_up_within_stack_advances_to_previous_member() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_stack_up_within_stack_advances_to_previous_member() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -5262,7 +5324,7 @@ mod input_tests {
             1,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -5290,9 +5352,9 @@ mod input_tests {
         assert_eq!(ctx.stack_focus.get(&focused_id).copied(), Some(0));
     }
 
-    #[test]
-    fn pane_stack_up_at_bottom_hands_off_to_pane_above() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_stack_up_at_bottom_hands_off_to_pane_above() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -5350,7 +5412,7 @@ mod input_tests {
             1,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -5404,9 +5466,9 @@ mod input_tests {
     /// the **previous** member of the focused `ZStack` in
     /// declaration order. Stop before the first member (no
     /// handoff in this test).
-    #[test]
-    fn pane_stack_left_within_stack_retreats_to_previous_member() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_stack_left_within_stack_retreats_to_previous_member() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -5454,7 +5516,7 @@ mod input_tests {
             1,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -5496,9 +5558,9 @@ mod input_tests {
     /// to the **next** member of the focused `ZStack` in
     /// declaration order. Stop before the last member (no
     /// handoff in this test).
-    #[test]
-    fn pane_stack_right_within_stack_advances_to_next_member() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_stack_right_within_stack_advances_to_next_member() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -5546,7 +5608,7 @@ mod input_tests {
             0,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -5596,9 +5658,9 @@ mod input_tests {
     /// focus must hand off to "`right_outside`" (path [0, 1]).
     /// Pinned by `split_rect_horizontal_60` in the
     /// cmdash-layout crate's ground-truth unit tests.
-    #[test]
-    fn pane_stack_right_at_last_member_hands_off_to_pane_right() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_stack_right_at_last_member_hands_off_to_pane_right() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -5655,7 +5717,7 @@ mod input_tests {
             1,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -5712,9 +5774,9 @@ mod input_tests {
     /// (x=40..80) so the geometry is unambiguous. Focus the
     /// FIRST member ("`left_inside`") and `press` `PaneStackLeft`;
     /// focus must hand off to "`left_outside`" (path [0, 0]).
-    #[test]
-    fn pane_stack_left_at_first_member_hands_off_to_pane_left() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_stack_left_at_first_member_hands_off_to_pane_left() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -5772,7 +5834,7 @@ mod input_tests {
             1,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -5832,9 +5894,9 @@ mod input_tests {
     /// regress it silently. Use `axis=horizontal` (column
     /// split -- same y, different x) so the side pane sits
     /// in the geometric right of the 1-member `ZStack`.
-    #[test]
-    fn pane_stack_right_on_one_member_zstack_immediately_hands_off_to_right() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_stack_right_on_one_member_zstack_immediately_hands_off_to_right() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -5888,7 +5950,7 @@ mod input_tests {
             0,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -5943,9 +6005,9 @@ mod input_tests {
     /// same dual boundary-condition rationale (single-member
     /// `ZStack` hits BOTH `member_idx == 0` and
     /// `member_idx + 1 == panes.len()` from inside `crosstack_member`).
-    #[test]
-    fn pane_stack_left_on_one_member_zstack_immediately_hands_off_to_left() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_stack_left_on_one_member_zstack_immediately_hands_off_to_left() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -6000,7 +6062,7 @@ mod input_tests {
             1,
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -6079,9 +6141,9 @@ mod input_tests {
     /// `crosstack_member`) cannot confound the assertion.
     /// Cycle's algorithm is closed (no handoff), so any axis
     /// trapdoor in the fixture would only add noise.
-    #[test]
-    fn pane_stack_cycle_on_one_member_zstack_wraps_to_same_member() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_stack_cycle_on_one_member_zstack_wraps_to_same_member() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -6117,7 +6179,7 @@ mod input_tests {
             0, // focus on "only" (SOLE member)
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -6177,9 +6239,9 @@ mod input_tests {
     /// be a semantic-noose (the fixture's trapdoor would
     /// be irrelevant to cycle's behavior and would invite a
     /// future reader to misinterpret the assertion).
-    #[test]
-    fn pane_stack_cycle_on_three_member_zstack_wraps_last_to_first() {
-        let (close_tx, _close_rx_unused): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn pane_stack_cycle_on_three_member_zstack_wraps_last_to_first() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -6227,7 +6289,7 @@ mod input_tests {
             2, // focus on "c" (LAST member)
             true,
             close_tx,
-            _close_rx_unused,
+            close_rx,
             graphics,
             &mut terminal,
             Duration::from_millis(33),
@@ -6321,9 +6383,9 @@ mod input_tests {
     /// for the up/down directions; left/right adjacency is
     /// exercised separately by
     /// `pane_focus_right_resolves_to_adjacent_pane_via_rect_proximity`.
-    #[test]
-    fn apply_action_full_pane_focus_up_down_noop_on_single_row() {
-        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn apply_action_full_pane_focus_up_down_noop_on_single_row() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -6418,9 +6480,9 @@ mod input_tests {
     /// distinguishable from the multi-leaf rebalance case
     /// (`pane_close_rebalance_collapses_split_to_one_leaf`
     /// keeps the survivor and doesn't quit).
-    #[test]
-    fn apply_action_full_pane_close_final_pane_quits() {
-        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn apply_action_full_pane_close_final_pane_quits() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -6490,9 +6552,9 @@ mod input_tests {
     /// accidentally treats any string as a `KeyAction::PanePreset`
     /// target (or panics on `BTreeMap::get` returning `None`)
     /// fails this check.
-    #[test]
-    fn apply_action_full_pane_preset_unknown_name_noop() {
-        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn apply_action_full_pane_preset_unknown_name_noop() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -6600,9 +6662,9 @@ mod input_tests {
     /// of a 2-pane H-Split, `close_rx`.`try_recv`() must yield
     /// the LEFT pane's dropped `PaneLayerId`, AND the
     /// survivor's `PaneLayerId` is unchanged.
-    #[test]
-    fn apply_action_full_pane_close_drops_runner_routes_close_message() {
-        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn apply_action_full_pane_close_drops_runner_routes_close_message() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -6702,9 +6764,9 @@ mod input_tests {
     /// through to the vector `PaneId` once `TickContext`
     /// `relayout`s on the next SIGWINCH or zero-area
     /// pin-event).
-    #[test]
-    fn apply_action_full_app_new_pane_survivor_path_len_reconciles_to_two() {
-        let (close_tx, close_rx): (PaneCloseTx, _) = mpsc::channel();
+    #[tokio::test]
+    async fn apply_action_full_app_new_pane_survivor_path_len_reconciles_to_two() {
+        let (close_tx, close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
         let shell = ShellSpec::Command {
             argv: vec!["true".into()],
         };
@@ -6786,175 +6848,340 @@ mod input_tests {
             "AppNewPane: original focused pane's LayerId is preserved (Hard rule)"
         );
     }
-}
 
-#[cfg(test)]
-mod shell_spec_from_command_tests {
-    use super::*;
+    /// Build a minimal context with one widget runner (no real PTY)
+    /// so `tick_and_render` is cheap and cannot leave a child process
+    /// behind if a test panics or times out. The keybinding `q` is
+    /// wired to `AppClose` so tests can drive a clean exit.
+    fn setup_run_loop_ctx<'a>(
+        terminal: &'a mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    ) -> TickContext<'a, ratatui::backend::TestBackend> {
+        use cmdash_widget_sdk::{CmdashWidget, WidgetEvent};
 
-    /// `None` command returns the default shell.
-    #[test]
-    fn none_returns_default() {
-        let default = ShellSpec::LoginShell;
-        let result = shell_spec_from_command(&None, &default);
-        assert_eq!(result, ShellSpec::LoginShell);
-    }
-
-    /// `Some("")` (empty string) returns the default shell
-    /// because `split_whitespace()` yields an empty iterator.
-    #[test]
-    fn empty_string_returns_default() {
-        let default = ShellSpec::LoginShell;
-        let result = shell_spec_from_command(&Some(String::new()), &default);
-        assert_eq!(result, ShellSpec::LoginShell);
-    }
-
-    /// `Some("  ")` (whitespace-only) returns the default shell
-    /// because `split_whitespace()` yields an empty iterator.
-    #[test]
-    fn whitespace_only_returns_default() {
-        let default = ShellSpec::LoginShell;
-        let result = shell_spec_from_command(&Some("  ".to_string()), &default);
-        assert_eq!(result, ShellSpec::LoginShell);
-    }
-
-    /// `Some("htop")` produces `Command { argv: ["htop"] }`.
-    #[test]
-    fn simple_command() {
-        let default = ShellSpec::LoginShell;
-        let result = shell_spec_from_command(&Some("htop".to_string()), &default);
-        assert_eq!(
-            result,
-            ShellSpec::Command {
-                argv: vec!["htop".to_string()]
+        struct DummyWidget;
+        impl CmdashWidget for DummyWidget {
+            fn name(&self) -> &str {
+                "dummy"
             }
-        );
-    }
-
-    /// `Some("htop --arg1 --arg2")` produces
-    /// `Command { argv: ["htop", "--arg1", "--arg2"] }`.
-    #[test]
-    fn command_with_args() {
-        let default = ShellSpec::LoginShell;
-        let result = shell_spec_from_command(&Some("htop --arg1 --arg2".to_string()), &default);
-        assert_eq!(
-            result,
-            ShellSpec::Command {
-                argv: vec![
-                    "htop".to_string(),
-                    "--arg1".to_string(),
-                    "--arg2".to_string()
-                ]
-            }
-        );
-    }
-
-    /// `Some("echo hello world")` produces
-    /// `Command { argv: ["echo", "hello", "world"] }`.
-    #[test]
-    fn command_with_multiple_args() {
-        let default = ShellSpec::LoginShell;
-        let result = shell_spec_from_command(&Some("echo hello world".to_string()), &default);
-        assert_eq!(
-            result,
-            ShellSpec::Command {
-                argv: vec!["echo".to_string(), "hello".to_string(), "world".to_string()]
-            }
-        );
-    }
-
-    /// Different default shell is preserved when command is `None`.
-    #[test]
-    fn none_preserves_custom_default() {
-        let default = ShellSpec::Command {
-            argv: vec!["/bin/bash".to_string()],
-        };
-        let result = shell_spec_from_command(&None, &default);
-        assert_eq!(
-            result,
-            ShellSpec::Command {
-                argv: vec!["/bin/bash".to_string()]
-            }
-        );
-    }
-
-    /// Explicit command overrides the default shell.
-    #[test]
-    fn some_overrides_default() {
-        let default = ShellSpec::Command {
-            argv: vec!["/bin/bash".to_string()],
-        };
-        let result = shell_spec_from_command(&Some("/bin/zsh".to_string()), &default);
-        assert_eq!(
-            result,
-            ShellSpec::Command {
-                argv: vec!["/bin/zsh".to_string()]
-            }
-        );
-    }
-}
-
-#[cfg(test)]
-mod tab_bar_render_tests {
-    use super::*;
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-
-    /// Helper: build a minimal `TabStack<TabState>` with `n` tabs,
-    /// the first tab active, no labels. Each `TabState` is
-    /// constructed with an empty runner Vec and a single-pane
-    /// layout root so `TabStack` invariants hold.
-    fn make_tabs(n: usize) -> TabStack<TabState> {
-        let dummy_state = TabState {
-            runners: Vec::new(),
-            focus: 0,
-            layout_root: LayoutNode::Pane(CfgPane {
-                kind: PaneKind::Shell,
-                label: None,
-                command: None,
-            }),
-            stack_focus: BTreeMap::new(),
-        };
-        let mut tabs = TabStack::new(dummy_state);
-        for _ in 1..n {
-            tabs.push(TabState {
-                runners: Vec::new(),
-                focus: 0,
-                layout_root: LayoutNode::Pane(CfgPane {
-                    kind: PaneKind::Shell,
-                    label: None,
-                    command: None,
-                }),
-                stack_focus: BTreeMap::new(),
-            });
+            fn render(&mut self, _area: ratatui::layout::Rect, _frame: &mut ratatui::Frame) {}
+            fn on_event(&mut self, _event: &WidgetEvent) {}
         }
-        // `push` sets the new tab as active; switch back to tab 0
-        // so the first tab is active by default.
-        tabs.switch_to(0);
-        tabs
+
+        let kdl = r#"layout { pane kind=shell }"#;
+        let cfg = cmdash_config::parse(kdl).expect("parse KDL");
+        let layout_root = cfg.layout.expect("layout block");
+        let last_area = LayoutRect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
+        let layout = ComputedLayout::compute(&layout_root, last_area).expect("compute layout");
+        let pane = layout.panes[0].clone();
+        let layer_id = cmdash::derive_layer_id(&pane.id);
+        let (close_tx, close_rx) = unbounded_channel::<PaneLayerId>();
+        let runner = PaneRunner::spawn_widget(
+            pane,
+            layer_id,
+            Box::new(DummyWidget),
+            Some(close_tx.clone()),
+        );
+        let runners = vec![runner];
+        let graphics = GraphicsState::new(
+            cmdash::graphics::Metrics::default(),
+            (last_area.w, last_area.h),
+        );
+        let bindings = Router::new(vec![Keybind {
+            mods: CfgModifiers::default(),
+            key: KeyToken::Char('q'),
+            action: KeyAction::AppClose,
+        }]);
+        TickContext::new_full(
+            runners,
+            bindings,
+            0,
+            true,
+            close_tx,
+            close_rx,
+            graphics,
+            terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            last_area,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
+            None,
+        )
     }
 
-    /// Helper: build a `TabStack` with labels on specific tabs.
-    /// `labels[i]` is the label for tab `i`; `None` means no label.
-    fn make_tabs_with_labels(labels: &[Option<&str>]) -> TabStack<TabState> {
-        assert!(!labels.is_empty(), "need at least one tab");
-        let dummy_state = TabState {
-            runners: Vec::new(),
-            focus: 0,
-            layout_root: LayoutNode::Pane(CfgPane {
-                kind: PaneKind::Shell,
-                label: None,
-                command: None,
-            }),
-            stack_focus: BTreeMap::new(),
-        };
-        let mut tabs = if let Some(l) = labels[0] {
-            TabStack::new_with_label(dummy_state, l)
-        } else {
-            TabStack::new(dummy_state)
-        };
-        for l in &labels[1..] {
-            let st = TabState {
+    /// When the crossterm input channel closes, the main loop should
+    /// break cleanly rather than spin forever.
+    #[tokio::test]
+    async fn input_rx_none_breaks_loop() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut ctx = setup_run_loop_ctx(&mut terminal);
+        let (_input_tx, input_rx) = unbounded_channel::<Event>();
+        // Dropping the sender makes `input_rx.recv()` return `None`.
+        drop(_input_tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), ctx.run_loop(input_rx)).await;
+
+        assert!(result.is_ok(), "run_loop should exit on input_rx None");
+        assert!(ctx.running, "loop should break without processing AppClose");
+    }
+
+    /// When the pane close channel has no senders left,
+    /// `close_rx.recv()` returns `None`. The loop should continue
+    /// processing other events (in this case, the AppClose keypress).
+    #[tokio::test]
+    async fn close_rx_none_continues_loop() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut ctx = setup_run_loop_ctx(&mut terminal);
+
+        // Replace the live close receiver with one whose sender has
+        // already been dropped, so the first `recv()` returns `None`.
+        let (close_tx, close_rx) = unbounded_channel::<PaneLayerId>();
+        drop(close_tx);
+        ctx.close_rx = close_rx;
+
+        let (input_tx, input_rx) = unbounded_channel::<Event>();
+        input_tx
+            .send(key_event(KeyCode::Char('q'), KeyModifiers::empty()))
+            .expect("send AppClose key");
+        drop(input_tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), ctx.run_loop(input_rx)).await;
+
+        assert!(result.is_ok(), "run_loop should not hang on close_rx None");
+        assert!(
+            !ctx.running,
+            "AppClose should have been processed after close_rx None"
+        );
+    }
+
+    /// When the config reload channel closes, the loop should disable
+    /// hot-reload. We keep the input channel alive but empty so the
+    /// only ready branch is the config reload receiver returning `None`;
+    /// the loop would otherwise run forever, so we stop it with a short
+    /// timeout and assert the field was cleared.
+    #[tokio::test]
+    async fn config_reload_rx_none_disables_hot_reload() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut ctx = setup_run_loop_ctx(&mut terminal);
+
+        // Set up a config reload receiver whose sender has been dropped.
+        let (cfg_tx, cfg_rx) = unbounded_channel::<ConfigReload>();
+        drop(cfg_tx);
+        ctx.config_reload_rx = Some(cfg_rx);
+
+        // Keep the input sender alive so `input_rx.recv()` stays pending.
+        // Disable the periodic tick so the config reload branch is the
+        // only ready one and is selected immediately.
+        ctx.tick = Duration::from_secs(3600);
+        let (_input_tx, input_rx) = unbounded_channel::<Event>();
+        let _ = tokio::time::timeout(Duration::from_millis(200), ctx.run_loop(input_rx)).await;
+
+        assert!(
+            ctx.config_reload_rx.is_none(),
+            "config hot-reload should be disabled after channel closes"
+        );
+    }
+
+    /// When no input events are pending, the tick branch should fire
+    /// and the loop should keep running. We let a few ticks elapse
+    /// under a short timeout and assert the loop is still alive.
+    #[tokio::test]
+    async fn tick_branch_fires_and_keeps_loop_alive() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut ctx = setup_run_loop_ctx(&mut terminal);
+        // Keep the input sender alive but empty so the only ready
+        // branch is the periodic tick.
+        let (_input_tx, input_rx) = unbounded_channel::<Event>();
+        let _ = tokio::time::timeout(Duration::from_millis(100), ctx.run_loop(input_rx)).await;
+        assert!(ctx.running, "tick branch should keep the loop running");
+    }
+
+    /// process_pending_resize should consume the pending_resize slot
+    /// and run relayout against the requested dimensions.
+    #[tokio::test]
+    async fn process_pending_resize_consumes_slot_and_relayouts() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut ctx = setup_run_loop_ctx(&mut terminal);
+        ctx.pending_resize = Some((132, 50));
+        ctx.process_pending_resize();
+        assert!(
+            ctx.pending_resize.is_none(),
+            "pending_resize should be consumed"
+        );
+        assert_eq!(ctx.last_area.w, 132, "layout width should be updated");
+        assert_eq!(
+            ctx.last_area.h,
+            50 - TAB_BAR_HEIGHT,
+            "layout height should account for tab bar"
+        );
+    }
+
+    /// drain_close_channel should remove all pending close messages
+    /// from the close receiver.
+    #[tokio::test]
+    async fn drain_close_channel_drains_messages() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut ctx = setup_run_loop_ctx(&mut terminal);
+        // Send a close message through the context's own close_tx.
+        let id = PaneLayerId(999);
+        ctx.close_tx.send(id).expect("send close message");
+        ctx.drain_close_channel();
+        assert!(
+            ctx.close_rx.try_recv().is_err(),
+            "close channel should be empty"
+        );
+    }
+
+    /// tick_runners should return one snapshot per runner and report
+    /// that not all panes have exited (the dummy widget never exits).
+    #[tokio::test]
+    async fn tick_runners_returns_snapshots_and_exit_status() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+        let mut ctx = setup_run_loop_ctx(&mut terminal);
+        let result = ctx.tick_runners().expect("tick_runners should succeed");
+        assert_eq!(
+            result.snapshots.len(),
+            ctx.runners.len(),
+            "one snapshot per runner"
+        );
+        assert!(
+            !result.all_exited,
+            "widget runner should not be considered exited"
+        );
+    }
+
+    #[cfg(test)]
+    mod shell_spec_from_command_tests {
+        use super::*;
+
+        /// `None` command returns the default shell.
+        #[tokio::test]
+        async fn none_returns_default() {
+            let default = ShellSpec::LoginShell;
+            let result = shell_spec_from_command(&None, &default);
+            assert_eq!(result, ShellSpec::LoginShell);
+        }
+
+        /// `Some("")` (empty string) returns the default shell
+        /// because `split_whitespace()` yields an empty iterator.
+        #[tokio::test]
+        async fn empty_string_returns_default() {
+            let default = ShellSpec::LoginShell;
+            let result = shell_spec_from_command(&Some(String::new()), &default);
+            assert_eq!(result, ShellSpec::LoginShell);
+        }
+
+        /// `Some("  ")` (whitespace-only) returns the default shell
+        /// because `split_whitespace()` yields an empty iterator.
+        #[tokio::test]
+        async fn whitespace_only_returns_default() {
+            let default = ShellSpec::LoginShell;
+            let result = shell_spec_from_command(&Some("  ".to_string()), &default);
+            assert_eq!(result, ShellSpec::LoginShell);
+        }
+
+        /// `Some("htop")` produces `Command { argv: ["htop"] }`.
+        #[tokio::test]
+        async fn simple_command() {
+            let default = ShellSpec::LoginShell;
+            let result = shell_spec_from_command(&Some("htop".to_string()), &default);
+            assert_eq!(
+                result,
+                ShellSpec::Command {
+                    argv: vec!["htop".to_string()]
+                }
+            );
+        }
+
+        /// `Some("htop --arg1 --arg2")` produces
+        /// `Command { argv: ["htop", "--arg1", "--arg2"] }`.
+        #[tokio::test]
+        async fn command_with_args() {
+            let default = ShellSpec::LoginShell;
+            let result = shell_spec_from_command(&Some("htop --arg1 --arg2".to_string()), &default);
+            assert_eq!(
+                result,
+                ShellSpec::Command {
+                    argv: vec![
+                        "htop".to_string(),
+                        "--arg1".to_string(),
+                        "--arg2".to_string()
+                    ]
+                }
+            );
+        }
+
+        /// `Some("echo hello world")` produces
+        /// `Command { argv: ["echo", "hello", "world"] }`.
+        #[tokio::test]
+        async fn command_with_multiple_args() {
+            let default = ShellSpec::LoginShell;
+            let result = shell_spec_from_command(&Some("echo hello world".to_string()), &default);
+            assert_eq!(
+                result,
+                ShellSpec::Command {
+                    argv: vec!["echo".to_string(), "hello".to_string(), "world".to_string()]
+                }
+            );
+        }
+
+        /// Different default shell is preserved when command is `None`.
+        #[tokio::test]
+        async fn none_preserves_custom_default() {
+            let default = ShellSpec::Command {
+                argv: vec!["/bin/bash".to_string()],
+            };
+            let result = shell_spec_from_command(&None, &default);
+            assert_eq!(
+                result,
+                ShellSpec::Command {
+                    argv: vec!["/bin/bash".to_string()]
+                }
+            );
+        }
+
+        /// Explicit command overrides the default shell.
+        #[tokio::test]
+        async fn some_overrides_default() {
+            let default = ShellSpec::Command {
+                argv: vec!["/bin/bash".to_string()],
+            };
+            let result = shell_spec_from_command(&Some("/bin/zsh".to_string()), &default);
+            assert_eq!(
+                result,
+                ShellSpec::Command {
+                    argv: vec!["/bin/zsh".to_string()]
+                }
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod tab_bar_render_tests {
+        use super::*;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        /// Helper: build a minimal `TabStack<TabState>` with `n` tabs,
+        /// the first tab active, no labels. Each `TabState` is
+        /// constructed with an empty runner Vec and a single-pane
+        /// layout root so `TabStack` invariants hold.
+        fn make_tabs(n: usize) -> TabStack<TabState> {
+            let dummy_state = TabState {
                 runners: Vec::new(),
                 focus: 0,
                 layout_root: LayoutNode::Pane(CfgPane {
@@ -6964,996 +7191,1250 @@ mod tab_bar_render_tests {
                 }),
                 stack_focus: BTreeMap::new(),
             };
-            match l {
-                Some(label) => {
-                    tabs.push_with_label(st, *label);
-                }
-                None => {
-                    tabs.push(st);
+            let mut tabs = TabStack::new(dummy_state);
+            for _ in 1..n {
+                tabs.push(TabState {
+                    runners: Vec::new(),
+                    focus: 0,
+                    layout_root: LayoutNode::Pane(CfgPane {
+                        kind: PaneKind::Shell,
+                        label: None,
+                        command: None,
+                    }),
+                    stack_focus: BTreeMap::new(),
+                });
+            }
+            // `push` sets the new tab as active; switch back to tab 0
+            // so the first tab is active by default.
+            tabs.switch_to(0);
+            tabs
+        }
+
+        /// Helper: build a `TabStack` with labels on specific tabs.
+        /// `labels[i]` is the label for tab `i`; `None` means no label.
+        fn make_tabs_with_labels(labels: &[Option<&str>]) -> TabStack<TabState> {
+            assert!(!labels.is_empty(), "need at least one tab");
+            let dummy_state = TabState {
+                runners: Vec::new(),
+                focus: 0,
+                layout_root: LayoutNode::Pane(CfgPane {
+                    kind: PaneKind::Shell,
+                    label: None,
+                    command: None,
+                }),
+                stack_focus: BTreeMap::new(),
+            };
+            let mut tabs = if let Some(l) = labels[0] {
+                TabStack::new_with_label(dummy_state, l)
+            } else {
+                TabStack::new(dummy_state)
+            };
+            for l in &labels[1..] {
+                let st = TabState {
+                    runners: Vec::new(),
+                    focus: 0,
+                    layout_root: LayoutNode::Pane(CfgPane {
+                        kind: PaneKind::Shell,
+                        label: None,
+                        command: None,
+                    }),
+                    stack_focus: BTreeMap::new(),
+                };
+                match l {
+                    Some(label) => {
+                        tabs.push_with_label(st, *label);
+                    }
+                    None => {
+                        tabs.push(st);
+                    }
                 }
             }
+            // `push` / `push_with_label` sets the new tab as active;
+            // switch back to tab 0 so the first tab is active by default.
+            tabs.switch_to(0);
+            tabs
         }
-        // `push` / `push_with_label` sets the new tab as active;
-        // switch back to tab 0 so the first tab is active by default.
-        tabs.switch_to(0);
-        tabs
-    }
 
-    /// Helper: extract the text content of row 0 from a buffer
-    /// as a `String` (symbol per cell, spaces included).
-    fn row_text(buf: &Buffer) -> String {
-        let w = buf.area.width as usize;
-        let mut s = String::with_capacity(w);
-        for x in 0..w {
-            s.push_str(buf.get(x as u16, 0).symbol());
+        /// Helper: extract the text content of row 0 from a buffer
+        /// as a `String` (symbol per cell, spaces included).
+        fn row_text(buf: &Buffer) -> String {
+            let w = buf.area.width as usize;
+            let mut s = String::with_capacity(w);
+            for x in 0..w {
+                s.push_str(buf.get(x as u16, 0).symbol());
+            }
+            s
         }
-        s
-    }
 
-    /// Helper: extract the `Style` of a single cell at `(x, 0)`.
-    fn cell_style(buf: &Buffer, x: u16) -> ratatui::style::Style {
-        buf.get(x, 0).style()
-    }
-
-    /// Single tab with no label: row 0 shows " 1 " starting at
-    /// column 0 with blue bg + white bold style (active tab).
-    #[test]
-    fn single_tab_no_label() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
-        let tabs = make_tabs(1);
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        assert!(
-            text.starts_with(" 1 "),
-            "single unlabeled tab must render as ' 1 '; got: {:?}",
-            &text[..5.min(text.len())]
-        );
-        // Active tab: blue bg, white fg, bold.
-        let s = cell_style(&buf, 1);
-        assert_eq!(s.bg, Some(Color::Blue), "active tab bg must be Blue");
-        assert_eq!(s.fg, Some(Color::White), "active tab fg must be White");
-        assert!(
-            s.add_modifier.contains(Modifier::BOLD),
-            "active tab must be bold"
-        );
-    }
-
-    /// Single tab with a label: row 0 shows " 1:main ".
-    #[test]
-    fn single_tab_with_label() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
-        let tabs = make_tabs_with_labels(&[Some("main")]);
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        assert!(
-            text.starts_with(" 1:main "),
-            "single labeled tab must render as ' 1:main '; got: {:?}",
-            &text[..10.min(text.len())]
-        );
-    }
-
-    /// Empty-string label is treated as `None` (no dangling colon).
-    #[test]
-    fn empty_label_filtered_to_no_colon() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
-        let tabs = make_tabs_with_labels(&[Some("")]);
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        assert!(
-            text.starts_with(" 1 "),
-            "empty label must render as unlabeled ' 1 '; got: {:?}",
-            &text[..5.min(text.len())]
-        );
-        assert!(
-            !text.starts_with(" 1:"),
-            "empty label must NOT produce a colon after the number"
-        );
-    }
-
-    /// Multi-tab layout: 3 tabs, first active. Verify ordering,
-    /// separator spaces, and that tab 2+3 use inactive style.
-    #[test]
-    fn multi_tab_ordering_and_separator() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
-        let tabs = make_tabs_with_labels(&[Some("a"), Some("b"), Some("c")]);
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        // " 1:a " + " " + " 2:b " + " " + " 3:c "
-        assert!(
-            text.starts_with(" 1:a   2:b   3:c "),
-            "3-tab layout must show ' 1:a   2:b   3:c '; got: {:?}",
-            &text[..20.min(text.len())]
-        );
-    }
-
-    /// Active tab highlight: tab 1 (idx 0) is active (blue bg);
-    /// tab 2 (idx 1) is inactive (dark gray bg).
-    #[test]
-    fn active_highlight_vs_inactive() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
-        let tabs = make_tabs_with_labels(&[Some("active"), Some("inactive")]);
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        // Active tab cell (column 1, inside ' 1:active ').
-        let active_s = cell_style(&buf, 1);
-        assert_eq!(active_s.bg, Some(Color::Blue));
-        assert_eq!(active_s.fg, Some(Color::White));
-        // Find the start of tab 2 text. " 1:active " = 10 chars,
-        // Tab 0 " 1:active " = 10 chars (cols 0-9). Separator
-        // bumps col to 11 but does NOT write a cell, so col 10
-        // retains the initial clear style (DarkGray bg). Tab 1
-        // starts writing at col 11 with inactive style.
-        let inactive_s = cell_style(&buf, 11);
-        assert_eq!(
-            inactive_s.bg,
-            Some(Color::DarkGray),
-            "inactive tab bg must be DarkGray"
-        );
-        assert_eq!(
-            inactive_s.fg,
-            Some(Color::Gray),
-            "inactive tab fg must be Gray"
-        );
-    }
-
-    /// Second tab is active: verify the highlight moves correctly.
-    #[test]
-    fn second_tab_active_highlight() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
-        let mut tabs = make_tabs_with_labels(&[Some("first"), Some("second")]);
-        // Switch active to tab 1 (second tab, 0-indexed).
-        tabs.switch_to(1);
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        // Tab 1 (idx 0) should be inactive.
-        let tab1_style = cell_style(&buf, 1);
-        assert_eq!(
-            tab1_style.bg,
-            Some(Color::DarkGray),
-            "first tab must be inactive when second is active"
-        );
-        // Tab 2 (idx 1) starts at col 10 (" 1:first " = 9 chars + separator).
-        let tab2_style = cell_style(&buf, 10);
-        assert_eq!(
-            tab2_style.bg,
-            Some(Color::Blue),
-            "second tab must be active (Blue bg)"
-        );
-    }
-
-    /// Truncation: 3 tabs in a 20-column buffer. Only tabs that
-    /// fit are rendered; the rest are silently dropped.
-    #[test]
-    fn three_tabs_fit_in_wide_buffer() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        let tabs = make_tabs_with_labels(&[Some("a"), Some("b"), Some("c")]);
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        // " 1:a " = 5, sep = 1, " 2:b " = 5, sep = 1, " 3:c " = 5 => 17 chars.
-        // All 3 tabs fit in 20 columns.
-        assert!(
-            text.contains(" 3:c "),
-            "all 3 tabs must fit in 20 cols; got: {:?}",
-            text
-        );
-    }
-
-    /// Truncation: 3 tabs in a 12-column buffer. Tab 3 is cut off.
-    #[test]
-    fn truncation_cuts_off_later_tabs() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 1));
-        let tabs = make_tabs_with_labels(&[Some("a"), Some("b"), Some("c")]);
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        // " 1:a " = 5, sep = 1, " 2:b " = 5 => 11 chars. Tab 3
-        // would start at col 11, but " 3:c " = 5 chars needs
-        // col 11..15, and only col 11 is available (width=12).
-        // One char of tab 3's text fits.
-        assert!(
-            text.contains(" 2:b "),
-            "tab 2 must fit in 12 cols; got: {:?}",
-            text
-        );
-        // Verify the boundary column has the trailing space of tab 2,
-        // not the leading space of tab 3
-        assert_eq!(
-            buf.get(11, 0).symbol(),
-            " ",
-            "col 11 must be separator/trailing space, not tab 3 content"
-        );
-        assert!(
-            !text.contains(" 3:c "),
-            "tab 3's full text must NOT fit in 12 cols; got: {:?}",
-            text
-        );
-    }
-
-    /// Background fill: cells beyond the last tab text are
-    /// cleared with the dark-gray background (not left as
-    /// stale content from a previous frame).
-    #[test]
-    fn background_fill_after_last_tab() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
-        // Pre-fill row 0 with 'X' to simulate stale content.
-        for x in 0..80 {
-            buf.get_mut(x, 0).set_symbol("X");
+        /// Helper: extract the `Style` of a single cell at `(x, 0)`.
+        fn cell_style(buf: &Buffer, x: u16) -> ratatui::style::Style {
+            buf.get(x, 0).style()
         }
-        let tabs = make_tabs(1);
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        // After " 1 " (3 chars), the rest should be spaces.
-        assert!(
-            !text.contains('X'),
-            "stale content must be cleared by background fill; got: {:?}",
-            &text[..10.min(text.len())]
-        );
-        // Verify trailing cells have dark-gray background.
-        let trail_s = cell_style(&buf, 10);
-        assert_eq!(
-            trail_s.bg,
-            Some(Color::DarkGray),
-            "trailing cells must have DarkGray background"
-        );
-    }
 
-    /// Zero-width buffer: `render_tab_bar` must not panic when
-    /// the buffer has width 0. The clear loop and tab-text loop
-    /// both guard on `col < bar_width` / `x < bar_width`, so
-    /// the body is a no-op. Pins the no-panic contract for a
-    /// degenerate (zero-column) terminal.
-    #[test]
-    fn zero_width_buffer_does_not_panic() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 0, 1));
-        let tabs = make_tabs(1);
-        // Must not panic — the buffer is zero-width, all loops
-        // are no-ops.
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        // Buffer is still empty (zero cells).
-        assert_eq!(buf.area.width, 0);
-    }
+        /// Single tab with no label: row 0 shows " 1 " starting at
+        /// column 0 with blue bg + white bold style (active tab).
+        #[tokio::test]
+        async fn single_tab_no_label() {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+            let tabs = make_tabs(1);
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            assert!(
+                text.starts_with(" 1 "),
+                "single unlabeled tab must render as ' 1 '; got: {:?}",
+                &text[..5.min(text.len())]
+            );
+            // Active tab: blue bg, white fg, bold.
+            let s = cell_style(&buf, 1);
+            assert_eq!(s.bg, Some(Color::Blue), "active tab bg must be Blue");
+            assert_eq!(s.fg, Some(Color::White), "active tab fg must be White");
+            assert!(
+                s.add_modifier.contains(Modifier::BOLD),
+                "active tab must be bold"
+            );
+        }
 
-    /// Single-char buffer width: only 1 column is available.
-    /// The leading space of the first tab's text (" 1 ") fits
-    /// at col 0; the digit and trailing space are truncated.
-    /// The single cell must have the active tab's Blue bg.
-    #[test]
-    fn single_char_buffer_shows_leading_space() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
-        let tabs = make_tabs(1);
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        // Only col 0 is available — the leading space of " 1 ".
-        assert_eq!(buf.get(0, 0).symbol(), " ");
-        let s = cell_style(&buf, 0);
-        assert_eq!(
-            s.bg,
-            Some(Color::Blue),
-            "single-char active tab must have Blue bg"
-        );
-        assert_eq!(
-            s.fg,
-            Some(Color::White),
-            "single-char active tab must have White fg"
-        );
-    }
+        /// Single tab with a label: row 0 shows " 1:main ".
+        #[tokio::test]
+        async fn single_tab_with_label() {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+            let tabs = make_tabs_with_labels(&[Some("main")]);
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            assert!(
+                text.starts_with(" 1:main "),
+                "single labeled tab must render as ' 1:main '; got: {:?}",
+                &text[..10.min(text.len())]
+            );
+        }
 
-    /// Long label truncated at buffer edge: a label wider than
-    /// the buffer is silently cut off mid-character. The cells
-    /// that DO fit must carry the active style; trailing cells
-    /// beyond the tab text must have the `DarkGray` background
-    /// fill.
-    #[test]
-    fn long_label_truncated_at_buffer_edge() {
-        // Buffer is 12 cols wide. Tab text " 1:longlabel "
-        // is 14 chars — 2 chars overflow.
-        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 1));
-        let tabs = make_tabs_with_labels(&[Some("longlabel")]);
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        // First 12 chars of " 1:longlabel " are " 1:longlabe".
-        let text = row_text(&buf);
-        assert!(
-            text.starts_with(" 1:longlabe"),
-            "first 12 cols must be the truncated label; got: {:?}",
-            &text[..text.len().min(14)]
-        );
-        // Col 11 (last col) is the char 'e' from "longlabe",
-        // which is part of the active tab text.
-        let s = cell_style(&buf, 11);
-        assert_eq!(
-            s.bg,
-            Some(Color::Blue),
-            "truncated label chars must still have active-tab Blue bg"
-        );
-        // The trailing space (col 13) and the "l" (col 12)
-        // don't fit, so they are absent from the buffer.
-        assert_eq!(text.len(), 12, "buffer width limits the output to 12 chars");
-    }
+        /// Empty-string label is treated as `None` (no dangling colon).
+        #[tokio::test]
+        async fn empty_label_filtered_to_no_colon() {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+            let tabs = make_tabs_with_labels(&[Some("")]);
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            assert!(
+                text.starts_with(" 1 "),
+                "empty label must render as unlabeled ' 1 '; got: {:?}",
+                &text[..5.min(text.len())]
+            );
+            assert!(
+                !text.starts_with(" 1:"),
+                "empty label must NOT produce a colon after the number"
+            );
+        }
 
-    /// Multiple tabs with long labels: the second tab's label
-    /// is truncated by the buffer edge. The separator and
-    /// second tab's leading space must still render correctly
-    /// for the portion that fits.
-    #[test]
-    fn multi_tab_long_labels_truncated() {
-        // 15 cols. Tab 1: " 1:ab " = 6 chars (col 0-5).
-        // Separator: col 6. Tab 2: " 2:longname " starts at
-        // col 7. 15 - 7 = 8 cols for tab 2, but " 2:longname "
-        // is 12 chars, so only " 2:longn" (8 chars) fits.
-        let mut buf = Buffer::empty(Rect::new(0, 0, 15, 1));
-        let tabs = make_tabs_with_labels(&[Some("ab"), Some("longname")]);
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        assert!(
-            text.starts_with(" 1:a"),
-            "tab 1 must appear at start; got: {:?}",
-            &text[..text.len().min(8)]
-        );
-        // Tab 2's text starts at col 7.
-        let tab2_start = cell_style(&buf, 7);
-        assert_eq!(
-            tab2_start.bg,
-            Some(Color::DarkGray),
-            "tab 2 (inactive) must have DarkGray bg"
-        );
-        // Col 14 (last col) is inside tab 2's truncated text.
-        let tab2_end = cell_style(&buf, 14);
-        assert_eq!(
-            tab2_end.bg,
-            Some(Color::DarkGray),
-            "truncated inactive tab chars must keep DarkGray bg"
-        );
-    }
-    // ----------------------------------------------------------------
-    // Multi-byte UTF-8 label tests.
-    // ----------------------------------------------------------------
+        /// Multi-tab layout: 3 tabs, first active. Verify ordering,
+        /// separator spaces, and that tab 2+3 use inactive style.
+        #[tokio::test]
+        async fn multi_tab_ordering_and_separator() {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+            let tabs = make_tabs_with_labels(&[Some("a"), Some("b"), Some("c")]);
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            // " 1:a " + " " + " 2:b " + " " + " 3:c "
+            assert!(
+                text.starts_with(" 1:a   2:b   3:c "),
+                "3-tab layout must show ' 1:a   2:b   3:c '; got: {:?}",
+                &text[..20.min(text.len())]
+            );
+        }
 
-    /// Emoji label: earth globe emoji is 4 bytes but one
-    /// Unicode scalar value. Tab text becomes ` 1:<emoji> `.
-    /// Pins that emoji labels don't panic and the symbol is
-    /// stored correctly in the buffer cell.
-    #[test]
-    fn emoji_label_renders_without_panic() {
-        let tabs = make_tabs_with_labels(&[Some("\u{1f30d}")]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        assert!(
-            text.contains('\u{1f30d}'),
-            "emoji must appear in rendered text; got: {text:?}"
-        );
-        // Active style on the emoji cell (col 3).
-        let emoji_style = cell_style(&buf, 3);
-        assert_eq!(
-            emoji_style.bg,
-            Some(Color::Blue),
-            "emoji cell must have active tab Blue bg"
-        );
-    }
-
-    /// CJK label: Japanese kanji is 9 bytes (3 per char) but
-    /// 3 Unicode scalar values. Pins that CJK labels render
-    /// without panicking and each character occupies one cell
-    /// in the buffer.
-    #[test]
-    fn cjk_label_renders_without_panic() {
-        let tabs = make_tabs_with_labels(&[Some("\u{65e5}\u{672c}\u{8a9e}")]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        assert!(
-            text.contains('\u{65e5}'),
-            "first CJK char must appear in rendered text; got: {text:?}"
-        );
-        assert!(
-            text.contains('\u{8a9e}'),
-            "third CJK char must appear in rendered text; got: {text:?}"
-        );
-        // Style check on first CJK char (col 3).
-        let cjk_style = cell_style(&buf, 3);
-        assert_eq!(
-            cjk_style.bg,
-            Some(Color::Blue),
-            "CJK char cell must have active tab Blue bg"
-        );
-    }
-
-    /// Mixed ASCII + accented: e-acute (U+00E9) is 2 bytes
-    /// but 1 column width and 1 Unicode scalar value. Pins
-    /// that precomposed accented characters (common in
-    /// European languages) render correctly.
-    #[test]
-    fn mixed_ascii_multibyte_label_renders() {
-        let tabs = make_tabs_with_labels(&[Some("caf\u{e9}")]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        assert!(
-            text.starts_with(" 1:caf\u{e9} "),
-            "mixed ASCII+accented label must render; got: {text:?}"
-        );
-        // Style on the accented char cell (col 5).
-        let accent_style = cell_style(&buf, 5);
-        assert_eq!(
-            accent_style.bg,
-            Some(Color::Blue),
-            "accented char cell must have active tab Blue bg"
-        );
-    }
-
-    /// Multi-tab mixed UTF-8 styles: emoji active tab + CJK
-    /// inactive tab. Pins that styles are applied correctly
-    /// to multi-byte character cells across active/inactive
-    /// tabs.
-    ///
-    /// Layout: tab 0 " 1:<rocket> " (5 chars, cols 0-4),
-    /// separator at col 5, tab 1 " 2:<CJK> " (6 chars,
-    /// cols 6-11).
-    #[test]
-    fn multi_tab_mixed_utf8_styles() {
-        let tabs = make_tabs_with_labels(&[Some("\u{1f680}"), Some("\u{65e5}\u{672c}")]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        assert!(
-            text.contains('\u{1f680}'),
-            "emoji must appear in rendered text; got: {text:?}"
-        );
-        assert!(
-            text.contains('\u{65e5}'),
-            "CJK must appear in rendered text; got: {text:?}"
-        );
-        // Active tab style on emoji cell (col 3).
-        let emoji_style = cell_style(&buf, 3);
-        assert_eq!(
-            emoji_style.bg,
-            Some(Color::Blue),
-            "active tab emoji must have Blue bg"
-        );
-        // Inactive tab style on first CJK char (col 9).
-        let cjk_style = cell_style(&buf, 9);
-        assert_eq!(
-            cjk_style.bg,
-            Some(Color::DarkGray),
-            "inactive tab CJK char must have DarkGray bg"
-        );
-    }
-
-    /// Truncation with multi-byte chars: a long emoji label
-    /// that exceeds the buffer width must be truncated at the
-    /// char boundary (not byte boundary). Pins that `.chars()`
-    /// iteration and the col >= `bar_width` truncation guard
-    /// work for non-ASCII text without panicking.
-    ///
-    /// Tab text is 9 chars (" 1:" + 5 emoji + " "). Buffer
-    /// width 6: chars 0-5 fit, chars 6+ truncated.
-    #[test]
-    fn truncation_with_emoji_label() {
-        let tabs = make_tabs_with_labels(&[Some("\u{1f30d}\u{1f680}\u{1f389}\u{1f38a}\u{2728}")]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        assert!(
-            text.starts_with(" 1:"),
-            "must start with \" 1:\"; got: {text:?}"
-        );
-        // First 3 emoji fit (cols 3, 4, 5).
-        assert!(
-            text.contains('\u{1f30d}') && text.contains('\u{1f680}') && text.contains('\u{1f389}'),
-            "first 3 emoji must appear; got: {text:?}"
-        );
-        // 4th and 5th emoji are truncated.
-        assert!(
-            !text.contains('\u{1f38a}') && !text.contains('\u{2728}'),
-            "truncated emoji must not appear; got: {text:?}"
-        );
-    }
-
-    /// Inactive tab with CJK label: verifies both bg and fg
-    /// styles (`DarkGray` bg + `Gray` fg) are applied to
-    /// multi-byte character cells, matching the ASCII
-    /// inactive tab contract.
-    #[test]
-    fn inactive_tab_with_cjk_label_has_dark_gray_style() {
-        let tabs = make_tabs_with_labels(&[Some("a"), Some("\u{65e5}\u{672c}\u{8a9e}")]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        // Tab 1 " 1:a " = 5 chars + 1 separator = 6 cols.
-        // Tab 2 starts at col 6: ' ' 6, '2' 7, ':' 8, CJK 9.
-        let cjk_style = cell_style(&buf, 9);
-        assert_eq!(
-            cjk_style.bg,
-            Some(Color::DarkGray),
-            "inactive tab CJK char must have DarkGray bg"
-        );
-        assert_eq!(
-            cjk_style.fg,
-            Some(Color::Gray),
-            "inactive tab CJK char must have Gray fg"
-        );
-    }
-
-    // ----------------------------------------------------------------
-    // Combining and zero-width Unicode character tests.
-    // ----------------------------------------------------------------
-
-    /// Combining character: "e" + U+0301 (COMBINING ACUTE ACCENT).
-    /// In `.chars()` iteration these are two separate scalar
-    /// values: the base letter and the combining mark. Each gets
-    /// its own cell (col += 1 per char). Pins that combining
-    /// sequences don't panic and the base letter + mark occupy
-    /// two adjacent cells.
-    ///
-    /// Tab text: " 1:e<unk> " where <unk> is U+0301 — 8 chars
-    /// (space, 1, colon, e, combining-acute, space).
-    #[test]
-    fn combining_accent_does_not_panic() {
-        // "e" + combining acute accent (U+0301)
-        let label = "e\u{0301}";
-        let tabs = make_tabs_with_labels(&[Some(label)]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        // The base 'e' is at col 3, combining mark at col 4.
-        // Both cells must have the active tab style.
-        let base_style = cell_style(&buf, 3);
-        assert_eq!(
-            base_style.bg,
-            Some(Color::Blue),
-            "base letter cell must have active tab Blue bg"
-        );
-        let combining_style = cell_style(&buf, 4);
-        assert_eq!(
-            combining_style.bg,
-            Some(Color::Blue),
-            "combining mark cell must have active tab Blue bg"
-        );
-        // The text must contain the base letter.
-        assert!(
-            text.contains('e'),
-            "rendered text must contain base letter 'e'; got: {text:?}"
-        );
-    }
-
-    /// Zero-width space (U+200B): a format character that has
-    /// no visual width but is a valid Unicode scalar value.
-    /// `.chars()` yields it as a separate char. In the buffer,
-    /// it occupies one cell (col += 1). Pins that zero-width
-    /// characters don't panic and the cell is styled.
-    #[test]
-    fn zero_width_space_does_not_panic() {
-        // Label: "a" + zero-width space + "b"
-        let label = "a\u{200b}b";
-        let tabs = make_tabs_with_labels(&[Some(label)]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        // Tab text: " 1:a<unk>b " = 9 chars.
-        // 'a' at col 3, ZWS at col 4, 'b' at col 5.
-        let zws_style = cell_style(&buf, 4);
-        assert_eq!(
-            zws_style.bg,
-            Some(Color::Blue),
-            "zero-width space cell must have active tab Blue bg"
-        );
-        // 'b' after the ZWS must also be styled.
-        let b_style = cell_style(&buf, 5);
-        assert_eq!(
-            b_style.bg,
-            Some(Color::Blue),
-            "char after ZWS must have active tab Blue bg"
-        );
-    }
-
-    /// Zero-width joiner (U+200D): used in emoji sequences
-    /// (e.g. family emoji). As a standalone char in a label,
-    /// it's a zero-width scalar that occupies one cell. Pins
-    /// that ZWJ doesn't panic.
-    #[test]
-    fn zero_width_joiner_in_label_does_not_panic() {
-        let label = "a\u{200d}b";
-        let tabs = make_tabs_with_labels(&[Some(label)]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        assert!(
-            text.contains('a') && text.contains('b'),
-            "base chars must appear around ZWJ; got: {text:?}"
-        );
-        // ZWJ cell at col 4 must have active tab style.
-        let zwj_style = cell_style(&buf, 4);
-        assert_eq!(
-            zwj_style.bg,
-            Some(Color::Blue),
-            "ZWJ cell must have active tab Blue bg"
-        );
-    }
-
-    /// Zero-width non-joiner (U+200C): another format character.
-    /// Pins that ZWNJ doesn't panic and occupies its own cell.
-    #[test]
-    fn zero_width_non_joiner_in_label_does_not_panic() {
-        let label = "x\u{200c}y";
-        let tabs = make_tabs_with_labels(&[Some(label)]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        assert!(
-            text.contains('x') && text.contains('y'),
-            "base chars must appear around ZWNJ; got: {text:?}"
-        );
-        // ZWNJ cell at col 4 must have active tab style.
-        let zwnj_style = cell_style(&buf, 4);
-        assert_eq!(
-            zwnj_style.bg,
-            Some(Color::Blue),
-            "ZWNJ cell must have active tab Blue bg"
-        );
-    }
-
-    /// Multiple combining marks on one base: "a" + U+0300
-    /// (grave) + U+0301 (acute) = 3 chars in `.chars()`. Each
-    /// gets its own cell. Pins that stacked combining marks
-    /// don't panic and all 3 cells are styled.
-    #[test]
-    fn stacked_combining_marks_do_not_panic() {
-        // "a" + combining grave + combining acute
-        let label = "a\u{0300}\u{0301}";
-        let tabs = make_tabs_with_labels(&[Some(label)]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        // Tab text: " 1:a<unk><unk> " = 8 chars.
-        // 'a' at col 3, first combining at col 4, second at col 5.
-        for col in [3u16, 4, 5] {
-            let style = cell_style(&buf, col);
+        /// Active tab highlight: tab 1 (idx 0) is active (blue bg);
+        /// tab 2 (idx 1) is inactive (dark gray bg).
+        #[tokio::test]
+        async fn active_highlight_vs_inactive() {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+            let tabs = make_tabs_with_labels(&[Some("active"), Some("inactive")]);
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            // Active tab cell (column 1, inside ' 1:active ').
+            let active_s = cell_style(&buf, 1);
+            assert_eq!(active_s.bg, Some(Color::Blue));
+            assert_eq!(active_s.fg, Some(Color::White));
+            // Find the start of tab 2 text. " 1:active " = 10 chars,
+            // Tab 0 " 1:active " = 10 chars (cols 0-9). Separator
+            // bumps col to 11 but does NOT write a cell, so col 10
+            // retains the initial clear style (DarkGray bg). Tab 1
+            // starts writing at col 11 with inactive style.
+            let inactive_s = cell_style(&buf, 11);
             assert_eq!(
-                style.bg,
+                inactive_s.bg,
+                Some(Color::DarkGray),
+                "inactive tab bg must be DarkGray"
+            );
+            assert_eq!(
+                inactive_s.fg,
+                Some(Color::Gray),
+                "inactive tab fg must be Gray"
+            );
+        }
+
+        /// Second tab is active: verify the highlight moves correctly.
+        #[tokio::test]
+        async fn second_tab_active_highlight() {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+            let mut tabs = make_tabs_with_labels(&[Some("first"), Some("second")]);
+            // Switch active to tab 1 (second tab, 0-indexed).
+            tabs.switch_to(1);
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            // Tab 1 (idx 0) should be inactive.
+            let tab1_style = cell_style(&buf, 1);
+            assert_eq!(
+                tab1_style.bg,
+                Some(Color::DarkGray),
+                "first tab must be inactive when second is active"
+            );
+            // Tab 2 (idx 1) starts at col 10 (" 1:first " = 9 chars + separator).
+            let tab2_style = cell_style(&buf, 10);
+            assert_eq!(
+                tab2_style.bg,
                 Some(Color::Blue),
-                "cell at col {col} must have active tab Blue bg"
+                "second tab must be active (Blue bg)"
+            );
+        }
+
+        /// Truncation: 3 tabs in a 20-column buffer. Only tabs that
+        /// fit are rendered; the rest are silently dropped.
+        #[tokio::test]
+        async fn three_tabs_fit_in_wide_buffer() {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+            let tabs = make_tabs_with_labels(&[Some("a"), Some("b"), Some("c")]);
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            // " 1:a " = 5, sep = 1, " 2:b " = 5, sep = 1, " 3:c " = 5 => 17 chars.
+            // All 3 tabs fit in 20 columns.
+            assert!(
+                text.contains(" 3:c "),
+                "all 3 tabs must fit in 20 cols; got: {:?}",
+                text
+            );
+        }
+
+        /// Truncation: 3 tabs in a 12-column buffer. Tab 3 is cut off.
+        #[tokio::test]
+        async fn truncation_cuts_off_later_tabs() {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 12, 1));
+            let tabs = make_tabs_with_labels(&[Some("a"), Some("b"), Some("c")]);
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            // " 1:a " = 5, sep = 1, " 2:b " = 5 => 11 chars. Tab 3
+            // would start at col 11, but " 3:c " = 5 chars needs
+            // col 11..15, and only col 11 is available (width=12).
+            // One char of tab 3's text fits.
+            assert!(
+                text.contains(" 2:b "),
+                "tab 2 must fit in 12 cols; got: {:?}",
+                text
+            );
+            // Verify the boundary column has the trailing space of tab 2,
+            // not the leading space of tab 3
+            assert_eq!(
+                buf.get(11, 0).symbol(),
+                " ",
+                "col 11 must be separator/trailing space, not tab 3 content"
+            );
+            assert!(
+                !text.contains(" 3:c "),
+                "tab 3's full text must NOT fit in 12 cols; got: {:?}",
+                text
+            );
+        }
+
+        /// Background fill: cells beyond the last tab text are
+        /// cleared with the dark-gray background (not left as
+        /// stale content from a previous frame).
+        #[tokio::test]
+        async fn background_fill_after_last_tab() {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+            // Pre-fill row 0 with 'X' to simulate stale content.
+            for x in 0..80 {
+                buf.get_mut(x, 0).set_symbol("X");
+            }
+            let tabs = make_tabs(1);
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            // After " 1 " (3 chars), the rest should be spaces.
+            assert!(
+                !text.contains('X'),
+                "stale content must be cleared by background fill; got: {:?}",
+                &text[..10.min(text.len())]
+            );
+            // Verify trailing cells have dark-gray background.
+            let trail_s = cell_style(&buf, 10);
+            assert_eq!(
+                trail_s.bg,
+                Some(Color::DarkGray),
+                "trailing cells must have DarkGray background"
+            );
+        }
+
+        /// Zero-width buffer: `render_tab_bar` must not panic when
+        /// the buffer has width 0. The clear loop and tab-text loop
+        /// both guard on `col < bar_width` / `x < bar_width`, so
+        /// the body is a no-op. Pins the no-panic contract for a
+        /// degenerate (zero-column) terminal.
+        #[tokio::test]
+        async fn zero_width_buffer_does_not_panic() {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 0, 1));
+            let tabs = make_tabs(1);
+            // Must not panic — the buffer is zero-width, all loops
+            // are no-ops.
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            // Buffer is still empty (zero cells).
+            assert_eq!(buf.area.width, 0);
+        }
+
+        /// Single-char buffer width: only 1 column is available.
+        /// The leading space of the first tab's text (" 1 ") fits
+        /// at col 0; the digit and trailing space are truncated.
+        /// The single cell must have the active tab's Blue bg.
+        #[tokio::test]
+        async fn single_char_buffer_shows_leading_space() {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+            let tabs = make_tabs(1);
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            // Only col 0 is available — the leading space of " 1 ".
+            assert_eq!(buf.get(0, 0).symbol(), " ");
+            let s = cell_style(&buf, 0);
+            assert_eq!(
+                s.bg,
+                Some(Color::Blue),
+                "single-char active tab must have Blue bg"
+            );
+            assert_eq!(
+                s.fg,
+                Some(Color::White),
+                "single-char active tab must have White fg"
+            );
+        }
+
+        /// Long label truncated at buffer edge: a label wider than
+        /// the buffer is silently cut off mid-character. The cells
+        /// that DO fit must carry the active style; trailing cells
+        /// beyond the tab text must have the `DarkGray` background
+        /// fill.
+        #[tokio::test]
+        async fn long_label_truncated_at_buffer_edge() {
+            // Buffer is 12 cols wide. Tab text " 1:longlabel "
+            // is 14 chars — 2 chars overflow.
+            let mut buf = Buffer::empty(Rect::new(0, 0, 12, 1));
+            let tabs = make_tabs_with_labels(&[Some("longlabel")]);
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            // First 12 chars of " 1:longlabel " are " 1:longlabe".
+            let text = row_text(&buf);
+            assert!(
+                text.starts_with(" 1:longlabe"),
+                "first 12 cols must be the truncated label; got: {:?}",
+                &text[..text.len().min(14)]
+            );
+            // Col 11 (last col) is the char 'e' from "longlabe",
+            // which is part of the active tab text.
+            let s = cell_style(&buf, 11);
+            assert_eq!(
+                s.bg,
+                Some(Color::Blue),
+                "truncated label chars must still have active-tab Blue bg"
+            );
+            // The trailing space (col 13) and the "l" (col 12)
+            // don't fit, so they are absent from the buffer.
+            assert_eq!(text.len(), 12, "buffer width limits the output to 12 chars");
+        }
+
+        /// Multiple tabs with long labels: the second tab's label
+        /// is truncated by the buffer edge. The separator and
+        /// second tab's leading space must still render correctly
+        /// for the portion that fits.
+        #[tokio::test]
+        async fn multi_tab_long_labels_truncated() {
+            // 15 cols. Tab 1: " 1:ab " = 6 chars (col 0-5).
+            // Separator: col 6. Tab 2: " 2:longname " starts at
+            // col 7. 15 - 7 = 8 cols for tab 2, but " 2:longname "
+            // is 12 chars, so only " 2:longn" (8 chars) fits.
+            let mut buf = Buffer::empty(Rect::new(0, 0, 15, 1));
+            let tabs = make_tabs_with_labels(&[Some("ab"), Some("longname")]);
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            assert!(
+                text.starts_with(" 1:a"),
+                "tab 1 must appear at start; got: {:?}",
+                &text[..text.len().min(8)]
+            );
+            // Tab 2's text starts at col 7.
+            let tab2_start = cell_style(&buf, 7);
+            assert_eq!(
+                tab2_start.bg,
+                Some(Color::DarkGray),
+                "tab 2 (inactive) must have DarkGray bg"
+            );
+            // Col 14 (last col) is inside tab 2's truncated text.
+            let tab2_end = cell_style(&buf, 14);
+            assert_eq!(
+                tab2_end.bg,
+                Some(Color::DarkGray),
+                "truncated inactive tab chars must keep DarkGray bg"
+            );
+        }
+        // ----------------------------------------------------------------
+        // Multi-byte UTF-8 label tests.
+        // ----------------------------------------------------------------
+
+        /// Emoji label: earth globe emoji is 4 bytes but one
+        /// Unicode scalar value. Tab text becomes ` 1:<emoji> `.
+        /// Pins that emoji labels don't panic and the symbol is
+        /// stored correctly in the buffer cell.
+        #[tokio::test]
+        async fn emoji_label_renders_without_panic() {
+            let tabs = make_tabs_with_labels(&[Some("\u{1f30d}")]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            assert!(
+                text.contains('\u{1f30d}'),
+                "emoji must appear in rendered text; got: {text:?}"
+            );
+            // Active style on the emoji cell (col 3).
+            let emoji_style = cell_style(&buf, 3);
+            assert_eq!(
+                emoji_style.bg,
+                Some(Color::Blue),
+                "emoji cell must have active tab Blue bg"
+            );
+        }
+
+        /// CJK label: Japanese kanji is 9 bytes (3 per char) but
+        /// 3 Unicode scalar values. Pins that CJK labels render
+        /// without panicking and each character occupies one cell
+        /// in the buffer.
+        #[tokio::test]
+        async fn cjk_label_renders_without_panic() {
+            let tabs = make_tabs_with_labels(&[Some("\u{65e5}\u{672c}\u{8a9e}")]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            assert!(
+                text.contains('\u{65e5}'),
+                "first CJK char must appear in rendered text; got: {text:?}"
+            );
+            assert!(
+                text.contains('\u{8a9e}'),
+                "third CJK char must appear in rendered text; got: {text:?}"
+            );
+            // Style check on first CJK char (col 3).
+            let cjk_style = cell_style(&buf, 3);
+            assert_eq!(
+                cjk_style.bg,
+                Some(Color::Blue),
+                "CJK char cell must have active tab Blue bg"
+            );
+        }
+
+        /// Mixed ASCII + accented: e-acute (U+00E9) is 2 bytes
+        /// but 1 column width and 1 Unicode scalar value. Pins
+        /// that precomposed accented characters (common in
+        /// European languages) render correctly.
+        #[tokio::test]
+        async fn mixed_ascii_multibyte_label_renders() {
+            let tabs = make_tabs_with_labels(&[Some("caf\u{e9}")]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            assert!(
+                text.starts_with(" 1:caf\u{e9} "),
+                "mixed ASCII+accented label must render; got: {text:?}"
+            );
+            // Style on the accented char cell (col 5).
+            let accent_style = cell_style(&buf, 5);
+            assert_eq!(
+                accent_style.bg,
+                Some(Color::Blue),
+                "accented char cell must have active tab Blue bg"
+            );
+        }
+
+        /// Multi-tab mixed UTF-8 styles: emoji active tab + CJK
+        /// inactive tab. Pins that styles are applied correctly
+        /// to multi-byte character cells across active/inactive
+        /// tabs.
+        ///
+        /// Layout: tab 0 " 1:<rocket> " (5 chars, cols 0-4),
+        /// separator at col 5, tab 1 " 2:<CJK> " (6 chars,
+        /// cols 6-11).
+        #[tokio::test]
+        async fn multi_tab_mixed_utf8_styles() {
+            let tabs = make_tabs_with_labels(&[Some("\u{1f680}"), Some("\u{65e5}\u{672c}")]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            assert!(
+                text.contains('\u{1f680}'),
+                "emoji must appear in rendered text; got: {text:?}"
+            );
+            assert!(
+                text.contains('\u{65e5}'),
+                "CJK must appear in rendered text; got: {text:?}"
+            );
+            // Active tab style on emoji cell (col 3).
+            let emoji_style = cell_style(&buf, 3);
+            assert_eq!(
+                emoji_style.bg,
+                Some(Color::Blue),
+                "active tab emoji must have Blue bg"
+            );
+            // Inactive tab style on first CJK char (col 9).
+            let cjk_style = cell_style(&buf, 9);
+            assert_eq!(
+                cjk_style.bg,
+                Some(Color::DarkGray),
+                "inactive tab CJK char must have DarkGray bg"
+            );
+        }
+
+        /// Truncation with multi-byte chars: a long emoji label
+        /// that exceeds the buffer width must be truncated at the
+        /// char boundary (not byte boundary). Pins that `.chars()`
+        /// iteration and the col >= `bar_width` truncation guard
+        /// work for non-ASCII text without panicking.
+        ///
+        /// Tab text is 9 chars (" 1:" + 5 emoji + " "). Buffer
+        /// width 6: chars 0-5 fit, chars 6+ truncated.
+        #[tokio::test]
+        async fn truncation_with_emoji_label() {
+            let tabs =
+                make_tabs_with_labels(&[Some("\u{1f30d}\u{1f680}\u{1f389}\u{1f38a}\u{2728}")]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            assert!(
+                text.starts_with(" 1:"),
+                "must start with \" 1:\"; got: {text:?}"
+            );
+            // First 3 emoji fit (cols 3, 4, 5).
+            assert!(
+                text.contains('\u{1f30d}')
+                    && text.contains('\u{1f680}')
+                    && text.contains('\u{1f389}'),
+                "first 3 emoji must appear; got: {text:?}"
+            );
+            // 4th and 5th emoji are truncated.
+            assert!(
+                !text.contains('\u{1f38a}') && !text.contains('\u{2728}'),
+                "truncated emoji must not appear; got: {text:?}"
+            );
+        }
+
+        /// Inactive tab with CJK label: verifies both bg and fg
+        /// styles (`DarkGray` bg + `Gray` fg) are applied to
+        /// multi-byte character cells, matching the ASCII
+        /// inactive tab contract.
+        #[tokio::test]
+        async fn inactive_tab_with_cjk_label_has_dark_gray_style() {
+            let tabs = make_tabs_with_labels(&[Some("a"), Some("\u{65e5}\u{672c}\u{8a9e}")]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            // Tab 1 " 1:a " = 5 chars + 1 separator = 6 cols.
+            // Tab 2 starts at col 6: ' ' 6, '2' 7, ':' 8, CJK 9.
+            let cjk_style = cell_style(&buf, 9);
+            assert_eq!(
+                cjk_style.bg,
+                Some(Color::DarkGray),
+                "inactive tab CJK char must have DarkGray bg"
+            );
+            assert_eq!(
+                cjk_style.fg,
+                Some(Color::Gray),
+                "inactive tab CJK char must have Gray fg"
+            );
+        }
+
+        // ----------------------------------------------------------------
+        // Combining and zero-width Unicode character tests.
+        // ----------------------------------------------------------------
+
+        /// Combining character: "e" + U+0301 (COMBINING ACUTE ACCENT).
+        /// In `.chars()` iteration these are two separate scalar
+        /// values: the base letter and the combining mark. Each gets
+        /// its own cell (col += 1 per char). Pins that combining
+        /// sequences don't panic and the base letter + mark occupy
+        /// two adjacent cells.
+        ///
+        /// Tab text: " 1:e<unk> " where <unk> is U+0301 — 8 chars
+        /// (space, 1, colon, e, combining-acute, space).
+        #[tokio::test]
+        async fn combining_accent_does_not_panic() {
+            // "e" + combining acute accent (U+0301)
+            let label = "e\u{0301}";
+            let tabs = make_tabs_with_labels(&[Some(label)]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            // The base 'e' is at col 3, combining mark at col 4.
+            // Both cells must have the active tab style.
+            let base_style = cell_style(&buf, 3);
+            assert_eq!(
+                base_style.bg,
+                Some(Color::Blue),
+                "base letter cell must have active tab Blue bg"
+            );
+            let combining_style = cell_style(&buf, 4);
+            assert_eq!(
+                combining_style.bg,
+                Some(Color::Blue),
+                "combining mark cell must have active tab Blue bg"
+            );
+            // The text must contain the base letter.
+            assert!(
+                text.contains('e'),
+                "rendered text must contain base letter 'e'; got: {text:?}"
+            );
+        }
+
+        /// Zero-width space (U+200B): a format character that has
+        /// no visual width but is a valid Unicode scalar value.
+        /// `.chars()` yields it as a separate char. In the buffer,
+        /// it occupies one cell (col += 1). Pins that zero-width
+        /// characters don't panic and the cell is styled.
+        #[tokio::test]
+        async fn zero_width_space_does_not_panic() {
+            // Label: "a" + zero-width space + "b"
+            let label = "a\u{200b}b";
+            let tabs = make_tabs_with_labels(&[Some(label)]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            // Tab text: " 1:a<unk>b " = 9 chars.
+            // 'a' at col 3, ZWS at col 4, 'b' at col 5.
+            let zws_style = cell_style(&buf, 4);
+            assert_eq!(
+                zws_style.bg,
+                Some(Color::Blue),
+                "zero-width space cell must have active tab Blue bg"
+            );
+            // 'b' after the ZWS must also be styled.
+            let b_style = cell_style(&buf, 5);
+            assert_eq!(
+                b_style.bg,
+                Some(Color::Blue),
+                "char after ZWS must have active tab Blue bg"
+            );
+        }
+
+        /// Zero-width joiner (U+200D): used in emoji sequences
+        /// (e.g. family emoji). As a standalone char in a label,
+        /// it's a zero-width scalar that occupies one cell. Pins
+        /// that ZWJ doesn't panic.
+        #[tokio::test]
+        async fn zero_width_joiner_in_label_does_not_panic() {
+            let label = "a\u{200d}b";
+            let tabs = make_tabs_with_labels(&[Some(label)]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            assert!(
+                text.contains('a') && text.contains('b'),
+                "base chars must appear around ZWJ; got: {text:?}"
+            );
+            // ZWJ cell at col 4 must have active tab style.
+            let zwj_style = cell_style(&buf, 4);
+            assert_eq!(
+                zwj_style.bg,
+                Some(Color::Blue),
+                "ZWJ cell must have active tab Blue bg"
+            );
+        }
+
+        /// Zero-width non-joiner (U+200C): another format character.
+        /// Pins that ZWNJ doesn't panic and occupies its own cell.
+        #[tokio::test]
+        async fn zero_width_non_joiner_in_label_does_not_panic() {
+            let label = "x\u{200c}y";
+            let tabs = make_tabs_with_labels(&[Some(label)]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            assert!(
+                text.contains('x') && text.contains('y'),
+                "base chars must appear around ZWNJ; got: {text:?}"
+            );
+            // ZWNJ cell at col 4 must have active tab style.
+            let zwnj_style = cell_style(&buf, 4);
+            assert_eq!(
+                zwnj_style.bg,
+                Some(Color::Blue),
+                "ZWNJ cell must have active tab Blue bg"
+            );
+        }
+
+        /// Multiple combining marks on one base: "a" + U+0300
+        /// (grave) + U+0301 (acute) = 3 chars in `.chars()`. Each
+        /// gets its own cell. Pins that stacked combining marks
+        /// don't panic and all 3 cells are styled.
+        #[tokio::test]
+        async fn stacked_combining_marks_do_not_panic() {
+            // "a" + combining grave + combining acute
+            let label = "a\u{0300}\u{0301}";
+            let tabs = make_tabs_with_labels(&[Some(label)]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            // Tab text: " 1:a<unk><unk> " = 8 chars.
+            // 'a' at col 3, first combining at col 4, second at col 5.
+            for col in [3u16, 4, 5] {
+                let style = cell_style(&buf, col);
+                assert_eq!(
+                    style.bg,
+                    Some(Color::Blue),
+                    "cell at col {col} must have active tab Blue bg"
+                );
+            }
+        }
+
+        /// Mixed combining + zero-width: label with base letter,
+        /// combining mark, zero-width space, and ASCII. Pins that
+        /// a complex Unicode mix doesn't panic and all cells get
+        /// the correct style.
+        #[tokio::test]
+        async fn mixed_combining_and_zero_width_does_not_panic() {
+            // "e" + combining acute + ZWS + "f"
+            let label = "e\u{0301}\u{200b}f";
+            let tabs = make_tabs_with_labels(&[Some(label)]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            // Tab text: " 1:e<unk><unk>f " = 10 chars.
+            // 'e' at col 3, combining at col 4, ZWS at col 5, 'f' at col 6.
+            for col in [3u16, 4, 5, 6] {
+                let style = cell_style(&buf, col);
+                assert_eq!(
+                    style.bg,
+                    Some(Color::Blue),
+                    "cell at col {col} in mixed Unicode label must have Blue bg"
+                );
+            }
+        }
+
+        /// Combining mark on inactive tab: verifies the inactive
+        /// style (`DarkGray` bg) is applied to combining character
+        /// cells, not just the base letter.
+        #[tokio::test]
+        async fn inactive_tab_combining_mark_has_dark_gray_bg() {
+            // Tab 1 (active): "a", Tab 2 (inactive): "e" + combining acute
+            let tabs = make_tabs_with_labels(&[Some("a"), Some("e\u{0301}")]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            // Tab 1 " 1:a " = 5 chars + 1 separator = 6 cols.
+            // Tab 2 starts at col 6: ' ' 6, '2' 7, ':' 8, 'e' 9, combining 10.
+            let combining_style = cell_style(&buf, 10);
+            assert_eq!(
+                combining_style.bg,
+                Some(Color::DarkGray),
+                "inactive tab combining mark must have DarkGray bg"
+            );
+        }
+
+        /// Truncation at combining sequence boundary: a label with
+        /// many combining marks that exceeds the buffer width. The
+        /// `.chars()` iteration truncates at the char boundary,
+        /// which may split a base+combining pair. Pins that this
+        /// doesn't panic.
+        #[tokio::test]
+        async fn truncation_splits_combining_sequence_without_panic() {
+            // Label: 5 base+combining pairs = 10 chars.
+            // Tab text: " 1:" + 10 chars + " " = 14 chars.
+            // Buffer width 8: chars 0-7 fit.
+            let pairs: String = "e\u{0301}".repeat(5);
+            let tabs = make_tabs_with_labels(&[Some(pairs.as_str())]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 8, 1));
+            render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
+            let text = row_text(&buf);
+            assert!(
+                text.starts_with(" 1:"),
+                "must start with ' 1:'; got: {text:?}"
             );
         }
     }
 
-    /// Mixed combining + zero-width: label with base letter,
-    /// combining mark, zero-width space, and ASCII. Pins that
-    /// a complex Unicode mix doesn't panic and all cells get
-    /// the correct style.
-    #[test]
-    fn mixed_combining_and_zero_width_does_not_panic() {
-        // "e" + combining acute + ZWS + "f"
-        let label = "e\u{0301}\u{200b}f";
-        let tabs = make_tabs_with_labels(&[Some(label)]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        // Tab text: " 1:e<unk><unk>f " = 10 chars.
-        // 'e' at col 3, combining at col 4, ZWS at col 5, 'f' at col 6.
-        for col in [3u16, 4, 5, 6] {
-            let style = cell_style(&buf, col);
+    #[cfg(test)]
+    mod config_hot_reload_tests {
+        use std::time::Duration;
+
+        /// Config hot-reload: write a config file, spawn a
+        /// `ConfigWatcher` for it, modify the file with different
+        /// keybinds, and assert the watcher's channel delivers a
+        /// `ConfigReload` with the new keybinds.
+        ///
+        /// This test exercises the full hot-reload pipeline:
+        /// file write -> notify event -> re-parse -> mpsc send ->
+        /// channel receive -> keybind assertion.
+        #[tokio::test]
+        async fn config_hot_reload_detects_keybind_changes() {
+            let dir = std::env::temp_dir().join("cmdash_hot_reload_test");
+            let _ = std::fs::create_dir_all(&dir);
+            let config_path = dir.join("config.kdl");
+
+            // Step 1: write initial config with alt-q -> app.close.
+            let initial = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-q\" action=\"app.close\"\n            }\n        ";
+            std::fs::write(&config_path, initial).expect("write initial config");
+
+            // Step 2: spawn the ConfigWatcher.
+            let (_watcher, rx_opt) = super::ConfigWatcher::spawn(Some(config_path.as_ref()));
+            let mut rx = rx_opt.expect("watcher must produce a receiver when path is Some");
+
+            // Give the watcher time to initialize (it watches the
+            // parent directory; the notify backend may need a tick).
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Step 3: overwrite the config with different keybinds
+            // (alt-w -> pane.close instead of alt-q -> app.close).
+            let updated = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-w\" action=\"pane.close\"\n            }\n        ";
+            std::fs::write(&config_path, updated).expect("write updated config");
+
+            // Step 4: wait for the watcher's debounce (500ms) plus
+            // margin. The channel should deliver the re-parsed
+            // config with the new keybinds.
+            let result = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+            // Cleanup BEFORE assertions so temp files don't leak
+            // if an assertion panics.
+            let _ = std::fs::remove_file(&config_path);
+            let _ = std::fs::remove_dir(&dir);
+
+            let reload = result
+                .expect("watcher must deliver a ConfigReload within 5s")
+                .expect("channel closed");
+
+            // Step 5: assert the new keybinds round-tripped.
+            // Exactly 1 keybind (the old alt-q -> app.close is gone).
             assert_eq!(
-                style.bg,
-                Some(Color::Blue),
-                "cell at col {col} in mixed Unicode label must have Blue bg"
+                reload.keybinds.len(),
+                1,
+                "reloaded config must have exactly 1 keybind; got: {}",
+                reload.keybinds.len()
+            );
+            let kb = &reload.keybinds[0];
+            // The new keybind should be alt-w -> pane.close.
+            assert_eq!(
+                kb.action,
+                cmdash_config::KeyAction::PaneClose,
+                "reloaded action must be PaneClose; got: {:?}",
+                kb.action
+            );
+            // Verify the modifier is Alt and the key is 'w'.
+            assert!(
+                kb.mods.alt,
+                "reloaded keybind modifier must include Alt; got: {:?}",
+                kb.mods
+            );
+            assert!(
+                matches!(kb.key, cmdash_config::KeyToken::Char('w')),
+                "reloaded keybind key must be Char('w'); got: {:?}",
+                kb.key
+            );
+        }
+
+        /// Config hot-reload: modify the layout tree (single pane ->
+        /// two-pane split) and assert the watcher delivers a
+        /// `ConfigReload` whose `layout_root` resolves to 2 panes
+        /// with correct labels. This pins the layout-change payload
+        /// that `check_config_reload` compares against the active
+        /// tree to decide whether to trigger a Wholesale reconcile.
+        #[tokio::test]
+        async fn config_hot_reload_detects_layout_changes() {
+            use cmdash_layout::{ComputedLayout, Rect as LayoutRect};
+
+            let dir = std::env::temp_dir().join("cmdash_hot_reload_layout_test");
+            let _ = std::fs::create_dir_all(&dir);
+            let config_path = dir.join("config.kdl");
+
+            // Step 1: write initial config with a SINGLE pane.
+            let initial = "\n            layout {\n                pane kind=shell label=\"solo\"\n            }\n        ";
+            std::fs::write(&config_path, initial).expect("write initial config");
+
+            // Step 2: spawn the ConfigWatcher.
+            let (_watcher, rx_opt) = super::ConfigWatcher::spawn(Some(config_path.as_ref()));
+            let mut rx = rx_opt.expect("watcher must produce a receiver");
+
+            // Give the watcher time to initialize.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Step 3: overwrite with a TWO-PANE split layout.
+            let updated = "\n            layout {\n                split axis=horizontal ratio=0.5 {\n                    pane kind=shell label=\"left\"\n                    pane kind=shell label=\"right\"\n                }\n            }\n        ";
+            std::fs::write(&config_path, updated).expect("write updated config");
+
+            // Step 4: wait for the watcher's debounce + margin.
+            let result = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+
+            // Cleanup BEFORE assertions.
+            let _ = std::fs::remove_file(&config_path);
+            let _ = std::fs::remove_dir(&dir);
+
+            let reload = result
+                .expect("watcher must deliver a ConfigReload within 5s")
+                .expect("channel closed");
+
+            // Step 5: assert the new layout tree resolves to 2 panes.
+            let new_root = reload
+                .layout_root
+                .expect("ConfigReload must carry a layout_root");
+            let computed = ComputedLayout::compute(
+                &new_root,
+                LayoutRect {
+                    x: 0,
+                    y: 0,
+                    w: 120,
+                    h: 40,
+                },
+            )
+            .expect("new layout must compute successfully");
+            assert_eq!(
+                computed.panes.len(),
+                2,
+                "new layout must resolve to 2 panes; got: {}",
+                computed.panes.len()
+            );
+            assert_eq!(
+                computed.panes[0].label.as_deref(),
+                Some("left"),
+                "pane 0 label must be 'left'"
+            );
+            assert_eq!(
+                computed.panes[1].label.as_deref(),
+                Some("right"),
+                "pane 1 label must be 'right'"
+            );
+        }
+
+        /// Debounce behavior: two rapid successive file writes
+        /// (well within the 500ms debounce window) must collapse
+        /// to a single `ConfigReload`. The watcher's debounce
+        /// coalesces rapid edits so the tick loop isn't spammed
+        /// with redundant reconciles. This test writes two
+        /// configs with DIFFERENT keybinds in quick succession
+        /// and asserts only ONE `ConfigReload` arrives, carrying
+        /// the SECOND write's keybinds.
+        #[tokio::test]
+        async fn config_hot_reload_debounces_rapid_writes() {
+            let dir = std::env::temp_dir().join("cmdash_hot_reload_debounce_test");
+            let _ = std::fs::create_dir_all(&dir);
+            let config_path = dir.join("config.kdl");
+
+            // Step 1: write initial config.
+            let initial = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-q\" action=\"app.close\"\n            }\n        ";
+            std::fs::write(&config_path, initial).expect("write initial config");
+
+            // Step 2: spawn the ConfigWatcher.
+            let (_watcher, rx_opt) = super::ConfigWatcher::spawn(Some(config_path.as_ref()));
+            let mut rx = rx_opt.expect("watcher must produce a receiver");
+
+            // Give the watcher time to initialize.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Step 3: two rapid successive writes WITHIN the 500ms
+            // debounce window. Both write the same keybind
+            // (alt-e -> pane.focus.next) so the content assertion
+            // is correct regardless of inotify coalescing behavior.
+            // The "only one message" assertion pins the collapse.
+            let first_update = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-e\" action=\"pane.focus.next\"\n            }\n        ";
+            std::fs::write(&config_path, first_update).expect("write first update");
+            // Immediately (<< 500ms) write again.
+            let second_update = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-e\" action=\"pane.focus.next\"\n            }\n        ";
+            std::fs::write(&config_path, second_update).expect("write second update");
+
+            // Step 4: wait for the debounce window to expire and
+            // the watcher to deliver.
+            let result = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+
+            // Step 5: assert no second ConfigReload arrives within
+            // a short grace period (debounce = 500ms, so 300ms
+            // after the first should be safe).
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let second_result = rx.try_recv();
+
+            // Cleanup BEFORE assertions.
+            let _ = std::fs::remove_file(&config_path);
+            let _ = std::fs::remove_dir(&dir);
+
+            let reload = result
+                .expect("watcher must deliver a ConfigReload within 5s")
+                .expect("channel closed");
+            assert!(
+                second_result.is_err(),
+                "debounce must collapse two rapid writes into one ConfigReload; \
+             got a second: {:?}",
+                second_result
+            );
+
+            // Step 6: the single ConfigReload must carry the
+            // expected keybinds (alt-e -> pane.focus.next).
+            // Both writes used the same keybind, so this is
+            // correct regardless of which event was processed.
+            assert_eq!(reload.keybinds.len(), 1);
+            let kb = &reload.keybinds[0];
+            assert_eq!(
+                kb.action,
+                cmdash_config::KeyAction::PaneFocusNext,
+                "debounced reload must carry the SECOND write's action; got: {:?}",
+                kb.action
+            );
+            assert!(
+                matches!(kb.key, cmdash_config::KeyToken::Char('e')),
+                "debounced reload must carry the SECOND write's key; got: {:?}",
+                kb.key
+            );
+        }
+
+        /// Invalid-config edge case: overwrite the config file with
+        /// unparseable KDL and assert the watcher does NOT deliver
+        /// a `ConfigReload` (the parse failure is logged and the
+        /// previous config stays active). Then write a valid config
+        /// and assert a `ConfigReload` DOES arrive, proving the
+        /// watcher recovered.
+        #[tokio::test]
+        async fn config_hot_reload_ignores_invalid_config() {
+            let dir = std::env::temp_dir().join("cmdash_hot_reload_invalid_test");
+            let _ = std::fs::create_dir_all(&dir);
+            let config_path = dir.join("config.kdl");
+
+            // Step 1: write a VALID initial config.
+            let initial = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-q\" action=\"app.close\"\n            }\n        ";
+            std::fs::write(&config_path, initial).expect("write initial config");
+
+            // Step 2: spawn the ConfigWatcher.
+            let (_watcher, rx_opt) = super::ConfigWatcher::spawn(Some(config_path.as_ref()));
+            let mut rx = rx_opt.expect("watcher must produce a receiver");
+
+            // Give the watcher time to initialize.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Step 3: overwrite with INVALID KDL (bare garbage).
+            std::fs::write(&config_path, "this is not valid KDL {{{")
+                .expect("write invalid config");
+
+            // Wait for the debounce window to expire. The watcher
+            // should attempt to parse, fail, log a warning, and
+            // NOT send a ConfigReload.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            // Step 4: assert NO ConfigReload arrived for the invalid edit.
+            let invalid_result = rx.try_recv();
+            assert!(
+                invalid_result.is_err(),
+                "invalid config must not produce a ConfigReload; got: {:?}",
+                invalid_result
+            );
+
+            // Step 5: now write a VALID config with different keybinds.
+            let valid_update = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-e\" action=\"pane.focus.next\"\n            }\n        ";
+            std::fs::write(&config_path, valid_update).expect("write valid config");
+
+            // Step 6: the watcher should deliver a ConfigReload for
+            // the valid edit, proving it recovered from the invalid one.
+            let result = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+
+            // Cleanup BEFORE assertions.
+            let _ = std::fs::remove_file(&config_path);
+            let _ = std::fs::remove_dir(&dir);
+
+            let reload = result
+                .expect("valid config after invalid must produce a ConfigReload")
+                .expect("channel closed");
+            assert_eq!(reload.keybinds.len(), 1);
+            let kb = &reload.keybinds[0];
+            assert_eq!(
+                kb.action,
+                cmdash_config::KeyAction::PaneFocusNext,
+                "recovered reload must carry the valid config's action; got: {:?}",
+                kb.action
             );
         }
     }
 
-    /// Combining mark on inactive tab: verifies the inactive
-    /// style (`DarkGray` bg) is applied to combining character
-    /// cells, not just the base letter.
-    #[test]
-    fn inactive_tab_combining_mark_has_dark_gray_bg() {
-        // Tab 1 (active): "a", Tab 2 (inactive): "e" + combining acute
-        let tabs = make_tabs_with_labels(&[Some("a"), Some("e\u{0301}")]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        // Tab 1 " 1:a " = 5 chars + 1 separator = 6 cols.
-        // Tab 2 starts at col 6: ' ' 6, '2' 7, ':' 8, 'e' 9, combining 10.
-        let combining_style = cell_style(&buf, 10);
-        assert_eq!(
-            combining_style.bg,
-            Some(Color::DarkGray),
-            "inactive tab combining mark must have DarkGray bg"
-        );
-    }
+    #[cfg(test)]
+    mod render_cell_body_tests {
+        use super::*;
+        use cmdash_widget_sdk::{CmdashWidget, WidgetEvent};
+        use ratatui::layout::Rect;
+        use ratatui::style::{Color, Style};
+        use ratatui::widgets::{Paragraph, Widget};
 
-    /// Truncation at combining sequence boundary: a label with
-    /// many combining marks that exceeds the buffer width. The
-    /// `.chars()` iteration truncates at the char boundary,
-    /// which may split a base+combining pair. Pins that this
-    /// doesn't panic.
-    #[test]
-    fn truncation_splits_combining_sequence_without_panic() {
-        // Label: 5 base+combining pairs = 10 chars.
-        // Tab text: " 1:" + 10 chars + " " = 14 chars.
-        // Buffer width 8: chars 0-7 fit.
-        let pairs: String = "e\u{0301}".repeat(5);
-        let tabs = make_tabs_with_labels(&[Some(pairs.as_str())]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 8, 1));
-        render_tab_bar(&mut buf, &tabs, &cmdash_config::Theme::default());
-        let text = row_text(&buf);
-        assert!(
-            text.starts_with(" 1:"),
-            "must start with ' 1:'; got: {text:?}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod config_hot_reload_tests {
-    use std::time::Duration;
-
-    /// Config hot-reload: write a config file, spawn a
-    /// `ConfigWatcher` for it, modify the file with different
-    /// keybinds, and assert the watcher's channel delivers a
-    /// `ConfigReload` with the new keybinds.
-    ///
-    /// This test exercises the full hot-reload pipeline:
-    /// file write -> notify event -> re-parse -> mpsc send ->
-    /// channel receive -> keybind assertion.
-    #[test]
-    fn config_hot_reload_detects_keybind_changes() {
-        let dir = std::env::temp_dir().join("cmdash_hot_reload_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let config_path = dir.join("config.kdl");
-
-        // Step 1: write initial config with alt-q -> app.close.
-        let initial = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-q\" action=\"app.close\"\n            }\n        ";
-        std::fs::write(&config_path, initial).expect("write initial config");
-
-        // Step 2: spawn the ConfigWatcher.
-        let (_watcher, rx_opt) = super::ConfigWatcher::spawn(Some(config_path.as_ref()));
-        let rx = rx_opt.expect("watcher must produce a receiver when path is Some");
-
-        // Give the watcher time to initialize (it watches the
-        // parent directory; the notify backend may need a tick).
-        std::thread::sleep(Duration::from_millis(200));
-
-        // Step 3: overwrite the config with different keybinds
-        // (alt-w -> pane.close instead of alt-q -> app.close).
-        let updated = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-w\" action=\"pane.close\"\n            }\n        ";
-        std::fs::write(&config_path, updated).expect("write updated config");
-
-        // Step 4: wait for the watcher's debounce (500ms) plus
-        // margin. The channel should deliver the re-parsed
-        // config with the new keybinds.
-        let result = rx.recv_timeout(Duration::from_secs(5));
-        // Cleanup BEFORE assertions so temp files don't leak
-        // if an assertion panics.
-        let _ = std::fs::remove_file(&config_path);
-        let _ = std::fs::remove_dir(&dir);
-
-        let reload = result.expect("watcher must deliver a ConfigReload within 5s");
-
-        // Step 5: assert the new keybinds round-tripped.
-        // Exactly 1 keybind (the old alt-q -> app.close is gone).
-        assert_eq!(
-            reload.keybinds.len(),
-            1,
-            "reloaded config must have exactly 1 keybind; got: {}",
-            reload.keybinds.len()
-        );
-        let kb = &reload.keybinds[0];
-        // The new keybind should be alt-w -> pane.close.
-        assert_eq!(
-            kb.action,
-            cmdash_config::KeyAction::PaneClose,
-            "reloaded action must be PaneClose; got: {:?}",
-            kb.action
-        );
-        // Verify the modifier is Alt and the key is 'w'.
-        assert!(
-            kb.mods.alt,
-            "reloaded keybind modifier must include Alt; got: {:?}",
-            kb.mods
-        );
-        assert!(
-            matches!(kb.key, cmdash_config::KeyToken::Char('w')),
-            "reloaded keybind key must be Char('w'); got: {:?}",
-            kb.key
-        );
-    }
-
-    /// Config hot-reload: modify the layout tree (single pane ->
-    /// two-pane split) and assert the watcher delivers a
-    /// `ConfigReload` whose `layout_root` resolves to 2 panes
-    /// with correct labels. This pins the layout-change payload
-    /// that `check_config_reload` compares against the active
-    /// tree to decide whether to trigger a Wholesale reconcile.
-    #[test]
-    fn config_hot_reload_detects_layout_changes() {
-        use cmdash_layout::{ComputedLayout, Rect as LayoutRect};
-
-        let dir = std::env::temp_dir().join("cmdash_hot_reload_layout_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let config_path = dir.join("config.kdl");
-
-        // Step 1: write initial config with a SINGLE pane.
-        let initial = "\n            layout {\n                pane kind=shell label=\"solo\"\n            }\n        ";
-        std::fs::write(&config_path, initial).expect("write initial config");
-
-        // Step 2: spawn the ConfigWatcher.
-        let (_watcher, rx_opt) = super::ConfigWatcher::spawn(Some(config_path.as_ref()));
-        let rx = rx_opt.expect("watcher must produce a receiver");
-
-        // Give the watcher time to initialize.
-        std::thread::sleep(Duration::from_millis(200));
-
-        // Step 3: overwrite with a TWO-PANE split layout.
-        let updated = "\n            layout {\n                split axis=horizontal ratio=0.5 {\n                    pane kind=shell label=\"left\"\n                    pane kind=shell label=\"right\"\n                }\n            }\n        ";
-        std::fs::write(&config_path, updated).expect("write updated config");
-
-        // Step 4: wait for the watcher's debounce + margin.
-        let result = rx.recv_timeout(Duration::from_secs(5));
-
-        // Cleanup BEFORE assertions.
-        let _ = std::fs::remove_file(&config_path);
-        let _ = std::fs::remove_dir(&dir);
-
-        let reload = result.expect("watcher must deliver a ConfigReload within 5s");
-
-        // Step 5: assert the new layout tree resolves to 2 panes.
-        let new_root = reload
-            .layout_root
-            .expect("ConfigReload must carry a layout_root");
-        let computed = ComputedLayout::compute(
-            &new_root,
-            LayoutRect {
+        /// Build a minimal context with a custom widget runner (no real PTY)
+        /// so `render_cell_body` can be exercised against a `TestBackend`
+        /// without spawning shell children.
+        fn setup_widget_ctx<'a>(
+            terminal: &'a mut ratatui::Terminal<ratatui::backend::TestBackend>,
+            widget: Box<dyn CmdashWidget>,
+        ) -> TickContext<'a, ratatui::backend::TestBackend> {
+            let kdl = r#"layout { pane kind=widget ref-name="marker" }"#;
+            let cfg = cmdash_config::parse(kdl).expect("parse KDL");
+            let layout_root = cfg.layout.expect("layout block");
+            let last_area = LayoutRect {
                 x: 0,
                 y: 0,
-                w: 120,
-                h: 40,
-            },
-        )
-        .expect("new layout must compute successfully");
-        assert_eq!(
-            computed.panes.len(),
-            2,
-            "new layout must resolve to 2 panes; got: {}",
-            computed.panes.len()
-        );
-        assert_eq!(
-            computed.panes[0].label.as_deref(),
-            Some("left"),
-            "pane 0 label must be 'left'"
-        );
-        assert_eq!(
-            computed.panes[1].label.as_deref(),
-            Some("right"),
-            "pane 1 label must be 'right'"
-        );
-    }
+                w: 80,
+                h: 24,
+            };
+            let layout = ComputedLayout::compute(&layout_root, last_area).expect("compute layout");
+            let pane = layout.panes[0].clone();
+            let layer_id = cmdash::derive_layer_id(&pane.id);
+            let (close_tx, close_rx) = unbounded_channel::<PaneLayerId>();
+            let runner = PaneRunner::spawn_widget(pane, layer_id, widget, Some(close_tx.clone()));
+            let runners = vec![runner];
+            let graphics = GraphicsState::new(
+                cmdash::graphics::Metrics::default(),
+                (last_area.w, last_area.h),
+            );
+            let bindings = Router::new(vec![]);
+            TickContext::new_full(
+                runners,
+                bindings,
+                0,
+                true,
+                close_tx,
+                close_rx,
+                graphics,
+                terminal,
+                Duration::from_millis(33),
+                layout_root,
+                None,
+                last_area,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                ShellSpec::LoginShell,
+                None,
+            )
+        }
 
-    /// Debounce behavior: two rapid successive file writes
-    /// (well within the 500ms debounce window) must collapse
-    /// to a single `ConfigReload`. The watcher's debounce
-    /// coalesces rapid edits so the tick loop isn't spammed
-    /// with redundant reconciles. This test writes two
-    /// configs with DIFFERENT keybinds in quick succession
-    /// and asserts only ONE `ConfigReload` arrives, carrying
-    /// the SECOND write's keybinds.
-    #[test]
-    fn config_hot_reload_debounces_rapid_writes() {
-        let dir = std::env::temp_dir().join("cmdash_hot_reload_debounce_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let config_path = dir.join("config.kdl");
+        /// A widget that renders a visible marker so tests can assert the
+        /// widget render path was exercised by `render_cell_body`.
+        struct MarkerWidget {
+            marker: String,
+        }
 
-        // Step 1: write initial config.
-        let initial = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-q\" action=\"app.close\"\n            }\n        ";
-        std::fs::write(&config_path, initial).expect("write initial config");
+        impl CmdashWidget for MarkerWidget {
+            fn name(&self) -> &str {
+                "marker"
+            }
 
-        // Step 2: spawn the ConfigWatcher.
-        let (_watcher, rx_opt) = super::ConfigWatcher::spawn(Some(config_path.as_ref()));
-        let rx = rx_opt.expect("watcher must produce a receiver");
+            fn render(&mut self, area: Rect, frame: &mut ratatui::Frame) {
+                let text = ratatui::text::Text::from(self.marker.clone());
+                Paragraph::new(text)
+                    .style(Style::default().fg(Color::Yellow))
+                    .render(area, frame.buffer_mut());
+            }
 
-        // Give the watcher time to initialize.
-        std::thread::sleep(Duration::from_millis(200));
+            fn on_event(&mut self, _event: &WidgetEvent) {}
+        }
 
-        // Step 3: two rapid successive writes WITHIN the 500ms
-        // debounce window. Both write the same keybind
-        // (alt-e -> pane.focus.next) so the content assertion
-        // is correct regardless of inotify coalescing behavior.
-        // The "only one message" assertion pins the collapse.
-        let first_update = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-e\" action=\"pane.focus.next\"\n            }\n        ";
-        std::fs::write(&config_path, first_update).expect("write first update");
-        // Immediately (<< 500ms) write again.
-        let second_update = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-e\" action=\"pane.focus.next\"\n            }\n        ";
-        std::fs::write(&config_path, second_update).expect("write second update");
+        /// `render_cell_body` must draw the tab bar into the ratatui buffer
+        /// even when no shell panes are present. The tab bar occupies row 0
+        /// and writes non-space content (the tab index / label), so the
+        /// buffer should differ from a blank screen.
+        #[tokio::test]
+        async fn render_cell_body_draws_tab_bar() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
 
-        // Step 4: wait for the debounce window to expire and
-        // the watcher to deliver.
-        let result = rx.recv_timeout(Duration::from_secs(5));
+            let snapshots: Vec<Option<cmdash_pty::PaneTerminalState>> = vec![None];
+            ctx.render_cell_body(&snapshots)
+                .expect("render_cell_body should succeed");
 
-        // Step 5: assert no second ConfigReload arrives within
-        // a short grace period (debounce = 500ms, so 300ms
-        // after the first should be safe).
-        std::thread::sleep(Duration::from_millis(800));
-        let second_result = rx.try_recv();
+            let buf = terminal.backend().buffer().clone();
+            let mut non_space_count = 0;
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    if buf.get(x, y).symbol() != " " {
+                        non_space_count += 1;
+                    }
+                }
+            }
+            assert!(
+                non_space_count > 0,
+                "render_cell_body must draw non-space content (tab bar) to the TestBackend buffer"
+            );
+        }
 
-        // Cleanup BEFORE assertions.
-        let _ = std::fs::remove_file(&config_path);
-        let _ = std::fs::remove_dir(&dir);
+        /// `render_cell_body` must call `widget.render()` for widget panes.
+        /// The marker widget writes a known string into its area; the test
+        /// asserts that string survives into the ratatui buffer.
+        #[tokio::test]
+        async fn render_cell_body_renders_widget_pane() {
+            // 25 rows: row 0 is reserved for the tab bar, rows 1-24 for the pane.
+            let backend = ratatui::backend::TestBackend::new(80, 25);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let widget = Box::new(MarkerWidget {
+                marker: "WIDGET_MARKER".to_string(),
+            });
+            let mut ctx = setup_widget_ctx(&mut terminal, widget);
 
-        let reload = result.expect("watcher must deliver a ConfigReload within 5s");
-        assert!(
-            second_result.is_err(),
-            "debounce must collapse two rapid writes into one ConfigReload; \
-             got a second: {:?}",
-            second_result
-        );
+            let snapshots: Vec<Option<cmdash_pty::PaneTerminalState>> = vec![None];
+            ctx.render_cell_body(&snapshots)
+                .expect("render_cell_body should succeed");
 
-        // Step 6: the single ConfigReload must carry the
-        // expected keybinds (alt-e -> pane.focus.next).
-        // Both writes used the same keybind, so this is
-        // correct regardless of which event was processed.
-        assert_eq!(reload.keybinds.len(), 1);
-        let kb = &reload.keybinds[0];
-        assert_eq!(
-            kb.action,
-            cmdash_config::KeyAction::PaneFocusNext,
-            "debounced reload must carry the SECOND write's action; got: {:?}",
-            kb.action
-        );
-        assert!(
-            matches!(kb.key, cmdash_config::KeyToken::Char('e')),
-            "debounced reload must carry the SECOND write's key; got: {:?}",
-            kb.key
-        );
-    }
+            let buf = terminal.backend().buffer().clone();
+            let mut found = false;
+            'outer: for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    if buf.get(x, y).symbol() == "W" {
+                        let mut ok = true;
+                        for (i, ch) in "WIDGET_MARKER".chars().enumerate() {
+                            let cx = x + i as u16;
+                            if cx >= buf.area.width || buf.get(cx, y).symbol() != ch.to_string() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            found = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            assert!(
+                found,
+                "render_cell_body must invoke widget.render() and place 'WIDGET_MARKER' in the buffer"
+            );
+        }
 
-    /// Invalid-config edge case: overwrite the config file with
-    /// unparseable KDL and assert the watcher does NOT deliver
-    /// a `ConfigReload` (the parse failure is logged and the
-    /// previous config stays active). Then write a valid config
-    /// and assert a `ConfigReload` DOES arrive, proving the
-    /// watcher recovered.
-    #[test]
-    fn config_hot_reload_ignores_invalid_config() {
-        let dir = std::env::temp_dir().join("cmdash_hot_reload_invalid_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let config_path = dir.join("config.kdl");
+        /// `render_cell_body` must be independent of the dashcompositor
+        /// graphics path. Calling it should not touch `GraphicsState` at all;
+        /// this test simply verifies it returns Ok and leaves the buffer in
+        /// a deterministic state (tab bar drawn, no panic).
+        #[tokio::test]
+        async fn render_cell_body_does_not_exercise_graphics_path() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
 
-        // Step 1: write a VALID initial config.
-        let initial = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-q\" action=\"app.close\"\n            }\n        ";
-        std::fs::write(&config_path, initial).expect("write initial config");
+            let snapshots: Vec<Option<cmdash_pty::PaneTerminalState>> = vec![None];
+            let result = ctx.render_cell_body(&snapshots);
+            assert!(
+                result.is_ok(),
+                "render_cell_body must succeed without touching GraphicsState"
+            );
 
-        // Step 2: spawn the ConfigWatcher.
-        let (_watcher, rx_opt) = super::ConfigWatcher::spawn(Some(config_path.as_ref()));
-        let rx = rx_opt.expect("watcher must produce a receiver");
+            // The buffer should contain the tab bar but no image-layer data.
+            let buf = terminal.backend().buffer().clone();
+            let has_non_space = (0..buf.area.height)
+                .any(|y| (0..buf.area.width).any(|x| buf.get(x, y).symbol() != " "));
+            assert!(
+                has_non_space,
+                "tab bar should be present in the text buffer"
+            );
+        }
 
-        // Give the watcher time to initialize.
-        std::thread::sleep(Duration::from_millis(200));
+        /// `emit_graphics` is the dashcompositor counter-part. It should
+        /// run without panic even when the only layer is a widget pane and
+        /// no images have been pushed.
+        #[tokio::test]
+        async fn emit_graphics_does_not_panic_with_empty_layers() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
 
-        // Step 3: overwrite with INVALID KDL (bare garbage).
-        std::fs::write(&config_path, "this is not valid KDL {{{").expect("write invalid config");
-
-        // Wait for the debounce window to expire. The watcher
-        // should attempt to parse, fail, log a warning, and
-        // NOT send a ConfigReload.
-        std::thread::sleep(Duration::from_secs(1));
-
-        // Step 4: assert NO ConfigReload arrived for the invalid edit.
-        let invalid_result = rx.try_recv();
-        assert!(
-            invalid_result.is_err(),
-            "invalid config must not produce a ConfigReload; got: {:?}",
-            invalid_result
-        );
-
-        // Step 5: now write a VALID config with different keybinds.
-        let valid_update = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-e\" action=\"pane.focus.next\"\n            }\n        ";
-        std::fs::write(&config_path, valid_update).expect("write valid config");
-
-        // Step 6: the watcher should deliver a ConfigReload for
-        // the valid edit, proving it recovered from the invalid one.
-        let result = rx.recv_timeout(Duration::from_secs(5));
-
-        // Cleanup BEFORE assertions.
-        let _ = std::fs::remove_file(&config_path);
-        let _ = std::fs::remove_dir(&dir);
-
-        let reload = result.expect("valid config after invalid must produce a ConfigReload");
-        assert_eq!(reload.keybinds.len(), 1);
-        let kb = &reload.keybinds[0];
-        assert_eq!(
-            kb.action,
-            cmdash_config::KeyAction::PaneFocusNext,
-            "recovered reload must carry the valid config's action; got: {:?}",
-            kb.action
-        );
+            let result = ctx.emit_graphics();
+            assert!(
+                result.is_ok(),
+                "emit_graphics must succeed with empty layers"
+            );
+        }
     }
 }

@@ -44,15 +44,15 @@ fn spawn_runner(source: &str, area: LayoutRect, close_tx: &PaneCloseTx) -> PaneR
 /// TabNew: pushing a new tab appends it to the stack and switches
 /// the active cursor to it. Both the original and new tab's runners
 /// must remain alive (tickable) after the push.
-#[test]
-fn tab_new_appends_and_switches_with_live_runners() {
+#[tokio::test]
+async fn tab_new_appends_and_switches_with_live_runners() {
     let area = LayoutRect {
         x: 0,
         y: 0,
         w: 80,
         h: 24,
     };
-    let (close_tx, _close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, _close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
 
     // Tab 1: initial single-pane tab.
     let runner1 = spawn_runner(
@@ -94,15 +94,15 @@ fn tab_new_appends_and_switches_with_live_runners() {
 
 /// TabNew: pushing multiple tabs sequentially creates a stack of
 /// the expected size, and the cursor always lands on the last push.
-#[test]
-fn tab_new_sequential_pushes_grow_stack() {
+#[tokio::test]
+async fn tab_new_sequential_pushes_grow_stack() {
     let area = LayoutRect {
         x: 0,
         y: 0,
         w: 80,
         h: 24,
     };
-    let (close_tx, _close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, _close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
 
     let runner1 = spawn_runner(r#"layout { pane kind=shell label="t1" }"#, area, &close_tx);
     let mut tabs: TabStack<Vec<PaneRunner>> = TabStack::new(vec![runner1]);
@@ -134,15 +134,15 @@ fn tab_new_sequential_pushes_grow_stack() {
 
 /// TabClose: removing the active tab from a 2-tab stack leaves
 /// the other tab's runner alive and the cursor clamped.
-#[test]
-fn tab_close_removes_active_tab_leaves_survivor_alive() {
+#[tokio::test]
+async fn tab_close_removes_active_tab_leaves_survivor_alive() {
     let area = LayoutRect {
         x: 0,
         y: 0,
         w: 80,
         h: 24,
     };
-    let (close_tx, close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, mut close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
 
     let runner1 = spawn_runner(
         r#"layout { pane kind=shell label="survivor" }"#,
@@ -190,15 +190,15 @@ fn tab_close_removes_active_tab_leaves_survivor_alive() {
 
 /// TabClose: closing the active tab (at index 0) from a 3-tab
 /// stack shifts the remaining tabs down and the cursor stays at 0.
-#[test]
-fn tab_close_first_tab_shifts_remaining_down() {
+#[tokio::test]
+async fn tab_close_first_tab_shifts_remaining_down() {
     let area = LayoutRect {
         x: 0,
         y: 0,
         w: 80,
         h: 24,
     };
-    let (close_tx, _close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, _close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
 
     let runner1 = spawn_runner(
         r#"layout { pane kind=shell label="first" }"#,
@@ -247,15 +247,15 @@ fn tab_close_first_tab_shifts_remaining_down() {
 /// TabClose: closing the LAST tab leaves an empty stack.
 /// Mirrors the production `TickContext::close_active_tab` path
 /// where `self.tabs.is_empty()` → `self.running = false`.
-#[test]
-fn tab_close_last_tab_leaves_empty_stack() {
+#[tokio::test]
+async fn tab_close_last_tab_leaves_empty_stack() {
     let area = LayoutRect {
         x: 0,
         y: 0,
         w: 80,
         h: 24,
     };
-    let (close_tx, _close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, _close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
 
     let runner = spawn_runner(
         r#"layout { pane kind=shell label="only" }"#,
@@ -282,15 +282,15 @@ fn tab_close_last_tab_leaves_empty_stack() {
 
 /// TabSwitch: switch_to(n) moves the cursor to the target tab.
 /// All runners remain alive and tickable after switching.
-#[test]
-fn tab_switch_changes_active_cursor() {
+#[tokio::test]
+async fn tab_switch_changes_active_cursor() {
     let area = LayoutRect {
         x: 0,
         y: 0,
         w: 80,
         h: 24,
     };
-    let (close_tx, _close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, _close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
 
     let runner1 = spawn_runner(
         r#"layout { pane kind=shell label="alpha" }"#,
@@ -347,15 +347,15 @@ fn tab_switch_changes_active_cursor() {
 /// TabSwitch: out-of-range switch_to is a silent no-op (returns false).
 /// Mirrors M-1..M-9 keybind semantics where out-of-range chords
 /// are silently ignored.
-#[test]
-fn tab_switch_out_of_range_is_noop() {
+#[tokio::test]
+async fn tab_switch_out_of_range_is_noop() {
     let area = LayoutRect {
         x: 0,
         y: 0,
         w: 80,
         h: 24,
     };
-    let (close_tx, _close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, _close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
 
     let runner1 = spawn_runner(r#"layout { pane kind=shell label="a" }"#, area, &close_tx);
     let runner2 = spawn_runner(r#"layout { pane kind=shell label="b" }"#, area, &close_tx);
@@ -388,15 +388,15 @@ fn tab_switch_out_of_range_is_noop() {
 
 /// Full lifecycle: create 3 tabs, switch between them, close the
 /// middle one, verify the remaining two runners survive.
-#[test]
-fn tab_lifecycle_new_switch_close_with_real_pty_runners() {
+#[tokio::test]
+async fn tab_lifecycle_new_switch_close_with_real_pty_runners() {
     let area = LayoutRect {
         x: 0,
         y: 0,
         w: 80,
         h: 24,
     };
-    let (close_tx, close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, mut close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
 
     // Tab 0: initial.
     let runner0 = spawn_runner(
@@ -481,15 +481,15 @@ fn tab_lifecycle_new_switch_close_with_real_pty_runners() {
 /// leaves an empty stack. Verifies the production
 /// `close_active_tab` → `self.tabs.is_empty()` → `running = false`
 /// contract.
-#[test]
-fn tab_lifecycle_new_switch_close_last_quits() {
+#[tokio::test]
+async fn tab_lifecycle_new_switch_close_last_quits() {
     let area = LayoutRect {
         x: 0,
         y: 0,
         w: 80,
         h: 24,
     };
-    let (close_tx, _close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, _close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
 
     let runner0 = spawn_runner(r#"layout { pane kind=shell label="a" }"#, area, &close_tx);
     let mut tabs: TabStack<Vec<PaneRunner>> = TabStack::new(vec![runner0]);
@@ -519,15 +519,15 @@ fn tab_lifecycle_new_switch_close_last_quits() {
 /// Multi-pane tab: a tab can hold multiple runners (e.g. a split
 /// layout). TabNew creates a new tab; TabClose drops all runners
 /// in the closed tab; TabSwitch moves focus.
-#[test]
-fn tab_operations_with_multi_pane_tabs() {
+#[tokio::test]
+async fn tab_operations_with_multi_pane_tabs() {
     let area = LayoutRect {
         x: 0,
         y: 0,
         w: 80,
         h: 24,
     };
-    let (close_tx, close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, mut close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
 
     // Tab 0: single-pane.
     let runner0 = spawn_runner(
@@ -620,15 +620,15 @@ fn tab_operations_with_multi_pane_tabs() {
 /// Switch-after-close: after closing a tab, switching to an
 /// out-of-range index is a no-op. Verifies cursor clamping
 /// interacts correctly with switch_to bounds checking.
-#[test]
-fn tab_switch_after_close_respects_bounds() {
+#[tokio::test]
+async fn tab_switch_after_close_respects_bounds() {
     let area = LayoutRect {
         x: 0,
         y: 0,
         w: 80,
         h: 24,
     };
-    let (close_tx, _close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, _close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
 
     let runner0 = spawn_runner(r#"layout { pane kind=shell label="a" }"#, area, &close_tx);
     let runner1 = spawn_runner(r#"layout { pane kind=shell label="b" }"#, area, &close_tx);

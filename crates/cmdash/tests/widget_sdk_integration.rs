@@ -67,9 +67,9 @@ fn find_widget_clock_lib() -> Option<PathBuf> {
 ///
 /// Skipped (not failed) if the widget-clock cdylib hasn't been built.
 /// Run with `cargo test --test widget_sdk_integration -- --ignored` to execute.
-#[test]
+#[tokio::test]
 #[ignore = "widget-clock cdylib not built; run: cargo build -p widget-clock"]
-fn load_widget_clock_cdylib_and_create_widget() {
+async fn load_widget_clock_cdylib_and_create_widget() {
     let lib_path = find_widget_clock_lib()
         .expect("widget-clock cdylib not found; build with: cargo build -p widget-clock");
 
@@ -125,9 +125,9 @@ fn load_widget_clock_cdylib_and_create_widget() {
 ///
 /// Skipped if cdylib not found.
 /// Run with `cargo test --test widget_sdk_integration -- --ignored` to execute.
-#[test]
+#[tokio::test]
 #[ignore = "widget-clock cdylib not built; run: cargo build -p widget-clock"]
-fn widget_clock_rejects_mismatched_abi_version() {
+async fn widget_clock_rejects_mismatched_abi_version() {
     let lib_path = find_widget_clock_lib().expect("widget-clock cdylib not found");
 
     unsafe {
@@ -195,8 +195,8 @@ impl CmdashWidget for MockWidget {
 }
 
 /// MockWidget renders without panicking and tracks render count.
-#[test]
-fn mock_widget_render_tracks_count() {
+#[tokio::test]
+async fn mock_widget_render_tracks_count() {
     let mut widget = MockWidget::default();
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
@@ -226,8 +226,8 @@ fn mock_widget_render_tracks_count() {
 }
 
 /// MockWidget receives and records events via on_event.
-#[test]
-fn mock_widget_receives_events() {
+#[tokio::test]
+async fn mock_widget_receives_events() {
     let mut widget = MockWidget::default();
 
     widget.on_event(&WidgetEvent::FocusGained);
@@ -262,8 +262,8 @@ fn mock_widget_receives_events() {
 /// name and functional behavior across the FFI boundary.
 /// Uses a type-erased "canary" value encoded in the render_area
 /// to verify state survived the round-trip without downcasting.
-#[test]
-fn ffi_round_trip_preserves_widget_state() {
+#[tokio::test]
+async fn ffi_round_trip_preserves_widget_state() {
     let mut widget: Box<dyn CmdashWidget> = Box::new(MockWidget::default());
 
     // Send an event before crossing the FFI boundary to modify state.
@@ -295,8 +295,8 @@ fn ffi_round_trip_preserves_widget_state() {
 }
 
 /// Render the widget into a ratatui buffer and verify visible content.
-#[test]
-fn mock_widget_renders_visible_content() {
+#[tokio::test]
+async fn mock_widget_renders_visible_content() {
     let mut widget = MockWidget::default();
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
@@ -342,8 +342,8 @@ fn mock_widget_renders_visible_content() {
 }
 
 /// Widget name is consistent across multiple calls.
-#[test]
-fn widget_name_is_consistent() {
+#[tokio::test]
+async fn widget_name_is_consistent() {
     let widget = MockWidget::default();
     let name1 = widget.name().to_string();
     let name2 = widget.name().to_string();
@@ -355,8 +355,8 @@ fn widget_name_is_consistent() {
 
 /// Widget renders correctly with zero-width or zero-height area
 /// (should not panic).
-#[test]
-fn widget_handles_zero_area_gracefully() {
+#[tokio::test]
+async fn widget_handles_zero_area_gracefully() {
     let mut widget = MockWidget::default();
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
@@ -387,8 +387,8 @@ fn widget_handles_zero_area_gracefully() {
 }
 
 /// Widget renders at offset position (non-zero x, y).
-#[test]
-fn widget_renders_at_offset_position() {
+#[tokio::test]
+async fn widget_renders_at_offset_position() {
     let mut widget = MockWidget::default();
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
@@ -434,8 +434,8 @@ fn widget_renders_at_offset_position() {
 }
 
 /// CmdashWidget is object-safe and can be stored as Box<dyn CmdashWidget>.
-#[test]
-fn cmdash_widget_is_object_safe() {
+#[tokio::test]
+async fn cmdash_widget_is_object_safe() {
     let mut widgets: Vec<Box<dyn CmdashWidget>> = vec![
         Box::new(MockWidget::default()),
         Box::new(MockWidget {

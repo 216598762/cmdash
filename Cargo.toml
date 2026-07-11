@@ -25,6 +25,7 @@ description = "Layer-based terminal multiplexer and dashboard."
 # upstream git source. As soon as v0.4 lands on the registry we'll
 # switch back to a registry-style version pin.
 dashcompositor = { git = "https://github.com/216598762/dashcompositor", default-features = false, features = ["kitty-encoder", "sixel-encoder", "image-decoder", "font-rasterizer"], branch = "main" }
+tokio = { version = "1.44.0", features = ["full"] }
 
 [profile.release]
 strip = "symbols"

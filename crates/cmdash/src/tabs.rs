@@ -238,9 +238,7 @@ impl<T> TabStack<T> {
 mod tests {
     use super::*;
     use crate::layer_id::derive_layer_id_for_tab;
-    use cmdash_config::{
-        LayoutNode, PaneKind, Ratio as CfgRatio, SplitAxis as CfgSplitAxis,
-    };
+    use cmdash_config::{LayoutNode, PaneKind, Ratio as CfgRatio, SplitAxis as CfgSplitAxis};
     use cmdash_layout::{ComputedLayout, PaneId, Rect};
     use cmdash_pty::PaneLayerId;
     // ----------------------------------------------------------------

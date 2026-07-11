@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
 use cmdash_config::{
-    parse, Config, KeyAction, KeyToken, LayoutNode, Modifiers, Pane, PaneKind,
-    Ratio, SplitAxis,
+    parse, Config, KeyAction, KeyToken, LayoutNode, Modifiers, Pane, PaneKind, Ratio, SplitAxis,
 };
 
 fn fixture() -> String {
@@ -125,7 +124,9 @@ fn parses_theme_example_round_trip() {
     let src = std::fs::read_to_string(&p).expect("09-theme.kdl is readable");
     // The entire file must parse as valid KDL v2.
     let cfg = parse(&src).expect("09-theme.kdl must parse cleanly");
-    let theme = cfg.theme.expect("theme block must be parsed from 09-theme.kdl");
+    let theme = cfg
+        .theme
+        .expect("theme block must be parsed from 09-theme.kdl");
 
     // All 15 theme keys should be populated (the light theme is active)
     assert!(theme.default_fg.is_some(), "default-fg should be set");
@@ -134,13 +135,31 @@ fn parses_theme_example_round_trip() {
     assert!(theme.tab_bar_bg.is_some(), "tab-bar-bg should be set");
     assert!(theme.tab_active_bg.is_some(), "tab-active-bg should be set");
     assert!(theme.tab_active_fg.is_some(), "tab-active-fg should be set");
-    assert!(theme.tab_inactive_bg.is_some(), "tab-inactive-bg should be set");
-    assert!(theme.tab_inactive_fg.is_some(), "tab-inactive-fg should be set");
+    assert!(
+        theme.tab_inactive_bg.is_some(),
+        "tab-inactive-bg should be set"
+    );
+    assert!(
+        theme.tab_inactive_fg.is_some(),
+        "tab-inactive-fg should be set"
+    );
     assert!(theme.status_bar_bg.is_some(), "status-bar-bg should be set");
-    assert!(theme.status_mode_fg.is_some(), "status-mode-fg should be set");
-    assert!(theme.status_mode_bg.is_some(), "status-mode-bg should be set");
-    assert!(theme.status_clock_fg.is_some(), "status-clock-fg should be set");
-    assert!(theme.status_pane_title_fg.is_some(), "status-pane-title-fg should be set");
+    assert!(
+        theme.status_mode_fg.is_some(),
+        "status-mode-fg should be set"
+    );
+    assert!(
+        theme.status_mode_bg.is_some(),
+        "status-mode-bg should be set"
+    );
+    assert!(
+        theme.status_clock_fg.is_some(),
+        "status-clock-fg should be set"
+    );
+    assert!(
+        theme.status_pane_title_fg.is_some(),
+        "status-pane-title-fg should be set"
+    );
     assert!(theme.border_color.is_some(), "border-color should be set");
     assert!(theme.error_color.is_some(), "error-color should be set");
 }
@@ -218,5 +237,8 @@ fn theme_unknown_key_errors() {
 "#;
     let err = parse(src).expect_err("unknown theme key must error");
     let msg = format!("{}", err);
-    assert!(msg.contains("bogus-key"), "error should mention the bad key: {msg}");
+    assert!(
+        msg.contains("bogus-key"),
+        "error should mention the bad key: {msg}"
+    );
 }

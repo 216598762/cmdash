@@ -55,8 +55,8 @@ fn spawn_test_widget(label: &str) -> Option<ScriptWidget> {
 
 /// Spawn a ScriptWidget and verify it starts successfully.
 /// The widget should be alive and its name should match the label.
-#[test]
-fn script_widget_spawn_succeeds() {
+#[tokio::test]
+async fn script_widget_spawn_succeeds() {
     let Some(mut widget) = spawn_test_widget("test-script") else {
         return;
     };
@@ -75,8 +75,8 @@ fn script_widget_spawn_succeeds() {
 }
 
 /// Spawn a ScriptWidget with default name (no label).
-#[test]
-fn script_widget_default_name() {
+#[tokio::test]
+async fn script_widget_default_name() {
     let script_path = match test_script_path() {
         Some(p) => p,
         None => return,
@@ -87,8 +87,8 @@ fn script_widget_default_name() {
 }
 
 /// Spawn with an invalid command returns an error.
-#[test]
-fn script_widget_invalid_command_returns_error() {
+#[tokio::test]
+async fn script_widget_invalid_command_returns_error() {
     let result = ScriptWidget::spawn("nonexistent_binary_12345", Some("bad"));
     assert!(result.is_err(), "spawn with invalid command must fail");
     if let Err(e) = result {
@@ -101,8 +101,8 @@ fn script_widget_invalid_command_returns_error() {
 }
 
 /// Spawn with empty command returns an error.
-#[test]
-fn script_widget_empty_command_returns_error() {
+#[tokio::test]
+async fn script_widget_empty_command_returns_error() {
     let result = ScriptWidget::spawn("", Some("empty"));
     assert!(result.is_err(), "spawn with empty command must fail");
 }
@@ -122,8 +122,8 @@ fn script_widget_empty_command_returns_error() {
 ///
 /// Uses generous timeouts (200ms x 15 = 3s max) for reliability
 /// under CI load.
-#[test]
-fn script_widget_renders_frame_response() {
+#[tokio::test]
+async fn script_widget_renders_frame_response() {
     let Some(mut widget) = spawn_test_widget("frame-test") else {
         return;
     };
@@ -162,7 +162,7 @@ fn script_widget_renders_frame_response() {
         if found_content {
             break;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     assert!(
@@ -178,8 +178,8 @@ fn script_widget_renders_frame_response() {
 ///
 /// Uses plain-text markers (no ANSI codes) to ensure reliable
 /// string matching in the buffer cells.
-#[test]
-fn script_widget_renders_expected_marker_text() {
+#[tokio::test]
+async fn script_widget_renders_expected_marker_text() {
     let Some(mut widget) = spawn_test_widget("marker-test") else {
         return;
     };
@@ -229,7 +229,7 @@ fn script_widget_renders_expected_marker_text() {
         if found_marker {
             break;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     assert!(
@@ -241,8 +241,8 @@ fn script_widget_renders_expected_marker_text() {
 
 /// Render the ScriptWidget into a bordered block and verify the border
 /// title matches the widget name.
-#[test]
-fn script_widget_border_title_matches_name() {
+#[tokio::test]
+async fn script_widget_border_title_matches_name() {
     let Some(mut widget) = spawn_test_widget("my-title") else {
         return;
     };
@@ -259,7 +259,7 @@ fn script_widget_border_title_matches_name() {
                 widget.render(area, frame);
             })
             .expect("render");
-        std::thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     let buf = terminal.backend().buffer().clone();
@@ -300,8 +300,8 @@ fn script_widget_border_title_matches_name() {
 // ---------------------------------------------------------------------------
 
 /// Forward a KEY event to the ScriptWidget and verify it doesn't panic.
-#[test]
-fn script_widget_forwards_key_event() {
+#[tokio::test]
+async fn script_widget_forwards_key_event() {
     let Some(mut widget) = spawn_test_widget("key-test") else {
         return;
     };
@@ -349,8 +349,8 @@ fn script_widget_forwards_key_event() {
 }
 
 /// Forward a RESIZE event and verify it doesn't panic.
-#[test]
-fn script_widget_forwards_resize_event() {
+#[tokio::test]
+async fn script_widget_forwards_resize_event() {
     let Some(mut widget) = spawn_test_widget("resize-test") else {
         return;
     };
@@ -376,8 +376,8 @@ fn script_widget_forwards_resize_event() {
 }
 
 /// Forward FOCUS events and verify they don't panic.
-#[test]
-fn script_widget_forwards_focus_events() {
+#[tokio::test]
+async fn script_widget_forwards_focus_events() {
     let Some(mut widget) = spawn_test_widget("focus-test") else {
         return;
     };
@@ -403,8 +403,8 @@ fn script_widget_forwards_focus_events() {
 
 /// Render the ScriptWidget multiple times with varying areas and
 /// verify it handles repeated FRAME requests without panicking.
-#[test]
-fn script_widget_handles_repeated_renders() {
+#[tokio::test]
+async fn script_widget_handles_repeated_renders() {
     let Some(mut widget) = spawn_test_widget("repeat-test") else {
         return;
     };
@@ -421,14 +421,14 @@ fn script_widget_handles_repeated_renders() {
                 widget.render(area, frame);
             })
             .expect("render must not panic");
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
 /// Drop the ScriptWidget while it's still rendering and verify
 /// the Drop impl cleans up properly (kills child, joins reader thread).
-#[test]
-fn script_widget_drop_cleans_up() {
+#[tokio::test]
+async fn script_widget_drop_cleans_up() {
     let Some(mut widget) = spawn_test_widget("drop-test") else {
         return;
     };
@@ -443,7 +443,7 @@ fn script_widget_drop_cleans_up() {
                 widget.render(area, frame);
             })
             .expect("render");
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // Drop the widget — this should kill the child and join the reader
@@ -457,8 +457,8 @@ fn script_widget_drop_cleans_up() {
 
 /// Render into a very small area (1x1) — the script should still respond
 /// without panicking.
-#[test]
-fn script_widget_renders_in_tiny_area() {
+#[tokio::test]
+async fn script_widget_renders_in_tiny_area() {
     let Some(mut widget) = spawn_test_widget("tiny-test") else {
         return;
     };
@@ -473,13 +473,13 @@ fn script_widget_renders_in_tiny_area() {
                 widget.render(area, frame);
             })
             .expect("1x1 render must not panic");
-        std::thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
 /// Render at a non-zero offset position.
-#[test]
-fn script_widget_renders_at_offset() {
+#[tokio::test]
+async fn script_widget_renders_at_offset() {
     let Some(mut widget) = spawn_test_widget("offset-test") else {
         return;
     };
@@ -494,7 +494,7 @@ fn script_widget_renders_at_offset() {
                 widget.render(area, frame);
             })
             .expect("offset render must not panic");
-        std::thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     // The border content should appear near the offset position.
@@ -519,8 +519,8 @@ fn script_widget_renders_at_offset() {
 
 /// Verify that a script process that exits immediately is handled
 /// gracefully (no panic, no hang).
-#[test]
-fn script_widget_handles_immediate_exit() {
+#[tokio::test]
+async fn script_widget_handles_immediate_exit() {
     // Use `true` (resolved from $PATH) which exits immediately with success.
     let mut widget = ScriptWidget::spawn("true", Some("immediate-exit")).expect("spawn true");
 
@@ -537,7 +537,7 @@ fn script_widget_handles_immediate_exit() {
                 widget.render(area, frame);
             })
             .expect("render after script exit must not panic");
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // Drop should not hang even if the child already exited.

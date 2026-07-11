@@ -452,18 +452,9 @@ mod tests {
 
     #[test]
     fn color_to_rgba_named() {
-        assert_eq!(
-            Theme::color_to_rgba(Color::Red, 255),
-            [255, 0, 0, 255]
-        );
-        assert_eq!(
-            Theme::color_to_rgba(Color::Blue, 200),
-            [0, 0, 255, 200]
-        );
-        assert_eq!(
-            Theme::color_to_rgba(Color::Reset, 255),
-            [0, 0, 0, 255]
-        );
+        assert_eq!(Theme::color_to_rgba(Color::Red, 255), [255, 0, 0, 255]);
+        assert_eq!(Theme::color_to_rgba(Color::Blue, 200), [0, 0, 255, 200]);
+        assert_eq!(Theme::color_to_rgba(Color::Reset, 255), [0, 0, 0, 255]);
     }
 
     #[test]

@@ -58,8 +58,8 @@ fn dispatch_key(router: &Router, alt: bool, code: crossterm::event::KeyCode) -> 
 
 /// Enter PaneResize mode via the configured keybind, verify mode
 /// changes, then exit via Escape and verify Normal mode is restored.
-#[test]
-fn enter_pane_resize_and_exit_with_escape() {
+#[tokio::test]
+async fn enter_pane_resize_and_exit_with_escape() {
     let mut router = router_with_resize_keybind();
     assert_eq!(router.mode(), Mode::Normal, "starts in Normal mode");
 
@@ -85,8 +85,8 @@ fn enter_pane_resize_and_exit_with_escape() {
 }
 
 /// In PaneResize mode, arrow keys dispatch resize actions.
-#[test]
-fn pane_resize_mode_arrow_keys_dispatch_resize_actions() {
+#[tokio::test]
+async fn pane_resize_mode_arrow_keys_dispatch_resize_actions() {
     let mut router = router_with_resize_keybind();
     router.set_mode(Mode::PaneResize);
 
@@ -125,8 +125,8 @@ fn pane_resize_mode_arrow_keys_dispatch_resize_actions() {
 
 /// In Normal mode, arrow keys do NOT dispatch resize actions
 /// (they fall through to the focused pane's PTY).
-#[test]
-fn normal_mode_arrow_keys_do_not_dispatch_resize_actions() {
+#[tokio::test]
+async fn normal_mode_arrow_keys_do_not_dispatch_resize_actions() {
     let router = router_with_resize_keybind();
     assert_eq!(router.mode(), Mode::Normal);
 
@@ -147,8 +147,8 @@ fn normal_mode_arrow_keys_do_not_dispatch_resize_actions() {
 
 /// Escape in Normal mode does NOT dispatch ModeExit (there is no
 /// mode to exit from).
-#[test]
-fn escape_in_normal_mode_is_unmatched() {
+#[tokio::test]
+async fn escape_in_normal_mode_is_unmatched() {
     let router = router_with_resize_keybind();
     let action = dispatch_key(&router, false, crossterm::event::KeyCode::Esc);
     assert_eq!(
@@ -160,8 +160,8 @@ fn escape_in_normal_mode_is_unmatched() {
 /// Unmatched keys in PaneResize mode fall through as None (forwarded
 /// to the focused pane's PTY), so users can still type while in
 /// resize mode.
-#[test]
-fn unmatched_keys_fall_through_in_pane_resize_mode() {
+#[tokio::test]
+async fn unmatched_keys_fall_through_in_pane_resize_mode() {
     let mut router = router_with_resize_keybind();
     router.set_mode(Mode::PaneResize);
 
@@ -202,8 +202,8 @@ fn unmatched_keys_fall_through_in_pane_resize_mode() {
 /// inner Split at path [0] (tree indices: outer child 0 → inner
 /// Split). `update_split_ratio(&root, &[0], ...)` targets that
 /// inner Split.
-#[test]
-fn full_mode_transition_resize_real_pty() {
+#[tokio::test]
+async fn full_mode_transition_resize_real_pty() {
     let source = r#"layout {
         split axis=horizontal ratio=0.6 {
             split axis=vertical ratio=0.5 {
@@ -224,14 +224,18 @@ fn full_mode_transition_resize_real_pty() {
 
     // Compute initial layout.
     let initial_layout = ComputedLayout::compute(&layout_root, area).expect("compute initial");
-    assert_eq!(initial_layout.panes.len(), 3, "fixture: 3-pane nested split");
+    assert_eq!(
+        initial_layout.panes.len(),
+        3,
+        "fixture: 3-pane nested split"
+    );
     // inner Split is at outer child 0: path [0] in tree indices.
     // top: outer(0) → inner(0) → (0, 0) pre_order=0
     // bot: outer(0) → inner(1) → (0, 1) pre_order=1
     // right: outer(1) → (1) pre_order=2
 
     // Spawn real PTY runners.
-    let (close_tx, _close_rx): (PaneCloseTx, _) = std::sync::mpsc::channel();
+    let (close_tx, _close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
     let mut runners: Vec<PaneRunner> = Vec::new();
     for pane in &initial_layout.panes {
         let layer = cmdash::derive_layer_id(&pane.id);
@@ -265,12 +269,10 @@ fn full_mode_transition_resize_real_pty() {
     // the inner Split is at tree path [0] (outer child 0).
     let initial_ratio: u8 = 50;
     let new_ratio: u8 = (initial_ratio + 2).clamp(1, 99); // 52
-    update_split_ratio(&mut layout_root, &[0], CfgRatio(new_ratio))
-        .expect("update_split_ratio");
+    update_split_ratio(&mut layout_root, &[0], CfgRatio(new_ratio)).expect("update_split_ratio");
 
     // Verify the ratio was updated by re-resolving the layout.
-    let resized_layout =
-        ComputedLayout::compute(&layout_root, area).expect("compute after resize");
+    let resized_layout = ComputedLayout::compute(&layout_root, area).expect("compute after resize");
     assert_eq!(resized_layout.panes.len(), 3);
 
     // inner Split now at 52% vertical. The inner area is 24 rows
@@ -289,22 +291,19 @@ fn full_mode_transition_resize_real_pty() {
     );
 
     // Resize the real PTY runners to match the new rects.
-    for (runner, pane) in runners
-        .iter_mut()
-        .zip(resized_layout.panes.iter())
-    {
-        runner
-            .resize(pane.rect)
-            .expect("resize runner to new rect");
+    for (runner, pane) in runners.iter_mut().zip(resized_layout.panes.iter()) {
+        runner.resize(pane.rect).expect("resize runner to new rect");
     }
 
     // Verify runner rects updated.
     assert_eq!(
-        runners[0].computed().rect.h, top_h,
+        runners[0].computed().rect.h,
+        top_h,
         "top runner rect.h after resize"
     );
     assert_eq!(
-        runners[1].computed().rect.h, bot_h,
+        runners[1].computed().rect.h,
+        bot_h,
         "bot runner rect.h after resize"
     );
 
@@ -330,8 +329,8 @@ fn full_mode_transition_resize_real_pty() {
 /// Full lifecycle with multiple resize steps: enter mode, resize
 /// right, resize right again, resize left, exit. Uses a nested
 /// split so the inner Split has a valid path for update_split_ratio.
-#[test]
-fn multiple_resizes_in_single_mode_session() {
+#[tokio::test]
+async fn multiple_resizes_in_single_mode_session() {
     let source = r#"layout {
         split axis=horizontal ratio=0.6 {
             split axis=vertical ratio=0.5 {
@@ -403,8 +402,8 @@ fn multiple_resizes_in_single_mode_session() {
 /// PaneResize mode and the key is in the global table, it should
 /// match). This tests that mode entry keybinds remain active even
 /// in non-Normal modes (they live in the global keybinds table).
-#[test]
-fn enter_resize_keybind_works_from_within_resize_mode() {
+#[tokio::test]
+async fn enter_resize_keybind_works_from_within_resize_mode() {
     let mut router = router_with_resize_keybind();
     router.set_mode(Mode::PaneResize);
 
@@ -424,8 +423,8 @@ fn enter_resize_keybind_works_from_within_resize_mode() {
 /// produce a zero-area child (inner width = 48, 48*1/100 = 0 →
 /// rejected as ZeroArea). So we test ratio=2 as the minimum safe
 /// value, and verify clamping prevents going below.
-#[test]
-fn resize_ratio_clamped_at_minimum() {
+#[tokio::test]
+async fn resize_ratio_clamped_at_minimum() {
     let source = r#"layout {
         split axis=horizontal ratio=0.6 {
             split axis=vertical ratio=0.5 {
@@ -440,13 +439,11 @@ fn resize_ratio_clamped_at_minimum() {
     // Start at ratio 5, then press Left 5 times (for child 0 of
     // the inner Split at tree path [0]).
     let mut ratio: u8 = 5;
-    update_split_ratio(&mut layout_root, &[0], CfgRatio(ratio))
-        .expect("set initial ratio");
+    update_split_ratio(&mut layout_root, &[0], CfgRatio(ratio)).expect("set initial ratio");
 
     for _ in 0..5 {
         ratio = (ratio as i16 - 2).clamp(1, 99) as u8;
-        update_split_ratio(&mut layout_root, &[0], CfgRatio(ratio))
-            .expect("update ratio");
+        update_split_ratio(&mut layout_root, &[0], CfgRatio(ratio)).expect("update ratio");
     }
 
     // Clamped at 1 (can't go below).
@@ -456,8 +453,8 @@ fn resize_ratio_clamped_at_minimum() {
 /// Verify the ratio clamping: resize to a high ratio, then try to go
 /// further right — it must clamp at 99. Uses a nested split so the
 /// inner Split is at tree path [0].
-#[test]
-fn resize_ratio_clamped_at_maximum() {
+#[tokio::test]
+async fn resize_ratio_clamped_at_maximum() {
     let source = r#"layout {
         split axis=horizontal ratio=0.6 {
             split axis=vertical ratio=0.5 {
@@ -479,13 +476,11 @@ fn resize_ratio_clamped_at_maximum() {
     // Start at ratio 95, then press Right 5 times (for child 0 of
     // the inner Split at tree path [0]).
     let mut ratio: u8 = 95;
-    update_split_ratio(&mut layout_root, &[0], CfgRatio(ratio))
-        .expect("set initial ratio");
+    update_split_ratio(&mut layout_root, &[0], CfgRatio(ratio)).expect("set initial ratio");
 
     for _ in 0..5 {
         ratio = (ratio + 2).clamp(1, 99);
-        update_split_ratio(&mut layout_root, &[0], CfgRatio(ratio))
-            .expect("update ratio");
+        update_split_ratio(&mut layout_root, &[0], CfgRatio(ratio)).expect("update ratio");
     }
 
     assert_eq!(ratio, 99, "ratio must clamp at 99, not exceed");
@@ -494,10 +489,7 @@ fn resize_ratio_clamped_at_maximum() {
     let layout = ComputedLayout::compute(&layout_root, area).expect("compute at ratio=99");
     assert_eq!(layout.panes.len(), 3);
     // inner Split at 99% of 24 rows: top gets (24*99)/100 = 23, bot gets 1.
-    assert_eq!(
-        layout.panes[0].rect.h, 23,
-        "top pane height at ratio=99"
-    );
+    assert_eq!(layout.panes[0].rect.h, 23, "top pane height at ratio=99");
     assert_eq!(
         layout.panes[1].rect.h, 1,
         "bot pane height at ratio=99 (remainder)"

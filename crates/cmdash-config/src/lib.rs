@@ -837,22 +837,20 @@ fn read_theme(n: &KdlNode) -> Result<Theme, ConfigError> {
                     })?;
                     theme.cursor_style = Some(cursor);
                 }
-                key @ (
-                    "default-fg"
-                    | "default-bg"
-                    | "tab-bar-bg"
-                    | "tab-active-bg"
-                    | "tab-active-fg"
-                    | "tab-inactive-bg"
-                    | "tab-inactive-fg"
-                    | "status-bar-bg"
-                    | "status-mode-fg"
-                    | "status-mode-bg"
-                    | "status-clock-fg"
-                    | "status-pane-title-fg"
-                    | "border-color"
-                    | "error-color"
-                ) => {
+                key @ ("default-fg"
+                | "default-bg"
+                | "tab-bar-bg"
+                | "tab-active-bg"
+                | "tab-active-fg"
+                | "tab-inactive-bg"
+                | "tab-inactive-fg"
+                | "status-bar-bg"
+                | "status-mode-fg"
+                | "status-mode-bg"
+                | "status-clock-fg"
+                | "status-pane-title-fg"
+                | "border-color"
+                | "error-color") => {
                     let color = theme::parse_color(val).ok_or_else(|| {
                         ConfigError::InvalidTheme(format!(
                             "invalid color value `{val}` for key `{key}`"
@@ -886,7 +884,6 @@ fn read_theme(n: &KdlNode) -> Result<Theme, ConfigError> {
     }
     Ok(theme)
 }
-
 
 fn read_keybind(n: &KdlNode) -> Result<Keybind, ConfigError> {
     let mut chord_str: Option<String> = None;

@@ -22,6 +22,7 @@ libloading = "0.8.9"
 notify = "7.0.0"
 ratatui = { version = "0.25", features = ["crossterm"] }
 thiserror = "2.0.18"
+tokio = { workspace = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
@@ -36,6 +37,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # declared dep so the workspace has a single `portable-pty`
 # version on the build graph.
 portable-pty = "0.9.0"
+# `tokio` is already a normal dependency, but dev-dependencies
+# need an explicit entry with the features used by tests
+# (`#[tokio::test]`, `tokio::time::timeout`).
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [[bin]]
 name = "cmdash"

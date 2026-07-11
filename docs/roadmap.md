@@ -92,7 +92,6 @@ when the viewport offset is > 0.
 
 **Remaining:**
 - Alternate screen detection/toggle (DECSET/DECRST 1047/1049).
-- Scroll-wheel scrollback navigation (Tier 3.2 mouse support).
 - Configurable scrollback capacity via KDL.
 
 ### 1.5 Sixel fallback verification
@@ -119,57 +118,71 @@ yields `TextOnly` (avoids startup delay for configured users).
 
 ### 2.1 Native Rust widget SDK
 
-**Current state:** `cmdash-widget-sdk` is a stub with only a module-level
-doc comment.
+**Status:** ✅ Working.
 
-**Goal:** Implement the `CmdashWidget` trait, the c-ABI export mechanism,
-and runtime loading via `libloading`.
+**Current state:** `cmdash-widget-sdk` defines a c-ABI-safe
+`CmdashWidget` trait, a `WidgetEvent` enum (Key, Resize, FocusGained,
+FocusLost), a pinned `CMDASH_WIDGET_ABI_VERSION`, and a
+`cmdash_widget_export!` macro that generates the required
+`cmdash_widget_create` C-ABI entry point. The host binary loads widgets
+at startup from `~/.config/cmdash/widgets/<name>/` via `libloading` and
+calls `widget.render(area, frame)` once per frame for each
+`pane kind=widget ref_name="<name>"` leaf. An example widget is provided
+at `examples/widget-clock/`.
 
-**Steps:**
-- Define `CmdashWidget` trait in `cmdash-widget-sdk/src/lib.rs`.
-- Define `WidgetEvent` enum (key, mouse, resize, focus).
-- Define the C ABI: `#[no_mangle] pub extern "C" fn cmdash_widget_create()
-  -> *mut dyn CmdashWidget`.
-- Add a version constant for ABI compatibility checking.
-- Implement the loader in `cmdash` binary: scan
-  `~/.config/cmdash/widgets/<name>/` for `.so`/`.dll`, load via
-  `libloading::Library::new`.
-- Add `PaneKind::Widget { ref: String }` to `cmdash-config`.
-- Wire widget panes into the render loop (phase 3a calls
-  `widget.render(area, frame)`).
-- Create an example widget (`examples/widget-clock/`) as a `cdylib`.
+**Implementation:**
+- `CmdashWidget` trait in `crates/cmdash-widget-sdk/src/lib.rs`.
+- `widget_into_raw` / `widget_from_raw` double-box FFI helpers.
+- `cmdash_widget_export!` macro for `.so` authors.
+- `load_widgets()` in `crates/cmdash/src/main.rs` scans the widget
+  directory and loads matching `.so`/`.dll`/`.dylib` files.
+- `PaneKind::Widget { ref_name: String }` parsed from KDL.
+- Integration tests in `crates/cmdash/tests/widget_sdk_integration.rs`
+  cover cdylib loading, FFI round-trip, zero-area handling, offset
+  rendering, and object safety.
+
+**Remaining:**
+- Hot-reload of widgets at runtime (out of scope for v1).
 
 ### 2.2 Script widget protocol
 
-**Current state:** `cmdash-protocol` is a stub. AGENTS.md describes the
-protocol shape but there is no implementation.
+**Status:** ✅ Working.
 
-**Goal:** Implement the line-delimited frame protocol so any executable
-can act as a widget.
+**Current state:** `cmdash-protocol` implements the line-delimited
+frame protocol. The host spawns a script process with piped stdin/stdout
+and sends `FRAME`, `KEY`, `RESIZE`, and `FOCUS` messages. The script
+replies with a `FRAME width=... height=...` header followed by ANSI text
+lines. `ScriptWidget` in `crates/cmdash/src/script_widget.rs` implements
+`CmdashWidget` so script widgets plug into the same render path as
+native widgets.
 
-**Steps:**
-- Write the protocol spec in `crates/cmdash-protocol/README.md`.
-- Implement frame parsing/serialization in `cmdash-protocol/src/lib.rs`.
-- Define message types: `Frame`, `Key`, `Resize`, `Mouse` (cmdash →
-  script) and `FrameReply` (script → cmdash).
-- Add `PaneKind::Script { ref: String }` to `cmdash-config`.
-- Implement the spawn path: `std::process::Command` with piped
-  stdin/stdout.
-- Wire into the render loop: send `FRAME` request, read reply, blit
-  ANSI text into the pane's rect.
-- Create an example script widget (`examples/script-hello/`).
+**Implementation:**
+- `HostMsg` enum and `FrameResponse` parsing in
+  `crates/cmdash-protocol/src/lib.rs`.
+- `ScriptWidget::spawn` and `CmdashWidget` impl in
+  `crates/cmdash/src/script_widget.rs`.
+- `PaneKind::Script` parsed from KDL (`pane kind=script command="..."`).
+- Integration tests in `crates/cmdash/tests/script_widget_integration.rs`
+  cover spawn/lifecycle, frame round-trip, event forwarding, repeated
+  renders, and immediate-exit handling.
+
+**Remaining:**
+- Pixel-bitmap frame mode (future goal, v1 is line+ANSI only).
+- Mouse event forwarding to scripts (message type exists but is not yet
+  wired in `ScriptWidget`).
 
 ### 2.3 Optional status bar
 
-**Current state:** No status bar is rendered. The tab bar (item 1.2)
-shows tab state but there's no general-purpose status line.
+**Status:** ✅ Working.
 
-**Goal:** Add an optional status bar configurable via KDL. When
-disabled (the default), no rows are reserved. When enabled, the status
-bar renders at the bottom of the screen as its own layer.
+**Current state:** An optional status bar is configurable via the
+`status_bar { ... }` KDL block. It is disabled by default; when enabled,
+one row is reserved and the layout area is reduced accordingly. The status
+bar renders in phase 3a after pane blits and shows the current keybind
+mode, the focused pane's label, and the current time. It is
+hot-reloadable via the config file watcher.
 
-**Steps:**
-- Add a `status_bar { ... }` block to the KDL config schema:
+**Example:**
 ```kdl
 status_bar {
     enabled     #true
@@ -179,29 +192,32 @@ status_bar {
     show-mode   #true
 }
 ```
-- Parse `status_bar` in `cmdash_config::parse` into a `StatusBar` struct.
-- When enabled, reserve 1 row (top or bottom) and reduce the layout
-  area accordingly.
-- Render status bar content in `TickContext::run` (phase 3a, after
-  pane + tab bar rendering). The status bar is its own layer per the
-  one-layer-per-instance rule.
-- Fields: active mode, focused pane title, clock, keybind hint.
-- Default: disabled (zero config surface for users who don't want it).
+
+**Implementation:**
+- `Bar` struct and `read_status_bar()` parser in `cmdash-config`.
+- `render_status_bar()` in `crates/cmdash/src/status_bar.rs`.
+- Layout area reduction and rendering wired in `TickContext::run`.
+- Unit tests in `crates/cmdash/src/status_bar.rs`.
+
+**Remaining:**
+- Configurable format strings / additional fields (CPU, memory, etc.).
 
 ### 2.4 Additional keybind modes
 
-**Current state:** `Mode::Normal` is the only routed mode. `PaneResize`,
-`TabSwitch`, `PresetPick` are enum stubs.
+**Status:** ✅ Working.
 
-**Goal:** Implement the remaining modes.
+**Current state:** All four modes are routed: `Normal`, `PaneResize`,
+`TabSwitch`, and `PresetPick`. `Normal` handles global bindings;
+`PaneResize` routes arrow keys to adjust the focused pane's parent split
+ratio; `TabSwitch` routes number keys 1–9 for tab switching; `PresetPick`
+routes number keys for preset selection. Escape exits any non-Normal
+mode.
 
-**Steps:**
-- `PaneResize`: enter on keybind, arrow keys resize the focused pane's
-  split ratio, escape exits.
-- `PresetPick`: enter on `M-p`, show a picker overlay, arrow keys
-  navigate, enter selects.
-- `TabSwitch`: enter on modifier+tab, cycle through tabs.
-- Each mode has its own binding set in the `Router`.
+**Implementation:**
+- `cmdash_keybinds::Mode` enum and `Router::set_mode()`.
+- `KeyAction::{EnterPaneResize, EnterTabSwitch, EnterPresetPick,
+  ModeExit}` plus `PaneResize{Up,Down,Left,Right}`.
+- Mode transitions tested in `crates/cmdash/tests/mode_transitions.rs`.
 
 ## Tier 3: Polish and robustness
 
@@ -222,17 +238,27 @@ with many panes.
 
 ### 3.2 Mouse support
 
-**Current state:** Mouse capture is enabled (`EnableMouseCapture`) but
-mouse events are not routed to panes or used for focus/resize.
+**Status:** ✅ Working.
 
-**Goal:** Support mouse-based pane focus, resize, and scroll.
+**Current state:** Mouse capture is enabled (`EnableMouseCapture`) and
+crossterm mouse events are handled in `TickContext::handle_mouse_event`.
+Left-click focuses the pane under the cursor; Alt+left-click-drag adjusts
+the nearest parent Split's ratio; scroll-wheel and other mouse events
+are forwarded to the focused pane's PTY as SGR extended mouse sequences.
 
-**Steps:**
-- Route `Event::Mouse` to the pane under the cursor for focus.
-- Add drag-to-resize on split borders.
-- Forward mouse events to the focused pane's PTY (for TUI apps that
-  support mouse).
-- Add scroll-wheel scrollback navigation.
+**Implementation:**
+- `focus_by_click()` maps a mouse click to the pane under the cursor.
+- `start_drag_resize()` / `update_drag_resize()` implement Alt+drag
+  split resizing.
+- `forward_mouse_to_pty()` encodes mouse events as SGR sequences and
+  writes them to the focused pane's PTY.
+- Mouse events are consumed by the host before reaching the child PTY,
+  except for forwarded SGR sequences.
+
+**Remaining:**
+- Scroll-wheel scrollback navigation (currently scroll-wheel events are
+  forwarded to the focused pane's PTY rather than driving the scrollback
+  viewport).
 
 ### 3.3 Theme / color customization
 
@@ -329,8 +355,10 @@ file labels and best-effort source line display.
 
 ## Testing priorities
 
-- **Integration tests for tab operations** — TabNew/TabClose/TabSwitch
-  through the full `TickContext` with real PTY children.
+- **Integration tests for tab operations** — ✅ Complete.
+  `crates/cmdash/tests/tab_operations.rs` exercises TabNew/TabClose/
+  TabSwitch through the full `TickContext` with real PTY children and
+  verifies cross-tab `LayerId` contracts.
 - **Widget loading test** — ✅ Complete. `widget_sdk_integration.rs`
   tests cdylib loading via libloading, CmdashWidget trait with MockWidget,
   FFI round-trip, zero-area handling, offset rendering, and object safety.
