@@ -223,18 +223,16 @@ mode.
 
 ### 3.1 Async I/O migration
 
-**Current state:** Each pane has a dedicated reader thread using
-blocking `std::sync::mpsc`. The main tick loop is synchronous.
+**Status:** ✅ Complete.
 
-**Goal:** Migrate to `tokio` for non-blocking I/O and better scalability
-with many panes.
-
-**Steps:**
-- Add `tokio` as a dependency.
-- Replace reader threads with `tokio::task::spawn_blocking` or async
-  reads.
-- Replace `mpsc` with `tokio::sync::mpsc`.
-- Keep the tick loop structure but make it async-friendly.
+**Current state:** The main loop is now async (`#[tokio::main]`).
+Crossterm input is read from a `tokio::task::spawn_blocking` task and
+forwarded over an unbounded channel, and the tick loop uses
+`tokio::select!` to await input, pane close notifications, config reload,
+and the periodic tick interval. `std::sync::mpsc` has been replaced with
+`tokio::sync::mpsc::unbounded_channel` for both the pane close channel
+and the config reload channel. Tests use `#[tokio::test]` and the
+`tokio::time::timeout` helper where needed.
 
 ### 3.2 Mouse support
 
