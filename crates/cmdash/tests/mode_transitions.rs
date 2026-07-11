@@ -458,12 +458,6 @@ fn resize_ratio_clamped_at_minimum() {
 
     // Clamped at 1 (can't go below).
     assert_eq!(ratio, 1, "ratio must clamp at 1, not go below");
-
-    // The ratio was set to 1 by update_split_ratio. The layout
-    // resolver may reject this as ZeroArea (at ratio=1 with
-    // inner_h=24, top child = 0 rows), but the resize action
-    // itself succeeded — clamping prevented going below 1.
-    let _ = ComputedLayout::compute(&layout_root, area);
 }
 
 /// Verify the ratio clamping: resize to a high ratio, then try to go
