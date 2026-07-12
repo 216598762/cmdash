@@ -428,6 +428,19 @@ impl ConfigWatcher {
         path: std::path::PathBuf,
         tx: UnboundedSender<ConfigReload>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Debounce window: collapse rapid successive Modify events
+        // into a single ConfigReload. 500ms is long enough to absorb
+        // editor save-temp-rename cycles but short enough to feel
+        // instant to the user.
+        //
+        // Edge case — inotify coalescing on Linux: the kernel can
+        // merge two back-to-back writes into a single inotify event,
+        // so only one Modify reaches the watcher. This is harmless
+        // here (we still get one reload) but tests that assert
+        // "exactly one reload from two writes" must insert a small
+        // sleep (~50ms) between writes so the kernel delivers them
+        // as separate events. See the
+        // `config_hot_reload_debounces_rapid_writes` test.
         let debounce_ms: u64 = 500;
         let mut last_reload = std::time::Instant::now() - Duration::from_millis(debounce_ms);
         let watcher_path = path.clone();
@@ -2792,14 +2805,17 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// FIRST so their revisions are visible before phase 2/3 in the
     /// same tick.
     fn drain_close_channel(&mut self) {
-        let mut closed = false;
+        let mut needs_sync = false;
         while let Ok(id) = self.close_rx.try_recv() {
             self.graphics.close_pane(id);
-            if self.pane_keyboard_flags.remove(&id).is_some() {
-                closed = true;
+            // Only trigger a host sync when the closed pane's flags
+            // were non-zero. A removed entry of 0 doesn't change the
+            // union, so the sync would be a no-op.
+            if self.pane_keyboard_flags.remove(&id).is_some_and(|f| f != 0) {
+                needs_sync = true;
             }
         }
-        if closed {
+        if needs_sync {
             self.sync_host_keyboard_flags();
         }
     }
@@ -8349,7 +8365,14 @@ mod input_tests {
             // The "only one message" assertion pins the collapse.
             let first_update = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-e\" action=\"pane.focus.next\"\n            }\n        ";
             std::fs::write(&config_path, first_update).expect("write first update");
-            // Immediately (<< 500ms) write again.
+            // Sleep briefly so inotify delivers this as a separate
+            // filesystem event. Without the gap, the kernel can
+            // coalesce the two rapid writes into a single event,
+            // yielding 0 reloads instead of 1. 50ms is well within
+            // the 500ms debounce window.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Second write (<< 500ms from first, so debounce
+            // collapses both into one ConfigReload).
             let second_update = "\n            layout {\n                pane kind=shell label=\"a\"\n            }\n            keybinds {\n                bind \"alt-e\" action=\"pane.focus.next\"\n            }\n        ";
             std::fs::write(&config_path, second_update).expect("write second update");
 

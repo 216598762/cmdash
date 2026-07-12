@@ -389,9 +389,6 @@ encoding is used otherwise.
 - `pop_host_keyboard_flags` called on `run()` exit.
 
 **Known tech debt:**
-- `collect_keyboard_enhancement_flags` is `pub` (not `pub(crate)`)
-  because Rust treats the lib and binary as separate crates. Add a
-  `# Crate-internal` doc note to signal this is not public API.
 - Dual flag tracking: `PanePty::keyboard_flags()` returns a cached
   value updated in `advance()`, while `collect_keyboard_enhancement_flags`
   reads from snapshot events. Both derive from the same source so they

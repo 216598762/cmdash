@@ -383,6 +383,11 @@ impl PaneRunner {
     /// Current Kitty keyboard protocol progressive-enhancement
     /// flags requested by the child PTY (0 if the pane is a
     /// widget or the child has not requested enhancement).
+    ///
+    /// This returns the *cached* value from [`PanePty::keyboard_flags`],
+    /// updated on every `advance()` call. For aggregate per-tick
+    /// collection from snapshot events, see
+    /// [`collect_keyboard_enhancement_flags`].
     pub fn keyboard_flags(&self) -> u8 {
         self.pty
             .as_ref()
@@ -488,10 +493,27 @@ impl PaneRunner {
 /// freshly-collected pane snapshots and merge any requested
 /// enhancement flags into `out`, keyed by layer id. Widget runners
 /// are skipped because they have no PTY to request enhancements.
-/// Returns `true` if any entry was inserted or updated. This helper
-/// is kept in the lib crate so it can be unit-tested with the
-/// `#[cfg(test)]` `PaneRunner::with_pty_for_test` constructor
+/// Returns `true` if any entry was inserted or updated.
+///
+/// This helper is kept in the lib crate so it can be unit-tested
+/// with the `#[cfg(test)]` `PaneRunner::with_pty_for_test` constructor
 /// without exposing that constructor in production builds.
+///
+/// # Crate-internal
+///
+/// This function is `pub` (not `pub(crate)`) because the binary
+/// crate (`cmdash`) is a *separate crate* from the lib crate
+/// (`cmdash` lib). `pub(crate)` would only be visible inside the
+/// lib; the binary needs cross-crate access. This is a known Rust
+/// lib↔binary boundary tradeoff — callers outside the workspace
+/// should not depend on this symbol. See `docs/roadmap.md` §4.1
+/// "Known tech debt".
+///
+/// Complementary to [`PaneRunner::keyboard_flags`] (which returns
+/// the cached value from [`PanePty::keyboard_flags`]); this
+/// function collects from snapshot events at tick boundaries.
+/// The binary's `update_keyboard_flags_from_snapshots` feeds
+/// results into `TickContext::pane_keyboard_flags`.
 pub fn collect_keyboard_enhancement_flags(
     runners: &[PaneRunner],
     snapshots: &[Option<PaneTerminalState>],
