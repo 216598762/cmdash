@@ -379,6 +379,9 @@ pub enum PaneEvent {
     Exit { status: i32 },
     /// PTY size changed.
     Resize { cols: u16, rows: u16 },
+    /// Kitty keyboard protocol progressive-enhancement flags
+    /// requested (or disabled) by the child application.
+    KeyboardEnhancement { flags: u8 },
 }
 
 /// A parsed kitty graphics command.
@@ -687,7 +690,7 @@ impl<'a> VtePerf<'a> {
             }
         }
     }
-    fn apply_csi(&mut self, params: &Params, action: char) {
+    fn apply_csi(&mut self, params: &Params, intermediates: &[u8], action: char) {
         let p0 = || {
             params
                 .iter()
@@ -757,6 +760,28 @@ impl<'a> VtePerf<'a> {
                 self.grid.erase_in_line(self.grid.cursor_y, mode);
             }
             'm' => self.apply_sgr(params),
+            // Kitty keyboard protocol progressive enhancement:
+            //   CSI = flags u       set flags (mode 1)
+            //   CSI > flags u       push flags onto stack
+            //   CSI < [n] u         pop n entries (default 1)
+            // The child uses these to tell the terminal what key
+            // reports it wants. cmdash intercepts them so the main
+            // loop can mirror the same enhancement on the host
+            // terminal and forward enhanced key events to the
+            // requesting pane.
+            'u' if intermediates.contains(&b'=') => {
+                let flags = p0() as u8;
+                self.events.push(PaneEvent::KeyboardEnhancement { flags });
+            }
+            'u' if intermediates.contains(&b'>') => {
+                let flags = p0() as u8;
+                self.events.push(PaneEvent::KeyboardEnhancement { flags });
+            }
+            'u' if intermediates.contains(&b'<') => {
+                // Pop request disables enhancement for this pane.
+                self.events
+                    .push(PaneEvent::KeyboardEnhancement { flags: 0 });
+            }
             _ => {}
         }
     }
@@ -859,7 +884,7 @@ impl<'a> vte::Perform for VtePerf<'a> {
         _ignore: bool,
         action: char,
     ) {
-        self.apply_csi(params, action);
+        self.apply_csi(params, _intermediates, action);
     }
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
@@ -895,6 +920,11 @@ pub struct PanePty {
     attrs: CellAttrs,
     title: String,
     pending_events: Vec<PaneEvent>,
+    /// Current Kitty keyboard protocol progressive-enhancement
+    /// flags requested by the child. Mirrored by the main loop
+    /// so the host terminal sends enhanced key reports when any
+    /// pane needs them.
+    keyboard_flags: u8,
     layer_id: PaneLayerId,
     cols: u16,
     rows: u16,
@@ -944,6 +974,11 @@ impl PanePty {
     }
     pub fn rows(&self) -> u16 {
         self.rows
+    }
+    /// Current Kitty keyboard protocol progressive-enhancement
+    /// flags requested by the child application.
+    pub fn keyboard_flags(&self) -> u8 {
+        self.keyboard_flags
     }
 
     /// Spawn a child PTY. Returns the pane state machine + a
@@ -1085,6 +1120,7 @@ impl PanePty {
                 attrs: CellAttrs::default(),
                 title: String::new(),
                 pending_events: Vec::new(),
+                keyboard_flags: 0,
                 layer_id,
                 cols,
                 rows,
@@ -1264,6 +1300,14 @@ impl PanePty {
             rows: self.rows,
         };
         self.parser.advance(&mut driver, &vte_bytes);
+        // Apply any keyboard-enhancement events emitted during
+        // parsing so subsequent snapshots report the pane's
+        // current requested flags.
+        for event in &self.pending_events {
+            if let PaneEvent::KeyboardEnhancement { flags } = event {
+                self.keyboard_flags = *flags;
+            }
+        }
         if let Some(child) = self.child.as_mut() {
             if let Ok(Some(status)) = child.try_wait() {
                 self.pending_events.push(PaneEvent::Exit {
@@ -1368,6 +1412,7 @@ pub trait PanePtyOps {
     fn snapshot(&mut self) -> PaneTerminalState;
     fn try_wait(&mut self) -> Result<Option<i32>, PtyError>;
     fn kill(&mut self) -> Result<(), PtyError>;
+    fn keyboard_flags(&self) -> u8;
     fn scrollback_up(&mut self, n: usize);
     fn scrollback_down(&mut self, n: usize);
     fn scrollback_reset(&mut self);
@@ -1401,6 +1446,9 @@ impl PanePtyOps for PanePty {
     }
     fn kill(&mut self) -> Result<(), PtyError> {
         PanePty::kill(self)
+    }
+    fn keyboard_flags(&self) -> u8 {
+        PanePty::keyboard_flags(self)
     }
     fn scrollback_up(&mut self, n: usize) {
         self.grid.scrollback_up(n);

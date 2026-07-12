@@ -37,7 +37,7 @@
 //! (which fails `clippy::arc-with-non-send-sync` because
 //! `dashcompositor::LayerStack` is not `Sync`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -93,8 +93,9 @@ fn shell_spec_from_command(command: &Option<String>, default: &ShellSpec) -> She
     }
 }
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use notify::Watcher as _;
 use ratatui::style::{Color, Modifier, Style};
@@ -1094,6 +1095,19 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// by [`load_widgets`] at startup; used by [`Self::reconcile_runners`]
     /// when spawning `PaneKind::Widget` panes.
     widget_factories: WidgetFactories,
+    /// Current Kitty keyboard protocol progressive-enhancement
+    /// flags advertised to the host terminal. The union of all
+    /// live pane flags; recomputed every tick after pane events
+    /// are drained.
+    host_keyboard_flags: u8,
+    /// Per-pane keyboard enhancement flags, keyed by layer id.
+    /// Updated from `PaneEvent::KeyboardEnhancement` events and
+    /// pruned when a pane closes.
+    pane_keyboard_flags: HashMap<PaneLayerId, u8>,
+    /// Whether we have pushed a keyboard enhancement entry onto
+    /// the host terminal's stack. Used to pop exactly once on
+    /// exit so the host returns to its prior state.
+    host_keyboard_pushed: bool,
 }
 
 /// Monotonic `LayerId` allocator for
@@ -1228,6 +1242,9 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             status_bar: None,
             theme: cmdash_config::Theme::default(),
             widget_factories: std::collections::HashMap::new(),
+            host_keyboard_flags: 0,
+            pane_keyboard_flags: HashMap::new(),
+            host_keyboard_pushed: false,
         }
     }
 
@@ -1465,9 +1482,6 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         else {
             return;
         };
-        if !matches!(kind, KeyEventKind::Press) {
-            return;
-        }
         // Intercept PageUp/PageDown for scrollback navigation.
         // These keys control the scrollback viewport instead of
         // being forwarded to the child PTY. Any other key
@@ -1509,12 +1523,27 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                 }
             }
         }
-        let Some(bytes) = event_to_bytes(*code) else {
-            return;
-        };
-        if let Some(runner) = self.runners.get_mut(self.focus) {
-            if runner.is_widget() {
-                // Forward key event to the widget instead of the PTY.
+        // Determine the focused pane's capabilities before deciding
+        // how to encode this key event. Widget panes keep the
+        // existing widget event path; PTY panes use the Kitty
+        // protocol when the child has requested enhancement.
+        let focused_flags = self
+            .runners
+            .get(self.focus)
+            .map(|r| r.keyboard_flags())
+            .unwrap_or(0);
+        let is_widget = self
+            .runners
+            .get(self.focus)
+            .map(|r| r.is_widget())
+            .unwrap_or(false);
+
+        if is_widget {
+            // Widgets only receive press events.
+            if !matches!(kind, KeyEventKind::Press) {
+                return;
+            }
+            if let Some(runner) = self.runners.get_mut(self.focus) {
                 if let Some(widget) = runner.widget.as_mut() {
                     let widget_code = match code {
                         KeyCode::Char(c) => cmdash_widget_sdk::KeyCode::Char(*c),
@@ -1544,7 +1573,22 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                     };
                     widget.on_event(&widget_evt);
                 }
-            } else if let Err(e) = runner.write_input(&bytes) {
+            }
+            return;
+        }
+
+        let bytes = if focused_flags != 0 {
+            encode_kitty_key_event(code, *modifiers, *kind)
+        } else if matches!(kind, KeyEventKind::Press) {
+            event_to_bytes(*code)
+        } else {
+            None
+        };
+        let Some(bytes) = bytes else {
+            return;
+        };
+        if let Some(runner) = self.runners.get_mut(self.focus) {
+            if let Err(e) = runner.write_input(&bytes) {
                 debug!(
                     error = ?e,
                     layer_id = ?runner.layer_id(),
@@ -2657,7 +2701,13 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             }
         });
 
-        self.run_loop(input_rx).await
+        let result = self.run_loop(input_rx).await;
+        // Ensure the host terminal's keyboard enhancement stack
+        // is popped before returning, even if the loop exited
+        // because of an error. This restores the host to its
+        // prior keyboard reporting mode.
+        self.pop_host_keyboard_flags();
+        result
     }
 
     /// Core event loop used by both production and tests.
@@ -2742,14 +2792,86 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// FIRST so their revisions are visible before phase 2/3 in the
     /// same tick.
     fn drain_close_channel(&mut self) {
+        let mut closed = false;
         while let Ok(id) = self.close_rx.try_recv() {
             self.graphics.close_pane(id);
+            if self.pane_keyboard_flags.remove(&id).is_some() {
+                closed = true;
+            }
+        }
+        if closed {
+            self.sync_host_keyboard_flags();
         }
     }
 
     /// Phase 1 (part 2): poll exits and tick runners.
     /// Returns the collected snapshots and a flag indicating whether
     /// all panes have exited.
+    /// Recompute the union of all live pane keyboard enhancement
+    /// flags and push/pop the host terminal's enhancement stack
+    /// so that it matches. Called after pane snapshots are
+    /// collected and after pane closures are drained.
+    fn sync_host_keyboard_flags(&mut self) {
+        let union = self
+            .pane_keyboard_flags
+            .values()
+            .fold(0u8, |acc, &f| acc | f);
+        if union == self.host_keyboard_flags {
+            return;
+        }
+        if union == 0 {
+            self.pop_host_keyboard_flags();
+        } else {
+            self.push_host_keyboard_flags(union);
+        }
+        self.host_keyboard_flags = union;
+    }
+
+    /// Push a keyboard enhancement flag set onto the host terminal.
+    /// Uses crossterm's `PushKeyboardEnhancementFlags` command.
+    fn push_host_keyboard_flags(&mut self, flags: u8) {
+        use crossterm::execute;
+        let flags = KeyboardEnhancementFlags::from_bits_truncate(flags);
+        if let Err(e) = execute!(std::io::stdout(), PushKeyboardEnhancementFlags(flags)) {
+            warn!(error = ?e, "failed to push keyboard enhancement flags");
+            return;
+        }
+        self.host_keyboard_pushed = true;
+    }
+
+    /// Pop the previously-pushed keyboard enhancement flags from
+    /// the host terminal. Uses crossterm's `PopKeyboardEnhancementFlags`
+    /// command. Safe to call multiple times: the second pop is a no-op.
+    fn pop_host_keyboard_flags(&mut self) {
+        use crossterm::execute;
+        if !self.host_keyboard_pushed {
+            return;
+        }
+        if let Err(e) = execute!(std::io::stdout(), PopKeyboardEnhancementFlags) {
+            warn!(error = ?e, "failed to pop keyboard enhancement flags");
+            return;
+        }
+        self.host_keyboard_pushed = false;
+    }
+
+    /// Drain `PaneEvent::KeyboardEnhancement` events from the
+    /// freshly-collected pane snapshots and update
+    /// `self.pane_keyboard_flags`. After updating, recompute the
+    /// host terminal's enhancement state.
+    fn update_keyboard_flags_from_snapshots(
+        &mut self,
+        snapshots: &[Option<cmdash_pty::PaneTerminalState>],
+    ) {
+        let changed = cmdash::pane::collect_keyboard_enhancement_flags(
+            &self.runners,
+            snapshots,
+            &mut self.pane_keyboard_flags,
+        );
+        if changed {
+            self.sync_host_keyboard_flags();
+        }
+    }
+
     fn tick_runners(
         &mut self,
     ) -> Result<RunnerTickResult, Box<dyn std::error::Error + Send + Sync>> {
@@ -2949,6 +3071,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             snapshots,
             all_exited,
         } = self.tick_runners()?;
+        self.update_keyboard_flags_from_snapshots(&snapshots);
         self.route_graphics_events(&snapshots);
         self.render_frame(&snapshots)?;
 
@@ -3086,6 +3209,86 @@ fn redacted_event_debug(evt: &Event) -> String {
 /// focused pane. Returns `None` for variants that should NOT
 /// leak to the PTY (Insert, F-keys above 4, media keys,
 /// modifier-only events).
+/// Map a crossterm [`KeyCode`] to a Kitty keyboard protocol key code.
+/// Returns `None` for keys that have no Kitty protocol representation.
+fn kitty_key_code(code: &KeyCode) -> Option<u32> {
+    match code {
+        KeyCode::Char(c) => Some(*c as u32),
+        KeyCode::Enter => Some(57351),
+        KeyCode::Tab => Some(57352),
+        KeyCode::Backspace => Some(57353),
+        KeyCode::Esc => Some(57350),
+        KeyCode::Delete => Some(57355),
+        KeyCode::Insert => Some(57354),
+        KeyCode::Left => Some(57356),
+        KeyCode::Right => Some(57357),
+        KeyCode::Up => Some(57358),
+        KeyCode::Down => Some(57359),
+        KeyCode::PageUp => Some(57360),
+        KeyCode::PageDown => Some(57361),
+        KeyCode::Home => Some(57362),
+        KeyCode::End => Some(57363),
+        KeyCode::F(n) => Some(57369u32.saturating_add(*n as u32)),
+        KeyCode::CapsLock => Some(57364),
+        KeyCode::ScrollLock => Some(57365),
+        KeyCode::NumLock => Some(57366),
+        KeyCode::PrintScreen => Some(57367),
+        KeyCode::Pause => Some(57368),
+        KeyCode::Menu => Some(57369),
+        _ => None,
+    }
+}
+
+/// Map crossterm [`KeyModifiers`] to a Kitty keyboard protocol modifier bitmask.
+fn kitty_modifiers(modifiers: KeyModifiers) -> u8 {
+    let mut mods = 0u8;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        mods |= 1;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        mods |= 2;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        mods |= 4;
+    }
+    if modifiers.contains(KeyModifiers::SUPER) {
+        mods |= 8;
+    }
+    mods
+}
+
+/// Map a crossterm [`KeyEventKind`] to a Kitty keyboard protocol event type.
+fn kitty_event_type(kind: KeyEventKind) -> u8 {
+    match kind {
+        KeyEventKind::Press => 1,
+        KeyEventKind::Repeat => 2,
+        KeyEventKind::Release => 3,
+    }
+}
+
+/// Encode a single key event using the Kitty keyboard protocol CSI `u` form.
+/// Returns `None` when the key has no Kitty protocol representation.
+fn encode_kitty_key_event(
+    code: &KeyCode,
+    modifiers: KeyModifiers,
+    kind: KeyEventKind,
+) -> Option<Vec<u8>> {
+    let key = kitty_key_code(code)?;
+    let mods = kitty_modifiers(modifiers);
+    let event_type = kitty_event_type(kind);
+
+    let mut seq = format!("\x1b[{}u", key);
+    if mods != 0 {
+        seq = format!("\x1b[{};{}u", key, mods);
+    }
+    if event_type != 1 {
+        // Repeat (2) or release (3): include the event type. Modifiers are
+        // required when event type is present, even if zero.
+        seq = format!("\x1b[{};{}:{}u", key, mods, event_type);
+    }
+    Some(seq.into_bytes())
+}
+
 fn event_to_bytes(code: KeyCode) -> Option<Vec<u8>> {
     let bytes: &[u8] = match code {
         KeyCode::Enter => b"\r",
@@ -3743,6 +3946,7 @@ mod input_tests {
     //! `PaneCloseTx`, and the next tick's phase 1 drains the
     //! channel and calls `GraphicsState::close_pane`.
     use super::*;
+    use cmdash_layout::ComputedPane;
     // `PaneCloseTx`, `PaneRunner`, `GraphicsState`, and `Metrics`
     // are all in scope via `super::*` -> the parent
     // (`fn main`'s module) re-exports them through
@@ -6849,6 +7053,54 @@ mod input_tests {
         );
     }
 
+    /// Build a minimal context with a single pane and a runner
+    /// produced by `make_runner`. The shared layout/compute/setup
+    /// logic is reused by `setup_run_loop_ctx` (widget runner) and
+    /// `setup_shell_ctx` (stub PTY runner).
+    fn setup_ctx_with_runner<'a>(
+        terminal: &'a mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        make_runner: impl FnOnce(ComputedPane, PaneLayerId, PaneCloseTx) -> PaneRunner,
+        bindings: Router,
+    ) -> TickContext<'a, ratatui::backend::TestBackend> {
+        let kdl = r#"layout { pane kind=shell }"#;
+        let cfg = cmdash_config::parse(kdl).expect("parse KDL");
+        let layout_root = cfg.layout.expect("layout block");
+        let last_area = LayoutRect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
+        let layout = ComputedLayout::compute(&layout_root, last_area).expect("compute layout");
+        let pane = layout.panes[0].clone();
+        let layer_id = cmdash::derive_layer_id(&pane.id);
+        let (close_tx, close_rx) = unbounded_channel::<PaneLayerId>();
+        let runner = make_runner(pane, layer_id, close_tx.clone());
+        let runners = vec![runner];
+        let graphics = GraphicsState::new(
+            cmdash::graphics::Metrics::default(),
+            (last_area.w, last_area.h),
+        );
+        TickContext::new_full(
+            runners,
+            bindings,
+            0,
+            true,
+            close_tx,
+            close_rx,
+            graphics,
+            terminal,
+            Duration::from_millis(33),
+            layout_root,
+            None,
+            last_area,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            ShellSpec::LoginShell,
+            None,
+        )
+    }
+
     /// Build a minimal context with one widget runner (no real PTY)
     /// so `tick_and_render` is cheap and cannot leave a child process
     /// behind if a test panics or times out. The keybinding `q` is
@@ -6867,52 +7119,16 @@ mod input_tests {
             fn on_event(&mut self, _event: &WidgetEvent) {}
         }
 
-        let kdl = r#"layout { pane kind=shell }"#;
-        let cfg = cmdash_config::parse(kdl).expect("parse KDL");
-        let layout_root = cfg.layout.expect("layout block");
-        let last_area = LayoutRect {
-            x: 0,
-            y: 0,
-            w: 80,
-            h: 24,
-        };
-        let layout = ComputedLayout::compute(&layout_root, last_area).expect("compute layout");
-        let pane = layout.panes[0].clone();
-        let layer_id = cmdash::derive_layer_id(&pane.id);
-        let (close_tx, close_rx) = unbounded_channel::<PaneLayerId>();
-        let runner = PaneRunner::spawn_widget(
-            pane,
-            layer_id,
-            Box::new(DummyWidget),
-            Some(close_tx.clone()),
-        );
-        let runners = vec![runner];
-        let graphics = GraphicsState::new(
-            cmdash::graphics::Metrics::default(),
-            (last_area.w, last_area.h),
-        );
-        let bindings = Router::new(vec![Keybind {
-            mods: CfgModifiers::default(),
-            key: KeyToken::Char('q'),
-            action: KeyAction::AppClose,
-        }]);
-        TickContext::new_full(
-            runners,
-            bindings,
-            0,
-            true,
-            close_tx,
-            close_rx,
-            graphics,
+        setup_ctx_with_runner(
             terminal,
-            Duration::from_millis(33),
-            layout_root,
-            None,
-            last_area,
-            BTreeMap::new(),
-            BTreeMap::new(),
-            ShellSpec::LoginShell,
-            None,
+            |pane, layer_id, close_tx| {
+                PaneRunner::spawn_widget(pane, layer_id, Box::new(DummyWidget), Some(close_tx))
+            },
+            Router::new(vec![Keybind {
+                mods: CfgModifiers::default(),
+                key: KeyToken::Char('q'),
+                action: KeyAction::AppClose,
+            }]),
         )
     }
 
@@ -8243,6 +8459,292 @@ mod input_tests {
                 "recovered reload must carry the valid config's action; got: {:?}",
                 kb.action
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod keyboard_protocol_tests {
+        use super::*;
+
+        // ------------------------------------------------------------------
+        // Free-function helpers
+        // ------------------------------------------------------------------
+
+        #[test]
+        fn kitty_key_code_maps_character_keys() {
+            assert_eq!(kitty_key_code(&KeyCode::Char('a')), Some('a' as u32));
+            assert_eq!(kitty_key_code(&KeyCode::Char('Z')), Some('Z' as u32));
+            assert_eq!(kitty_key_code(&KeyCode::Char(' ')), Some(' ' as u32));
+        }
+
+        #[test]
+        fn kitty_key_code_maps_special_keys() {
+            assert_eq!(kitty_key_code(&KeyCode::Enter), Some(57351));
+            assert_eq!(kitty_key_code(&KeyCode::Tab), Some(57352));
+            assert_eq!(kitty_key_code(&KeyCode::Backspace), Some(57353));
+            assert_eq!(kitty_key_code(&KeyCode::Esc), Some(57350));
+            assert_eq!(kitty_key_code(&KeyCode::Delete), Some(57355));
+            assert_eq!(kitty_key_code(&KeyCode::Left), Some(57356));
+            assert_eq!(kitty_key_code(&KeyCode::Right), Some(57357));
+            assert_eq!(kitty_key_code(&KeyCode::Up), Some(57358));
+            assert_eq!(kitty_key_code(&KeyCode::Down), Some(57359));
+            assert_eq!(kitty_key_code(&KeyCode::PageUp), Some(57360));
+            assert_eq!(kitty_key_code(&KeyCode::PageDown), Some(57361));
+            assert_eq!(kitty_key_code(&KeyCode::Home), Some(57362));
+            assert_eq!(kitty_key_code(&KeyCode::End), Some(57363));
+        }
+
+        #[test]
+        fn kitty_key_code_maps_function_keys() {
+            assert_eq!(kitty_key_code(&KeyCode::F(1)), Some(57370));
+            assert_eq!(kitty_key_code(&KeyCode::F(4)), Some(57373));
+            assert_eq!(kitty_key_code(&KeyCode::F(12)), Some(57381));
+        }
+
+        #[test]
+        fn kitty_key_code_returns_none_for_unsupported() {
+            // Null has no Kitty protocol representation in this mapping.
+            assert!(kitty_key_code(&KeyCode::Null).is_none());
+        }
+
+        #[test]
+        fn kitty_modifiers_maps_individual_bits() {
+            assert_eq!(kitty_modifiers(KeyModifiers::SHIFT), 1);
+            assert_eq!(kitty_modifiers(KeyModifiers::ALT), 2);
+            assert_eq!(kitty_modifiers(KeyModifiers::CONTROL), 4);
+            assert_eq!(kitty_modifiers(KeyModifiers::SUPER), 8);
+        }
+
+        #[test]
+        fn kitty_modifiers_combines_bits() {
+            let mods = KeyModifiers::SHIFT | KeyModifiers::CONTROL;
+            assert_eq!(kitty_modifiers(mods), 5);
+
+            let all = KeyModifiers::SHIFT
+                | KeyModifiers::ALT
+                | KeyModifiers::CONTROL
+                | KeyModifiers::SUPER;
+            assert_eq!(kitty_modifiers(all), 15);
+        }
+
+        #[test]
+        fn kitty_modifiers_empty_is_zero() {
+            assert_eq!(kitty_modifiers(KeyModifiers::empty()), 0);
+        }
+
+        #[test]
+        fn kitty_event_type_maps_kinds() {
+            assert_eq!(kitty_event_type(KeyEventKind::Press), 1);
+            assert_eq!(kitty_event_type(KeyEventKind::Repeat), 2);
+            assert_eq!(kitty_event_type(KeyEventKind::Release), 3);
+        }
+
+        #[test]
+        fn encode_kitty_key_event_basic_press() {
+            let bytes = encode_kitty_key_event(
+                &KeyCode::Char('a'),
+                KeyModifiers::empty(),
+                KeyEventKind::Press,
+            )
+            .expect("encodeable key");
+            assert_eq!(bytes, b"\x1b[97u");
+        }
+
+        #[test]
+        fn encode_kitty_key_event_with_modifiers() {
+            let bytes = encode_kitty_key_event(
+                &KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            )
+            .expect("encodeable key");
+            assert_eq!(bytes, b"\x1b[97;4u");
+
+            let bytes = encode_kitty_key_event(
+                &KeyCode::Char('a'),
+                KeyModifiers::SHIFT | KeyModifiers::ALT,
+                KeyEventKind::Press,
+            )
+            .expect("encodeable key");
+            assert_eq!(bytes, b"\x1b[97;3u");
+        }
+
+        #[test]
+        fn encode_kitty_key_event_release_requires_event_type() {
+            let bytes = encode_kitty_key_event(
+                &KeyCode::Char('a'),
+                KeyModifiers::empty(),
+                KeyEventKind::Release,
+            )
+            .expect("encodeable key");
+            assert_eq!(bytes, b"\x1b[97;0:3u");
+
+            let bytes = encode_kitty_key_event(
+                &KeyCode::Char('a'),
+                KeyModifiers::SHIFT,
+                KeyEventKind::Release,
+            )
+            .expect("encodeable key");
+            assert_eq!(bytes, b"\x1b[97;1:3u");
+        }
+
+        #[test]
+        fn encode_kitty_key_event_repeat() {
+            let bytes = encode_kitty_key_event(
+                &KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            )
+            .expect("encodeable key");
+            assert_eq!(bytes, b"\x1b[97;4:2u");
+        }
+
+        #[test]
+        fn encode_kitty_key_event_returns_none_for_unsupported() {
+            assert!(encode_kitty_key_event(
+                &KeyCode::Null,
+                KeyModifiers::empty(),
+                KeyEventKind::Press
+            )
+            .is_none());
+        }
+
+        #[test]
+        fn event_to_bytes_maps_common_keys() {
+            assert_eq!(event_to_bytes(KeyCode::Enter), Some(b"\r".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::Backspace), Some(b"\x7f".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::Tab), Some(b"\t".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::Esc), Some(b"\x1b".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::Up), Some(b"\x1b[A".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::Down), Some(b"\x1b[B".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::Right), Some(b"\x1b[C".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::Left), Some(b"\x1b[D".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::Home), Some(b"\x1b[H".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::End), Some(b"\x1b[F".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::PageUp), Some(b"\x1b[5~".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::PageDown), Some(b"\x1b[6~".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::Delete), Some(b"\x1b[3~".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::F(1)), Some(b"\x1b[OP".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::F(2)), Some(b"\x1b[OQ".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::F(3)), Some(b"\x1b[OR".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::F(4)), Some(b"\x1b[OS".to_vec()));
+        }
+
+        #[test]
+        fn event_to_bytes_maps_characters() {
+            assert_eq!(event_to_bytes(KeyCode::Char('a')), Some(b"a".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::Char('A')), Some(b"A".to_vec()));
+            assert_eq!(event_to_bytes(KeyCode::Char(' ')), Some(b" ".to_vec()));
+        }
+
+        #[test]
+        fn event_to_bytes_returns_none_for_unsupported() {
+            assert!(event_to_bytes(KeyCode::F(5)).is_none());
+            assert!(event_to_bytes(KeyCode::Null).is_none());
+        }
+
+        // ------------------------------------------------------------------
+        // TickContext state management
+        // ------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn sync_host_keyboard_flags_computes_union() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
+
+            ctx.pane_keyboard_flags.insert(PaneLayerId(1), 0b0000_0001);
+            ctx.pane_keyboard_flags.insert(PaneLayerId(2), 0b0000_0010);
+            ctx.sync_host_keyboard_flags();
+
+            assert_eq!(ctx.host_keyboard_flags, 0b0000_0011);
+            assert!(ctx.host_keyboard_pushed);
+        }
+
+        #[tokio::test]
+        async fn sync_host_keyboard_flags_pops_when_union_drops_to_zero() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
+
+            // First push some flags.
+            ctx.pane_keyboard_flags.insert(PaneLayerId(1), 0b0000_0001);
+            ctx.sync_host_keyboard_flags();
+            assert!(ctx.host_keyboard_pushed);
+
+            // Remove all pane flags and re-sync.
+            ctx.pane_keyboard_flags.clear();
+            ctx.sync_host_keyboard_flags();
+
+            assert_eq!(ctx.host_keyboard_flags, 0);
+            assert!(!ctx.host_keyboard_pushed);
+        }
+
+        #[tokio::test]
+        async fn sync_host_keyboard_flags_noop_when_union_unchanged() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
+
+            ctx.pane_keyboard_flags.insert(PaneLayerId(1), 0b0000_0001);
+            ctx.sync_host_keyboard_flags();
+            let pushed_once = ctx.host_keyboard_pushed;
+
+            // Calling sync again with the same union should not change state.
+            ctx.sync_host_keyboard_flags();
+            assert_eq!(ctx.host_keyboard_flags, 0b0000_0001);
+            assert_eq!(ctx.host_keyboard_pushed, pushed_once);
+        }
+
+        #[tokio::test]
+        async fn pop_host_keyboard_flags_is_idempotent() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
+
+            ctx.host_keyboard_pushed = true;
+            ctx.pop_host_keyboard_flags();
+            assert!(!ctx.host_keyboard_pushed);
+
+            // Second pop should be a no-op and not panic.
+            ctx.pop_host_keyboard_flags();
+            assert!(!ctx.host_keyboard_pushed);
+        }
+
+        #[tokio::test]
+        async fn pop_host_keyboard_flags_noop_when_not_pushed() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
+
+            ctx.host_keyboard_pushed = false;
+            ctx.pop_host_keyboard_flags();
+            assert!(!ctx.host_keyboard_pushed);
+        }
+
+        #[tokio::test]
+        async fn update_keyboard_flags_from_snapshots_ignores_widget_runners() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
+
+            // The single runner in setup_run_loop_ctx is a widget runner.
+            assert!(ctx.runners[0].is_widget());
+
+            let snapshot = cmdash_pty::PaneTerminalState {
+                grid: cmdash_pty::TextGrid::new(80, 24),
+                cols: 80,
+                rows: 24,
+                pending_events: vec![cmdash_pty::PaneEvent::KeyboardEnhancement {
+                    flags: 0b0000_0111,
+                }],
+            };
+
+            ctx.update_keyboard_flags_from_snapshots(&[Some(snapshot)]);
+
+            // Widget runners should not contribute keyboard flags.
+            assert!(ctx.pane_keyboard_flags.is_empty());
+            assert_eq!(ctx.host_keyboard_flags, 0);
         }
     }
 

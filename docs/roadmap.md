@@ -351,6 +351,228 @@ file labels and best-effort source line display.
   best-effort substring match; full column tracking needs KDL span
   integration.
 
+## Tier 4: Modern terminal emulator extensions
+
+Goal: make cmdash a first-class modern terminal host by passing through,
+emulating, or explicitly negotiating the terminal extensions that
+contemporary TUI applications expect. These features are grouped by
+function: input, output, rendering, synchronization, queries/reports,
+image protocols, and Unicode/text layout.
+
+### 4.1 Kitty keyboard protocol
+
+**Status:** Not started.
+
+**Goal:** Report key events with full modifier/state information to
+child PTYs.
+
+**Steps:**
+- Negotiate with the host terminal via `CSI > 1 u` / `CSI < u`.
+- Forward enhanced key reports (`CSI u`) to the focused pane's PTY.
+- Gate on host capability detection; fall back to legacy key encoding.
+
+### 4.2 Bracketed paste
+
+**Status:** Not started.
+
+**Goal:** Support bracketed paste (`CSI ? 2004 h`/`l`) passthrough.
+
+**Steps:**
+- Track per-pane bracketed-paste state from child PTY mode requests.
+- Wrap pasted content in `ESC [ 200 ~` / `ESC [ 201 ~`.
+- Forward the wrapped bytes to the focused pane's PTY.
+
+### 4.3 Focus reporting
+
+**Status:** Not started.
+
+**Goal:** Report focus-in/focus-out events to child PTYs.
+
+**Steps:**
+- Track focus-reporting mode per pane (`CSI ? 1004 h`/`l`).
+- Emit `CSI I` / `CSI O` on focus changes.
+- Forward host focus events when cmdash itself gains/loses focus.
+
+### 4.4 Hyperlinks (OSC 8)
+
+**Status:** Not started.
+
+**Goal:** Pass through OSC 8 hyperlink sequences.
+
+**Steps:**
+- Preserve OSC 8 escape sequences in `cmdash-pty` output.
+- Route hyperlink metadata to dashcompositor text layers or passthrough.
+- Maintain per-pane hyperlink ID namespaces.
+
+### 4.5 OSC 52 clipboard integration
+
+**Status:** Not started.
+
+**Goal:** Allow child PTYs to read/write the system clipboard via OSC 52.
+
+**Steps:**
+- Intercept OSC 52 set/query sequences from child PTYs.
+- Integrate with a clipboard crate or crossterm clipboard APIs.
+- Implement a security policy (allow/deny read vs. write; per-pane opt-in).
+
+### 4.6 Synchronized output (BSU/ESU)
+
+**Status:** Not started.
+
+**Goal:** Support synchronized output DCS sequences (`CSI ? 2026 h`/`l`).
+
+**Steps:**
+- Buffer output between Begin Synchronized Update (BSU) and End
+  Synchronized Update (ESU).
+- Flush atomically on ESU to avoid tearing.
+- Coalesce with the existing tick loop frame boundaries.
+
+### 4.7 Extended SGR attributes
+
+**Status:** Partial (cursor styles done).
+
+**Goal:** Support undercurl, colored underlines, strikethrough, italic,
+and bold.
+
+**Steps:**
+- Ensure the `vte` parser preserves extended SGR attributes.
+- Extend the internal cell attribute model.
+- Map attributes to dashcompositor text styling.
+
+### 4.8 True color / 24-bit color guarantees
+
+**Status:** Working (via `ratatui`/`dashcompositor`).
+
+**Goal:** Ensure 24-bit color is preserved end-to-end.
+
+**Steps:**
+- Audit color handling in the `vte` → dashcompositor path.
+- Add tests for 24-bit color round-trip.
+- Document host terminal true-color requirements.
+
+### 4.9 Bi-directional text and complex scripts
+
+**Status:** Not started.
+
+**Goal:** Correctly render Arabic, Hebrew, and mixed-direction text.
+
+**Steps:**
+- Evaluate `unicode-bidi` / `harfbuzz` integration.
+- Handle bidi reordering in the text grid.
+- Preserve logical-to-visual cursor mapping.
+
+### 4.10 Font ligatures
+
+**Status:** Not started.
+
+**Goal:** Render font ligatures when the host font supports them.
+
+**Steps:**
+- Pass ligature hints to the dashcompositor font rasterizer.
+- Detect ligature-friendly fonts.
+- Provide a config toggle for ligature rendering.
+
+### 4.11 Emoji and grapheme clusters
+
+**Status:** Partial.
+
+**Goal:** Correctly handle emoji ZWJ sequences and wide characters.
+
+**Steps:**
+- Use `unicode-width` / `unicode-segmentation` for width calculations.
+- Ensure cursor movement accounts for wide characters.
+- Update grapheme cluster handling as Unicode versions evolve.
+
+### 4.12 Color palette queries (OSC 4/10/11)
+
+**Status:** Not started.
+
+**Goal:** Respond to color queries from child PTYs.
+
+**Steps:**
+- Maintain palette state synchronized with the active theme.
+- Reply to OSC 4 (indexed), OSC 10 (foreground), and OSC 11 (background)
+  queries.
+- Handle palette updates from child PTYs.
+
+### 4.13 Window title reports
+
+**Status:** Not started.
+
+**Goal:** Set the host terminal title from child PTY OSC 2 sequences.
+
+**Steps:**
+- Intercept `OSC 2` / `OSC 0` title sequences from child PTYs.
+- Emit the title to the host terminal.
+- Optionally display the title in the status bar.
+
+### 4.14 Desktop notifications
+
+**Status:** Not started.
+
+**Goal:** Support OSC 777 and OSC 99 notifications.
+
+**Steps:**
+- Intercept notification escape sequences from child PTYs.
+- Integrate with OS notification APIs.
+- Provide a config toggle and per-pane allowlist.
+
+### 4.15 Additional image protocols
+
+**Status:** Partial (Kitty/Sixel done).
+
+**Goal:** Support iTerm inline images, Contour, and WezTerm image
+extensions.
+
+**Steps:**
+- Extend the `cmdash-pty` graphics parser.
+- Route decoded images to dashcompositor image layers.
+- Maintain per-pane image ID namespaces.
+
+### 4.16 Unicode version support
+
+**Status:** Not started.
+
+**Goal:** Track the Unicode version used for width and segmentation.
+
+**Steps:**
+- Pin Unicode version in dependency manifests.
+- Document the supported Unicode version.
+- Update as new Unicode versions are released.
+
+### 4.17 DECRPM / mode reports
+
+**Status:** Not started.
+
+**Goal:** Respond to `DECRQM` / `DECRPM` queries.
+
+**Steps:**
+- Implement a mode report state machine.
+- Reply with accurate mode values for supported modes.
+- Track private and standard modes per pane.
+
+### 4.18 Soft fonts (DRCS)
+
+**Status:** Not started.
+
+**Goal:** Support `DECDLD` soft font loading.
+
+**Steps:**
+- Capture soft font definitions from child PTYs.
+- Route them to the dashcompositor font rasterizer.
+- Manage per-pane font glyph caches.
+
+### 4.19 Overline / double underline
+
+**Status:** Not started.
+
+**Goal:** Support SGR 53/55/21 and `SGR 4:2`/`4:3` underline styles.
+
+**Steps:**
+- Extend the cell attribute model.
+- Map styles to dashcompositor text rendering.
+- Add tests for underline style round-trip.
+
 ## Testing priorities
 
 - **Integration tests for tab operations** — ✅ Complete.

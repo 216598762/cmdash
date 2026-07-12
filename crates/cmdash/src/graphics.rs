@@ -376,7 +376,7 @@ const TAB_BAR_INACTIVE_FG: [u8; 4] = [160, 160, 160, 255]; // Gray
 
 /// Snapshot of tab bar state passed to
 /// [`GraphicsState::update_tab_bar`] each frame. Rebuilt from
-/// [`cmdash::TabStack`] at the call site so `GraphicsState`
+/// [`crate::TabStack`] at the call site so `GraphicsState`
 /// doesn't borrow the full `TabStack`.
 pub struct TabBarData<'a> {
     /// Per-tab labels (`None` for tabs without a label).
@@ -685,7 +685,7 @@ impl GraphicsState {
     /// dashcompositor's bundled fontdue rasterizer via the
     /// `font-rasterizer` feature.
     ///
-    /// Called once per frame from [`TickContext::run`] before
+    /// Called once per frame from `TickContext::run` before
     /// `render_and_write`. The ratatui text tab bar in phase 3a
     /// is preserved as a degraded-mode fallback for non-kitty
     /// terminals; the pixel overlay overwrites it on kitty-

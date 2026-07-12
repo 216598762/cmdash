@@ -38,10 +38,13 @@
 //! `tokio` for true non-blocking IO per AGENTS.md §"Key
 //! dependencies".
 
+use std::collections::HashMap;
 use std::io::Read;
 
 use cmdash_layout::{ComputedPane, Rect as LayoutRect};
-use cmdash_pty::{PaneLayerId, PanePty, PaneReader, PaneTerminalState, PtyError, ShellSpec};
+use cmdash_pty::{
+    PaneEvent, PaneLayerId, PanePty, PaneReader, PaneTerminalState, PtyError, ShellSpec,
+};
 use cmdash_widget_sdk::CmdashWidget;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -377,6 +380,16 @@ impl PaneRunner {
         self.widget.is_some()
     }
 
+    /// Current Kitty keyboard protocol progressive-enhancement
+    /// flags requested by the child PTY (0 if the pane is a
+    /// widget or the child has not requested enhancement).
+    pub fn keyboard_flags(&self) -> u8 {
+        self.pty
+            .as_ref()
+            .map(|pty| pty.keyboard_flags())
+            .unwrap_or(0)
+    }
+
     /// Move the scrollback viewport up by `n` rows.
     pub fn scrollback_up(&mut self, n: usize) {
         if let Some(pty) = self.pty.as_mut() {
@@ -446,6 +459,11 @@ impl PaneRunner {
     /// Lives inside [`impl PaneRunner`] (not as a free fn) so the
     /// test call site `PaneRunner::with_pty_for_test(...)`
     /// resolves via the standard associated-fn syntax.
+    /// Test-only ctor that injects a [`PanePtyOps`] trait object
+    /// WITHOUT spawning a real PTY reader thread. Used by the
+    /// `internal_sanity_tests` block below to pin invariants that
+    /// real-PTY tests can't reach deterministically. Production
+    /// paths still go through [`PaneRunner::spawn_with_graphics`].
     #[cfg(test)]
     pub(crate) fn with_pty_for_test(
         computed: ComputedPane,
@@ -464,6 +482,38 @@ impl PaneRunner {
             close_tx,
         }
     }
+}
+
+/// Drain `PaneEvent::KeyboardEnhancement` events from the
+/// freshly-collected pane snapshots and merge any requested
+/// enhancement flags into `out`, keyed by layer id. Widget runners
+/// are skipped because they have no PTY to request enhancements.
+/// Returns `true` if any entry was inserted or updated. This helper
+/// is kept in the lib crate so it can be unit-tested with the
+/// `#[cfg(test)]` `PaneRunner::with_pty_for_test` constructor
+/// without exposing that constructor in production builds.
+pub fn collect_keyboard_enhancement_flags(
+    runners: &[PaneRunner],
+    snapshots: &[Option<PaneTerminalState>],
+    out: &mut HashMap<PaneLayerId, u8>,
+) -> bool {
+    let mut changed = false;
+    for (runner, snapshot) in runners.iter().zip(snapshots.iter()) {
+        if runner.is_widget() {
+            continue;
+        }
+        if let Some(snapshot) = snapshot {
+            for event in &snapshot.pending_events {
+                if let PaneEvent::KeyboardEnhancement { flags: f } = event {
+                    let old = out.insert(runner.layer_id(), *f);
+                    if old != Some(*f) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    changed
 }
 
 impl Drop for PaneRunner {
@@ -615,6 +665,9 @@ mod internal_sanity_tests {
         }
         fn kill(&mut self) -> Result<(), PtyError> {
             Ok(())
+        }
+        fn keyboard_flags(&self) -> u8 {
+            0
         }
         fn scrollback_up(&mut self, _n: usize) {}
         fn scrollback_down(&mut self, _n: usize) {}
@@ -772,6 +825,37 @@ mod internal_sanity_tests {
             layer_id,
             "Drop must send the correct PaneLayerId"
         );
+    }
+
+    /// Keyboard-enhancement flag extraction: a non-widget runner's
+    /// `KeyboardEnhancement` events must be collected into a map keyed
+    /// by layer id. Widget runners are skipped entirely.
+    #[test]
+    fn collect_keyboard_enhancement_flags_extracts_flags() {
+        let computed = make_test_pane();
+        let layer_id = PaneLayerId(42);
+        let stub = StubPty::new(layer_id);
+        let runner = PaneRunner::with_pty_for_test(
+            computed,
+            layer_id,
+            Box::new(stub),
+            None,
+        );
+        let runners = vec![runner];
+        let snapshot = cmdash_pty::PaneTerminalState {
+            grid: TextGrid::new(80, 24),
+            cols: 80,
+            rows: 24,
+            pending_events: vec![cmdash_pty::PaneEvent::KeyboardEnhancement {
+                flags: 0b0000_0111,
+            }],
+        };
+
+        let mut flags = HashMap::new();
+        let changed = collect_keyboard_enhancement_flags(&runners, &[Some(snapshot)], &mut flags);
+
+        assert!(changed);
+        assert_eq!(flags.get(&layer_id), Some(&0b0000_0111));
     }
 
     /// Ordering test: `close_tx.send()` fires BEFORE
