@@ -361,15 +361,51 @@ image protocols, and Unicode/text layout.
 
 ### 4.1 Kitty keyboard protocol
 
-**Status:** Not started.
+**Status:** ✅ Working.
 
-**Goal:** Report key events with full modifier/state information to
-child PTYs.
+**Current state:** PTY-side VTE parsing intercepts `CSI =/>/< u`
+sequences (set/push/pop) and emits `PaneEvent::KeyboardEnhancement`.
+`PanePty` tracks `keyboard_flags` per-pane; `PanePtyOps` trait exposes
+`keyboard_flags()`. Host-side, `TickContext` pushes/pops keyboard
+enhancement on the host terminal and maintains per-pane flag tracking
+with merge semantics (flags accumulate across ticks; stale entries
+pruned on pane close). Enhanced key events are encoded via
+`encode_kitty_key_event` when the focused pane requests them; legacy
+encoding is used otherwise.
 
-**Steps:**
+**Implementation:**
+- `PaneEvent::KeyboardEnhancement { flags }` in `cmdash-pty`.
+- `PanePty::keyboard_flags` field updated in `advance()` from events.
+- `PanePtyOps::keyboard_flags()` trait method.
+- `collect_keyboard_enhancement_flags()` helper in `cmdash::pane`
+  (pub, takes `&mut HashMap<PaneLayerId, u8>`, returns `bool`).
+- `TickContext` state: `host_keyboard_flags`, `pane_keyboard_flags`,
+  `host_keyboard_pushed`.
+- `sync_host_keyboard_flags` / `push_host_keyboard_flags` /
+  `pop_host_keyboard_flags` lifecycle methods.
+- `handle_event_full` routes widget press events separately;
+  PTY panes use Kitty encoding when `focused_flags != 0`.
+- `drain_close_channel` prunes `pane_keyboard_flags` on close.
+- `pop_host_keyboard_flags` called on `run()` exit.
+
+**Known tech debt:**
+- `collect_keyboard_enhancement_flags` is `pub` (not `pub(crate)`)
+  because Rust treats the lib and binary as separate crates. Add a
+  `# Crate-internal` doc note to signal this is not public API.
+- Dual flag tracking: `PanePty::keyboard_flags()` returns a cached
+  value updated in `advance()`, while `collect_keyboard_enhancement_flags`
+  reads from snapshot events. Both derive from the same source so they
+  stay consistent, but a cross-linking comment would help maintainers.
+- `drain_close_channel` calls `sync_host_keyboard_flags` unconditionally
+  when any pane closes; short-circuit when the closed pane's flags were
+  already 0 to avoid a redundant host escape sequence write.
+
+**Remaining:**
 - Negotiate with the host terminal via `CSI > 1 u` / `CSI < u`.
-- Forward enhanced key reports (`CSI u`) to the focused pane's PTY.
-- Gate on host capability detection; fall back to legacy key encoding.
+  Currently, enhancement is pushed when any pane requests it, but
+  the initial negotiation sequence is not sent on startup.
+- Gate on host capability detection; fall back to legacy key encoding
+  when the host does not support Kitty keyboard protocol.
 
 ### 4.2 Bracketed paste
 
