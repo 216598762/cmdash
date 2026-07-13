@@ -120,7 +120,7 @@ impl Theme {
 
     // -- Tab bar defaults --
 
-    /// Default tab bar background: DarkGray.
+    /// Default tab bar background: `DarkGray`.
     pub fn tab_bar_bg(&self) -> Color {
         self.tab_bar_bg.unwrap_or(Color::DarkGray)
     }
@@ -135,7 +135,7 @@ impl Theme {
         self.tab_active_fg.unwrap_or(Color::White)
     }
 
-    /// Default inactive tab background: DarkGray.
+    /// Default inactive tab background: `DarkGray`.
     pub fn tab_inactive_bg(&self) -> Color {
         self.tab_inactive_bg.unwrap_or(Color::DarkGray)
     }
@@ -147,7 +147,7 @@ impl Theme {
 
     // -- Status bar defaults --
 
-    /// Default status bar background: DarkGray.
+    /// Default status bar background: `DarkGray`.
     pub fn status_bar_bg(&self) -> Color {
         self.status_bar_bg.unwrap_or(Color::DarkGray)
     }
@@ -157,7 +157,7 @@ impl Theme {
         self.status_mode_fg.unwrap_or(Color::White)
     }
 
-    /// Default status mode background: DarkGray.
+    /// Default status mode background: `DarkGray`.
     pub fn status_mode_bg(&self) -> Color {
         self.status_mode_bg.unwrap_or(Color::DarkGray)
     }
@@ -174,7 +174,7 @@ impl Theme {
 
     // -- Widget/border defaults --
 
-    /// Default border color: DarkGray.
+    /// Default border color: `DarkGray`.
     pub fn border_color(&self) -> Color {
         self.border_color.unwrap_or(Color::DarkGray)
     }

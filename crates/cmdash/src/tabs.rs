@@ -1097,7 +1097,7 @@ mod tests {
     // collision-free `LayerId` values across tabs.
     // ----------------------------------------------------------------
 
-    /// Same `PaneId` (pre_order=0) on two different tab indices
+    /// Same `PaneId` (`pre_order`=0) on two different tab indices
     /// (via `TabStack::active_idx`) produces distinct `LayerId`s.
     /// This is the fundamental cross-tab namespace invariant and
     /// exercises the production contract: every fresh pane spawn
@@ -1125,8 +1125,8 @@ mod tests {
 
     /// Collision sweep: for 100 tab indices, the same `PaneId`
     /// must produce 100 distinct `LayerId` values. This catches
-    /// packing bugs where the high-32-bit tab_id field bleeds
-    /// into the low-32-bit pre_order field (e.g. missing shift,
+    /// packing bugs where the high-32-bit `tab_id` field bleeds
+    /// into the low-32-bit `pre_order` field (e.g. missing shift,
     /// wrong mask).
     #[test]
     fn cross_tab_collision_sweep_100_tabs_same_pane() {
@@ -1146,9 +1146,9 @@ mod tests {
         );
     }
 
-    /// Full matrix: M tab_ids × N panes must all produce distinct
+    /// Full matrix: M `tab_id`s × N panes must all produce distinct
     /// `LayerId` values. The packing `(tab_id << 32) | pre_order`
-    /// means each (tab_id, pre_order) pair maps to a unique u64;
+    /// means each (`tab_id`, `pre_order`) pair maps to a unique u64;
     /// this test verifies no two cells in the matrix alias.
     #[test]
     fn cross_tab_full_matrix_no_collision() {
@@ -1247,10 +1247,10 @@ mod tests {
         );
     }
 
-    /// TabStack lifecycle + LayerId contract: push/remove/switch
-    /// operations must not corrupt the tab_id → LayerId mapping.
+    /// `TabStack` lifecycle + `LayerId` contract: push/remove/switch
+    /// operations must not corrupt the `tab_id` → `LayerId` mapping.
     /// After a push-remove-switch cycle, the surviving tab's
-    /// LayerId derivation must still be collision-free.
+    /// `LayerId` derivation must still be collision-free.
     #[test]
     fn cross_tab_lifecycle_preserves_layer_id_contract() {
         let mut ts: TabStack<u32> = TabStack::new(0);

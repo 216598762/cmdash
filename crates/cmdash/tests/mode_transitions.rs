@@ -1,4 +1,4 @@
-//! Mode transitions integration tests: enter PaneResize via keybind,
+//! Mode transitions integration tests: enter `PaneResize` via keybind,
 //! arrow keys resize panes, Escape exits back to Normal.
 //!
 //! These tests exercise the full mode lifecycle through the
@@ -21,7 +21,7 @@ fn long_shell() -> ShellSpec {
     }
 }
 
-/// Build a Router with a keybind for entering PaneResize mode.
+/// Build a Router with a keybind for entering `PaneResize` mode.
 /// Uses `alt-r` → `pane.resize.enter` to match the default config.
 fn router_with_resize_keybind() -> Router {
     let keybinds = vec![cmdash_config::Keybind {
@@ -56,7 +56,7 @@ fn dispatch_key(router: &Router, alt: bool, code: crossterm::event::KeyCode) -> 
 // Basic mode transition tests
 // ==========================================================================
 
-/// Enter PaneResize mode via the configured keybind, verify mode
+/// Enter `PaneResize` mode via the configured keybind, verify mode
 /// changes, then exit via Escape and verify Normal mode is restored.
 #[tokio::test]
 async fn enter_pane_resize_and_exit_with_escape() {
@@ -84,7 +84,7 @@ async fn enter_pane_resize_and_exit_with_escape() {
     assert_eq!(router.mode(), Mode::Normal, "Escape restores Normal mode");
 }
 
-/// In PaneResize mode, arrow keys dispatch resize actions.
+/// In `PaneResize` mode, arrow keys dispatch resize actions.
 #[tokio::test]
 async fn pane_resize_mode_arrow_keys_dispatch_resize_actions() {
     let mut router = router_with_resize_keybind();
@@ -145,7 +145,7 @@ async fn normal_mode_arrow_keys_do_not_dispatch_resize_actions() {
     }
 }
 
-/// Escape in Normal mode does NOT dispatch ModeExit (there is no
+/// Escape in Normal mode does NOT dispatch `ModeExit` (there is no
 /// mode to exit from).
 #[tokio::test]
 async fn escape_in_normal_mode_is_unmatched() {
@@ -157,7 +157,7 @@ async fn escape_in_normal_mode_is_unmatched() {
     );
 }
 
-/// Unmatched keys in PaneResize mode fall through as None (forwarded
+/// Unmatched keys in `PaneResize` mode fall through as None (forwarded
 /// to the focused pane's PTY), so users can still type while in
 /// resize mode.
 #[tokio::test]
@@ -184,8 +184,8 @@ async fn unmatched_keys_fall_through_in_pane_resize_mode() {
 // Full lifecycle: enter → resize → exit with real PTYs
 // ==========================================================================
 
-/// Full lifecycle: enter PaneResize mode, resize a split pane via
-/// update_split_ratio, verify the rect changes, exit mode, and
+/// Full lifecycle: enter `PaneResize` mode, resize a split pane via
+/// `update_split_ratio`, verify the rect changes, exit mode, and
 /// verify Normal mode is restored. Uses a nested split layout so
 /// the focused leaf's parent Split is NOT the root (the root is
 /// an outer Split containing an inner Split), which is the
@@ -198,7 +198,7 @@ async fn unmatched_keys_fall_through_in_pane_resize_mode() {
 ///                         │     └─ bot (pre_order=1)
 ///                         └─ right (pre_order=2)
 /// ```
-/// Focused pane = "top" (pre_order=0). Its parent Split is the
+/// Focused pane = "top" (`pre_order=0`). Its parent Split is the
 /// inner Split at path [0] (tree indices: outer child 0 → inner
 /// Split). `update_split_ratio(&root, &[0], ...)` targets that
 /// inner Split.
@@ -328,7 +328,7 @@ async fn full_mode_transition_resize_real_pty() {
 
 /// Full lifecycle with multiple resize steps: enter mode, resize
 /// right, resize right again, resize left, exit. Uses a nested
-/// split so the inner Split has a valid path for update_split_ratio.
+/// split so the inner Split has a valid path for `update_split_ratio`.
 #[tokio::test]
 async fn multiple_resizes_in_single_mode_session() {
     let source = r#"layout {
@@ -396,10 +396,10 @@ async fn multiple_resizes_in_single_mode_session() {
     assert_eq!(router.mode(), Mode::Normal);
 }
 
-/// Enter PaneResize mode, verify M-r is NOT dispatched again while
-/// already in PaneResize mode (global keybind for enter-resize is
+/// Enter `PaneResize` mode, verify M-r is NOT dispatched again while
+/// already in `PaneResize` mode (global keybind for enter-resize is
 /// looked up in the global table, but since we're already in
-/// PaneResize mode and the key is in the global table, it should
+/// `PaneResize` mode and the key is in the global table, it should
 /// match). This tests that mode entry keybinds remain active even
 /// in non-Normal modes (they live in the global keybinds table).
 #[tokio::test]
@@ -421,7 +421,7 @@ async fn enter_resize_keybind_works_from_within_resize_mode() {
 /// further left — it must clamp at 1. Uses a nested split so the
 /// inner Split's parent area is small enough that ratio=1 doesn't
 /// produce a zero-area child (inner width = 48, 48*1/100 = 0 →
-/// rejected as ZeroArea). So we test ratio=2 as the minimum safe
+/// rejected as `ZeroArea`). So we test ratio=2 as the minimum safe
 /// value, and verify clamping prevents going below.
 #[tokio::test]
 async fn resize_ratio_clamped_at_minimum() {

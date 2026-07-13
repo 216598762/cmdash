@@ -1,4 +1,4 @@
-//! Tab operations integration tests: TabNew, TabClose, TabSwitch
+//! Tab operations integration tests: `TabNew`, `TabClose`, `TabSwitch`
 //! driven through `cmdash::tabs::TabStack` with real PTY children.
 //!
 //! These tests exercise the tab-axis runtime primitives end-to-end:
@@ -41,7 +41,7 @@ fn spawn_runner(source: &str, area: LayoutRect, close_tx: &PaneCloseTx) -> PaneR
 // TabNew: create a new tab with a fresh runner, verify TabStack state.
 // ===========================================================================
 
-/// TabNew: pushing a new tab appends it to the stack and switches
+/// `TabNew`: pushing a new tab appends it to the stack and switches
 /// the active cursor to it. Both the original and new tab's runners
 /// must remain alive (tickable) after the push.
 #[tokio::test]
@@ -92,7 +92,7 @@ async fn tab_new_appends_and_switches_with_live_runners() {
     }
 }
 
-/// TabNew: pushing multiple tabs sequentially creates a stack of
+/// `TabNew`: pushing multiple tabs sequentially creates a stack of
 /// the expected size, and the cursor always lands on the last push.
 #[tokio::test]
 async fn tab_new_sequential_pushes_grow_stack() {
@@ -132,7 +132,7 @@ async fn tab_new_sequential_pushes_grow_stack() {
 // TabClose: close the active tab, verify runner cleanup.
 // ===========================================================================
 
-/// TabClose: removing the active tab from a 2-tab stack leaves
+/// `TabClose`: removing the active tab from a 2-tab stack leaves
 /// the other tab's runner alive and the cursor clamped.
 #[tokio::test]
 async fn tab_close_removes_active_tab_leaves_survivor_alive() {
@@ -188,7 +188,7 @@ async fn tab_close_removes_active_tab_leaves_survivor_alive() {
     let _ = received; // valid LayerId received on the close channel
 }
 
-/// TabClose: closing the active tab (at index 0) from a 3-tab
+/// `TabClose`: closing the active tab (at index 0) from a 3-tab
 /// stack shifts the remaining tabs down and the cursor stays at 0.
 #[tokio::test]
 async fn tab_close_first_tab_shifts_remaining_down() {
@@ -244,7 +244,7 @@ async fn tab_close_first_tab_shifts_remaining_down() {
     }
 }
 
-/// TabClose: closing the LAST tab leaves an empty stack.
+/// `TabClose`: closing the LAST tab leaves an empty stack.
 /// Mirrors the production `TickContext::close_active_tab` path
 /// where `self.tabs.is_empty()` → `self.running = false`.
 #[tokio::test]
@@ -280,7 +280,7 @@ async fn tab_close_last_tab_leaves_empty_stack() {
 // TabSwitch: switch between tabs, verify cursor movement.
 // ===========================================================================
 
-/// TabSwitch: switch_to(n) moves the cursor to the target tab.
+/// `TabSwitch`: `switch_to(n)` moves the cursor to the target tab.
 /// All runners remain alive and tickable after switching.
 #[tokio::test]
 async fn tab_switch_changes_active_cursor() {
@@ -344,7 +344,7 @@ async fn tab_switch_changes_active_cursor() {
     }
 }
 
-/// TabSwitch: out-of-range switch_to is a silent no-op (returns false).
+/// `TabSwitch`: out-of-range `switch_to` is a silent no-op (returns false).
 /// Mirrors M-1..M-9 keybind semantics where out-of-range chords
 /// are silently ignored.
 #[tokio::test]
@@ -477,7 +477,7 @@ async fn tab_lifecycle_new_switch_close_with_real_pty_runners() {
     );
 }
 
-/// Full lifecycle: TabNew → TabSwitch → TabNew → TabClose(last)
+/// Full lifecycle: `TabNew` → `TabSwitch` → `TabNew` → TabClose(last)
 /// leaves an empty stack. Verifies the production
 /// `close_active_tab` → `self.tabs.is_empty()` → `running = false`
 /// contract.
@@ -517,8 +517,8 @@ async fn tab_lifecycle_new_switch_close_last_quits() {
 }
 
 /// Multi-pane tab: a tab can hold multiple runners (e.g. a split
-/// layout). TabNew creates a new tab; TabClose drops all runners
-/// in the closed tab; TabSwitch moves focus.
+/// layout). `TabNew` creates a new tab; `TabClose` drops all runners
+/// in the closed tab; `TabSwitch` moves focus.
 #[tokio::test]
 async fn tab_operations_with_multi_pane_tabs() {
     let area = LayoutRect {
@@ -619,7 +619,7 @@ async fn tab_operations_with_multi_pane_tabs() {
 
 /// Switch-after-close: after closing a tab, switching to an
 /// out-of-range index is a no-op. Verifies cursor clamping
-/// interacts correctly with switch_to bounds checking.
+/// interacts correctly with `switch_to` bounds checking.
 #[tokio::test]
 async fn tab_switch_after_close_respects_bounds() {
     let area = LayoutRect {

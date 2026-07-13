@@ -53,7 +53,7 @@ fn spawn_test_widget(label: &str) -> Option<ScriptWidget> {
 // ScriptWidget spawn + lifecycle tests
 // ---------------------------------------------------------------------------
 
-/// Spawn a ScriptWidget and verify it starts successfully.
+/// Spawn a `ScriptWidget` and verify it starts successfully.
 /// The widget should be alive and its name should match the label.
 #[tokio::test]
 async fn script_widget_spawn_succeeds() {
@@ -74,7 +74,7 @@ async fn script_widget_spawn_succeeds() {
     // Drop kills the child process.
 }
 
-/// Spawn a ScriptWidget with default name (no label).
+/// Spawn a `ScriptWidget` with default name (no label).
 #[tokio::test]
 async fn script_widget_default_name() {
     let script_path = match test_script_path() {
@@ -111,7 +111,7 @@ async fn script_widget_empty_command_returns_error() {
 // Frame protocol round-trip tests
 // ---------------------------------------------------------------------------
 
-/// Render the ScriptWidget with a FRAME request and verify it receives
+/// Render the `ScriptWidget` with a FRAME request and verify it receives
 /// a frame response with visible content.
 ///
 /// Protocol flow:
@@ -239,7 +239,7 @@ async fn script_widget_renders_expected_marker_text() {
     );
 }
 
-/// Render the ScriptWidget into a bordered block and verify the border
+/// Render the `ScriptWidget` into a bordered block and verify the border
 /// title matches the widget name.
 #[tokio::test]
 async fn script_widget_border_title_matches_name() {
@@ -299,7 +299,7 @@ async fn script_widget_border_title_matches_name() {
 // Event forwarding tests
 // ---------------------------------------------------------------------------
 
-/// Forward a KEY event to the ScriptWidget and verify it doesn't panic.
+/// Forward a KEY event to the `ScriptWidget` and verify it doesn't panic.
 #[tokio::test]
 async fn script_widget_forwards_key_event() {
     let Some(mut widget) = spawn_test_widget("key-test") else {
@@ -401,7 +401,7 @@ async fn script_widget_forwards_focus_events() {
 // Multiple renders and lifecycle tests
 // ---------------------------------------------------------------------------
 
-/// Render the ScriptWidget multiple times with varying areas and
+/// Render the `ScriptWidget` multiple times with varying areas and
 /// verify it handles repeated FRAME requests without panicking.
 #[tokio::test]
 async fn script_widget_handles_repeated_renders() {
@@ -425,7 +425,7 @@ async fn script_widget_handles_repeated_renders() {
     }
 }
 
-/// Drop the ScriptWidget while it's still rendering and verify
+/// Drop the `ScriptWidget` while it's still rendering and verify
 /// the Drop impl cleans up properly (kills child, joins reader thread).
 #[tokio::test]
 async fn script_widget_drop_cleans_up() {

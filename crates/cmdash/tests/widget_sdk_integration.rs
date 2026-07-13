@@ -1,4 +1,4 @@
-//! Integration tests for the widget SDK: cdylib loading, CmdashWidget
+//! Integration tests for the widget SDK: cdylib loading, `CmdashWidget`
 //! trait, and C-ABI FFI round-trip.
 //!
 //! These tests exercise the full widget loading pipeline that the
@@ -194,7 +194,7 @@ impl CmdashWidget for MockWidget {
     }
 }
 
-/// MockWidget renders without panicking and tracks render count.
+/// `MockWidget` renders without panicking and tracks render count.
 #[tokio::test]
 async fn mock_widget_render_tracks_count() {
     let mut widget = MockWidget::default();
@@ -225,7 +225,7 @@ async fn mock_widget_render_tracks_count() {
     assert_eq!(widget.last_area, Some((80, 24)));
 }
 
-/// MockWidget receives and records events via on_event.
+/// `MockWidget` receives and records events via `on_event`.
 #[tokio::test]
 async fn mock_widget_receives_events() {
     let mut widget = MockWidget::default();
@@ -258,9 +258,9 @@ async fn mock_widget_receives_events() {
     assert_eq!(widget.events_received[4], "focus_lost");
 }
 
-/// widget_into_raw / widget_from_raw round-trip preserves widget
+/// `widget_into_raw` / `widget_from_raw` round-trip preserves widget
 /// name and functional behavior across the FFI boundary.
-/// Uses a type-erased "canary" value encoded in the render_area
+/// Uses a type-erased "canary" value encoded in the `render_area`
 /// to verify state survived the round-trip without downcasting.
 #[tokio::test]
 async fn ffi_round_trip_preserves_widget_state() {
@@ -433,7 +433,7 @@ async fn widget_renders_at_offset_position() {
     );
 }
 
-/// CmdashWidget is object-safe and can be stored as Box<dyn CmdashWidget>.
+/// `CmdashWidget` is object-safe and can be stored as Box<dyn CmdashWidget>.
 #[tokio::test]
 async fn cmdash_widget_is_object_safe() {
     let mut widgets: Vec<Box<dyn CmdashWidget>> = vec![

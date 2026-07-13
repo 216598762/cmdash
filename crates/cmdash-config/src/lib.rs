@@ -107,7 +107,7 @@ pub struct Bar {
     pub show_clock: bool,
     /// Show the focused pane's label (if set).
     pub show_pane_title: bool,
-    /// Show the active keybind mode (Normal, PaneResize, etc.).
+    /// Show the active keybind mode (`Normal`, `PaneResize`, etc.).
     pub show_mode: bool,
 }
 
@@ -316,17 +316,17 @@ pub enum KeyAction {
     /// `tab.switch.<n>` (n in 1..=9) -- switch focus to the
     /// nth tab; the M-1..M-9 default keybinds.
     TabSwitch(usize),
-    /// Enter PaneResize mode. Arrow keys will resize the focused
+    /// Enter `PaneResize` mode. Arrow keys will resize the focused
     /// pane's parent split until Escape is pressed.
     EnterPaneResize,
-    /// Enter TabSwitch mode. Number keys 1-9 switch tabs.
+    /// Enter `TabSwitch` mode. Number keys 1-9 switch tabs.
     EnterTabSwitch,
-    /// Enter PresetPick mode. Number keys select presets.
+    /// Enter `PresetPick` mode. Number keys select presets.
     EnterPresetPick,
     /// Exit the current mode back to Normal.
     ModeExit,
     /// Resize the focused pane's split in a direction.
-    /// Used while in PaneResize mode.
+    /// Used while in `PaneResize` mode.
     PaneResizeUp,
     PaneResizeDown,
     PaneResizeLeft,
@@ -2599,7 +2599,7 @@ mod tests {
         assert_eq!(extract_line_col_from_msg(""), None);
     }
 
-    /// format_errors_with_context shows correct source line
+    /// `format_errors_with_context` shows correct source line
     /// for a KDL error with positional info.
     #[test]
     fn format_errors_shows_correct_source_line() {
@@ -2624,7 +2624,7 @@ line three
         );
     }
 
-    /// format_errors_with_context skips context for non-KDL
+    /// `format_errors_with_context` skips context for non-KDL
     /// errors that have no positional info.
     #[test]
     fn format_errors_no_context_for_semantic_error() {
@@ -2644,7 +2644,7 @@ line two
         );
     }
 
-    /// format_errors_with_context prepends file_label.
+    /// `format_errors_with_context` prepends `file_label`.
     #[test]
     fn format_errors_prepends_file_label() {
         let src = "bad

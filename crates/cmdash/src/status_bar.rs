@@ -20,7 +20,7 @@ use ratatui::text::{Line, Span};
 ///
 /// * `buf` — the ratatui buffer to render into.
 /// * `area` — the 1-row rect for the status bar.
-/// * `mode` — the current keybind mode name (e.g. "Normal", "PaneResize").
+/// * `mode` — the current keybind mode name (e.g. `Normal`, `PaneResize`).
 /// * `pane_title` — the focused pane's label, if set.
 /// * `show_clock` — whether to display the current time.
 /// * `show_pane_title` — whether to display the pane title.

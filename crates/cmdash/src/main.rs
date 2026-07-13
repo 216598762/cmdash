@@ -3134,8 +3134,15 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         // the terminal immediately reports whether it is focused.
         for runner in self.runners.iter_mut() {
             let layer_id = runner.layer_id();
-            let was_enabled = prev_focus_reporting.get(&layer_id).copied().unwrap_or(false);
-            let is_enabled = self.pane_focus_reporting.get(&layer_id).copied().unwrap_or(false);
+            let was_enabled = prev_focus_reporting
+                .get(&layer_id)
+                .copied()
+                .unwrap_or(false);
+            let is_enabled = self
+                .pane_focus_reporting
+                .get(&layer_id)
+                .copied()
+                .unwrap_or(false);
             if is_enabled && !was_enabled {
                 Self::write_focus_event_to_runner(runner, self.host_focused);
             }
@@ -9532,7 +9539,11 @@ mod input_tests {
             label: &str,
             host_focused: bool,
             pane_focus_reporting: bool,
-        ) -> (TickContext<'a, ratatui::backend::TestBackend>, Recorder, PaneLayerId) {
+        ) -> (
+            TickContext<'a, ratatui::backend::TestBackend>,
+            Recorder,
+            PaneLayerId,
+        ) {
             let kdl = format!(
                 r#"
                 layout {{
@@ -9571,7 +9582,8 @@ mod input_tests {
                 );
             ctx.host_focused = host_focused;
             let layer_id = ctx.runners[0].layer_id();
-            ctx.pane_focus_reporting.insert(layer_id, pane_focus_reporting);
+            ctx.pane_focus_reporting
+                .insert(layer_id, pane_focus_reporting);
             ctx.host_focus_reporting = pane_focus_reporting;
             let recorder = recorder.into_inner().expect("recorder was set");
             (ctx, recorder, layer_id)
