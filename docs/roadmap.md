@@ -406,25 +406,68 @@ encoding is used otherwise.
 
 ### 4.2 Bracketed paste
 
-**Status:** Not started.
+**Status:** ✅ Working.
 
-**Goal:** Support bracketed paste (`CSI ? 2004 h`/`l`) passthrough.
+**Current state:** PTY-side VTE parsing intercepts `CSI ? 2004 h`/`l`
+sequences and emits `PaneEvent::BracketedPaste { enabled }`.
+`PanePty` tracks bracketed-paste state per-pane; `PanePtyOps` exposes
+`bracketed_paste_enabled()`. Host-side, `TickContext` enables/disables
+bracketed paste on the host terminal and maintains the host state as the
+*union* of all live pane requests, so focus changes never disable the
+mode while any pane still needs it. Pasted content is wrapped in
+`ESC [ 200 ~` / `ESC [ 201 ~` and forwarded to the focused pane's PTY.
 
-**Steps:**
-- Track per-pane bracketed-paste state from child PTY mode requests.
-- Wrap pasted content in `ESC [ 200 ~` / `ESC [ 201 ~`.
-- Forward the wrapped bytes to the focused pane's PTY.
+**Implementation:**
+- `PaneEvent::BracketedPaste { enabled }` in `cmdash-pty`.
+- `PanePty::bracketed_paste_enabled` field updated in `advance()` from events.
+- `PanePtyOps::bracketed_paste_enabled()` trait method.
+- `collect_bracketed_paste_flags()` helper in `cmdash::pane` merges
+  per-pane state and detects changes.
+- `TickContext` state: `host_bracketed_paste_enabled`,
+  `pane_bracketed_paste_flags`.
+- `sync_host_bracketed_paste` enables/disables host bracketed paste
+  when the union changes.
+- `prepare_paste_bytes()` wraps pasted text only when the focused pane
+  has requested bracketed paste.
+- Integration test `host_bracketed_paste_union_across_focus_changes`
+  verifies the union semantics across focus changes.
+
+**Remaining:**
+- Gate on host capability detection; fall back to raw paste when the
+  host terminal does not support bracketed paste.
 
 ### 4.3 Focus reporting
 
-**Status:** Not started.
+**Status:** ✅ Working.
 
-**Goal:** Report focus-in/focus-out events to child PTYs.
+**Current state:** PTY-side VTE parsing intercepts `CSI ? 1004 h`/`l`
+sequences and emits `PaneEvent::FocusReporting { enabled }`.
+`PanePty` tracks `focus_reporting_enabled` per-pane; `PanePtyOps` exposes
+`focus_reporting_enabled()`. Host-side, `TickContext` enables/disables
+focus-change reporting on the host terminal and maintains the host state as
+the *union* of all live pane requests. When the host gains or loses focus,
+`CSI I` / `CSI O` is forwarded to the focused pane. When a pane newly
+enables focus reporting, the current host focus state is immediately
+reported to that pane.
 
-**Steps:**
-- Track focus-reporting mode per pane (`CSI ? 1004 h`/`l`).
-- Emit `CSI I` / `CSI O` on focus changes.
-- Forward host focus events when cmdash itself gains/loses focus.
+**Implementation:**
+- `PaneEvent::FocusReporting { enabled }` in `cmdash-pty`.
+- `PanePty::focus_reporting_enabled` field updated in `advance()` from events.
+- `PanePtyOps::focus_reporting_enabled()` trait method.
+- `collect_focus_reporting_flags()` helper in `cmdash::pane` merges
+  per-pane state and detects changes.
+- `TickContext` state: `host_focus_reporting`, `pane_focus_reporting`,
+  `host_focus_reporting_pushed`, `host_focused`.
+- `sync_host_focus_reporting` enables/disables host focus-change
+  reporting when the union changes.
+- `forward_focus_event_to_focused_pane` forwards `CSI I`/`CSI O` to
+  the focused pane on host focus changes.
+- `update_focus_reporting_from_snapshots` sends the initial host focus
+  state to any pane that just enabled focus reporting.
+
+**Remaining:**
+- Gate on host capability detection; fall back when the host terminal
+  does not support focus events.
 
 ### 4.4 Hyperlinks (OSC 8)
 

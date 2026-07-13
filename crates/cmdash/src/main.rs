@@ -93,9 +93,9 @@ fn shell_spec_from_command(command: &Option<String>, default: &ShellSpec) -> She
     }
 }
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use notify::Watcher as _;
 use ratatui::style::{Color, Modifier, Style};
@@ -967,7 +967,7 @@ pub(crate) struct TabState {
 struct DragState {
     /// Tree path (child indices from root) to the Split node
     /// whose ratio is being adjusted. Fixed-size array backed
-    /// by MAX_TREE_DEPTH (8).
+    /// by `MAX_TREE_DEPTH` (8).
     split_path: [u16; 8],
     /// Number of valid elements in `split_path`.
     split_path_len: u8,
@@ -1121,6 +1121,31 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     /// the host terminal's stack. Used to pop exactly once on
     /// exit so the host returns to its prior state.
     host_keyboard_pushed: bool,
+    /// Per-pane bracketed-paste mode state, keyed by layer id.
+    /// Updated from `PaneEvent::BracketedPaste` events and pruned
+    /// when a pane closes.
+    pane_bracketed_paste: HashMap<PaneLayerId, bool>,
+    /// Whether any pane currently has bracketed paste enabled.
+    /// Mirrors the union of `pane_bracketed_paste` and drives
+    /// host `CSI ? 2004 h` / `CSI ? 2004 l` synchronization.
+    host_bracketed_paste: bool,
+    /// Whether we have enabled bracketed paste on the host
+    /// terminal. Used to disable exactly once on exit.
+    host_bracketed_paste_pushed: bool,
+    /// Per-pane focus-reporting mode state, keyed by layer id.
+    /// Updated from `PaneEvent::FocusReporting` events and pruned
+    /// when a pane closes.
+    pane_focus_reporting: HashMap<PaneLayerId, bool>,
+    /// Whether any pane currently has focus reporting enabled.
+    /// Mirrors the union of `pane_focus_reporting` and drives
+    /// host focus-change event synchronization.
+    host_focus_reporting: bool,
+    /// Whether we have enabled focus-change reporting on the host
+    /// terminal. Used to disable exactly once on exit.
+    host_focus_reporting_pushed: bool,
+    /// Whether the host terminal currently has focus. Drives
+    /// forwarding of `CSI I` / `CSI O` to the focused pane.
+    host_focused: bool,
 }
 
 /// Monotonic `LayerId` allocator for
@@ -1258,6 +1283,13 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             host_keyboard_flags: 0,
             pane_keyboard_flags: HashMap::new(),
             host_keyboard_pushed: false,
+            pane_bracketed_paste: HashMap::new(),
+            host_bracketed_paste: false,
+            host_bracketed_paste_pushed: false,
+            pane_focus_reporting: HashMap::new(),
+            host_focus_reporting: false,
+            host_focus_reporting_pushed: false,
+            host_focused: true,
         }
     }
 
@@ -1484,6 +1516,28 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         // Mouse events: click-to-focus, Alt+drag resize, PTY forwarding.
         if let Event::Mouse(mouse) = evt {
             self.handle_mouse_event(mouse);
+            return;
+        }
+        // Paste events: forward to the focused pane. If the pane has
+        // requested bracketed paste, wrap the pasted content in the
+        // standard bracketed-paste delimiters so the child application
+        // can distinguish pasted input from typed input.
+        if let Event::Paste(text) = evt {
+            self.handle_paste(text);
+            return;
+        }
+        // Host focus-change events: forward `CSI I` / `CSI O` to the
+        // focused pane when it (or any pane) has requested focus
+        // reporting. The host only emits these events when focus-change
+        // reporting is enabled via `EnableFocusChange`.
+        if let Event::FocusGained = evt {
+            self.host_focused = true;
+            self.forward_focus_event_to_focused_pane(true);
+            return;
+        }
+        if let Event::FocusLost = evt {
+            self.host_focused = false;
+            self.forward_focus_event_to_focused_pane(false);
             return;
         }
         let Event::Key(KeyEvent {
@@ -2720,6 +2774,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         // because of an error. This restores the host to its
         // prior keyboard reporting mode.
         self.pop_host_keyboard_flags();
+        self.pop_host_bracketed_paste();
+        self.pop_host_focus_reporting();
         result
     }
 
@@ -2805,18 +2861,40 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// FIRST so their revisions are visible before phase 2/3 in the
     /// same tick.
     fn drain_close_channel(&mut self) {
-        let mut needs_sync = false;
+        let mut needs_keyboard_sync = false;
+        let mut needs_bracketed_paste_sync = false;
+        let mut needs_focus_reporting_sync = false;
         while let Ok(id) = self.close_rx.try_recv() {
             self.graphics.close_pane(id);
             // Only trigger a host sync when the closed pane's flags
             // were non-zero. A removed entry of 0 doesn't change the
             // union, so the sync would be a no-op.
             if self.pane_keyboard_flags.remove(&id).is_some_and(|f| f != 0) {
-                needs_sync = true;
+                needs_keyboard_sync = true;
+            }
+            if self
+                .pane_bracketed_paste
+                .remove(&id)
+                .is_some_and(|enabled| enabled)
+            {
+                needs_bracketed_paste_sync = true;
+            }
+            if self
+                .pane_focus_reporting
+                .remove(&id)
+                .is_some_and(|enabled| enabled)
+            {
+                needs_focus_reporting_sync = true;
             }
         }
-        if needs_sync {
+        if needs_keyboard_sync {
             self.sync_host_keyboard_flags();
+        }
+        if needs_bracketed_paste_sync {
+            self.sync_host_bracketed_paste();
+        }
+        if needs_focus_reporting_sync {
+            self.sync_host_focus_reporting();
         }
     }
 
@@ -2870,6 +2948,130 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         self.host_keyboard_pushed = false;
     }
 
+    /// Synchronize the host terminal's bracketed-paste mode with
+    /// the union of all live pane requests. If any pane has
+    /// requested bracketed paste, enable it on the host so
+    /// crossterm emits `Event::Paste`; disable it when no pane
+    /// still wants it.
+    fn sync_host_bracketed_paste(&mut self) {
+        let any = self.pane_bracketed_paste.values().any(|&v| v);
+        if any == self.host_bracketed_paste {
+            return;
+        }
+        if any {
+            self.push_host_bracketed_paste();
+        } else {
+            self.pop_host_bracketed_paste();
+        }
+        self.host_bracketed_paste = any;
+    }
+
+    /// Enable bracketed paste on the host terminal.
+    fn push_host_bracketed_paste(&mut self) {
+        use crossterm::execute;
+        if self.host_bracketed_paste_pushed {
+            return;
+        }
+        if let Err(e) = execute!(std::io::stdout(), EnableBracketedPaste) {
+            warn!(error = ?e, "failed to enable bracketed paste");
+            return;
+        }
+        self.host_bracketed_paste_pushed = true;
+    }
+
+    /// Disable bracketed paste on the host terminal. Safe to call
+    /// multiple times: the second disable is a no-op.
+    fn pop_host_bracketed_paste(&mut self) {
+        use crossterm::execute;
+        if !self.host_bracketed_paste_pushed {
+            return;
+        }
+        if let Err(e) = execute!(std::io::stdout(), DisableBracketedPaste) {
+            warn!(error = ?e, "failed to disable bracketed paste");
+            return;
+        }
+        self.host_bracketed_paste_pushed = false;
+    }
+
+    /// Synchronize the host terminal's focus-change reporting mode
+    /// with the union of all live pane requests. If any pane has
+    /// requested focus reporting, enable it on the host so crossterm
+    /// emits `Event::FocusGained` / `Event::FocusLost`.
+    fn sync_host_focus_reporting(&mut self) {
+        let any = self.pane_focus_reporting.values().any(|&v| v);
+        if any == self.host_focus_reporting {
+            return;
+        }
+        if any {
+            self.push_host_focus_reporting();
+        } else {
+            self.pop_host_focus_reporting();
+        }
+        self.host_focus_reporting = any;
+    }
+
+    /// Enable focus-change reporting on the host terminal.
+    fn push_host_focus_reporting(&mut self) {
+        use crossterm::event::EnableFocusChange;
+        use crossterm::execute;
+        if self.host_focus_reporting_pushed {
+            return;
+        }
+        if let Err(e) = execute!(std::io::stdout(), EnableFocusChange) {
+            warn!(error = ?e, "failed to enable focus-change reporting");
+            return;
+        }
+        self.host_focus_reporting_pushed = true;
+    }
+
+    /// Disable focus-change reporting on the host terminal. Safe to
+    /// call multiple times: the second disable is a no-op.
+    fn pop_host_focus_reporting(&mut self) {
+        use crossterm::event::DisableFocusChange;
+        use crossterm::execute;
+        if !self.host_focus_reporting_pushed {
+            return;
+        }
+        if let Err(e) = execute!(std::io::stdout(), DisableFocusChange) {
+            warn!(error = ?e, "failed to disable focus-change reporting");
+            return;
+        }
+        self.host_focus_reporting_pushed = false;
+    }
+
+    /// Forward a focus-in/focus-out event to the focused pane when
+    /// that pane has requested focus reporting. Widget panes and
+    /// panes that have not enabled focus reporting are skipped.
+    fn forward_focus_event_to_focused_pane(&mut self, focused: bool) {
+        if self.runners.is_empty() {
+            return;
+        }
+        let Some(runner) = self.runners.get_mut(self.focus) else {
+            return;
+        };
+        if runner.is_widget() {
+            return;
+        }
+        if !runner.focus_reporting_enabled() {
+            return;
+        }
+        Self::write_focus_event_to_runner(runner, focused);
+    }
+
+    /// Write a focus-in/focus-out event (`CSI I` / `CSI O`) to a
+    /// specific runner. The caller is responsible for ensuring the
+    /// runner is a PTY pane that has requested focus reporting.
+    fn write_focus_event_to_runner(runner: &mut PaneRunner, focused: bool) {
+        let bytes = if focused {
+            b"\x1b[I".to_vec()
+        } else {
+            b"\x1b[O".to_vec()
+        };
+        if let Err(e) = runner.write_input(&bytes) {
+            debug!(error = ?e, layer_id = ?runner.layer_id(), "write_input failed for focus event");
+        }
+    }
+
     /// Drain `PaneEvent::KeyboardEnhancement` events from the
     /// freshly-collected pane snapshots and update
     /// `self.pane_keyboard_flags`. After updating, recompute the
@@ -2885,6 +3087,58 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         );
         if changed {
             self.sync_host_keyboard_flags();
+        }
+    }
+
+    /// Drain `PaneEvent::BracketedPaste` events from the freshly-
+    /// collected pane snapshots and update `self.pane_bracketed_paste`.
+    /// After updating, recompute the host terminal's bracketed-paste
+    /// state.
+    fn update_bracketed_paste_from_snapshots(
+        &mut self,
+        snapshots: &[Option<cmdash_pty::PaneTerminalState>],
+    ) {
+        let changed = cmdash::pane::collect_bracketed_paste_flags(
+            &self.runners,
+            snapshots,
+            &mut self.pane_bracketed_paste,
+        );
+        if changed {
+            self.sync_host_bracketed_paste();
+        }
+    }
+
+    /// Drain `PaneEvent::FocusReporting` events from the freshly-
+    /// collected pane snapshots and update `self.pane_focus_reporting`.
+    /// After updating, recompute the host terminal's focus-change
+    /// reporting state and send the current host focus state to any
+    /// pane that just enabled focus reporting.
+    fn update_focus_reporting_from_snapshots(
+        &mut self,
+        snapshots: &[Option<cmdash_pty::PaneTerminalState>],
+    ) {
+        // Capture the prior tick's state so we can detect panes that
+        // just enabled focus reporting and immediately report the
+        // current host focus state to them.
+        let prev_focus_reporting = self.pane_focus_reporting.clone();
+        let changed = cmdash::pane::collect_focus_reporting_flags(
+            &self.runners,
+            snapshots,
+            &mut self.pane_focus_reporting,
+        );
+        if changed {
+            self.sync_host_focus_reporting();
+        }
+        // Send the initial focus state to any pane that just enabled
+        // focus reporting. Standard terminal behavior: on `CSI ? 1004 h`,
+        // the terminal immediately reports whether it is focused.
+        for runner in self.runners.iter_mut() {
+            let layer_id = runner.layer_id();
+            let was_enabled = prev_focus_reporting.get(&layer_id).copied().unwrap_or(false);
+            let is_enabled = self.pane_focus_reporting.get(&layer_id).copied().unwrap_or(false);
+            if is_enabled && !was_enabled {
+                Self::write_focus_event_to_runner(runner, self.host_focused);
+            }
         }
     }
 
@@ -3046,8 +3300,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// pipeline" step 6 prescribes this exact path.
     ///
     /// Before compositing, rebuild the tab bar as
-    /// dashcompositor layers (RectLayer background +
-    /// TextLayer per tab via fontdue). The ratatui
+    /// dashcompositor layers (`RectLayer` background +
+    /// `TextLayer` per tab via fontdue). The ratatui
     /// text tab bar from phase 3a is preserved as a
     /// degraded-mode fallback; the pixel overlay
     /// overwrites it on kitty-capable hosts.
@@ -3088,6 +3342,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             all_exited,
         } = self.tick_runners()?;
         self.update_keyboard_flags_from_snapshots(&snapshots);
+        self.update_bracketed_paste_from_snapshots(&snapshots);
+        self.update_focus_reporting_from_snapshots(&snapshots);
         self.route_graphics_events(&snapshots);
         self.render_frame(&snapshots)?;
 
@@ -3096,6 +3352,112 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         }
 
         Ok(())
+    }
+
+    /// Render a crossterm `Event` into the file-log payload we
+    /// emit at `handle_event_full`'s entry point with the printable
+    /// payload content REDACTED before persistence under
+    /// `--log=<path>`.
+    ///
+    /// **Privacy story.** An unredacted
+    /// `debug!("crossterm event = {:?}", evt)` trace would emit
+    /// printable text byte-for-byte into the `--log=<path>`
+    /// subscriber. Over a long `--log=foo.log` session that means
+    /// any printable text reaching the focused pane (passwords,
+    /// API keys, essays, clipboard paste contents, etc.) gets
+    /// persisted to the log file verbatim -- a privacy leak.
+    /// Rather than gate the whole trace on
+    /// `cfg!(debug_assertions)` (which would strip the trace from
+    /// release binaries -- exactly the builds where the trace is
+    /// most useful for field debugging), this helper redacts
+    /// printable payloads while keeping everything else
+    /// observable.
+    ///
+    /// **What's kept vs redacted.**
+    /// - REDACTED: `KeyCode::Char(_)` printable character
+    ///   (`Char(<redacted char>)` sentinel).
+    /// - REDACTED: `Event::Paste(_)` pasted string content
+    ///   (`Paste(<redacted>)` sentinel). Reviewer-feedback
+    ///   catch here -- clipboard paste events carry
+    ///   typed passwords / API keys / etc. verbatim, same
+    ///   severity as the `Char(c)` keystroke leak.
+    /// - KEPT (full Debug escape): `modifiers`, `kind`, `state`,
+    ///   every non-`Char` `KeyCode` variant (`F(n)`, arrows,
+    ///   `Backspace`, `Tab`, etc. carry no printable text),
+    ///   `Resize`, `Mouse` (carry geometry + button state;
+    ///   no printable text), `FocusGained`, `FocusLost`.
+    ///
+    /// **Open-fallback trade-off.** The match's
+    /// `_ => format!("{:?}", evt)` arm forwards all UNKNOWN
+    /// future crossterm `Event` variants verbatim. If crossterm
+    /// ever adds a variant carrying printable text (a hypothetical
+    /// `SpeechInput(String)` or `SnippetInsert(String)` payload),
+    /// it auto-leaks through this fall-through -- the same root
+    /// cause as the `Event::Paste(String)` leak this helper closes.
+    /// Re-audit this arm every time `crossterm` is upgraded;
+    /// the round-2 paste leak is the precedent.
+    ///
+    /// **Hot-path cost.** One `String` allocation per event the
+    /// logger captures (controlled by the file-only subscriber's
+    /// level filter; off the hot path under the default launch
+    /// where `--log=<path>` is absent). Allocations are bounded
+    /// by the real event rate (human-keystroke-rate for `Key`
+    /// events, paste-burst-rate for `Paste`, zero for `Resize`
+    /// outside a host drag-resize burst).
+    /// Return whether the focused pane has requested bracketed paste
+    /// mode. Widget panes are treated as not supporting bracketed paste.
+    fn focused_bracketed_paste_enabled(&self) -> bool {
+        let Some(layer_id) = self.runners.get(self.focus).map(|r| r.layer_id()) else {
+            return false;
+        };
+        self.pane_bracketed_paste
+            .get(&layer_id)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Forward a paste event to the focused pane. When the pane has
+    /// requested bracketed paste, wrap the content in `ESC [ 200 ~`
+    /// and `ESC [ 201 ~` so the child can treat it as a paste. When
+    /// bracketed paste is not enabled, forward the raw bytes as-is.
+    /// Build the byte payload for a paste event directed at the
+    /// focused pane. When the pane has requested bracketed paste,
+    /// wrap the content in `ESC [ 200 ~` and `ESC [ 201 ~` so the
+    /// child can treat it as a paste. Otherwise forward the raw
+    /// bytes as-is.
+    fn prepare_paste_bytes(&self, text: &str) -> Vec<u8> {
+        let bracketed = self.focused_bracketed_paste_enabled();
+        if bracketed {
+            let mut out = Vec::with_capacity(text.len() + 12);
+            out.extend_from_slice(b"\x1b[200~");
+            out.extend_from_slice(text.as_bytes());
+            out.extend_from_slice(b"\x1b[201~");
+            out
+        } else {
+            text.as_bytes().to_vec()
+        }
+    }
+
+    fn handle_paste(&mut self, text: &str) {
+        if self.runners.is_empty() {
+            return;
+        }
+        // Widget panes do not have a PTY and cannot receive raw input;
+        // skip paste events for them.
+        if self
+            .runners
+            .get(self.focus)
+            .map(|r| r.is_widget())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let bytes = self.prepare_paste_bytes(text);
+        if let Some(runner) = self.runners.get_mut(self.focus) {
+            if let Err(e) = runner.write_input(&bytes) {
+                debug!(error = ?e, layer_id = ?runner.layer_id(), "write_input failed for paste");
+            }
+        }
     }
 }
 
@@ -3153,56 +3515,6 @@ fn render_tab_bar(
     }
 }
 
-/// Render a crossterm `Event` into the file-log payload we
-/// emit at `handle_event_full`'s entry point with the printable
-/// payload content REDACTED before persistence under
-/// `--log=<path>`.
-///
-/// **Privacy story.** An unredacted
-/// `debug!("crossterm event = {:?}", evt)` trace would emit
-/// printable text byte-for-byte into the `--log=<path>`
-/// subscriber. Over a long `--log=foo.log` session that means
-/// any printable text reaching the focused pane (passwords,
-/// API keys, essays, clipboard paste contents, etc.) gets
-/// persisted to the log file verbatim -- a privacy leak.
-/// Rather than gate the whole trace on
-/// `cfg!(debug_assertions)` (which would strip the trace from
-/// release binaries -- exactly the builds where the trace is
-/// most useful for field debugging), this helper redacts
-/// printable payloads while keeping everything else
-/// observable.
-///
-/// **What's kept vs redacted.**
-/// - REDACTED: `KeyCode::Char(_)` printable character
-///   (`Char(<redacted char>)` sentinel).
-/// - REDACTED: `Event::Paste(_)` pasted string content
-///   (`Paste(<redacted>)` sentinel). Reviewer-feedback
-///   catch here -- clipboard paste events carry
-///   typed passwords / API keys / etc. verbatim, same
-///   severity as the `Char(c)` keystroke leak.
-/// - KEPT (full Debug escape): `modifiers`, `kind`, `state`,
-///   every non-`Char` `KeyCode` variant (`F(n)`, arrows,
-///   `Backspace`, `Tab`, etc. carry no printable text),
-///   `Resize`, `Mouse` (carry geometry + button state;
-///   no printable text), `FocusGained`, `FocusLost`.
-///
-/// **Open-fallback trade-off.** The match's
-/// `_ => format!("{:?}", evt)` arm forwards all UNKNOWN
-/// future crossterm `Event` variants verbatim. If crossterm
-/// ever adds a variant carrying printable text (a hypothetical
-/// `SpeechInput(String)` or `SnippetInsert(String)` payload),
-/// it auto-leaks through this fall-through -- the same root
-/// cause as the `Event::Paste(String)` leak this helper closes.
-/// Re-audit this arm every time `crossterm` is upgraded;
-/// the round-2 paste leak is the precedent.
-///
-/// **Hot-path cost.** One `String` allocation per event the
-/// logger captures (controlled by the file-only subscriber's
-/// level filter; off the hot path under the default launch
-/// where `--log=<path>` is absent). Allocations are bounded
-/// by the real event rate (human-keystroke-rate for `Key`
-/// events, paste-burst-rate for `Paste`, zero for `Resize`
-/// outside a host drag-resize burst).
 fn redacted_event_debug(evt: &Event) -> String {
     match evt {
         Event::Key(KeyEvent {
@@ -4106,7 +4418,7 @@ mod input_tests {
     /// AGENTS.md "minimal API surface" rule says no
     /// fixture-side `Opts` struct; the 6-arg flat signature
     /// is the agreed helper shape.
-    fn setup_fixture_ctx<'a>(
+    pub(crate) fn setup_fixture_ctx<'a>(
         kdl: &str,
         focus: usize,
         bindings: Router,
@@ -4118,23 +4430,47 @@ mod input_tests {
         LayoutNode,
         LayoutRect,
     ) {
-        let cfg = cmdash_config::parse(kdl).expect("setup_fixture_ctx: parse KDL");
-        let layout_root = cfg.layout.expect("setup_fixture_ctx: layout block");
-        let layout =
-            ComputedLayout::compute(&layout_root, last_area).expect("setup_fixture_ctx: compute");
+        setup_fixture_ctx_with_runner(
+            kdl,
+            focus,
+            bindings,
+            |pane, layer_id, close_tx| {
+                PaneRunner::spawn_with_graphics(pane, layer_id, shell.clone(), Some(close_tx))
+                    .expect("setup_fixture_ctx: spawn pane")
+            },
+            last_area,
+            terminal,
+        )
+    }
+
+    /// Variant of [`setup_fixture_ctx`] that accepts a custom runner
+    /// factory. Used by tests that need stub PTY runners instead of
+    /// spawning real child processes.
+    pub(crate) fn setup_fixture_ctx_with_runner<'a>(
+        kdl: &str,
+        focus: usize,
+        bindings: Router,
+        mut make_runner: impl FnMut(ComputedPane, PaneLayerId, PaneCloseTx) -> PaneRunner,
+        last_area: LayoutRect,
+        terminal: &'a mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    ) -> (
+        TickContext<'a, ratatui::backend::TestBackend>,
+        LayoutNode,
+        LayoutRect,
+    ) {
+        let cfg = cmdash_config::parse(kdl).expect("setup_fixture_ctx_with_runner: parse KDL");
+        let layout_root = cfg
+            .layout
+            .expect("setup_fixture_ctx_with_runner: layout block");
+        let layout = ComputedLayout::compute(&layout_root, last_area)
+            .expect("setup_fixture_ctx_with_runner: compute");
         let (close_tx, close_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut runners: Vec<PaneRunner> = Vec::with_capacity(layout.panes.len());
         for pane in &layout.panes {
             let tx_clone = close_tx.clone();
             let layer_id = cmdash::derive_layer_id(&pane.id);
-            let r = PaneRunner::spawn_with_graphics(
-                pane.clone(),
-                layer_id,
-                shell.clone(),
-                Some(tx_clone),
-            )
-            .expect("setup_fixture_ctx: spawn pane");
-            runners.push(r);
+            let runner = make_runner(pane.clone(), layer_id, tx_clone);
+            runners.push(runner);
         }
         let graphics = GraphicsState::new(
             cmdash::graphics::Metrics::default(),
@@ -4155,7 +4491,7 @@ mod input_tests {
             last_area,
             std::collections::BTreeMap::new(),
             std::collections::BTreeMap::new(),
-            shell,
+            ShellSpec::LoginShell,
             None,
         );
         (ctx, layout_root, last_area)
@@ -7167,7 +7503,7 @@ mod input_tests {
 
     /// When the pane close channel has no senders left,
     /// `close_rx.recv()` returns `None`. The loop should continue
-    /// processing other events (in this case, the AppClose keypress).
+    /// processing other events (in this case, the `AppClose` keypress).
     #[tokio::test]
     async fn close_rx_none_continues_loop() {
         let backend = ratatui::backend::TestBackend::new(80, 24);
@@ -7239,7 +7575,7 @@ mod input_tests {
         assert!(ctx.running, "tick branch should keep the loop running");
     }
 
-    /// process_pending_resize should consume the pending_resize slot
+    /// `process_pending_resize` should consume the `pending_resize` slot
     /// and run relayout against the requested dimensions.
     #[tokio::test]
     async fn process_pending_resize_consumes_slot_and_relayouts() {
@@ -7260,7 +7596,7 @@ mod input_tests {
         );
     }
 
-    /// drain_close_channel should remove all pending close messages
+    /// `drain_close_channel` should remove all pending close messages
     /// from the close receiver.
     #[tokio::test]
     async fn drain_close_channel_drains_messages() {
@@ -7277,7 +7613,7 @@ mod input_tests {
         );
     }
 
-    /// tick_runners should return one snapshot per runner and report
+    /// `tick_runners` should return one snapshot per runner and report
     /// that not all panes have exited (the dummy widget never exits).
     #[tokio::test]
     async fn tick_runners_returns_snapshots_and_exit_status() {
@@ -8768,6 +9104,604 @@ mod input_tests {
             // Widget runners should not contribute keyboard flags.
             assert!(ctx.pane_keyboard_flags.is_empty());
             assert_eq!(ctx.host_keyboard_flags, 0);
+        }
+    }
+
+    #[cfg(test)]
+    mod test_helpers {
+        use cmdash_pty::{PaneLayerId, PanePtyOps, PaneTerminalState, PtyError, TextGrid};
+
+        /// Stub PTY backend used by integration tests to avoid spawning real
+        /// child processes. The stub returns valid empty snapshots and can
+        /// optionally record bytes written via `PanePtyOps::write`.
+        pub struct StubPty {
+            layer_id: PaneLayerId,
+            focus_reporting: bool,
+            written: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        }
+
+        impl StubPty {
+            pub fn new(layer_id: PaneLayerId) -> Self {
+                Self {
+                    layer_id,
+                    focus_reporting: false,
+                    written: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                }
+            }
+
+            /// Create a stub that records every byte payload written through
+            /// `PanePtyOps::write`. The returned `Arc<Mutex<...>>` can be
+            /// inspected after the stub has been moved into a `PaneRunner`.
+            pub fn new_recording(
+                layer_id: PaneLayerId,
+            ) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+                let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let stub = Self {
+                    layer_id,
+                    focus_reporting: false,
+                    written: std::sync::Arc::clone(&written),
+                };
+                (stub, written)
+            }
+
+            /// Create a stub with focus reporting enabled that also records
+            /// every byte payload written through `PanePtyOps::write`.
+            pub fn with_focus_reporting_recording(
+                layer_id: PaneLayerId,
+            ) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+                let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let stub = Self {
+                    layer_id,
+                    focus_reporting: true,
+                    written: std::sync::Arc::clone(&written),
+                };
+                (stub, written)
+            }
+        }
+
+        impl PanePtyOps for StubPty {
+            fn layer_id(&self) -> PaneLayerId {
+                self.layer_id
+            }
+            fn resize(&mut self, _cols: u16, _rows: u16) -> Result<(), PtyError> {
+                Ok(())
+            }
+            fn write(&mut self, bytes: &[u8]) -> Result<usize, PtyError> {
+                self.written.lock().unwrap().push(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn advance(&mut self, _bytes: &[u8]) -> Result<(), PtyError> {
+                Ok(())
+            }
+            fn snapshot(&mut self) -> PaneTerminalState {
+                PaneTerminalState {
+                    grid: TextGrid::new(80, 24),
+                    cols: 80,
+                    rows: 24,
+                    pending_events: Vec::new(),
+                }
+            }
+            fn try_wait(&mut self) -> Result<Option<i32>, PtyError> {
+                Ok(None)
+            }
+            fn kill(&mut self) -> Result<(), PtyError> {
+                Ok(())
+            }
+            fn keyboard_flags(&self) -> u8 {
+                0
+            }
+            fn focus_reporting_enabled(&self) -> bool {
+                self.focus_reporting
+            }
+            fn scrollback_up(&mut self, _n: usize) {}
+            fn scrollback_down(&mut self, _n: usize) {}
+            fn scrollback_reset(&mut self) {}
+            fn in_scrollback(&self) -> bool {
+                false
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod bracketed_paste_tests {
+        use super::test_helpers::StubPty;
+        use super::*;
+
+        #[tokio::test]
+        async fn prepare_paste_bytes_wraps_when_bracketed_paste_enabled() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
+            let layer_id = ctx.runners[0].layer_id();
+            ctx.pane_bracketed_paste.insert(layer_id, true);
+
+            let bytes = ctx.prepare_paste_bytes("hello");
+
+            assert_eq!(
+                bytes,
+                b"\x1b[200~hello\x1b[201~".to_vec(),
+                "pasted text should be wrapped in bracketed-paste delimiters"
+            );
+        }
+
+        #[tokio::test]
+        async fn prepare_paste_bytes_forwards_raw_when_bracketed_paste_disabled() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
+            let layer_id = ctx.runners[0].layer_id();
+            ctx.pane_bracketed_paste.insert(layer_id, false);
+
+            let bytes = ctx.prepare_paste_bytes("hello");
+
+            assert_eq!(
+                bytes,
+                b"hello".to_vec(),
+                "pasted text should be forwarded raw when bracketed paste is disabled"
+            );
+        }
+
+        #[tokio::test]
+        async fn handle_paste_skips_widget_runners() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
+            // setup_run_loop_ctx creates a widget runner.
+            assert!(ctx.runners[0].is_widget());
+
+            // Should not panic and should not write anything.
+            ctx.handle_paste("hello");
+        }
+
+        /// Integration test: the host terminal's bracketed-paste state is
+        /// the *union* of all live pane requests, not a property of the
+        /// focused pane. Focus changes must not disable bracketed paste
+        /// while any pane still has it enabled.
+        #[tokio::test]
+        async fn host_bracketed_paste_union_across_focus_changes() {
+            use cmdash_pty::{PaneEvent, PaneTerminalState, TextGrid};
+
+            let kdl = r#"
+                layout {
+                    split axis=horizontal ratio=0.5 {
+                        pane kind=shell label="left"
+                        pane kind=shell label="right"
+                    }
+                }
+            "#;
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let (mut ctx, _layout_root, _last_area) =
+                super::input_tests::setup_fixture_ctx_with_runner(
+                    kdl,
+                    0,
+                    Router::new(vec![]),
+                    |pane, layer_id, close_tx| {
+                        PaneRunner::with_pty_for_test(
+                            pane,
+                            layer_id,
+                            Box::new(StubPty::new(layer_id)),
+                            Some(close_tx),
+                        )
+                    },
+                    LayoutRect {
+                        x: 0,
+                        y: 0,
+                        w: 80,
+                        h: 24,
+                    },
+                    &mut terminal,
+                );
+
+            assert_eq!(ctx.runners.len(), 2, "fixture must provide two panes");
+            let layer_a = ctx.runners[0].layer_id();
+            let layer_b = ctx.runners[1].layer_id();
+
+            // Pane A enables bracketed paste; pane B does not.
+            let snapshots = vec![
+                Some(PaneTerminalState {
+                    grid: TextGrid::new(80, 24),
+                    cols: 80,
+                    rows: 24,
+                    pending_events: vec![PaneEvent::BracketedPaste { enabled: true }],
+                }),
+                Some(PaneTerminalState {
+                    grid: TextGrid::new(80, 24),
+                    cols: 80,
+                    rows: 24,
+                    pending_events: vec![],
+                }),
+            ];
+            ctx.update_bracketed_paste_from_snapshots(&snapshots);
+            ctx.sync_host_bracketed_paste();
+
+            assert_eq!(
+                ctx.pane_bracketed_paste.get(&layer_a),
+                Some(&true),
+                "pane A should report bracketed paste enabled"
+            );
+            assert_eq!(
+                ctx.pane_bracketed_paste.get(&layer_b),
+                None,
+                "pane B should have no bracketed-paste state yet"
+            );
+            assert!(
+                ctx.host_bracketed_paste,
+                "host bracketed paste should be enabled when any pane requests it"
+            );
+
+            // Focus moves to pane B, which has not requested bracketed paste.
+            // Host state must remain enabled because it is a union across all panes.
+            ctx.apply_action_full(KeyAction::PaneFocusNext);
+            assert_eq!(ctx.focus, 1, "focus should move to pane B");
+            assert!(
+                ctx.host_bracketed_paste,
+                "host bracketed paste must stay enabled across focus changes when any pane is active"
+            );
+
+            // Now pane A disables bracketed paste. With no pane requesting it,
+            // the host should disable.
+            let snapshots = vec![
+                Some(PaneTerminalState {
+                    grid: TextGrid::new(80, 24),
+                    cols: 80,
+                    rows: 24,
+                    pending_events: vec![PaneEvent::BracketedPaste { enabled: false }],
+                }),
+                Some(PaneTerminalState {
+                    grid: TextGrid::new(80, 24),
+                    cols: 80,
+                    rows: 24,
+                    pending_events: vec![],
+                }),
+            ];
+            ctx.update_bracketed_paste_from_snapshots(&snapshots);
+            ctx.sync_host_bracketed_paste();
+
+            assert_eq!(
+                ctx.pane_bracketed_paste.get(&layer_a),
+                Some(&false),
+                "pane A should report bracketed paste disabled"
+            );
+            assert!(
+                !ctx.host_bracketed_paste,
+                "host bracketed paste should disable when no pane requests it"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod focus_reporting_tests {
+        use super::test_helpers::StubPty;
+        use super::*;
+        use cmdash_pty::{PaneEvent, PaneTerminalState, TextGrid};
+
+        /// Recorder shared between `StubPty` and the test assertions.
+        type Recorder = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+        /// Build a single-pane `PaneTerminalState` snapshot that reports the
+        /// requested focus-reporting state.
+        fn focus_reporting_enabled_snapshot(enabled: bool) -> Option<PaneTerminalState> {
+            Some(PaneTerminalState {
+                grid: TextGrid::new(80, 24),
+                cols: 80,
+                rows: 24,
+                pending_events: vec![PaneEvent::FocusReporting { enabled }],
+            })
+        }
+
+        #[tokio::test]
+        async fn update_focus_reporting_from_snapshots_collects_state() {
+            let kdl = r#"
+                layout {
+                    pane kind=shell label="focus-test"
+                }
+            "#;
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let (mut ctx, _layout_root, _last_area) =
+                super::input_tests::setup_fixture_ctx_with_runner(
+                    kdl,
+                    0,
+                    Router::new(vec![]),
+                    |pane, layer_id, close_tx| {
+                        PaneRunner::with_pty_for_test(
+                            pane,
+                            layer_id,
+                            Box::new(StubPty::new(layer_id)),
+                            Some(close_tx),
+                        )
+                    },
+                    LayoutRect {
+                        x: 0,
+                        y: 0,
+                        w: 80,
+                        h: 24,
+                    },
+                    &mut terminal,
+                );
+            let layer_id = ctx.runners[0].layer_id();
+
+            let snapshots = vec![Some(PaneTerminalState {
+                grid: TextGrid::new(80, 24),
+                cols: 80,
+                rows: 24,
+                pending_events: vec![PaneEvent::FocusReporting { enabled: true }],
+            })];
+            ctx.update_focus_reporting_from_snapshots(&snapshots);
+
+            assert_eq!(
+                ctx.pane_focus_reporting.get(&layer_id),
+                Some(&true),
+                "focus reporting should be enabled for the pane"
+            );
+            assert!(
+                ctx.host_focus_reporting,
+                "host focus reporting should be enabled when any pane requests it"
+            );
+        }
+
+        #[tokio::test]
+        async fn host_focus_event_forwards_to_focused_pane() {
+            let kdl = r#"
+                layout {
+                    pane kind=shell label="focus-test"
+                }
+            "#;
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let (mut ctx, _layout_root, _last_area) =
+                super::input_tests::setup_fixture_ctx_with_runner(
+                    kdl,
+                    0,
+                    Router::new(vec![]),
+                    |pane, layer_id, close_tx| {
+                        PaneRunner::with_pty_for_test(
+                            pane,
+                            layer_id,
+                            Box::new(StubPty::new(layer_id)),
+                            Some(close_tx),
+                        )
+                    },
+                    LayoutRect {
+                        x: 0,
+                        y: 0,
+                        w: 80,
+                        h: 24,
+                    },
+                    &mut terminal,
+                );
+            let layer_id = ctx.runners[0].layer_id();
+            ctx.pane_focus_reporting.insert(layer_id, true);
+            ctx.host_focus_reporting = true;
+
+            // The runner is a widget by default in setup_run_loop_ctx, so we
+            // cannot easily observe the written bytes. Instead, verify the
+            // method does not panic and that the host focus state is tracked.
+            ctx.handle_event_full(&crossterm::event::Event::FocusGained);
+            assert!(ctx.host_focused, "host should be marked as focused");
+
+            ctx.handle_event_full(&crossterm::event::Event::FocusLost);
+            assert!(!ctx.host_focused, "host should be marked as unfocused");
+        }
+
+        #[tokio::test]
+        async fn host_focus_event_skips_pane_without_focus_reporting() {
+            let kdl = r#"
+                layout {
+                    pane kind=shell label="focus-test"
+                }
+            "#;
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let (mut ctx, _layout_root, _last_area) =
+                super::input_tests::setup_fixture_ctx_with_runner(
+                    kdl,
+                    0,
+                    Router::new(vec![]),
+                    |pane, layer_id, close_tx| {
+                        PaneRunner::with_pty_for_test(
+                            pane,
+                            layer_id,
+                            Box::new(StubPty::new(layer_id)),
+                            Some(close_tx),
+                        )
+                    },
+                    LayoutRect {
+                        x: 0,
+                        y: 0,
+                        w: 80,
+                        h: 24,
+                    },
+                    &mut terminal,
+                );
+            // Pane has not requested focus reporting.
+            ctx.handle_event_full(&crossterm::event::Event::FocusGained);
+            assert!(ctx.host_focused);
+            ctx.handle_event_full(&crossterm::event::Event::FocusLost);
+            assert!(!ctx.host_focused);
+        }
+
+        /// Build a `TickContext` with a single pane backed by a recording
+        /// `StubPty`. `pane_focus_reporting` initializes both the stub's
+        /// `focus_reporting_enabled` state and the context's
+        /// `pane_focus_reporting` / `host_focus_reporting` flags. Returns the
+        /// context, the recorder, and the pane's layer id.
+        fn setup_focus_recording_test<'a>(
+            terminal: &'a mut ratatui::Terminal<ratatui::backend::TestBackend>,
+            label: &str,
+            host_focused: bool,
+            pane_focus_reporting: bool,
+        ) -> (TickContext<'a, ratatui::backend::TestBackend>, Recorder, PaneLayerId) {
+            let kdl = format!(
+                r#"
+                layout {{
+                    pane kind=shell label="{}"
+                }}
+            "#,
+                label
+            );
+            let recorder: std::cell::RefCell<Option<Recorder>> = std::cell::RefCell::new(None);
+            let (mut ctx, _layout_root, _last_area) =
+                super::input_tests::setup_fixture_ctx_with_runner(
+                    &kdl,
+                    0,
+                    Router::new(vec![]),
+                    |pane, layer_id, close_tx| {
+                        let (stub, rec) = if pane_focus_reporting {
+                            StubPty::with_focus_reporting_recording(layer_id)
+                        } else {
+                            StubPty::new_recording(layer_id)
+                        };
+                        *recorder.borrow_mut() = Some(rec);
+                        PaneRunner::with_pty_for_test(
+                            pane,
+                            layer_id,
+                            Box::new(stub),
+                            Some(close_tx),
+                        )
+                    },
+                    LayoutRect {
+                        x: 0,
+                        y: 0,
+                        w: 80,
+                        h: 24,
+                    },
+                    terminal,
+                );
+            ctx.host_focused = host_focused;
+            let layer_id = ctx.runners[0].layer_id();
+            ctx.pane_focus_reporting.insert(layer_id, pane_focus_reporting);
+            ctx.host_focus_reporting = pane_focus_reporting;
+            let recorder = recorder.into_inner().expect("recorder was set");
+            (ctx, recorder, layer_id)
+        }
+
+        /// End-to-end: when the focused pane has requested focus reporting,
+        /// a host `FocusGained` event is forwarded as `CSI I` (ESC [ I).
+        #[tokio::test]
+        async fn focus_gained_forwards_csi_i_to_focused_pane() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let (mut ctx, recorder, _layer_id) =
+                setup_focus_recording_test(&mut terminal, "focus-gained-test", true, true);
+
+            ctx.handle_event_full(&crossterm::event::Event::FocusGained);
+
+            let written = recorder.lock().unwrap();
+            assert_eq!(written.len(), 1, "exactly one write should be recorded");
+            assert_eq!(
+                written[0], b"[I",
+                "FocusGained should forward CSI I to the focused pane"
+            );
+        }
+
+        /// End-to-end: when the focused pane has requested focus reporting,
+        /// a host `FocusLost` event is forwarded as `CSI O` (ESC [ O).
+        #[tokio::test]
+        async fn focus_lost_forwards_csi_o_to_focused_pane() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let (mut ctx, recorder, _layer_id) =
+                setup_focus_recording_test(&mut terminal, "focus-lost-test", true, true);
+
+            ctx.handle_event_full(&crossterm::event::Event::FocusLost);
+
+            let written = recorder.lock().unwrap();
+            assert_eq!(written.len(), 1, "exactly one write should be recorded");
+            assert_eq!(
+                written[0], b"[O",
+                "FocusLost should forward CSI O to the focused pane"
+            );
+        }
+
+        /// End-to-end: focus events must NOT be forwarded to a pane that has
+        /// not requested focus reporting, even when the host terminal reports
+        /// a focus change.
+        #[tokio::test]
+        async fn focus_event_not_forwarded_when_focus_reporting_disabled() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let (mut ctx, recorder, _layer_id) =
+                setup_focus_recording_test(&mut terminal, "focus-disabled-test", true, false);
+
+            ctx.handle_event_full(&crossterm::event::Event::FocusGained);
+            ctx.handle_event_full(&crossterm::event::Event::FocusLost);
+
+            let written = recorder.lock().unwrap();
+            assert!(
+                written.is_empty(),
+                "no focus events should be forwarded when focus reporting is disabled"
+            );
+        }
+
+        /// When a pane enables focus reporting, cmdash must immediately
+        /// report the current host focus state to that pane. If the host
+        /// is focused, the pane receives `CSI I` (`ESC [ I`).
+        #[tokio::test]
+        async fn initial_focus_state_sent_when_pane_enables_focus_reporting() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let (mut ctx, recorder, layer_id) =
+                setup_focus_recording_test(&mut terminal, "focus-init-test", true, false);
+
+            ctx.update_focus_reporting_from_snapshots(&[focus_reporting_enabled_snapshot(true)]);
+
+            let written = recorder.lock().unwrap();
+            assert_eq!(
+                written.as_slice(),
+                vec![b"[I".to_vec()].as_slice(),
+                "newly enabled pane should immediately receive CSI I when host is focused"
+            );
+            assert_eq!(
+                ctx.pane_focus_reporting.get(&layer_id),
+                Some(&true),
+                "pane focus reporting state should be recorded"
+            );
+        }
+
+        /// When a pane enables focus reporting while the host is not
+        /// focused, the pane immediately receives `CSI O` (`ESC [ O`).
+        #[tokio::test]
+        async fn initial_focus_state_sends_focus_out_when_host_unfocused() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let (mut ctx, recorder, _layer_id) =
+                setup_focus_recording_test(&mut terminal, "focus-init-out-test", false, false);
+
+            ctx.update_focus_reporting_from_snapshots(&[focus_reporting_enabled_snapshot(true)]);
+
+            let written = recorder.lock().unwrap();
+            assert_eq!(
+                written.as_slice(),
+                vec![b"[O".to_vec()].as_slice(),
+                "newly enabled pane should immediately receive CSI O when host is unfocused"
+            );
+        }
+
+        /// Re-enabling focus reporting (e.g. the child emitted the enable
+        /// sequence again) must not send a duplicate initial focus event.
+        #[tokio::test]
+        async fn re_enabling_focus_reporting_does_not_resend_initial_state() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let (mut ctx, recorder, _layer_id) =
+                setup_focus_recording_test(&mut terminal, "focus-reenable-test", true, false);
+
+            ctx.update_focus_reporting_from_snapshots(&[focus_reporting_enabled_snapshot(true)]);
+
+            {
+                let mut written = recorder.lock().unwrap();
+                written.clear();
+            }
+
+            ctx.update_focus_reporting_from_snapshots(&[focus_reporting_enabled_snapshot(true)]);
+
+            let written = recorder.lock().unwrap();
+            assert!(
+                written.is_empty(),
+                "re-enabling focus reporting should not send a duplicate initial focus event"
+            );
         }
     }
 
