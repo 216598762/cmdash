@@ -382,6 +382,14 @@ pub enum PaneEvent {
     /// Kitty keyboard protocol progressive-enhancement flags
     /// requested (or disabled) by the child application.
     KeyboardEnhancement { flags: u8 },
+    /// Bracketed paste mode requested (enabled/disabled) by the
+    /// child application. `CSI ? 2004 h` enables; `CSI ? 2004 l`
+    /// disables.
+    BracketedPaste { enabled: bool },
+    /// Focus reporting mode requested (enabled/disabled) by the
+    /// child application. `CSI ? 1004 h` enables; `CSI ? 1004 l`
+    /// disables.
+    FocusReporting { enabled: bool },
 }
 
 /// A parsed kitty graphics command.
@@ -782,6 +790,31 @@ impl<'a> VtePerf<'a> {
                 self.events
                     .push(PaneEvent::KeyboardEnhancement { flags: 0 });
             }
+            // Bracketed paste mode: CSI ? 2004 h enables, CSI ? 2004 l disables.
+            // The '?' private marker arrives in `intermediates`; the mode number
+            // is the first parameter.
+            'h' if intermediates.contains(&b'?') => {
+                let mode = p0();
+                if mode == 2004 {
+                    self.events
+                        .push(PaneEvent::BracketedPaste { enabled: true });
+                }
+                if mode == 1004 {
+                    self.events
+                        .push(PaneEvent::FocusReporting { enabled: true });
+                }
+            }
+            'l' if intermediates.contains(&b'?') => {
+                let mode = p0();
+                if mode == 2004 {
+                    self.events
+                        .push(PaneEvent::BracketedPaste { enabled: false });
+                }
+                if mode == 1004 {
+                    self.events
+                        .push(PaneEvent::FocusReporting { enabled: false });
+                }
+            }
             _ => {}
         }
     }
@@ -925,6 +958,9 @@ pub struct PanePty {
     /// so the host terminal sends enhanced key reports when any
     /// pane needs them.
     keyboard_flags: u8,
+    /// Whether the child application has requested focus
+    /// reporting (`CSI ? 1004 h`).
+    focus_reporting_enabled: bool,
     layer_id: PaneLayerId,
     cols: u16,
     rows: u16,
@@ -979,6 +1015,12 @@ impl PanePty {
     /// flags requested by the child application.
     pub fn keyboard_flags(&self) -> u8 {
         self.keyboard_flags
+    }
+
+    /// Whether the child application has requested focus
+    /// reporting (`CSI ? 1004 h`).
+    pub fn focus_reporting_enabled(&self) -> bool {
+        self.focus_reporting_enabled
     }
 
     /// Spawn a child PTY. Returns the pane state machine + a
@@ -1121,6 +1163,7 @@ impl PanePty {
                 title: String::new(),
                 pending_events: Vec::new(),
                 keyboard_flags: 0,
+                focus_reporting_enabled: false,
                 layer_id,
                 cols,
                 rows,
@@ -1300,12 +1343,15 @@ impl PanePty {
             rows: self.rows,
         };
         self.parser.advance(&mut driver, &vte_bytes);
-        // Apply any keyboard-enhancement events emitted during
-        // parsing so subsequent snapshots report the pane's
-        // current requested flags.
+        // Apply any keyboard-enhancement or focus-reporting
+        // events emitted during parsing so subsequent snapshots
+        // report the pane's current requested state.
         for event in &self.pending_events {
             if let PaneEvent::KeyboardEnhancement { flags } = event {
                 self.keyboard_flags = *flags;
+            }
+            if let PaneEvent::FocusReporting { enabled } = event {
+                self.focus_reporting_enabled = *enabled;
             }
         }
         if let Some(child) = self.child.as_mut() {
@@ -1413,6 +1459,7 @@ pub trait PanePtyOps {
     fn try_wait(&mut self) -> Result<Option<i32>, PtyError>;
     fn kill(&mut self) -> Result<(), PtyError>;
     fn keyboard_flags(&self) -> u8;
+    fn focus_reporting_enabled(&self) -> bool;
     fn scrollback_up(&mut self, n: usize);
     fn scrollback_down(&mut self, n: usize);
     fn scrollback_reset(&mut self);
@@ -1449,6 +1496,9 @@ impl PanePtyOps for PanePty {
     }
     fn keyboard_flags(&self) -> u8 {
         PanePty::keyboard_flags(self)
+    }
+    fn focus_reporting_enabled(&self) -> bool {
+        PanePty::focus_reporting_enabled(self)
     }
     fn scrollback_up(&mut self, n: usize) {
         self.grid.scrollback_up(n);
@@ -1602,6 +1652,60 @@ mod internal_sanity_tests {
     fn invalid_size_spawn_rejected() {
         let err = PanePty::spawn(ShellSpec::LoginShell, 0, 0, PaneLayerId(0)).unwrap_err();
         assert!(matches!(err, PtyError::InvalidSize(0, 0)));
+    }
+
+    /// Focus reporting mode CSI sequences are surfaced as
+    /// `PaneEvent::FocusReporting` events. `CSI ? 1004 h`
+    /// enables; `CSI ? 1004 l` disables.
+    #[test]
+    fn focus_reporting_csi_sequences_emit_events() {
+        let (mut pty, _reader) = PanePty::spawn(
+            ShellSpec::Command {
+                argv: vec!["/bin/cat".to_string()],
+            },
+            10,
+            10,
+            PaneLayerId(55),
+        )
+        .expect("spawn pty");
+        pty.advance(b"\x1b[?1004h").expect("advance enable");
+        let events = pty.drain_events();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, PaneEvent::FocusReporting { enabled: true })));
+        assert!(pty.focus_reporting_enabled());
+        pty.advance(b"\x1b[?1004l").expect("advance disable");
+        let events = pty.drain_events();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, PaneEvent::FocusReporting { enabled: false })));
+        assert!(!pty.focus_reporting_enabled());
+    }
+
+    /// Bracketed paste mode CSI sequences are surfaced as
+    /// `PaneEvent::BracketedPaste` events. `CSI ? 2004 h`
+    /// enables; `CSI ? 2004 l` disables.
+    #[test]
+    fn bracketed_paste_csi_sequences_emit_events() {
+        let (mut pty, _reader) = PanePty::spawn(
+            ShellSpec::Command {
+                argv: vec!["/bin/cat".to_string()],
+            },
+            10,
+            10,
+            PaneLayerId(55),
+        )
+        .expect("spawn pty");
+        pty.advance(b"\x1b[?2004h").expect("advance enable");
+        let events = pty.drain_events();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, PaneEvent::BracketedPaste { enabled: true })));
+        pty.advance(b"\x1b[?2004l").expect("advance disable");
+        let events = pty.drain_events();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, PaneEvent::BracketedPaste { enabled: false })));
     }
 
     /// Pending-wrap deferral: a printable that fills the

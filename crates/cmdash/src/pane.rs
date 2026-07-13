@@ -395,6 +395,15 @@ impl PaneRunner {
             .unwrap_or(0)
     }
 
+    /// Whether the child PTY has requested focus reporting
+    /// (`CSI ? 1004 h`). Widget panes always return `false`.
+    pub fn focus_reporting_enabled(&self) -> bool {
+        self.pty
+            .as_ref()
+            .map(|pty| pty.focus_reporting_enabled())
+            .unwrap_or(false)
+    }
+
     /// Move the scrollback viewport up by `n` rows.
     pub fn scrollback_up(&mut self, n: usize) {
         if let Some(pty) = self.pty.as_mut() {
@@ -469,8 +478,15 @@ impl PaneRunner {
     /// `internal_sanity_tests` block below to pin invariants that
     /// real-PTY tests can't reach deterministically. Production
     /// paths still go through [`PaneRunner::spawn_with_graphics`].
-    #[cfg(test)]
-    pub(crate) fn with_pty_for_test(
+    /// # Crate-internal
+    ///
+    /// This constructor is `#[doc(hidden)] pub` (rather than
+    /// `#[cfg(test)] pub(crate)`) because binary integration tests
+    /// in `cmdash/src/main.rs` need to construct stub-backed
+    /// runners without spawning real PTYs. It is still a test-only
+    /// API and should not be used outside test code.
+    #[doc(hidden)]
+    pub fn with_pty_for_test(
         computed: ComputedPane,
         #[allow(unused)] layer_id: PaneLayerId,
         pty: Box<dyn PanePtyOps + Send>,
@@ -489,11 +505,11 @@ impl PaneRunner {
     }
 }
 
-/// Drain `PaneEvent::KeyboardEnhancement` events from the
-/// freshly-collected pane snapshots and merge any requested
-/// enhancement flags into `out`, keyed by layer id. Widget runners
-/// are skipped because they have no PTY to request enhancements.
-/// Returns `true` if any entry was inserted or updated.
+/// Generic helper: drain matching [`PaneEvent`]s from the
+/// freshly-collected pane snapshots and merge the extracted value
+/// into `out`, keyed by layer id. Widget runners are skipped
+/// because they have no PTY to request PTY-level modes. Returns
+/// `true` if any entry was inserted or updated.
 ///
 /// This helper is kept in the lib crate so it can be unit-tested
 /// with the `#[cfg(test)]` `PaneRunner::with_pty_for_test` constructor
@@ -508,6 +524,39 @@ impl PaneRunner {
 /// lib↔binary boundary tradeoff — callers outside the workspace
 /// should not depend on this symbol. See `docs/roadmap.md` §4.1
 /// "Known tech debt".
+pub fn collect_pane_events<T>(
+    runners: &[PaneRunner],
+    snapshots: &[Option<PaneTerminalState>],
+    out: &mut HashMap<PaneLayerId, T>,
+    mut extract: impl FnMut(&PaneEvent) -> Option<T>,
+) -> bool
+where
+    T: Copy + PartialEq,
+{
+    let mut changed = false;
+    for (runner, snapshot) in runners.iter().zip(snapshots.iter()) {
+        if runner.is_widget() {
+            continue;
+        }
+        if let Some(snapshot) = snapshot {
+            for event in &snapshot.pending_events {
+                if let Some(value) = extract(event) {
+                    let old = out.insert(runner.layer_id(), value);
+                    if old != Some(value) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Drain `PaneEvent::KeyboardEnhancement` events from the
+/// freshly-collected pane snapshots and merge any requested
+/// enhancement flags into `out`, keyed by layer id. Widget runners
+/// are skipped because they have no PTY to request enhancements.
+/// Returns `true` if any entry was inserted or updated.
 ///
 /// Complementary to [`PaneRunner::keyboard_flags`] (which returns
 /// the cached value from [`PanePty::keyboard_flags`]); this
@@ -519,23 +568,61 @@ pub fn collect_keyboard_enhancement_flags(
     snapshots: &[Option<PaneTerminalState>],
     out: &mut HashMap<PaneLayerId, u8>,
 ) -> bool {
-    let mut changed = false;
-    for (runner, snapshot) in runners.iter().zip(snapshots.iter()) {
-        if runner.is_widget() {
-            continue;
+    collect_pane_events(runners, snapshots, out, |event| {
+        if let PaneEvent::KeyboardEnhancement { flags } = event {
+            Some(*flags)
+        } else {
+            None
         }
-        if let Some(snapshot) = snapshot {
-            for event in &snapshot.pending_events {
-                if let PaneEvent::KeyboardEnhancement { flags: f } = event {
-                    let old = out.insert(runner.layer_id(), *f);
-                    if old != Some(*f) {
-                        changed = true;
-                    }
-                }
-            }
+    })
+}
+
+/// Drain `PaneEvent::BracketedPaste` events from the freshly-
+/// collected pane snapshots and merge the requested state into
+/// `out`, keyed by layer id. Widget runners are skipped because
+/// they have no PTY to request bracketed paste. Returns `true` if
+/// any entry was inserted or updated.
+///
+/// This helper is the bracketed-paste twin of
+/// [`collect_keyboard_enhancement_flags`]. The binary's
+/// `update_bracketed_paste_from_snapshots` feeds results into
+/// `TickContext::pane_bracketed_paste`.
+pub fn collect_bracketed_paste_flags(
+    runners: &[PaneRunner],
+    snapshots: &[Option<PaneTerminalState>],
+    out: &mut HashMap<PaneLayerId, bool>,
+) -> bool {
+    collect_pane_events(runners, snapshots, out, |event| {
+        if let PaneEvent::BracketedPaste { enabled } = event {
+            Some(*enabled)
+        } else {
+            None
         }
-    }
-    changed
+    })
+}
+
+/// Drain `PaneEvent::FocusReporting` events from the freshly-
+/// collected pane snapshots and merge the requested state into
+/// `out`, keyed by layer id. Widget runners are skipped because
+/// they have no PTY to request focus reporting. Returns `true` if
+/// any entry was inserted or updated.
+///
+/// This helper is the focus-reporting twin of
+/// [`collect_bracketed_paste_flags`]. The binary's
+/// `update_focus_reporting_from_snapshots` feeds results into
+/// `TickContext::pane_focus_reporting`.
+pub fn collect_focus_reporting_flags(
+    runners: &[PaneRunner],
+    snapshots: &[Option<PaneTerminalState>],
+    out: &mut HashMap<PaneLayerId, bool>,
+) -> bool {
+    collect_pane_events(runners, snapshots, out, |event| {
+        if let PaneEvent::FocusReporting { enabled } = event {
+            Some(*enabled)
+        } else {
+            None
+        }
+    })
 }
 
 impl Drop for PaneRunner {
@@ -690,6 +777,9 @@ mod internal_sanity_tests {
         }
         fn keyboard_flags(&self) -> u8 {
             0
+        }
+        fn focus_reporting_enabled(&self) -> bool {
+            false
         }
         fn scrollback_up(&mut self, _n: usize) {}
         fn scrollback_down(&mut self, _n: usize) {}
@@ -857,20 +947,13 @@ mod internal_sanity_tests {
         let computed = make_test_pane();
         let layer_id = PaneLayerId(42);
         let stub = StubPty::new(layer_id);
-        let runner = PaneRunner::with_pty_for_test(
-            computed,
-            layer_id,
-            Box::new(stub),
-            None,
-        );
+        let runner = PaneRunner::with_pty_for_test(computed, layer_id, Box::new(stub), None);
         let runners = vec![runner];
         let snapshot = cmdash_pty::PaneTerminalState {
             grid: TextGrid::new(80, 24),
             cols: 80,
             rows: 24,
-            pending_events: vec![cmdash_pty::PaneEvent::KeyboardEnhancement {
-                flags: 0b0000_0111,
-            }],
+            pending_events: vec![cmdash_pty::PaneEvent::KeyboardEnhancement { flags: 0b0000_0111 }],
         };
 
         let mut flags = HashMap::new();
@@ -878,6 +961,132 @@ mod internal_sanity_tests {
 
         assert!(changed);
         assert_eq!(flags.get(&layer_id), Some(&0b0000_0111));
+    }
+
+    /// `collect_pane_events` generic helper: when a pane emits
+    /// multiple matching events in one tick, the last extracted
+    /// value wins.
+    #[test]
+    fn collect_pane_events_last_value_wins_per_pane() {
+        let computed = make_test_pane();
+        let layer_id = PaneLayerId(42);
+        let stub = StubPty::new(layer_id);
+        let runner = PaneRunner::with_pty_for_test(computed, layer_id, Box::new(stub), None);
+        let runners = vec![runner];
+        let snapshot = cmdash_pty::PaneTerminalState {
+            grid: TextGrid::new(80, 24),
+            cols: 80,
+            rows: 24,
+            pending_events: vec![
+                cmdash_pty::PaneEvent::KeyboardEnhancement { flags: 0b0000_0001 },
+                cmdash_pty::PaneEvent::KeyboardEnhancement { flags: 0b0000_0110 },
+            ],
+        };
+
+        let mut flags = HashMap::new();
+        let changed = collect_pane_events(&runners, &[Some(snapshot)], &mut flags, |event| {
+            if let cmdash_pty::PaneEvent::KeyboardEnhancement { flags } = event {
+                Some(*flags)
+            } else {
+                None
+            }
+        });
+
+        assert!(changed);
+        assert_eq!(flags.get(&layer_id), Some(&0b0000_0110));
+    }
+
+    /// `collect_pane_events` generic helper: widget runners are
+    /// skipped because they have no PTY to request PTY-level modes.
+    #[test]
+    fn collect_pane_events_skips_widget_runners() {
+        use cmdash_widget_sdk::{CmdashWidget, WidgetEvent};
+
+        struct DummyWidget;
+        impl CmdashWidget for DummyWidget {
+            fn name(&self) -> &str {
+                "dummy"
+            }
+            fn render(&mut self, _area: ratatui::layout::Rect, _frame: &mut ratatui::Frame) {}
+            fn on_event(&mut self, _event: &WidgetEvent) {}
+        }
+
+        let computed = make_test_pane();
+        let layer_id = PaneLayerId(42);
+        let runner = PaneRunner::spawn_widget(computed, layer_id, Box::new(DummyWidget), None);
+        let runners = vec![runner];
+        let snapshot = cmdash_pty::PaneTerminalState {
+            grid: TextGrid::new(80, 24),
+            cols: 80,
+            rows: 24,
+            pending_events: vec![cmdash_pty::PaneEvent::BracketedPaste { enabled: true }],
+        };
+
+        let mut out = HashMap::new();
+        let changed = collect_pane_events(&runners, &[Some(snapshot)], &mut out, |event| {
+            if let cmdash_pty::PaneEvent::BracketedPaste { enabled } = event {
+                Some(*enabled)
+            } else {
+                None
+            }
+        });
+
+        assert!(!changed);
+        assert!(out.is_empty());
+    }
+
+    /// `collect_pane_events` generic helper: re-inserting the
+    /// same value returns false and leaves the map unchanged.
+    #[test]
+    fn collect_pane_events_no_change_when_value_unchanged() {
+        let computed = make_test_pane();
+        let layer_id = PaneLayerId(42);
+        let stub = StubPty::new(layer_id);
+        let runner = PaneRunner::with_pty_for_test(computed, layer_id, Box::new(stub), None);
+        let runners = vec![runner];
+        let snapshot = cmdash_pty::PaneTerminalState {
+            grid: TextGrid::new(80, 24),
+            cols: 80,
+            rows: 24,
+            pending_events: vec![cmdash_pty::PaneEvent::BracketedPaste { enabled: true }],
+        };
+
+        let mut out = HashMap::new();
+        out.insert(layer_id, true);
+        let changed = collect_pane_events(&runners, &[Some(snapshot)], &mut out, |event| {
+            if let cmdash_pty::PaneEvent::BracketedPaste { enabled } = event {
+                Some(*enabled)
+            } else {
+                None
+            }
+        });
+
+        assert!(!changed);
+        assert_eq!(out.get(&layer_id), Some(&true));
+    }
+
+    /// Focus-reporting flag extraction: a non-widget runner's
+    /// `FocusReporting` events must be collected into a map keyed
+    /// by layer id.
+    #[test]
+    fn collect_focus_reporting_flags_extracts_state() {
+        let computed = make_test_pane();
+        let layer_id = PaneLayerId(42);
+        let stub = StubPty::new(layer_id);
+        let runner = PaneRunner::with_pty_for_test(computed, layer_id, Box::new(stub), None);
+        let runners = vec![runner];
+        let snapshot = cmdash_pty::PaneTerminalState {
+            grid: TextGrid::new(80, 24),
+            cols: 80,
+            rows: 24,
+            pending_events: vec![cmdash_pty::PaneEvent::FocusReporting { enabled: true }],
+        };
+
+        let mut flags = HashMap::new();
+        let changed = collect_focus_reporting_flags(&runners, &[Some(snapshot)], &mut flags);
+
+        assert!(changed);
+        assert_eq!(flags.get(&layer_id), Some(&true));
     }
 
     /// Ordering test: `close_tx.send()` fires BEFORE

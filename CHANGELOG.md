@@ -96,8 +96,25 @@ The workspace has 7 crates:
 - **Sixel fallback**: `GraphicsProtocol` enum with `detect()` from
   `TERM`/`TERM_PROGRAM`/`CMDASH_GRAPHICS` env vars and DA1 device-
   attributes query for runtime detection. Verified with unit tests.
+- **Bracketed paste support**: `cmdash-pty` parses `CSI ? 2004 h` /
+  `CSI ? 2004 l` and surfaces `PaneEvent::BracketedPaste`; the binary
+  tracks per-pane state, synchronizes the host terminal via crossterm
+  `EnableBracketedPaste` / `DisableBracketedPaste`, and wraps pasted
+  text in `\x1b[200~` / `\x1b[201~` for panes that requested it.
+  Host state is the union across all live panes, so focus changes do
+  not disable the mode while any pane still has it enabled.
 - **GPG signing wrapper** for TTY-less hosts:
   `scripts/gpg-cmdash-wrapper.sh` + `just gpg-setup` recipe.
+- **Focus reporting support**: `cmdash-pty` parses `CSI ? 1004 h` /
+  `CSI ? 1004 l` and surfaces `PaneEvent::FocusReporting`; the binary
+  tracks per-pane state and forwards host `FocusGained` / `FocusLost`
+  events to requesting panes as `ESC [ I` / `ESC [ O`. Host state is
+  the union across all live panes, so focus changes do not disable the
+  mode while another pane still has it requested.
+- **Shared test helpers**: a new `test_helpers` module in
+  `crates/cmdash/src/main.rs` provides a reusable `StubPty` for unit
+  tests, deduplicating the previously separate stub implementations in
+  the bracketed-paste and focus-reporting test suites.
 
 ### Known limitations
 

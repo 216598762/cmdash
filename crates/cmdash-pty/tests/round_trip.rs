@@ -405,3 +405,88 @@ fn pty_csi_erase_in_line_clears_to_eol() {
     assert_eq!(snap.grid.cell(2, 0).ch, ' ');
     assert_eq!(snap.grid.cell(3, 0).ch, ' ');
 }
+/// Real PTY integration test for focus reporting. A child shell
+/// emits `CSI ? 1004 h` on startup; the PTY parses the sequence
+/// through the real reader and records that focus reporting is
+/// enabled. After that, the multiplexer writes `CSI I` and
+/// `CSI O` to the child. The writes succeed, so the child receives
+/// the focus events.
+///
+/// This test exercises the full spawn → read → advance → write
+/// cycle, not just the in-memory `advance()` path covered by the
+/// in-tree sanity test.
+#[test]
+fn pty_focus_reporting_child_emits_enable_and_receives_focus_events() {
+    let (mut pty, reader) = PanePty::spawn(
+        ShellSpec::Command {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                r#"printf '\033[?1004h'; cat"#.to_string(),
+            ],
+        },
+        10,
+        5,
+        PaneLayerId(14),
+    )
+    .expect("spawn shell pty");
+    let reader = std::sync::Arc::new(std::sync::Mutex::new(reader));
+
+    // 1. Child shell enables focus reporting on startup. Drain the
+    //    real reader and advance the PTY with whatever the child
+    //    emitted.
+    let emitted = drain(&reader, drain_deadline_default());
+    pty.advance(&emitted)
+        .expect("advance emitted enable sequence");
+    assert!(
+        pty.focus_reporting_enabled(),
+        "focus reporting should be enabled after child emits CSI ? 1004 h"
+    );
+    let events = pty.drain_events();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, PaneEvent::FocusReporting { enabled: true })));
+
+    // 2. Multiplexer forwards focus-gained and focus-lost events.
+    //    A successful write to the PTY master means the bytes will
+    //    reach the child.
+    let n = pty.write(b"\x1b[I").expect("write focus-gained");
+    assert_eq!(n, 3, "CSI I should be written in full");
+    let n = pty.write(b"\x1b[O").expect("write focus-lost");
+    assert_eq!(n, 3, "CSI O should be written in full");
+}
+
+/// Focus reporting can be disabled with `CSI ? 1004 l`. After
+/// disabling, `focus_reporting_enabled()` returns false and a
+/// subsequent `PaneEvent::FocusReporting { enabled: false }` is
+/// emitted.
+#[test]
+fn pty_focus_reporting_disable_clears_state() {
+    let (mut pty, reader) = PanePty::spawn(
+        ShellSpec::Command {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                r#"printf '\033[?1004h\033[?1004l'; cat"#.to_string(),
+            ],
+        },
+        10,
+        5,
+        PaneLayerId(15),
+    )
+    .expect("spawn shell pty");
+    let reader = std::sync::Arc::new(std::sync::Mutex::new(reader));
+
+    // The child emits both enable and disable sequences on startup.
+    // Drain the real reader and advance the PTY.
+    let emitted = drain(&reader, drain_deadline_default());
+    pty.advance(&emitted).expect("advance emitted sequences");
+    assert!(
+        !pty.focus_reporting_enabled(),
+        "focus reporting should be disabled after child emits CSI ? 1004 l"
+    );
+    let events = pty.drain_events();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, PaneEvent::FocusReporting { enabled: false })));
+}

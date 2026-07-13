@@ -120,6 +120,16 @@ The `--log=<path>` flag controls **where** tracing events land;
 mode), `RUST_LOG` is honored. See
 [`docs/configuration.md`](./docs/configuration.md) for details.
 
+## Bracketed paste support
+
+cmdash supports the standard terminal bracketed-paste protocol. When a
+child application emits `ESC[?2004h`, cmdash enables bracketed paste on
+the host terminal and wraps subsequent pasted text in `ESC[200~` /
+`ESC[201~` for that pane. The host state is the union across all live
+panes, so focus changes do not disable the mode while another pane still
+has it requested. See
+[`docs/configuration.md`](./docs/configuration.md) §5.5 for details.
+
 ## Architecture (one frame)
 
 The `TickContext::run` loop iterates `self.runners` once per frame:

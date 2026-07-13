@@ -479,6 +479,113 @@ keybinds {
 pane's PTY, so you can still type normally while in PaneResize or
 PresetPick mode — only the explicitly bound keys are intercepted.
 
+### 5.5. Bracketed paste support
+
+cmdash supports the terminal bracketed-paste protocol so child
+applications can distinguish pasted text from typed keystrokes. A pane
+requests the mode by emitting the standard private-mode sequences:
+
+```text
+# Enable bracketed paste
+ESC [ ? 2 0 4 h
+
+# Disable bracketed paste
+ESC [ ? 2 0 4 l
+```
+
+When a pane has requested bracketed paste, cmdash wraps pasted content
+in the standard delimiters before forwarding it to that pane:
+
+```text
+ESC [ 2 0 0 ~ <pasted text> ESC [ 2 0 1 ~
+```
+
+Pasted text is forwarded raw for panes that have not requested the mode.
+
+**Host synchronization.** cmdash tracks bracketed-paste state per pane
+and enables it on the host terminal whenever **any** live pane has it
+requested. This means:
+
+- Focus changes do not disable bracketed paste while another pane still
+  wants it.
+- The host terminal is disabled only when no pane still has the mode
+  enabled.
+
+**Example — a shell that enables bracketed paste on startup:**
+
+```kdl
+layout {
+    // \\033 is the octal escape for the ESC byte, so the shell emits
+    // the literal sequence ESC[?2004h before replacing itself with bash.
+    pane kind=shell label="editor" command="sh -c 'printf \"\\033[?2004h\"; exec bash'"
+}
+
+keybinds {
+    bind "alt-w"  action="pane.close"
+    bind "alt-q"  action="app.close"
+}
+```
+
+In this example the shell prints `ESC[?2004h` on startup. cmdash
+intercepts the sequence, records that the pane wants bracketed paste,
+enables it on the host terminal, and from then on wraps any pasted
+text in `ESC[200~` / `ESC[201~` for that pane.
+
+### 5.6. Focus reporting support
+
+cmdash supports the standard terminal focus-reporting protocol so child
+applications can react to the host terminal gaining or losing focus. A pane
+requests the mode by emitting the standard private-mode sequences:
+
+```text
+# Enable focus reporting
+ESC [ ? 1 0 0 4 h
+
+# Disable focus reporting
+ESC [ ? 1 0 0 4 l
+```
+
+When a pane has requested focus reporting and the host terminal reports a focus
+change, cmdash forwards the appropriate sequence to the focused pane:
+
+```text
+# Host gained focus
+ESC [ I
+
+# Host lost focus
+ESC [ O
+```
+
+**Host synchronization.** cmdash tracks focus-reporting state per pane and
+enables focus-change events on the host terminal whenever **any** live pane has
+it requested. This means:
+
+- Focus changes are forwarded to the currently focused pane only when that pane
+  has requested focus reporting.
+- Focus changes are not forwarded to panes that have not requested the mode.
+- The host terminal continues to emit focus-change events while any pane still
+  wants them.
+
+**Example — a shell that enables focus reporting on startup:**
+
+```kdl
+layout {
+    // \\033 is the octal escape for the ESC byte, so the shell emits
+    // the literal sequence ESC[?1004h before replacing itself with bash.
+    pane kind=shell label="editor" command="sh -c 'printf \"\\033[?1004h\"; exec bash'"
+}
+
+keybinds {
+    bind "alt-w"  action="pane.close"
+    bind "alt-q"  action="app.close"
+}
+```
+
+In this example the shell prints `ESC[?1004h` on startup. cmdash intercepts the
+sequence, records that the pane wants focus reporting, enables focus-change
+events on the host terminal, and from then on forwards `ESC[I` / `ESC[O` to the
+focused pane whenever the host terminal gains or loses focus.
+
 ---
 
 ## 6. Worked examples
