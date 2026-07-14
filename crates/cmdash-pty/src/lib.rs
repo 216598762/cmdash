@@ -241,6 +241,20 @@ impl TextGrid {
     pub fn scrollback_row(&self, idx: usize) -> Option<&[Cell]> {
         self.scrollback.get(idx).map(Vec::as_slice)
     }
+    /// Write a single character at the given grid coordinates.
+    /// Public so tests in downstream crates can build grid fixtures
+    /// without going through the full VT parser.
+    pub fn put_char(&mut self, x: u16, y: u16, ch: char) {
+        self.put(
+            x,
+            y,
+            Color::Default,
+            Color::Default,
+            CellAttrs::default(),
+            ch,
+        );
+    }
+
     fn put(&mut self, x: u16, y: u16, fg: Color, bg: Color, attrs: CellAttrs, ch: char) {
         let idx = self.cell_idx(x, y);
         let next = Cell { ch, fg, bg, attrs };
@@ -390,6 +404,23 @@ pub enum PaneEvent {
     /// child application. `CSI ? 1004 h` enables; `CSI ? 1004 l`
     /// disables.
     FocusReporting { enabled: bool },
+    /// Device attributes query emitted by the child application.
+    /// `CSI c` (DA1) requests primary device attributes;
+    /// `CSI > c` (DA2) requests secondary device attributes.
+    /// The terminal multiplexer is responsible for generating
+    /// the response and writing it back to the child PTY.
+    DeviceAttributesQuery { kind: DeviceAttributesKind },
+}
+
+/// Kind of device-attributes query a child PTY sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceAttributesKind {
+    /// Primary Device Attributes (DA1), triggered by `CSI c`
+    /// or `CSI 0 c`.
+    Primary,
+    /// Secondary Device Attributes (DA2), triggered by
+    /// `CSI > c`.
+    Secondary,
 }
 
 /// A parsed kitty graphics command.
@@ -815,6 +846,24 @@ impl<'a> VtePerf<'a> {
                         .push(PaneEvent::FocusReporting { enabled: false });
                 }
             }
+            // Device attributes queries:
+            //   CSI c       -> Primary Device Attributes (DA1)
+            //   CSI > c     -> Secondary Device Attributes (DA2)
+            // The child is asking the terminal to identify itself.
+            // cmdash intercepts these so the main loop can generate
+            // a capability-appropriate response.
+            'c' if !intermediates.contains(&b'>') && !intermediates.contains(&b'?') => {
+                if p0() == 0 {
+                    self.events.push(PaneEvent::DeviceAttributesQuery {
+                        kind: DeviceAttributesKind::Primary,
+                    });
+                }
+            }
+            'c' if intermediates.contains(&b'>') => {
+                self.events.push(PaneEvent::DeviceAttributesQuery {
+                    kind: DeviceAttributesKind::Secondary,
+                });
+            }
             _ => {}
         }
     }
@@ -1093,11 +1142,30 @@ impl PanePty {
         Ok(())
     }
 
+    /// Spawn a child PTY with no additional environment
+    /// variables. Convenience wrapper around
+    /// [`Self::spawn_with_env`].
     pub fn spawn(
         shell: ShellSpec,
         cols: u16,
         rows: u16,
         layer_id: PaneLayerId,
+    ) -> Result<(Self, PaneReader), PtyError> {
+        Self::spawn_with_env(shell, cols, rows, layer_id, Vec::new())
+    }
+
+    /// Spawn a child PTY, applying the supplied environment
+    /// variables to the child's command. The `env_vars` vector
+    /// contains `(key, value)` pairs that are set on the
+    /// `CommandBuilder` before spawning. This is how cmdash
+    /// advertises host terminal capabilities (TERM, COLORTERM,
+    /// CMDASH_*) to nested shells and applications.
+    pub fn spawn_with_env(
+        shell: ShellSpec,
+        cols: u16,
+        rows: u16,
+        layer_id: PaneLayerId,
+        env_vars: Vec<(String, String)>,
     ) -> Result<(Self, PaneReader), PtyError> {
         if cols == 0 || rows == 0 {
             return Err(PtyError::InvalidSize(cols, rows));
@@ -1131,7 +1199,7 @@ impl PanePty {
         if let Some(fd) = pair.master.as_raw_fd() {
             Self::enable_pty_echo(fd).map_err(|e| PtyError::Spawn(e.into()))?;
         }
-        let cmd = build_command(shell);
+        let cmd = build_command(shell, env_vars);
         debug!(
             layer_id = layer_id.0,
             cols,
@@ -1514,7 +1582,7 @@ impl PanePtyOps for PanePty {
     }
 }
 
-fn build_command(shell: ShellSpec) -> CommandBuilder {
+fn build_command(shell: ShellSpec, env_vars: Vec<(String, String)>) -> CommandBuilder {
     let (program, args): (String, Vec<String>) = match shell {
         ShellSpec::LoginShell => {
             let prog = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -1529,6 +1597,9 @@ fn build_command(shell: ShellSpec) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(program);
     for a in args {
         cmd.arg(a);
+    }
+    for (k, v) in env_vars {
+        cmd.env(k, v);
     }
     cmd
 }
@@ -1941,6 +2012,75 @@ mod internal_sanity_tests {
             events
         );
         assert_eq!(pty.apc.state, ApcScannerState::Idle);
+    }
+
+    /// DA1 query (`ESC [ c`) is surfaced as a
+    /// `PaneEvent::DeviceAttributesQuery` with kind `Primary`.
+    #[test]
+    fn da1_query_emits_primary_device_attributes_event() {
+        let (mut pty, _reader) = PanePty::spawn(
+            ShellSpec::Command {
+                argv: vec!["/bin/cat".to_string()],
+            },
+            10,
+            10,
+            PaneLayerId(60),
+        )
+        .expect("spawn pty");
+        pty.advance(b"\x1b[c").expect("advance DA1");
+        let events = pty.drain_events();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            PaneEvent::DeviceAttributesQuery {
+                kind: DeviceAttributesKind::Primary
+            }
+        )));
+    }
+
+    /// DA1 query with explicit param 0 (`ESC [ 0 c`) is also
+    /// surfaced as a `Primary` device-attributes query.
+    #[test]
+    fn da1_query_with_zero_param_emits_primary_event() {
+        let (mut pty, _reader) = PanePty::spawn(
+            ShellSpec::Command {
+                argv: vec!["/bin/cat".to_string()],
+            },
+            10,
+            10,
+            PaneLayerId(61),
+        )
+        .expect("spawn pty");
+        pty.advance(b"\x1b[0c").expect("advance DA1 with 0");
+        let events = pty.drain_events();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            PaneEvent::DeviceAttributesQuery {
+                kind: DeviceAttributesKind::Primary
+            }
+        )));
+    }
+
+    /// DA2 query (`ESC [ > c`) is surfaced as a
+    /// `PaneEvent::DeviceAttributesQuery` with kind `Secondary`.
+    #[test]
+    fn da2_query_emits_secondary_device_attributes_event() {
+        let (mut pty, _reader) = PanePty::spawn(
+            ShellSpec::Command {
+                argv: vec!["/bin/cat".to_string()],
+            },
+            10,
+            10,
+            PaneLayerId(62),
+        )
+        .expect("spawn pty");
+        pty.advance(b"\x1b[>c").expect("advance DA2");
+        let events = pty.drain_events();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            PaneEvent::DeviceAttributesQuery {
+                kind: DeviceAttributesKind::Secondary
+            }
+        )));
     }
 
     /// Non-APC escape sequences are unaffected by the

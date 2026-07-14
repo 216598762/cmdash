@@ -107,6 +107,30 @@ pub fn blit_grid(grid: &TextGrid, buf: &mut Buffer, area: RatRect) {
     }
 }
 
+/// Render a rectangular selection overlay on top of a pane.
+///
+/// `sel_start` and `sel_end` are pane-local (x, y) cell
+/// coordinates. The inclusive bounding box is highlighted with a
+/// reversed-video style. Coordinates outside the pane area are
+/// clamped.
+pub fn blit_selection(buf: &mut Buffer, area: RatRect, sel_start: (u16, u16), sel_end: (u16, u16)) {
+    let min_x = sel_start.0.min(sel_end.0);
+    let max_x = sel_start.0.max(sel_end.0);
+    let min_y = sel_start.1.min(sel_end.1);
+    let max_y = sel_start.1.max(sel_end.1);
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let bx = area.x + x;
+            let by = area.y + y;
+            if bx >= buf.area.width || by >= buf.area.height {
+                continue;
+            }
+            let dest = buf.get_mut(bx, by);
+            dest.set_style(dest.style().add_modifier(Modifier::REVERSED));
+        }
+    }
+}
+
 /// Render the cursor as a reverse-video cell, if the cursor sits
 /// inside the pane rect.
 pub fn blit_cursor(grid: &TextGrid, buf: &mut Buffer, area: RatRect) {
@@ -121,6 +145,62 @@ pub fn blit_cursor(grid: &TextGrid, buf: &mut Buffer, area: RatRect) {
     }
     let dest = buf.get_mut(bx, by);
     dest.set_style(dest.style().add_modifier(Modifier::REVERSED));
+}
+
+/// Extract the text covered by the current copy-mode selection.
+/// If no selection anchor is set, only the character under the cursor
+/// is returned. Coordinates are clamped to the grid bounds.
+///
+/// `cursor_x`/`cursor_y` are the current cursor coordinates.
+/// `selection_start` is the optional anchor coordinate.
+pub fn extract_selected_text(
+    grid: &TextGrid,
+    cursor_x: u16,
+    cursor_y: u16,
+    selection_start: Option<(u16, u16)>,
+) -> String {
+    let cols = grid.cols();
+    let rows = grid.rows();
+    let (start_x, start_y, end_x, end_y) = if let Some(anchor) = selection_start {
+        let min_x = anchor.0.min(cursor_x);
+        let max_x = anchor.0.max(cursor_x);
+        let min_y = anchor.1.min(cursor_y);
+        let max_y = anchor.1.max(cursor_y);
+        (min_x, min_y, max_x, max_y)
+    } else {
+        // No selection: copy only the character under the cursor.
+        let cx = cursor_x.min(cols.saturating_sub(1));
+        let cy = cursor_y.min(rows.saturating_sub(1));
+        return grid.cell(cx, cy).ch.to_string();
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for y in start_y..=end_y {
+        if y >= rows {
+            break;
+        }
+        let mut line = String::new();
+        for x in start_x..=end_x {
+            if x >= cols {
+                break;
+            }
+            let cell = grid.cell(x, y);
+            line.push(cell.ch);
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    lines.join("\n")
+}
+
+/// Copy the given text to the system clipboard.
+///
+/// This is a thin wrapper around [`arboard::Clipboard`] so the
+/// copy-mode path can be tested without mocking the clipboard.
+pub fn copy_text_to_clipboard(
+    text: impl Into<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_text(text.into())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -206,6 +286,49 @@ mod tests {
             "Y",
             "blit_grid with blank grid must not overwrite pre-existing buffer content; \
              the skip-blank guard should leave cell (5,3) at its sentinel value"
+        );
+    }
+
+    /// `blit_selection` highlights the inclusive bounding box
+    /// between two pane-local coordinates with the REVERSED
+    /// modifier.
+    #[test]
+    fn blit_selection_highlights_inclusive_bounding_box() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+                blit_selection(frame.buffer_mut(), area, (1, 1), (3, 2));
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        // Cells inside the selection should be reversed.
+        for y in 1..=2 {
+            for x in 1..=3 {
+                assert!(
+                    buf.get(x, y)
+                        .style()
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::REVERSED),
+                    "cell ({x},{y}) must be reversed"
+                );
+            }
+        }
+        // Cells outside the selection should NOT be reversed.
+        assert!(
+            !buf.get(0, 0)
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "cell (0,0) must not be reversed"
+        );
+        assert!(
+            !buf.get(4, 2)
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "cell (4,2) must not be reversed"
         );
     }
 

@@ -258,8 +258,24 @@ impl PaneRunner {
         shell: ShellSpec,
         close_tx: Option<PaneCloseTx>,
     ) -> Result<Self, RunnerError> {
-        let (pty, reader) = PanePty::spawn(shell, computed.rect.w, computed.rect.h, layer_id)
-            .map_err(RunnerError::Spawn)?;
+        Self::spawn_with_graphics_and_env(computed, layer_id, shell, close_tx, Vec::new())
+    }
+
+    /// Same as [`PaneRunner::spawn_with_graphics`] but applies
+    /// the supplied environment variables to the child PTY. Used
+    /// by the production binary to advertise host terminal
+    /// capabilities (TERM, COLORTERM, CMDASH_*) to nested
+    /// shells and applications.
+    pub fn spawn_with_graphics_and_env(
+        computed: ComputedPane,
+        layer_id: PaneLayerId,
+        shell: ShellSpec,
+        close_tx: Option<PaneCloseTx>,
+        env_vars: Vec<(String, String)>,
+    ) -> Result<Self, RunnerError> {
+        let (pty, reader) =
+            PanePty::spawn_with_env(shell, computed.rect.w, computed.rect.h, layer_id, env_vars)
+                .map_err(RunnerError::Spawn)?;
         let (tx, rx) = unbounded_channel::<Vec<u8>>();
         let reader_task = tokio::task::spawn_blocking(move || run_reader(reader, tx));
         Ok(Self {

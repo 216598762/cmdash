@@ -19,6 +19,7 @@ crossterm = "0.29.0"
 dashcompositor.workspace = true
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 libloading = "0.8.9"
+arboard = "3.4"
 notify = "7.0.0"
 ratatui = { version = "0.25", features = ["crossterm"] }
 thiserror = "2.0.18"

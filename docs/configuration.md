@@ -139,7 +139,56 @@ keybind/layout changes take effect in cmdash without restarting.
 
 ---
 
-## 3. Top-level schema
+## 3. Environment variables
+
+cmdash reads a small set of environment variables at startup and also
+advertises a matching set to every child PTY it spawns.
+
+### 3.1. Host-side variables (read by cmdash)
+
+| Variable | Purpose |
+|----------|---------|
+| `CMDASH_CONFIG_DIR` | Directory to load `config.kdl` from (see §2). Overrides the XDG default. |
+| `CMDASH_GRAPHICS` | Force the graphics protocol: `kitty`, `sixel`, `none`, `text`, or `off`. Takes priority over `TERM`/`TERM_PROGRAM` detection. |
+| `TERM` | Used to detect the host terminal type and graphics capabilities. |
+| `TERM_PROGRAM` | Used together with `TERM` to identify the host terminal emulator. |
+| `COLORTERM` | Used to detect true-color/256-color support (`truecolor`, `24bit`, `256color`). |
+| `RUST_LOG` | Standard `tracing`/`EnvFilter` log level when `--log` is not used (see §1.5). |
+
+### 3.2. Child-PTY variables (advertised to nested shells)
+
+cmdash derives a capability profile from the host terminal and injects
+the following variables into every spawned pane so that nested
+applications can discover what the multiplexer supports:
+
+| Variable | Values | Meaning |
+|----------|--------|---------|
+| `TERM` | `xterm-kitty`, `xterm-256color` | Capability-appropriate terminal type. `xterm-kitty` is used when Kitty graphics are active; otherwise `xterm-256color`. |
+| `COLORTERM` | `truecolor`, `256color`, `no` | Color depth advertised by the host. |
+| `CMDASH_GRAPHICS` | `kitty`, `sixel`, `none` | Graphics protocol cmdash is using for the host terminal. Applications should consult this (not just `TERM`) when deciding whether to emit Kitty graphics or Sixel. |
+| `CMDASH_KITTY_KEYBOARD` | `1` / `0` | Host supports the Kitty keyboard protocol progressive enhancement (`CSI > 1 u`). |
+| `CMDASH_FOCUS_EVENTS` | `1` / `0` | Host supports focus-change reporting (`CSI ? 1004 h`). |
+| `CMDASH_BRACKETED_PASTE` | `1` / `0` | Host supports bracketed paste (`CSI ? 2004 h`). |
+| `CMDASH_QUERIES` | `1` / `0` | Host responds to capability queries such as DA1/DA2. |
+
+These variables are set automatically; you do not need to declare them
+in your KDL config. They can be read inside a pane just like any other
+environment variable:
+
+```sh
+# Inside a cmdash pane
+echo "Graphics protocol: $CMDASH_GRAPHICS"
+echo "Kitty keyboard:    $CMDASH_KITTY_KEYBOARD"
+```
+
+> **Note:** `CMDASH_GRAPHICS` is read by cmdash itself **and**
+> advertised to children. Setting it in cmdash's own environment
+> forces the host protocol; the same value is then inherited by
+> children unless cmdash overrides it with its detected profile.
+
+---
+
+## 4. Top-level schema
 
 A cmdash config has **five** valid top-level KDL nodes:
 
@@ -151,12 +200,12 @@ A cmdash config has **five** valid top-level KDL nodes:
 | `status_bar { ... }` | optional | Enable/configure the status bar. |
 | `theme { ... }` | optional | Customize colors and cursor style. |
 
-### 3.1. Inside `layout { ... }`
+### 4.1. Inside `layout { ... }`
 
 Must hold **exactly one** `LayoutNode` (`split` / `stack` / `zstack` /
 `pane` / `preset`).
 
-### 3.2. Inside `keybinds { ... }`
+### 4.2. Inside `keybinds { ... }`
 
 Each child must be a `bind` line:
 
@@ -167,7 +216,7 @@ keybinds {
 }
 ```
 
-### 3.3. Inside `presets { ... }`
+### 4.3. Inside `presets { ... }`
 
 Each child must be a `preset "<name>" { <body> }` block. Duplicate
 names are rejected.
@@ -183,7 +232,7 @@ presets {
 }
 ```
 
-### 3.4. Inside `status_bar { ... }`
+### 4.4. Inside `status_bar { ... }`
 
 Enables an optional single-row status bar rendered below the tab bar
 (or above panes when `position = "top"`). When present and
@@ -218,7 +267,7 @@ The status bar is **hot-reloadable**: editing the `status_bar` block
 in your config file at runtime will enable/disable the bar and
 recalculate the layout area immediately (no restart required).
 
-### 3.5. Inside `theme { ... }`
+### 4.5. Inside `theme { ... }`
 
 Customizes the color scheme for the tab bar, status bar, widget
 borders, and error messages. All fields are optional — when omitted,
@@ -298,9 +347,9 @@ Color values accept any of the following formats (case-insensitive):
 
 ---
 
-## 4. Layout tree semantics & primitives
+## 5. Layout tree semantics & primitives
 
-### 4.1. `pane` — a leaf PTY
+### 5.1. `pane` — a leaf PTY
 
 ```kdl
 pane kind=shell [label="<text>"] [command="<cmd>"]
@@ -323,7 +372,7 @@ pane kind=shell [label="<text>"] [command="<cmd>"]
 - An empty `command=""` falls back to the default login shell.
 - Each pane in a layout can have its own independent `command`.
 
-### 4.2. `split` — a binary tree split (TWO children exactly)
+### 5.2. `split` — a binary tree split (TWO children exactly)
 
 ```kdl
 split axis=horizontal|vertical ratio=<float> {
@@ -341,7 +390,7 @@ split axis=horizontal|vertical ratio=<float> {
 >   **top-to-bottom along y** (top ↓ bottom). Child 0 = top
 >   `ratio%`; child 1 = bottom remainder.
 
-### 4.3. `stack` — equal-height vertical strips
+### 5.3. `stack` — equal-height vertical strips
 
 ```kdl
 stack {
@@ -353,7 +402,7 @@ stack {
 Divides the area into `N` equal-height vertical strips, top-to-bottom;
 the last child absorbs any remainder rows.
 
-### 4.4. `zstack` — overlay z-stack (same rect, different IDs)
+### 5.4. `zstack` — overlay z-stack (same rect, different IDs)
 
 ```kdl
 zstack {
@@ -366,21 +415,21 @@ Every member **shares the parent's rect verbatim** — they overlay
 rather than tile. Z-order = declaration order (last member on top).
 Each member still gets its own `PaneId`.
 
-### 4.5. `preset` — a name reference inside the active layout
+### 5.5. `preset` — a name reference inside the active layout
 
 The root of `layout { ... }` **cannot** be a `preset` reference
 (`LayoutError::PresetAtRoot`).
 
-### 4.6. Tree depth
+### 5.6. Tree depth
 
 Max nesting: **8** (`MAX_TREE_DEPTH`). Deeper trees return
 `LayoutError::TreeTooDeep(N)`.
 
 ---
 
-## 5. Keybinds & runtime mutations
+## 6. Keybinds & runtime mutations
 
-### 5.1. Chord grammar
+### 6.1. Chord grammar
 
 ```
 <modifier>-<modifier>-...-<key>
@@ -400,7 +449,7 @@ Valid **`<key>`** tokens: single character, named key (`enter`,
 > **Pitfall #3 — Press-only key events.** The router only matches
 > **Press** events. Repeat and Release fall through to the PTY.
 
-### 5.2. Action grammar
+### 6.2. Action grammar
 
 | Action string | Behaviour |
 |---------------|-----------|
@@ -415,16 +464,16 @@ Valid **`<key>`** tokens: single character, named key (`enter`,
 | `tab.new` | Create a new empty tab and switch to it. |
 | `tab.close` | Close the active tab. Closing last tab quits. |
 | `tab.switch.<n>` (n=1..=9) | Switch to the nth tab. |
-| `pane.resize.enter` | Enter PaneResize mode. See §5.4. |
-| `tab.switch.enter` | Enter TabSwitch mode. See §5.4. |
-| `preset.pick.enter` | Enter PresetPick mode. See §5.4. |
+| `pane.resize.enter` | Enter PaneResize mode. See §6.4. |
+| `tab.switch.enter` | Enter TabSwitch mode. See §6.4. |
+| `preset.pick.enter` | Enter PresetPick mode. See §6.4. |
 | `mode.exit` | Return to Normal mode from any non-Normal mode. |
-| `pane.resize.up` / `.down` / `.left` / `.right` | Resize focused pane's split ±2% (PaneResize mode only). See §5.4. |
+| `pane.resize.up` / `.down` / `.left` / `.right` | Resize focused pane's split ±2% (PaneResize mode only). See §6.4. |
 
 > **Pitfall #4 — Unknown action strings are rejected** as
 > `InvalidAction(<string>)` at config parse time.
 
-### 5.3. Runtime mutations
+### 6.3. Runtime mutations
 
 - **`app.new-pane`** — replaces focused leaf with
   `split axis=horizontal ratio=0.5 [original, new_shell]`.
@@ -433,7 +482,7 @@ Valid **`<key>`** tokens: single character, named key (`enter`,
 - **`pane.preset.<name>`** — drops all runners, swaps layout tree,
   spawns fresh runners with fresh `LayerId`s.
 
-### 5.4. Keybind modes
+### 6.4. Keybind modes
 
 cmdash has a mode-based keybind router with four modes:
 
@@ -443,6 +492,7 @@ cmdash has a mode-based keybind router with four modes:
 | **PaneResize** | Arrow keys resize the focused pane's parent split (±2% per press). |
 | **TabSwitch** | Number keys 1–9 switch tabs. |
 | **PresetPick** | Number keys select layout presets. |
+| **Copy** | Arrow keys move the copy-mode cursor; `v` starts/extends the selection; `y` or Enter copies to the system clipboard. |
 
 **Entering a mode:** Press the configured keybind
 (e.g. `M-r` for `pane.resize.enter`, `M-p` for `preset.pick.enter`).
@@ -464,6 +514,10 @@ immediate visual feedback that a mode is active.
 | `pane.resize.up` / `.down` / `.left` / `.right` | PaneResize | Resize the focused pane's parent split ±2%. |
 | `tab.switch.enter` | Normal → TabSwitch | Enter TabSwitch mode. |
 | `preset.pick.enter` | Normal → PresetPick | Enter PresetPick mode. |
+| `copy.enter` | Normal → Copy | Enter Copy mode. |
+| `copy.move.up` / `.down` / `.left` / `.right` | Copy | Move the copy-mode cursor. |
+| `copy.select` | Copy | Start/extend the text selection. |
+| `copy.copy` | Copy | Copy the selected text to the system clipboard and exit Copy mode. |
 | `mode.exit` | any non-Normal | Return to Normal mode (also triggered by Escape). |
 
 **Default mode-entry keybinds (in the bundled `config.kdl`):**
@@ -479,7 +533,7 @@ keybinds {
 pane's PTY, so you can still type normally while in PaneResize or
 PresetPick mode — only the explicitly bound keys are intercepted.
 
-### 5.5. Bracketed paste support
+### 6.5. Bracketed paste support
 
 cmdash supports the terminal bracketed-paste protocol so child
 applications can distinguish pasted text from typed keystrokes. A pane
@@ -531,7 +585,7 @@ intercepts the sequence, records that the pane wants bracketed paste,
 enables it on the host terminal, and from then on wraps any pasted
 text in `ESC[200~` / `ESC[201~` for that pane.
 
-### 5.6. Focus reporting support
+### 6.6. Focus reporting support
 
 cmdash supports the standard terminal focus-reporting protocol so child
 applications can react to the host terminal gaining or losing focus. A pane
@@ -588,12 +642,12 @@ focused pane whenever the host terminal gains or loses focus.
 
 ---
 
-## 6. Worked examples
+## 7. Worked examples
 
 Standing copies live in [`examples/`](../examples/). To try one: copy
 it on top of `crates/cmdash/config.kdl` and rebuild.
 
-### 6.1. Minimal — single shell pane
+### 7.1. Minimal — single shell pane
 
 ```kdl
 layout {
@@ -606,7 +660,7 @@ keybinds {
 }
 ```
 
-### 6.2. Two-pane horizontal split + directional focus
+### 7.2. Two-pane horizontal split + directional focus
 
 *(See [`examples/02-two-pane-split.kdl`](../examples/02-two-pane-split.kdl))*
 
@@ -630,7 +684,7 @@ keybinds {
 }
 ```
 
-### 6.3. Tabbed stack + ZStack overlay
+### 7.3. Tabbed stack + ZStack overlay
 
 *(See [`examples/03-stack-and-zstack.kdl`](../examples/03-stack-and-zstack.kdl))*
 
@@ -660,7 +714,7 @@ keybinds {
 }
 ```
 
-### 6.4. Presets — define once, swap wholesale at runtime
+### 7.4. Presets — define once, swap wholesale at runtime
 
 ```kdl
 layout {
@@ -686,7 +740,7 @@ keybinds {
 }
 ```
 
-### 6.5. Per-pane commands — override the default shell
+### 7.5. Per-pane commands — override the default shell
 
 *(See [`examples/05-per-pane-commands.kdl`](../examples/05-per-pane-commands.kdl))*
 
@@ -717,7 +771,7 @@ right pane, instead of spawning login shells.
 pane kind=shell label="build" command="sh -c 'cargo build && echo DONE'"
 ```
 
-### 6.6. Advanced — 4-pane 2×2 grid
+### 7.6. Advanced — 4-pane 2×2 grid
 
 *(See [`examples/04-four-pane-tiled.kdl`](../examples/04-four-pane-tiled.kdl))*
 
@@ -738,7 +792,7 @@ layout {
 
 ---
 
-## 7. Cross-references
+## 8. Cross-references
 
 - [`README.md`](../README.md) — top-level overview, installation.
 - [`AGENTS.md`](../AGENTS.md) — architecture rules, non-goals,

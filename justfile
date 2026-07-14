@@ -96,6 +96,18 @@ lint-doc-family-strict:
     echo "== PASS: lint-doc-family-strict strict-pin holds at EXPECTED=ACTUAL=$COUNT =="
 
 # ------------------------------------------------------------------------------
+# lint-doc-numbering: verify docs/configuration.md heading numbers are sequential.
+# ------------------------------------------------------------------------------
+[group('lint')]
+lint-doc-numbering:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "== lint-doc-numbering =="
+    python3 tests/check-doc-numbering.py docs/configuration.md
+    echo ""
+    echo "== PASS: lint-doc-numbering =="
+
+# ------------------------------------------------------------------------------
 # nextest: run the full workspace test suite via cargo-nextest.
 #
 # Faster than `cargo test` due to per-binary parallelism and

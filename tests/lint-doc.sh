@@ -21,7 +21,7 @@ cd "$PROJECT_ROOT"
 echo "== tests/lint-doc.sh =="
 echo "project root: $PROJECT_ROOT"
 
-for recipe in lint-doc lint-doc-family-strict; do
+for recipe in lint-doc lint-doc-family-strict lint-doc-numbering; do
     echo "--- just --show $recipe ---"
     if ! just --show "$recipe" > /tmp/lint-doc-show.txt; then
         echo "::FAIL:: just --show $recipe returned non-zero"
@@ -35,7 +35,7 @@ for recipe in lint-doc lint-doc-family-strict; do
     echo "  --show $recipe: OK"
 done
 
-for recipe in lint-doc lint-doc-family-strict; do
+for recipe in lint-doc lint-doc-family-strict lint-doc-numbering; do
     echo "--- $recipe (runtime) ---"
     OUT_FILE=/tmp/lint-doc-${recipe}.out.txt
     if ! just "$recipe" 2>&1 | tee "$OUT_FILE" | grep -q '^== PASS:'; then

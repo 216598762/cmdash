@@ -144,6 +144,16 @@ impl GraphicsProtocol {
     ///    `none`) — explicit user choice wins
     /// 5. Otherwise → `TextOnly`
     pub fn detect() -> Self {
+        Self::detect_from_env(
+            std::env::var("TERM").ok().as_deref(),
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+        )
+    }
+
+    /// Detect the graphics protocol from explicit environment
+    /// values. Tests use this to avoid mutating process-global
+    /// env vars.
+    pub fn detect_from_env(term: Option<&str>, term_program: Option<&str>) -> Self {
         // Explicit override takes priority.
         if let Ok(val) = std::env::var("CMDASH_GRAPHICS") {
             match val.to_lowercase().as_str() {
@@ -153,8 +163,8 @@ impl GraphicsProtocol {
                 _ => {}
             }
         }
-        let term = std::env::var("TERM").unwrap_or_default();
-        let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+        let term = term.unwrap_or("");
+        let term_program = term_program.unwrap_or("");
         // Kitty-native terminals.
         if term == "kitty" || term == "xterm-kitty" || term_program == "kitty" {
             return Self::Kitty;
@@ -302,6 +312,230 @@ impl Default for GraphicsProtocol {
         Self::detect()
     }
 }
+
+/// Detected capabilities of the host terminal. cmdash uses this
+/// registry both to decide which features it can safely enable on
+/// the host and to advertise support to child PTYs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TermCapabilities {
+    /// Selected graphics protocol for the host terminal.
+    pub graphics: GraphicsProtocol,
+    /// Host supports the Kitty keyboard protocol progressive
+    /// enhancement (`CSI > 1 u` / `CSI < u`).
+    pub kitty_keyboard: bool,
+    /// Host supports focus-change reporting (`CSI ? 1004 h` /
+    /// `CSI ? 1004 l`).
+    pub focus_events: bool,
+    /// Host supports bracketed paste (`CSI ? 2004 h` /
+    /// `CSI ? 2004 l`).
+    pub bracketed_paste: bool,
+    /// Host supports 24-bit true color.
+    pub true_color: bool,
+    /// Host supports 256-color indexed mode.
+    pub color_256: bool,
+    /// Host responds to capability queries (DA1/DA2, OSC
+    /// 4/10/11, DECRQM). This is a conservative default;
+    /// individual query support is refined as features land.
+    pub queries: bool,
+}
+
+impl Default for TermCapabilities {
+    fn default() -> Self {
+        Self::detect()
+    }
+}
+
+impl TermCapabilities {
+    /// Detect host terminal capabilities from environment variables
+    /// and the existing graphics-protocol heuristic.
+    pub fn detect() -> Self {
+        Self::from_env(
+            std::env::var("TERM").ok().as_deref(),
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+            std::env::var("COLORTERM").ok().as_deref(),
+        )
+    }
+
+    /// Build capabilities from explicit environment values. Tests
+    /// use this to avoid mutating process-global env vars.
+    pub fn from_env(
+        term: Option<&str>,
+        term_program: Option<&str>,
+        colorterm: Option<&str>,
+    ) -> Self {
+        let graphics = GraphicsProtocol::detect_from_env(term, term_program);
+        let term = term.unwrap_or("");
+        let term_program = term_program.unwrap_or("");
+        let colorterm = colorterm.unwrap_or("");
+
+        let is_kitty = term == "kitty" || term == "xterm-kitty" || term_program == "kitty";
+        let is_wezterm = term_program.eq_ignore_ascii_case("WezTerm")
+            || term_program.eq_ignore_ascii_case("wezterm");
+        let is_foot = term == "foot" || term_program == "foot";
+        let is_alacritty = term == "alacritty" || term_program == "alacritty";
+        let is_ghostty = term_program.eq_ignore_ascii_case("ghostty");
+        let is_modern = is_kitty || is_wezterm || is_foot || is_alacritty || is_ghostty;
+        let is_tmux = term.contains("tmux") || term_program == "tmux";
+        let is_screen = term.contains("screen") || term_program == "screen";
+        let is_xterm = term.contains("xterm") || term_program.contains("xterm");
+
+        let true_color = colorterm.eq_ignore_ascii_case("truecolor")
+            || colorterm.eq_ignore_ascii_case("24bit")
+            || term.contains("truecolor")
+            || is_kitty
+            || is_wezterm
+            || is_foot
+            || is_alacritty
+            || is_ghostty;
+
+        Self {
+            graphics,
+            kitty_keyboard: is_kitty || is_wezterm || is_foot || is_ghostty,
+            focus_events: is_modern || is_tmux || is_screen || is_xterm,
+            bracketed_paste: is_modern || is_tmux || is_screen || is_xterm,
+            true_color,
+            color_256: true_color || term.contains("256color") || term.contains("256"),
+            queries: is_modern || is_tmux || is_screen || is_xterm,
+        }
+    }
+
+    /// Derive environment variables that advertise cmdash's host
+    /// capabilities to a child PTY. The returned vector can be
+    /// applied to the child's `CommandBuilder` before spawning.
+    ///
+    /// Variables set:
+    /// - `TERM`: a capability-appropriate terminal type
+    ///   (`xterm-kitty` for Kitty graphics, `xterm-256color`
+    ///   otherwise).
+    /// - `COLORTERM`: `truecolor`, `256color`, or `no`.
+    /// - `CMDASH_GRAPHICS`: `kitty`, `sixel`, or `none`.
+    /// - `CMDASH_KITTY_KEYBOARD`: `1` or `0`.
+    /// - `CMDASH_FOCUS_EVENTS`: `1` or `0`.
+    /// - `CMDASH_BRACKETED_PASTE`: `1` or `0`.
+    /// - `CMDASH_QUERIES`: `1` or `0`.
+    pub fn to_env_vars(&self) -> Vec<(String, String)> {
+        vec![
+            ("TERM".to_string(), self.term_value()),
+            ("COLORTERM".to_string(), self.colorterm_value()),
+            (
+                "CMDASH_GRAPHICS".to_string(),
+                match self.graphics {
+                    GraphicsProtocol::Kitty => "kitty".to_string(),
+                    GraphicsProtocol::Sixel => "sixel".to_string(),
+                    GraphicsProtocol::TextOnly => "none".to_string(),
+                },
+            ),
+            (
+                "CMDASH_KITTY_KEYBOARD".to_string(),
+                if self.kitty_keyboard {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                },
+            ),
+            (
+                "CMDASH_FOCUS_EVENTS".to_string(),
+                if self.focus_events {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                },
+            ),
+            (
+                "CMDASH_BRACKETED_PASTE".to_string(),
+                if self.bracketed_paste {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                },
+            ),
+            (
+                "CMDASH_QUERIES".to_string(),
+                if self.queries {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                },
+            ),
+        ]
+    }
+
+    fn term_value(&self) -> String {
+        match self.graphics {
+            GraphicsProtocol::Kitty => "xterm-kitty".to_string(),
+            // Sixel-capable and text-only hosts both advertise as a
+            // modern 256-color xterm. Applications that care about
+            // the specific graphics protocol should consult
+            // `CMDASH_GRAPHICS` instead.
+            GraphicsProtocol::Sixel | GraphicsProtocol::TextOnly => "xterm-256color".to_string(),
+        }
+    }
+
+    fn colorterm_value(&self) -> String {
+        if self.true_color {
+            "truecolor".to_string()
+        } else if self.color_256 {
+            "256color".to_string()
+        } else {
+            "no".to_string()
+        }
+    }
+
+    /// Convenience accessor for the selected graphics protocol.
+    pub fn graphics_protocol(&self) -> GraphicsProtocol {
+        self.graphics
+    }
+
+    /// Returns `true` if the host terminal advertises support for
+    /// the Kitty keyboard protocol.
+    pub fn supports_kitty_keyboard(&self) -> bool {
+        self.kitty_keyboard
+    }
+
+    /// Returns `true` if the host terminal advertises support for
+    /// focus-change reporting.
+    pub fn supports_focus_events(&self) -> bool {
+        self.focus_events
+    }
+
+    /// Returns `true` if the host terminal advertises support for
+    /// bracketed paste.
+    pub fn supports_bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+    /// Generate a DEC VT220 Primary Device Attributes (DA1)
+    /// response reflecting cmdash's advertised capabilities.
+    /// The response has the form `ESC [ ? <params> c`.
+    ///
+    /// Advertised params:
+    /// - `62` VT220
+    /// - `1` 132-column mode
+    /// - `22` color support (only when true color or 256-color
+    ///   mode is advertised)
+    /// - `4`  Sixel graphics (only when the selected graphics
+    ///   protocol is [`GraphicsProtocol::Sixel`])
+    pub fn da1_response(&self) -> String {
+        let mut params = vec!["62", "1"];
+        if self.true_color || self.color_256 {
+            params.push("22");
+        }
+        if self.graphics == GraphicsProtocol::Sixel {
+            params.push("4");
+        }
+        format!("\x1b[?{}c", params.join(";"))
+    }
+
+    /// Generate a Secondary Device Attributes (DA2) response
+    /// identifying cmdash. The response has the form
+    /// `ESC [ > <params> c`.
+    ///
+    /// Product code `99` is reserved for cmdash; revision
+    /// `1;0` denotes the v1 protocol revision.
+    pub fn da2_response(&self) -> String {
+        "\x1b[>99;1;0c".to_string()
+    }
+}
+
 /// Parse a DEC VT220 Primary Device Attributes (DA1) response.
 /// The response has the form `ESC [ ? {params} c` where params
 /// are semicolon-separated integers. Returns `Some(Sixel)` if
@@ -431,12 +665,11 @@ pub struct GraphicsState {
     /// have tab bar layers pushed and never emit a full-frame
     /// APC-G block that would produce garbled output.
     kitty_capable: bool,
-    /// Detected graphics protocol for the host terminal.
-    /// Drives encoder selection in [`Self::render_and_write`].
-    /// Defaults to [`GraphicsProtocol::detect()`] at
-    /// construction; can be overridden via the
-    /// `CMDASH_GRAPHICS` env var.
-    protocol: GraphicsProtocol,
+    /// Detected host terminal capabilities. Drives encoder
+    /// selection in [`Self::render_and_write`] and feature
+    /// gating for Kitty keyboard, bracketed paste, focus
+    /// events, etc.
+    caps: TermCapabilities,
 }
 
 impl GraphicsState {
@@ -448,7 +681,7 @@ impl GraphicsState {
     /// in the panic message is consumed by the
     /// `graphics_state_new_panics_on_zero_*` regression tests.
     pub fn new(metrics: Metrics, cells: (u16, u16)) -> Self {
-        Self::new_with_protocol(metrics, cells, GraphicsProtocol::detect())
+        Self::new_with_caps(metrics, cells, TermCapabilities::detect())
     }
 
     /// Construct a [`GraphicsState`] with an explicit protocol
@@ -459,13 +692,31 @@ impl GraphicsState {
         cells: (u16, u16),
         protocol: GraphicsProtocol,
     ) -> Self {
+        Self::new_with_caps(
+            metrics,
+            cells,
+            TermCapabilities {
+                graphics: protocol,
+                ..TermCapabilities::detect()
+            },
+        )
+    }
+
+    /// Construct a [`GraphicsState`] with explicit host
+    /// capabilities. Production uses [`Self::new`]; tests use
+    /// [`Self::new_with_protocol`] to force a graphics protocol
+    /// without overriding unrelated capability flags.
+    pub fn new_with_caps(metrics: Metrics, cells: (u16, u16), caps: TermCapabilities) -> Self {
         assert!(
             cells.0 > 0 && cells.1 > 0,
             "GraphicsState::new: cells must be non-zero (cols > 0 and rows > 0), got {}x{}",
             cells.0,
             cells.1,
         );
-        info!(protocol = protocol.name(), "graphics protocol detected");
+        info!(
+            protocol = caps.graphics.name(),
+            "graphics protocol detected"
+        );
         Self {
             stack: LayerStack::default(),
             metrics,
@@ -474,7 +725,7 @@ impl GraphicsState {
             pane_images: HashMap::new(),
             tab_bar_layers: Vec::new(),
             kitty_capable: false,
-            protocol,
+            caps,
         }
     }
 
@@ -625,14 +876,14 @@ impl GraphicsState {
         // above already handles the empty-stack case; if we
         // reach here with layers but TextOnly protocol, skip
         // encoding to avoid garbled output.
-        if self.protocol == GraphicsProtocol::TextOnly {
+        if self.caps.graphics == GraphicsProtocol::TextOnly {
             return Ok(());
         }
         let w_px = self.cells.0 as u32 * self.metrics.cell_w;
         let h_px = self.cells.1 as u32 * self.metrics.cell_h;
         let mut fb = FrameBuffer::new(w_px, h_px);
         CpuCompositor.compose(&self.stack, &mut fb);
-        match self.protocol {
+        match self.caps.graphics {
             GraphicsProtocol::Kitty => {
                 encode_passthrough_to_writer(&fb, writer)
                     .map_err(|e| GraphicsError::Dispatch(e.to_string()))?;
@@ -651,7 +902,13 @@ impl GraphicsState {
     /// The detected graphics protocol. Exposed for logging
     /// and diagnostics.
     pub fn protocol(&self) -> GraphicsProtocol {
-        self.protocol
+        self.caps.graphics
+    }
+
+    /// The detected host terminal capabilities. Exposed for
+    /// feature gating in the binary's tick loop.
+    pub fn caps(&self) -> &TermCapabilities {
+        &self.caps
     }
 
     /// Returns `true` if a record exists for `(pane, kitty_id)`,
@@ -710,7 +967,7 @@ impl GraphicsState {
         // On kitty terminals, the first pane image load sets
         // kitty_capable. On sixel terminals, the protocol field
         // is set at construction.
-        let has_graphics = self.kitty_capable || self.protocol != GraphicsProtocol::TextOnly;
+        let has_graphics = self.kitty_capable || self.caps.graphics != GraphicsProtocol::TextOnly;
         if !has_graphics || data.bar_width_cells == 0 {
             return;
         }
@@ -1582,6 +1839,205 @@ mod internal_sanity_tests {
             Some(GraphicsProtocol::Sixel),
             "trailing bytes after DA1 terminator must not break parsing"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // TermCapabilities detection tests.
+    // ------------------------------------------------------------------
+
+    /// `TermCapabilities::from_env()` must report Kitty keyboard
+    /// support for `TERM=xterm-kitty`.
+    #[test]
+    fn term_caps_detects_kitty_keyboard_for_xterm_kitty() {
+        let caps = TermCapabilities::from_env(Some("xterm-kitty"), None, None);
+        assert!(
+            caps.kitty_keyboard,
+            "xterm-kitty should support kitty keyboard"
+        );
+        assert!(caps.focus_events, "xterm-kitty should support focus events");
+        assert!(
+            caps.bracketed_paste,
+            "xterm-kitty should support bracketed paste"
+        );
+        assert!(caps.true_color, "xterm-kitty should support true color");
+        assert_eq!(caps.graphics, GraphicsProtocol::Kitty);
+    }
+
+    /// `TermCapabilities::from_env()` must report Sixel graphics
+    /// for `TERM=foot`.
+    #[test]
+    fn term_caps_detects_sixel_for_foot() {
+        let caps = TermCapabilities::from_env(Some("foot"), None, None);
+        assert_eq!(caps.graphics, GraphicsProtocol::Sixel);
+        assert!(caps.kitty_keyboard, "foot should support kitty keyboard");
+    }
+
+    /// `TermCapabilities::from_env()` must report no graphics
+    /// protocol for an unknown `TERM`.
+    #[test]
+    fn term_caps_defaults_to_text_only_for_unknown_term() {
+        let caps = TermCapabilities::from_env(Some("dumb"), None, None);
+        assert_eq!(caps.graphics, GraphicsProtocol::TextOnly);
+        assert!(!caps.kitty_keyboard);
+        assert!(!caps.focus_events);
+        assert!(!caps.bracketed_paste);
+    }
+
+    /// `TermCapabilities::from_env()` must respect `COLORTERM=truecolor`.
+    #[test]
+    fn term_caps_detects_true_color_from_colorterm() {
+        let caps = TermCapabilities::from_env(Some("dumb"), None, Some("truecolor"));
+        assert!(caps.true_color);
+        assert!(caps.color_256);
+    }
+
+    /// `TermCapabilities::to_env_vars()` must advertise the
+    /// selected graphics protocol and capability flags to child
+    /// PTYs. For Kitty graphics, `TERM` should be `xterm-kitty`
+    /// and `CMDASH_GRAPHICS` should be `kitty`.
+    #[test]
+    fn term_caps_to_env_vars_kitty() {
+        let caps = TermCapabilities {
+            graphics: GraphicsProtocol::Kitty,
+            kitty_keyboard: true,
+            focus_events: true,
+            bracketed_paste: true,
+            true_color: true,
+            color_256: true,
+            queries: true,
+        };
+        let vars: Vec<(String, String)> = caps.to_env_vars();
+        assert_eq!(vars.len(), 7, "to_env_vars must return exactly 7 entries");
+        let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
+        assert_eq!(map.get("TERM"), Some(&"xterm-kitty".to_string()));
+        assert_eq!(map.get("COLORTERM"), Some(&"truecolor".to_string()));
+        assert_eq!(map.get("CMDASH_GRAPHICS"), Some(&"kitty".to_string()));
+        assert_eq!(map.get("CMDASH_KITTY_KEYBOARD"), Some(&"1".to_string()));
+        assert_eq!(map.get("CMDASH_FOCUS_EVENTS"), Some(&"1".to_string()));
+        assert_eq!(map.get("CMDASH_BRACKETED_PASTE"), Some(&"1".to_string()));
+        assert_eq!(map.get("CMDASH_QUERIES"), Some(&"1".to_string()));
+    }
+
+    /// `TermCapabilities::to_env_vars()` must advertise Sixel
+    /// graphics as `xterm-256color` with `CMDASH_GRAPHICS=sixel`.
+    #[test]
+    fn term_caps_to_env_vars_sixel() {
+        let caps = TermCapabilities {
+            graphics: GraphicsProtocol::Sixel,
+            kitty_keyboard: false,
+            focus_events: true,
+            bracketed_paste: true,
+            true_color: false,
+            color_256: true,
+            queries: true,
+        };
+        let vars: Vec<(String, String)> = caps.to_env_vars();
+        assert_eq!(vars.len(), 7, "to_env_vars must return exactly 7 entries");
+        let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
+        assert_eq!(map.get("TERM"), Some(&"xterm-256color".to_string()));
+        assert_eq!(map.get("COLORTERM"), Some(&"256color".to_string()));
+        assert_eq!(map.get("CMDASH_GRAPHICS"), Some(&"sixel".to_string()));
+        assert_eq!(map.get("CMDASH_KITTY_KEYBOARD"), Some(&"0".to_string()));
+        assert_eq!(map.get("CMDASH_FOCUS_EVENTS"), Some(&"1".to_string()));
+    }
+
+    /// `TermCapabilities::to_env_vars()` must advertise text-only
+    /// mode as `xterm-256color` with `CMDASH_GRAPHICS=none`.
+    #[test]
+    fn term_caps_to_env_vars_text_only() {
+        let caps = TermCapabilities {
+            graphics: GraphicsProtocol::TextOnly,
+            kitty_keyboard: false,
+            focus_events: false,
+            bracketed_paste: false,
+            true_color: false,
+            color_256: false,
+            queries: false,
+        };
+        let vars: Vec<(String, String)> = caps.to_env_vars();
+        assert_eq!(vars.len(), 7, "to_env_vars must return exactly 7 entries");
+        let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
+        assert_eq!(map.get("TERM"), Some(&"xterm-256color".to_string()));
+        assert_eq!(map.get("COLORTERM"), Some(&"no".to_string()));
+        assert_eq!(map.get("CMDASH_GRAPHICS"), Some(&"none".to_string()));
+        assert_eq!(map.get("CMDASH_KITTY_KEYBOARD"), Some(&"0".to_string()));
+        assert_eq!(map.get("CMDASH_FOCUS_EVENTS"), Some(&"0".to_string()));
+        assert_eq!(map.get("CMDASH_BRACKETED_PASTE"), Some(&"0".to_string()));
+        assert_eq!(map.get("CMDASH_QUERIES"), Some(&"0".to_string()));
+    }
+
+    /// `TermCapabilities::da1_response()` must advertise
+    /// VT220 + 132-column + color when color is supported,
+    /// and include the Sixel attribute only when the graphics
+    /// protocol is Sixel.
+    #[test]
+    fn term_caps_da1_response_reflects_graphics_protocol() {
+        let kitty_caps = TermCapabilities {
+            graphics: GraphicsProtocol::Kitty,
+            kitty_keyboard: true,
+            focus_events: true,
+            bracketed_paste: true,
+            true_color: true,
+            color_256: true,
+            queries: true,
+        };
+        let kitty_resp = kitty_caps.da1_response();
+        assert!(kitty_resp.starts_with("\x1b[?"));
+        assert!(kitty_resp.ends_with("c"));
+        assert!(kitty_resp.contains("62;1;22"));
+        assert!(!kitty_resp.contains(";4") && !kitty_resp.contains("4;"));
+
+        let sixel_caps = TermCapabilities {
+            graphics: GraphicsProtocol::Sixel,
+            ..kitty_caps
+        };
+        let sixel_resp = sixel_caps.da1_response();
+        assert!(sixel_resp.contains("62;1;22;4"));
+
+        let no_color_caps = TermCapabilities {
+            graphics: GraphicsProtocol::TextOnly,
+            true_color: false,
+            color_256: false,
+            ..kitty_caps
+        };
+        let no_color_resp = no_color_caps.da1_response();
+        assert!(!no_color_resp.contains("22"));
+        assert!(!no_color_resp.contains("4"));
+    }
+
+    /// `TermCapabilities::da2_response()` must identify cmdash
+    /// with a stable product/revision tuple.
+    #[test]
+    fn term_caps_da2_response_identifies_cmdash() {
+        let caps = TermCapabilities {
+            graphics: GraphicsProtocol::Kitty,
+            kitty_keyboard: true,
+            focus_events: true,
+            bracketed_paste: true,
+            true_color: true,
+            color_256: true,
+            queries: true,
+        };
+        assert_eq!(caps.da2_response(), "\x1b[>99;1;0c");
+    }
+
+    /// `TermCapabilities` helper accessors must mirror the
+    /// underlying boolean fields.
+    #[test]
+    fn term_caps_accessors_reflect_fields() {
+        let caps = TermCapabilities {
+            graphics: GraphicsProtocol::Kitty,
+            kitty_keyboard: true,
+            focus_events: false,
+            bracketed_paste: true,
+            true_color: true,
+            color_256: true,
+            queries: true,
+        };
+        assert!(caps.supports_kitty_keyboard());
+        assert!(!caps.supports_focus_events());
+        assert!(caps.supports_bracketed_paste());
+        assert_eq!(caps.graphics_protocol(), GraphicsProtocol::Kitty);
     }
 
     /// `parse_da1_response` with Sixel as the sole parameter

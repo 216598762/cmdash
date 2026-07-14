@@ -17,10 +17,15 @@ pub mod script_widget;
 pub mod status_bar;
 pub mod tabs;
 
-pub use graphics::{GraphicsError, GraphicsProtocol, GraphicsState, Metrics, TabBarData};
+pub use graphics::{
+    GraphicsError, GraphicsProtocol, GraphicsState, Metrics, TabBarData, TermCapabilities,
+};
 pub use layer_id::{derive_layer_id, derive_layer_id_for_tab, SINGLE_TAB};
 pub use pane::{PaneCloseTx, PaneRunner, RunnerError};
-pub use render::{blit_cursor, blit_grid, pty_attrs_to_modifier, pty_color_to_ratatui};
+pub use render::{
+    blit_cursor, blit_grid, copy_text_to_clipboard, extract_selected_text, pty_attrs_to_modifier,
+    pty_color_to_ratatui,
+};
 pub use tabs::{Tab, TabStack};
 
 #[doc(hidden)]

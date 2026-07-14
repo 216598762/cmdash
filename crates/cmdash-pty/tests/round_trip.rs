@@ -456,6 +456,90 @@ fn pty_focus_reporting_child_emits_enable_and_receives_focus_events() {
     assert_eq!(n, 3, "CSI O should be written in full");
 }
 
+/// `PanePty::spawn_with_env` must actually apply the supplied
+/// environment variables to the child process. We spawn a shell
+/// that prints a selection of the variables cmdash advertises and
+/// verify the grid contains the expected values.
+#[test]
+fn pty_spawn_with_env_sets_variables_in_child() {
+    let env_vars = vec![
+        ("TERM".to_string(), "xterm-kitty".to_string()),
+        ("COLORTERM".to_string(), "truecolor".to_string()),
+        ("CMDASH_GRAPHICS".to_string(), "kitty".to_string()),
+        ("CMDASH_KITTY_KEYBOARD".to_string(), "1".to_string()),
+        ("CMDASH_FOCUS_EVENTS".to_string(), "0".to_string()),
+        ("CMDASH_BRACKETED_PASTE".to_string(), "1".to_string()),
+        ("CMDASH_QUERIES".to_string(), "0".to_string()),
+    ];
+    let expected = env_vars
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let format_string = env_vars
+        .iter()
+        .map(|(k, _)| format!("{k}=%s"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let var_args = env_vars
+        .iter()
+        .map(|(k, _)| format!("\"${k}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let shell_cmd = format!("printf '{format_string}' {var_args}");
+    let (mut pty, reader) = PanePty::spawn_with_env(
+        ShellSpec::Command {
+            argv: vec!["/bin/sh".to_string(), "-c".to_string(), shell_cmd],
+        },
+        160,
+        5,
+        PaneLayerId(100),
+        env_vars,
+    )
+    .expect("spawn pty with env");
+    let reader = std::sync::Arc::new(std::sync::Mutex::new(reader));
+    let emitted = drain(&reader, drain_deadline_default());
+    pty.advance(&emitted).expect("advance emitted env output");
+    let snap = pty.snapshot();
+    let text: String = (0..snap.grid.cols() as usize)
+        .map(|x| snap.grid.cell(x as u16, 0).ch)
+        .take_while(|&c| c != ' ')
+        .collect();
+    assert_eq!(text, expected);
+}
+
+/// `PanePty::spawn_with_env` must override inherited environment
+/// variables when an explicit value is supplied. This pins the
+/// contract that cmdash's advertised `TERM` wins over whatever
+/// the test runner inherited.
+#[test]
+fn pty_spawn_with_env_overrides_inherited_term() {
+    let env_vars = vec![("TERM".to_string(), "xterm-override".to_string())];
+    let (mut pty, reader) = PanePty::spawn_with_env(
+        ShellSpec::Command {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                r#"printf '%s' "$TERM""#.to_string(),
+            ],
+        },
+        40,
+        5,
+        PaneLayerId(101),
+        env_vars,
+    )
+    .expect("spawn pty with env override");
+    let reader = std::sync::Arc::new(std::sync::Mutex::new(reader));
+    let emitted = drain(&reader, drain_deadline_default());
+    pty.advance(&emitted).expect("advance emitted term output");
+    let snap = pty.snapshot();
+    let text: String = (0..snap.grid.cols() as usize)
+        .map(|x| snap.grid.cell(x as u16, 0).ch)
+        .take_while(|&c| c != ' ')
+        .collect();
+    assert_eq!(text, "xterm-override");
+}
+
 /// Focus reporting can be disabled with `CSI ? 1004 l`. After
 /// disabling, `focus_reporting_enabled()` returns false and a
 /// subsequent `PaneEvent::FocusReporting { enabled: false }` is

@@ -32,6 +32,7 @@ pub enum Mode {
     PaneResize,
     TabSwitch,
     PresetPick,
+    Copy,
 }
 
 /// Hold the parsed keybind table plus the current mode. Built
@@ -103,6 +104,49 @@ impl Router {
         // The main loop wires these at startup based on actual preset names.
         // For now, register empty; main.rs calls set_mode_keybinds after
         // loading presets.
+        // --- Copy mode defaults ---
+        // Arrow keys move the copy-mode cursor; 'v' starts/extends the
+        // selection; 'y' or Enter copies to the system clipboard.
+        mode_keybinds.insert(
+            Mode::Copy,
+            vec![
+                Keybind {
+                    mods: Modifiers::default(),
+                    key: KeyToken::Named(KeyName::Up),
+                    action: KeyAction::CopyModeMoveUp,
+                },
+                Keybind {
+                    mods: Modifiers::default(),
+                    key: KeyToken::Named(KeyName::Down),
+                    action: KeyAction::CopyModeMoveDown,
+                },
+                Keybind {
+                    mods: Modifiers::default(),
+                    key: KeyToken::Named(KeyName::Left),
+                    action: KeyAction::CopyModeMoveLeft,
+                },
+                Keybind {
+                    mods: Modifiers::default(),
+                    key: KeyToken::Named(KeyName::Right),
+                    action: KeyAction::CopyModeMoveRight,
+                },
+                Keybind {
+                    mods: Modifiers::default(),
+                    key: KeyToken::Char('v'),
+                    action: KeyAction::CopyModeStartSelection,
+                },
+                Keybind {
+                    mods: Modifiers::default(),
+                    key: KeyToken::Char('y'),
+                    action: KeyAction::CopyModeCopy,
+                },
+                Keybind {
+                    mods: Modifiers::default(),
+                    key: KeyToken::Named(KeyName::Enter),
+                    action: KeyAction::CopyModeCopy,
+                },
+            ],
+        );
         Self {
             keybinds,
             mode_keybinds,

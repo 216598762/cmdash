@@ -331,6 +331,23 @@ pub enum KeyAction {
     PaneResizeDown,
     PaneResizeLeft,
     PaneResizeRight,
+    /// Enter copy mode. In copy mode the user can select text
+    /// from the focused pane and copy it to the system clipboard.
+    EnterCopyMode,
+    /// Move the copy-mode cursor up.
+    CopyModeMoveUp,
+    /// Move the copy-mode cursor down.
+    CopyModeMoveDown,
+    /// Move the copy-mode cursor left.
+    CopyModeMoveLeft,
+    /// Move the copy-mode cursor right.
+    CopyModeMoveRight,
+    /// Begin or extend the selection from the current copy-mode
+    /// cursor position.
+    CopyModeStartSelection,
+    /// Copy the selected text to the system clipboard and exit
+    /// copy mode.
+    CopyModeCopy,
 }
 
 /// A cmdash config error.
@@ -1014,6 +1031,14 @@ fn parse_action(s: &str) -> Option<KeyAction> {
         "pane.resize.down" => Some(KeyAction::PaneResizeDown),
         "pane.resize.left" => Some(KeyAction::PaneResizeLeft),
         "pane.resize.right" => Some(KeyAction::PaneResizeRight),
+        // Copy-mode actions.
+        "copy.enter" => Some(KeyAction::EnterCopyMode),
+        "copy.move.up" => Some(KeyAction::CopyModeMoveUp),
+        "copy.move.down" => Some(KeyAction::CopyModeMoveDown),
+        "copy.move.left" => Some(KeyAction::CopyModeMoveLeft),
+        "copy.move.right" => Some(KeyAction::CopyModeMoveRight),
+        "copy.select" => Some(KeyAction::CopyModeStartSelection),
+        "copy.copy" => Some(KeyAction::CopyModeCopy),
         // `pane.preset` (bare, no name suffix) is rejected so a
         // missing name surfaces as `InvalidAction` at config-parse
         // time rather than as a runtime no-op — mirrors the
@@ -1570,6 +1595,34 @@ mod tests {
             let act = parse_action(&s).unwrap_or_else(|| panic!("{s} must parse"));
             assert_eq!(act, KeyAction::TabSwitch(n), "{s}");
         }
+    }
+
+    /// Copy-mode action strings round-trip into the expected
+    /// `KeyAction` variants.
+    #[test]
+    fn parse_copy_mode_actions_round_trip() {
+        assert_eq!(parse_action("copy.enter"), Some(KeyAction::EnterCopyMode));
+        assert_eq!(
+            parse_action("copy.move.up"),
+            Some(KeyAction::CopyModeMoveUp)
+        );
+        assert_eq!(
+            parse_action("copy.move.down"),
+            Some(KeyAction::CopyModeMoveDown)
+        );
+        assert_eq!(
+            parse_action("copy.move.left"),
+            Some(KeyAction::CopyModeMoveLeft)
+        );
+        assert_eq!(
+            parse_action("copy.move.right"),
+            Some(KeyAction::CopyModeMoveRight)
+        );
+        assert_eq!(
+            parse_action("copy.select"),
+            Some(KeyAction::CopyModeStartSelection)
+        );
+        assert_eq!(parse_action("copy.copy"), Some(KeyAction::CopyModeCopy));
     }
 
     /// `tab.switch.0` and `tab.switch.10` are OUT OF RANGE

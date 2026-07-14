@@ -45,7 +45,9 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use cmdash::graphics::{GraphicsState, Metrics};
 use cmdash::pane::{PaneCloseTx, PaneRunner};
-use cmdash::render::{blit_cursor, blit_grid};
+use cmdash::render::{
+    blit_cursor, blit_grid, blit_selection, copy_text_to_clipboard, extract_selected_text,
+};
 // `TabStack` (and `Tab`) are re-exported from the lib crate's
 // `tabs` module via `cmdash::TabStack`. main.rs is the binary
 // entrypoint; `crate::TabStack` would resolve to the binary
@@ -541,9 +543,9 @@ async fn main() {
 }
 
 async fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut gfx_protocol = cmdash::GraphicsProtocol::detect();
+    let mut caps = cmdash::graphics::TermCapabilities::detect();
     info!(
-        graphics = gfx_protocol.name(),
+        graphics = caps.graphics.name(),
         "cmdash starting (ratatui text body + dashcompositor graphics)"
     );
     let (config_path, source_label) = resolve_config_path(cli.config.as_deref());
@@ -643,6 +645,10 @@ async fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
     // Load widget factories before spawning panes so widget panes
     // can be instantiated immediately.
     let widget_factories = load_widgets();
+    // Derive the environment variables that advertise host
+    // terminal capabilities to child PTYs once, then reuse
+    // them for every shell pane spawned in the initial layout.
+    let pane_env_vars = caps.to_env_vars();
     for pane in &layout.panes {
         let layer_id = cmdash::derive_layer_id(&pane.id);
         let tx: PaneCloseTx = close_tx.clone();
@@ -685,7 +691,13 @@ async fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
             }
             PaneKind::Shell => {
                 let shell = shell_spec_from_command(&pane.command, &ShellSpec::LoginShell);
-                match PaneRunner::spawn_with_graphics(pane.clone(), layer_id, shell, Some(tx)) {
+                match PaneRunner::spawn_with_graphics_and_env(
+                    pane.clone(),
+                    layer_id,
+                    shell,
+                    Some(tx),
+                    pane_env_vars.clone(),
+                ) {
                     Ok(r) => runners.push(r),
                     Err(e) => warn!(error = %e, ?layer_id, "failed to spawn pane"),
                 }
@@ -725,7 +737,7 @@ async fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
     // Only runs after raw mode is active so the response is
     // byte-oriented (not line-buffered). Skipped when
     // CMDASH_GRAPHICS or TERM already identified a protocol.
-    if gfx_protocol == cmdash::GraphicsProtocol::TextOnly {
+    if caps.graphics == cmdash::GraphicsProtocol::TextOnly {
         if let Some(detected) =
             cmdash::GraphicsProtocol::query_device_attributes(Duration::from_millis(100))
         {
@@ -733,12 +745,11 @@ async fn run(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
                 protocol = detected.name(),
                 "DA1 query detected graphics protocol"
             );
-            gfx_protocol = detected;
+            caps.graphics = detected;
         }
     }
 
-    let graphics =
-        GraphicsState::new_with_protocol(Metrics::default(), (total.w, total.h), gfx_protocol);
+    let graphics = GraphicsState::new_with_caps(Metrics::default(), (total.w, total.h), caps);
 
     let tick = Duration::from_millis(33);
     let mut ctx = TickContext::new_full(
@@ -958,6 +969,22 @@ pub(crate) struct TabState {
     /// semantics).
     pub stack_focus: BTreeMap<cmdash_layout::PaneId, usize>,
 }
+/// Active copy-mode state. When `Some`, the user is selecting
+/// text in the focused pane to copy to the system clipboard.
+/// Coordinates are stored in visual (pane-local) cell space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyModeState {
+    /// Visual x coordinate of the copy-mode cursor (0-based,
+    /// relative to the pane's left edge).
+    cursor_x: u16,
+    /// Visual y coordinate of the copy-mode cursor (0-based,
+    /// relative to the pane's top edge).
+    cursor_y: u16,
+    /// Anchor of the selection, if any. When `Some`, the
+    /// selection spans from the anchor to the current cursor
+    /// position (inclusive).
+    selection_start: Option<(u16, u16)>,
+}
 
 /// Active drag-to-resize state for Alt+drag on split panes.
 ///
@@ -1081,6 +1108,16 @@ struct TickContext<'a, B: ratatui::backend::Backend> {
     shell: ShellSpec,
     /// Active drag-to-resize state (Alt+drag on any pane).
     drag_state: Option<DragState>,
+    /// Latest snapshot of the focused pane captured during the
+    /// most recent tick. Kept so copy-mode can read the focused
+    /// pane's text grid without re-advancing the PTY state
+    /// machine. Only the focused pane is retained to avoid
+    /// cloning every pane's grid every tick.
+    last_focused_snapshot: Option<cmdash_pty::PaneTerminalState>,
+    /// Active copy-mode state. When `Some`, the user is
+    /// selecting text in the focused pane to copy to the
+    /// system clipboard.
+    copy_mode: Option<CopyModeState>,
     /// Per-tab payload stack. The v1 singular `runners` /
     /// `focus` / `layout_root` / `stack_focus` fields above
     /// are unaffected by the tab-axis actions; the call sites
@@ -1203,7 +1240,6 @@ struct RunnerTickResult {
     snapshots: Vec<Option<cmdash_pty::PaneTerminalState>>,
     all_exited: bool,
 }
-
 impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// Construct a [`TickContext`] from all 14 per-frame
     /// building blocks, including the runtime-mutation hooks
@@ -1275,6 +1311,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             stack_focus,
             shell,
             drag_state: None,
+            copy_mode: None,
+            last_focused_snapshot: None,
             tabs: TabStack::new(initial_tab),
             config_reload_rx,
             status_bar: None,
@@ -1417,12 +1455,12 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             }
             KeyAction::PaneFocusNext => {
                 if !self.runners.is_empty() {
-                    self.focus = (self.focus + 1) % self.runners.len();
+                    self.set_focus((self.focus + 1) % self.runners.len());
                 }
             }
             KeyAction::PaneFocusPrev => {
                 if !self.runners.is_empty() {
-                    self.focus = (self.focus + self.runners.len() - 1) % self.runners.len();
+                    self.set_focus((self.focus + self.runners.len() - 1) % self.runners.len());
                 }
             }
             KeyAction::PaneFocusUp => self.focus_by_direction(Direction::Up),
@@ -1468,8 +1506,24 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             KeyAction::EnterPresetPick => {
                 self.bindings.set_mode(cmdash_keybinds::Mode::PresetPick);
             }
+            KeyAction::EnterCopyMode => {
+                self.enter_copy_mode();
+            }
             KeyAction::ModeExit => {
                 self.bindings.set_mode(cmdash_keybinds::Mode::Normal);
+                self.copy_mode = None;
+                self.last_focused_snapshot = None;
+            }
+            // Copy-mode movement and selection actions.
+            KeyAction::CopyModeMoveUp => self.copy_mode_move(0, -1),
+            KeyAction::CopyModeMoveDown => self.copy_mode_move(0, 1),
+            KeyAction::CopyModeMoveLeft => self.copy_mode_move(-1, 0),
+            KeyAction::CopyModeMoveRight => self.copy_mode_move(1, 0),
+            KeyAction::CopyModeStartSelection => self.copy_mode_start_selection(),
+            KeyAction::CopyModeCopy => {
+                if let Err(e) = self.copy_mode_copy() {
+                    warn!(error = ?e, "copy-mode copy failed");
+                }
             }
             // Pane resize actions (active in PaneResize mode).
             KeyAction::PaneResizeUp => self.pane_resize_by_direction(Direction::Up),
@@ -1644,7 +1698,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             return;
         }
 
-        let bytes = if focused_flags != 0 {
+        let bytes = if focused_flags != 0 && self.graphics.caps().supports_kitty_keyboard() {
             encode_kitty_key_event(code, *modifiers, *kind)
         } else if matches!(kind, KeyEventKind::Press) {
             event_to_bytes(*code)
@@ -1663,6 +1717,15 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                 );
             }
         }
+    }
+
+    /// Set the focused pane index, clearing copy-mode state when
+    /// the focus moves to a different pane.
+    fn set_focus(&mut self, idx: usize) {
+        if idx != self.focus {
+            self.copy_mode = None;
+        }
+        self.focus = idx;
     }
 
     /// Carry-forward: `PaneFocus{Direction}`. Resolve the
@@ -1730,7 +1793,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                 && pane.rect.y <= layout_row
                 && layout_row < pane.rect.y.saturating_add(pane.rect.h)
             {
-                self.focus = idx;
+                self.set_focus(idx);
                 return;
             }
         }
@@ -1763,7 +1826,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         let Some(pane_idx) = clicked_pane_idx else {
             return;
         };
-        self.focus = pane_idx;
+        self.set_focus(pane_idx);
         // Walk the layout tree to find the nearest enclosing Split.
         // The pane's resolver path gives us the tree location; the
         // parent of the leaf is the Split we want to resize.
@@ -1912,6 +1975,91 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Copy-mode helpers
+    // ------------------------------------------------------------------
+
+    /// Enter copy mode for the focused pane. The cursor starts at
+    /// the top-left of the pane's visible area. Widget panes have
+    /// no PTY text grid, so copy mode is disabled for them.
+    fn enter_copy_mode(&mut self) {
+        if self.runners.is_empty() {
+            return;
+        }
+        if self.runners[self.focus].is_widget() {
+            return;
+        }
+        self.copy_mode = Some(CopyModeState {
+            cursor_x: 0,
+            cursor_y: 0,
+            selection_start: None,
+        });
+        self.bindings.set_mode(cmdash_keybinds::Mode::Copy);
+    }
+
+    /// Move the copy-mode cursor by `(dx, dy)` cells, clamping to
+    /// the focused pane's rect.
+    fn copy_mode_move(&mut self, dx: i16, dy: i16) {
+        let Some(state) = self.copy_mode.as_mut() else {
+            return;
+        };
+        let rect = self.runners.get(self.focus).map(|r| r.computed().rect);
+        let Some(rect) = rect else { return };
+        let new_x =
+            (state.cursor_x as i32 + dx as i32).clamp(0, rect.w.saturating_sub(1) as i32) as u16;
+        let new_y =
+            (state.cursor_y as i32 + dy as i32).clamp(0, rect.h.saturating_sub(1) as i32) as u16;
+        state.cursor_x = new_x;
+        state.cursor_y = new_y;
+    }
+
+    /// Toggle the selection anchor at the current cursor position.
+    /// If no selection exists, start one; if one exists, clear it.
+    fn copy_mode_start_selection(&mut self) {
+        let Some(state) = self.copy_mode.as_mut() else {
+            return;
+        };
+        if state.selection_start.is_some() {
+            state.selection_start = None;
+        } else {
+            state.selection_start = Some((state.cursor_x, state.cursor_y));
+        }
+    }
+
+    /// Update `last_focused_snapshot` from the latest runner
+    /// snapshots. Only the focused pane's snapshot is retained,
+    /// and only while copy mode is active.
+    fn update_last_focused_snapshot(
+        &mut self,
+        snapshots: &[Option<cmdash_pty::PaneTerminalState>],
+    ) {
+        if self.copy_mode.is_some() {
+            self.last_focused_snapshot = snapshots.get(self.focus).cloned().flatten();
+        } else {
+            self.last_focused_snapshot = None;
+        }
+    }
+    /// Copy the selected text from the focused pane to the system
+    /// clipboard and exit copy mode. Returns an error if the
+    /// clipboard cannot be accessed.
+    fn copy_mode_copy(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let state = self.copy_mode.as_ref().copied();
+        let Some(state) = state else { return Ok(()) };
+        let Some(snapshot) = self.last_focused_snapshot.as_ref() else {
+            return Ok(());
+        };
+        let text = extract_selected_text(
+            &snapshot.grid,
+            state.cursor_x,
+            state.cursor_y,
+            state.selection_start,
+        );
+        copy_text_to_clipboard(&text)?;
+        self.copy_mode = None;
+        self.bindings.set_mode(cmdash_keybinds::Mode::Normal);
+        Ok(())
+    }
+
     /// Find the parent Split of the focused pane and return
     /// `(split_path, axis, current_ratio, child_index)`. Returns
     /// `None` if the focused pane has no parent Split.
@@ -1993,7 +2141,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             return;
         }
         if self.focus >= self.runners.len() {
-            self.focus = self.runners.len() - 1;
+            self.set_focus(self.runners.len() - 1);
         }
         let focused_id = self.runners[self.focus].computed().id;
         let layout = match ComputedLayout::compute(&self.layout_root, self.last_area) {
@@ -2011,7 +2159,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             .iter()
             .position(|r| r.computed().id == target_id)
         {
-            self.focus = idx;
+            self.set_focus(idx);
         }
     }
 
@@ -2087,7 +2235,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             return;
         }
         if self.focus >= self.runners.len() {
-            self.focus = self.runners.len() - 1;
+            self.set_focus(self.runners.len() - 1);
         }
         let focused_id = self.runners[self.focus].computed().id;
         let seed_path = focused_id.path();
@@ -2114,7 +2262,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             let tp: &[u16] = if !rp.is_empty() { &rp[1..] } else { &[] };
             tp == next_path.as_slice()
         }) {
-            self.focus = idx;
+            self.set_focus(idx);
             let new_id = self.runners[idx].computed().id;
             self.stack_focus.insert(new_id, next_idx);
         }
@@ -2192,7 +2340,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             return;
         }
         if self.focus >= self.runners.len() {
-            self.focus = self.runners.len() - 1;
+            self.set_focus(self.runners.len() - 1);
         }
         let focused_id = self.runners[self.focus].computed().id;
         let seed_path = focused_id.path();
@@ -2233,7 +2381,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                 let tp: &[u16] = if !rp.is_empty() { &rp[1..] } else { &[] };
                 tp == next_path.as_slice()
             }) {
-                self.focus = idx;
+                self.set_focus(idx);
                 let new_id = self.runners[idx].computed().id;
                 self.stack_focus.insert(new_id, next_idx);
             }
@@ -2256,7 +2404,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                 let tp: &[u16] = if !rp.is_empty() { &rp[1..] } else { &[] };
                 tp == next_path.as_slice()
             }) {
-                self.focus = idx;
+                self.set_focus(idx);
                 let new_id = self.runners[idx].computed().id;
                 self.stack_focus.insert(new_id, prev_idx);
             }
@@ -2278,7 +2426,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             return;
         }
         if self.focus >= self.runners.len() {
-            self.focus = self.runners.len() - 1;
+            self.set_focus(self.runners.len() - 1);
         }
         let focused_id = self.runners[self.focus].computed().id;
         // The resolver seeds `path[0] = 0` to represent an
@@ -2354,7 +2502,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             return;
         }
         if self.focus >= self.runners.len() {
-            self.focus = self.runners.len() - 1;
+            self.set_focus(self.runners.len() - 1);
         }
         let focused_id = self.runners[self.focus].computed().id;
         // When the focused leaf IS the root (resolver path
@@ -2388,7 +2536,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             return;
         }
         if self.focus >= self.runners.len() {
-            self.focus = self.runners.len() - 1;
+            self.set_focus(self.runners.len() - 1);
         }
         self.reconcile_runners(ReconcileMode::InPlace);
     }
@@ -2518,6 +2666,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
         // spawn fresh LayerIds for genuinely new panes / for
         // Wholesale slots.
         let mut new_runners: Vec<PaneRunner> = Vec::with_capacity(post_layout.panes.len());
+        let env_vars = self.graphics.caps().to_env_vars();
         for pane in &post_layout.panes {
             let survivor_opt: Option<PaneRunner> = if matches!(mode, ReconcileMode::InPlace) {
                 pane.label
@@ -2606,11 +2755,12 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                     }
                     PaneKind::Shell => {
                         let shell = shell_spec_from_command(&pane.command, &self.shell);
-                        match PaneRunner::spawn_with_graphics(
+                        match PaneRunner::spawn_with_graphics_and_env(
                             pane.clone(),
                             layer_id,
                             shell,
                             Some(tx),
+                            env_vars.clone(),
                         ) {
                             Ok(r) => new_runners.push(r),
                             Err(e) => {
@@ -2906,10 +3056,13 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// so that it matches. Called after pane snapshots are
     /// collected and after pane closures are drained.
     fn sync_host_keyboard_flags(&mut self) {
-        let union = self
-            .pane_keyboard_flags
-            .values()
-            .fold(0u8, |acc, &f| acc | f);
+        let union = if self.graphics.caps().supports_kitty_keyboard() {
+            self.pane_keyboard_flags
+                .values()
+                .fold(0u8, |acc, &f| acc | f)
+        } else {
+            0
+        };
         if union == self.host_keyboard_flags {
             return;
         }
@@ -2954,7 +3107,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// crossterm emits `Event::Paste`; disable it when no pane
     /// still wants it.
     fn sync_host_bracketed_paste(&mut self) {
-        let any = self.pane_bracketed_paste.values().any(|&v| v);
+        let any = self.graphics.caps().supports_bracketed_paste()
+            && self.pane_bracketed_paste.values().any(|&v| v);
         if any == self.host_bracketed_paste {
             return;
         }
@@ -2998,7 +3152,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// requested focus reporting, enable it on the host so crossterm
     /// emits `Event::FocusGained` / `Event::FocusLost`.
     fn sync_host_focus_reporting(&mut self) {
-        let any = self.pane_focus_reporting.values().any(|&v| v);
+        let any = self.graphics.caps().supports_focus_events()
+            && self.pane_focus_reporting.values().any(|&v| v);
         if any == self.host_focus_reporting {
             return;
         }
@@ -3044,6 +3199,9 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// panes that have not enabled focus reporting are skipped.
     fn forward_focus_event_to_focused_pane(&mut self, focused: bool) {
         if self.runners.is_empty() {
+            return;
+        }
+        if !self.graphics.caps().supports_focus_events() {
             return;
         }
         let Some(runner) = self.runners.get_mut(self.focus) else {
@@ -3143,8 +3301,47 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                 .get(&layer_id)
                 .copied()
                 .unwrap_or(false);
-            if is_enabled && !was_enabled {
+            if is_enabled && !was_enabled && self.graphics.caps().supports_focus_events() {
                 Self::write_focus_event_to_runner(runner, self.host_focused);
+            }
+        }
+    }
+
+    /// Drain `PaneEvent::DeviceAttributesQuery` events from the
+    /// freshly-collected pane snapshots and write the appropriate
+    /// DA1/DA2 response back to each requesting child PTY.
+    /// Responses are generated from `self.graphics.caps()` so
+    /// they reflect the host terminal's advertised capabilities.
+    fn handle_device_attributes_queries(
+        &mut self,
+        snapshots: &[Option<cmdash_pty::PaneTerminalState>],
+    ) {
+        use cmdash_pty::{DeviceAttributesKind, PaneEvent};
+        let caps = self.graphics.caps();
+        for (runner, snapshot) in self.runners.iter_mut().zip(snapshots.iter()) {
+            if runner.is_widget() {
+                continue;
+            }
+            let Some(snapshot) = snapshot else { continue };
+            for event in &snapshot.pending_events {
+                let response = match event {
+                    PaneEvent::DeviceAttributesQuery {
+                        kind: DeviceAttributesKind::Primary,
+                    } => Some(caps.da1_response()),
+                    PaneEvent::DeviceAttributesQuery {
+                        kind: DeviceAttributesKind::Secondary,
+                    } => Some(caps.da2_response()),
+                    _ => None,
+                };
+                if let Some(resp) = response {
+                    if let Err(e) = runner.write_input(resp.as_bytes()) {
+                        debug!(
+                            error = ?e,
+                            layer_id = ?runner.layer_id(),
+                            "device attributes response write failed"
+                        );
+                    }
+                }
             }
         }
     }
@@ -3220,7 +3417,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             // pass 2 via widget.render().
             {
                 let buf = frame.buffer_mut();
-                for (runner, snap) in self.runners.iter().zip(snapshots.iter()) {
+                for (idx, (runner, snap)) in self.runners.iter().zip(snapshots.iter()).enumerate() {
                     let computed_rect = runner.computed().rect;
                     debug!(
                         layer_id = ?runner.layer_id(),
@@ -3237,6 +3434,15 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                     if let Some(snap) = snap {
                         blit_grid(&snap.grid, buf, area);
                         blit_cursor(&snap.grid, buf, area);
+                        // If this pane is focused and copy-mode is
+                        // active, draw the selection overlay.
+                        if idx == self.focus {
+                            if let Some(state) = self.copy_mode.as_ref() {
+                                let cursor = (state.cursor_x, state.cursor_y);
+                                let end = state.selection_start.unwrap_or(cursor);
+                                blit_selection(buf, area, cursor, end);
+                            }
+                        }
                     }
                 }
                 render_tab_bar(buf, &self.tabs, &self.theme);
@@ -3261,6 +3467,7 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
                             cmdash_keybinds::Mode::PaneResize => "Resize",
                             cmdash_keybinds::Mode::TabSwitch => "TabSwitch",
                             cmdash_keybinds::Mode::PresetPick => "PresetPick",
+                            cmdash_keybinds::Mode::Copy => "Copy",
                         };
                         let pane_title = self
                             .runners
@@ -3348,9 +3555,11 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
             snapshots,
             all_exited,
         } = self.tick_runners()?;
+        self.update_last_focused_snapshot(&snapshots);
         self.update_keyboard_flags_from_snapshots(&snapshots);
         self.update_bracketed_paste_from_snapshots(&snapshots);
         self.update_focus_reporting_from_snapshots(&snapshots);
+        self.handle_device_attributes_queries(&snapshots);
         self.route_graphics_events(&snapshots);
         self.render_frame(&snapshots)?;
 
@@ -3433,7 +3642,8 @@ impl<'a, B: ratatui::backend::Backend> TickContext<'a, B> {
     /// child can treat it as a paste. Otherwise forward the raw
     /// bytes as-is.
     fn prepare_paste_bytes(&self, text: &str) -> Vec<u8> {
-        let bracketed = self.focused_bracketed_paste_enabled();
+        let bracketed = self.focused_bracketed_paste_enabled()
+            && self.graphics.caps().supports_bracketed_paste();
         if bracketed {
             let mut out = Vec::with_capacity(text.len() + 12);
             out.extend_from_slice(b"\x1b[200~");
@@ -4281,6 +4491,7 @@ mod input_tests {
     //! `PaneCloseTx`, and the next tick's phase 1 drains the
     //! channel and calls `GraphicsState::close_pane`.
     use super::*;
+    use cmdash::graphics::{GraphicsProtocol, TermCapabilities};
     use cmdash_layout::ComputedPane;
     // `PaneCloseTx`, `PaneRunner`, `GraphicsState`, and `Metrics`
     // are all in scope via `super::*` -> the parent
@@ -4479,9 +4690,18 @@ mod input_tests {
             let runner = make_runner(pane.clone(), layer_id, tx_clone);
             runners.push(runner);
         }
-        let graphics = GraphicsState::new(
+        let graphics = GraphicsState::new_with_caps(
             cmdash::graphics::Metrics::default(),
             (last_area.w, last_area.h),
+            TermCapabilities {
+                graphics: GraphicsProtocol::Kitty,
+                kitty_keyboard: true,
+                focus_events: true,
+                bracketed_paste: true,
+                true_color: true,
+                color_256: true,
+                queries: true,
+            },
         );
         let ctx = TickContext::new_full(
             runners,
@@ -7421,6 +7641,24 @@ mod input_tests {
         make_runner: impl FnOnce(ComputedPane, PaneLayerId, PaneCloseTx) -> PaneRunner,
         bindings: Router,
     ) -> TickContext<'a, ratatui::backend::TestBackend> {
+        let caps = TermCapabilities {
+            graphics: GraphicsProtocol::Kitty,
+            kitty_keyboard: true,
+            focus_events: true,
+            bracketed_paste: true,
+            true_color: true,
+            color_256: true,
+            queries: true,
+        };
+        setup_ctx_with_runner_and_caps(terminal, make_runner, bindings, caps)
+    }
+
+    fn setup_ctx_with_runner_and_caps<'a>(
+        terminal: &'a mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        make_runner: impl FnOnce(ComputedPane, PaneLayerId, PaneCloseTx) -> PaneRunner,
+        bindings: Router,
+        caps: TermCapabilities,
+    ) -> TickContext<'a, ratatui::backend::TestBackend> {
         let kdl = r#"layout { pane kind=shell }"#;
         let cfg = cmdash_config::parse(kdl).expect("parse KDL");
         let layout_root = cfg.layout.expect("layout block");
@@ -7436,9 +7674,10 @@ mod input_tests {
         let (close_tx, close_rx) = unbounded_channel::<PaneLayerId>();
         let runner = make_runner(pane, layer_id, close_tx.clone());
         let runners = vec![runner];
-        let graphics = GraphicsState::new(
+        let graphics = GraphicsState::new_with_caps(
             cmdash::graphics::Metrics::default(),
             (last_area.w, last_area.h),
+            caps,
         );
         TickContext::new_full(
             runners,
@@ -9063,6 +9302,110 @@ mod input_tests {
         }
 
         #[tokio::test]
+        async fn sync_host_keyboard_flags_noop_when_host_unsupported() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
+            ctx.graphics = GraphicsState::new_with_caps(
+                cmdash::graphics::Metrics::default(),
+                (80, 24),
+                TermCapabilities {
+                    graphics: GraphicsProtocol::TextOnly,
+                    kitty_keyboard: false,
+                    focus_events: false,
+                    bracketed_paste: false,
+                    true_color: false,
+                    color_256: false,
+                    queries: false,
+                },
+            );
+
+            ctx.pane_keyboard_flags.insert(PaneLayerId(1), 0b0000_0001);
+            ctx.sync_host_keyboard_flags();
+
+            assert_eq!(ctx.host_keyboard_flags, 0);
+            assert!(!ctx.host_keyboard_pushed);
+        }
+
+        #[tokio::test]
+        async fn sync_host_bracketed_paste_noop_when_host_unsupported() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
+            ctx.graphics = GraphicsState::new_with_caps(
+                cmdash::graphics::Metrics::default(),
+                (80, 24),
+                TermCapabilities {
+                    graphics: GraphicsProtocol::TextOnly,
+                    kitty_keyboard: false,
+                    focus_events: false,
+                    bracketed_paste: false,
+                    true_color: false,
+                    color_256: false,
+                    queries: false,
+                },
+            );
+
+            ctx.pane_bracketed_paste.insert(PaneLayerId(1), true);
+            ctx.sync_host_bracketed_paste();
+
+            assert!(!ctx.host_bracketed_paste);
+            assert!(!ctx.host_bracketed_paste_pushed);
+        }
+
+        #[tokio::test]
+        async fn sync_host_focus_reporting_noop_when_host_unsupported() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
+            ctx.graphics = GraphicsState::new_with_caps(
+                cmdash::graphics::Metrics::default(),
+                (80, 24),
+                TermCapabilities {
+                    graphics: GraphicsProtocol::TextOnly,
+                    kitty_keyboard: false,
+                    focus_events: false,
+                    bracketed_paste: false,
+                    true_color: false,
+                    color_256: false,
+                    queries: false,
+                },
+            );
+
+            ctx.pane_focus_reporting.insert(PaneLayerId(1), true);
+            ctx.sync_host_focus_reporting();
+
+            assert!(!ctx.host_focus_reporting);
+            assert!(!ctx.host_focus_reporting_pushed);
+        }
+
+        #[tokio::test]
+        async fn prepare_paste_bytes_forwards_raw_when_host_bracketed_paste_unsupported() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let mut ctx = setup_run_loop_ctx(&mut terminal);
+            ctx.graphics = GraphicsState::new_with_caps(
+                cmdash::graphics::Metrics::default(),
+                (80, 24),
+                TermCapabilities {
+                    graphics: GraphicsProtocol::TextOnly,
+                    kitty_keyboard: false,
+                    focus_events: false,
+                    bracketed_paste: false,
+                    true_color: false,
+                    color_256: false,
+                    queries: false,
+                },
+            );
+
+            // Pane requests bracketed paste, but host does not support it.
+            ctx.pane_bracketed_paste
+                .insert(ctx.runners[0].layer_id(), true);
+            let bytes = ctx.prepare_paste_bytes("hello");
+            assert_eq!(bytes, b"hello");
+        }
+
+        #[tokio::test]
         async fn pop_host_keyboard_flags_is_idempotent() {
             let backend = ratatui::backend::TestBackend::new(80, 24);
             let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
@@ -9892,6 +10235,30 @@ mod input_tests {
             );
         }
 
+        /// `extract_selected_text` returns the character under the
+        /// cursor when no selection anchor is set.
+        #[test]
+        fn extract_selected_text_returns_cursor_cell_without_selection() {
+            let mut grid = cmdash_pty::TextGrid::new(10, 5);
+            // Put a known character at the origin.
+            grid.put_char(0, 0, 'X');
+            let text = extract_selected_text(&grid, 0, 0, None);
+            assert_eq!(text, "X");
+        }
+
+        /// `extract_selected_text` returns the rectangular selection
+        /// between the anchor and the cursor.
+        #[test]
+        fn extract_selected_text_returns_rectangular_selection() {
+            let mut grid = cmdash_pty::TextGrid::new(10, 5);
+            // Row 1: " hello" (leading space).
+            grid.put_char(1, 1, ' ');
+            for (i, c) in "hello".chars().enumerate() {
+                grid.put_char(2 + i as u16, 1, c);
+            }
+            let text = extract_selected_text(&grid, 6, 1, Some((1, 1)));
+            assert_eq!(text, " hello");
+        }
         /// `emit_graphics` is the dashcompositor counter-part. It should
         /// run without panic even when the only layer is a widget pane and
         /// no images have been pushed.
@@ -9906,6 +10273,143 @@ mod input_tests {
                 result.is_ok(),
                 "emit_graphics must succeed with empty layers"
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod copy_mode_snapshot_tests {
+        use super::*;
+        use cmdash_pty::{PaneLayerId, PanePtyOps, PaneTerminalState, PtyError, TextGrid};
+
+        /// Stub PTY that returns a snapshot with a unique marker in the grid.
+        struct MarkedStubPty {
+            layer_id: PaneLayerId,
+            marker: char,
+        }
+
+        impl MarkedStubPty {
+            fn new(layer_id: PaneLayerId, marker: char) -> Self {
+                Self { layer_id, marker }
+            }
+        }
+
+        impl PanePtyOps for MarkedStubPty {
+            fn layer_id(&self) -> PaneLayerId {
+                self.layer_id
+            }
+            fn resize(&mut self, _cols: u16, _rows: u16) -> Result<(), PtyError> {
+                Ok(())
+            }
+            fn write(&mut self, _bytes: &[u8]) -> Result<usize, PtyError> {
+                Ok(0)
+            }
+            fn advance(&mut self, _bytes: &[u8]) -> Result<(), PtyError> {
+                Ok(())
+            }
+            fn snapshot(&mut self) -> PaneTerminalState {
+                let mut grid = TextGrid::new(10, 5);
+                grid.put_char(0, 0, self.marker);
+                PaneTerminalState {
+                    grid,
+                    cols: 10,
+                    rows: 5,
+                    pending_events: Vec::new(),
+                }
+            }
+            fn try_wait(&mut self) -> Result<Option<i32>, PtyError> {
+                Ok(None)
+            }
+            fn kill(&mut self) -> Result<(), PtyError> {
+                Ok(())
+            }
+            fn keyboard_flags(&self) -> u8 {
+                0
+            }
+            fn focus_reporting_enabled(&self) -> bool {
+                false
+            }
+            fn scrollback_up(&mut self, _n: usize) {}
+            fn scrollback_down(&mut self, _n: usize) {}
+            fn scrollback_reset(&mut self) {}
+            fn in_scrollback(&self) -> bool {
+                false
+            }
+        }
+
+        /// `last_focused_snapshot` retains only the focused pane's
+        /// snapshot while in copy mode, not every pane's snapshot.
+        #[test]
+        fn copy_mode_retains_only_focused_pane_snapshot() {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend->Terminal");
+            let kdl = r#"layout {
+                split axis=horizontal {
+                    pane kind=shell label="left"
+                    pane kind=shell label="right"
+                }
+            }"#;
+            let (mut ctx, _root, _area) = setup_fixture_ctx_with_runner(
+                kdl,
+                0,
+                Router::new(Vec::new()),
+                |pane, layer_id, close_tx| {
+                    let marker = if pane.label.as_deref() == Some("left") {
+                        'L'
+                    } else {
+                        'R'
+                    };
+                    PaneRunner::with_pty_for_test(
+                        pane,
+                        layer_id,
+                        Box::new(MarkedStubPty::new(layer_id, marker)),
+                        Some(close_tx),
+                    )
+                },
+                LayoutRect {
+                    x: 0,
+                    y: 0,
+                    w: 80,
+                    h: 24,
+                },
+                &mut terminal,
+            );
+
+            // Before entering copy mode, no snapshot is retained.
+            assert!(ctx.last_focused_snapshot.is_none());
+
+            // Enter copy mode and tick once.
+            ctx.enter_copy_mode();
+            let result = ctx.tick_runners().expect("tick runners");
+            ctx.update_last_focused_snapshot(&result.snapshots);
+
+            // Only the focused (left) pane's snapshot should be retained.
+            let snapshot = ctx
+                .last_focused_snapshot
+                .as_ref()
+                .expect("snapshot should be retained in copy mode");
+            assert_eq!(snapshot.grid.cell(0, 0).ch, 'L');
+
+            // Move focus to the second pane and tick again.
+            ctx.set_focus(1);
+            ctx.enter_copy_mode();
+            let result = ctx.tick_runners().expect("tick runners");
+            ctx.update_last_focused_snapshot(&result.snapshots);
+
+            let snapshot = ctx
+                .last_focused_snapshot
+                .as_ref()
+                .expect("snapshot should be retained in copy mode");
+            assert_eq!(snapshot.grid.cell(0, 0).ch, 'R');
+
+            // Exiting copy mode should clear the retained snapshot.
+            ctx.apply_action_full(KeyAction::ModeExit);
+            assert!(ctx.last_focused_snapshot.is_none());
+
+            // When copy mode is inactive, further ticks should not retain
+            // any snapshot.
+            let result = ctx.tick_runners().expect("tick runners");
+            ctx.update_last_focused_snapshot(&result.snapshots);
+            assert!(ctx.last_focused_snapshot.is_none());
         }
     }
 }

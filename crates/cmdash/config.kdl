@@ -38,6 +38,7 @@ keybinds {
     // Mode entry (Escape exits any non-Normal mode)
     bind "M-r"    action="pane.resize.enter"
     bind "M-p"    action="preset.pick.enter"
+    bind "M-c"    action="copy.enter"
 }
 
 // Theme customization. Uncomment and edit to override the default

@@ -287,15 +287,34 @@ style supports `"block"`, `"underline"`, and `"bar"` (with aliases).
 
 ### 3.4 Clipboard integration
 
-**Current state:** No clipboard support. `Event::Paste` is redacted in
-the event logger but not forwarded.
+**Status:** ✅ Working.
 
-**Goal:** Support paste from system clipboard.
+**Current state:** `Event::Paste` is forwarded to the focused pane's
+PTY, wrapped in bracketed-paste delimiters when the pane has requested
+bracketed-paste mode. A copy-mode (`Mode::Copy`) lets the user select
+text in the focused pane and copy it to the system clipboard via the
+`arboard` crate.
 
-**Steps:**
-- Forward `Event::Paste` content to the focused pane's PTY.
-- Add a copy-mode (select text in a pane, copy to clipboard).
-- Use `crossterm` or a clipboard crate for system integration.
+**Implementation:**
+- `Event::Paste` is handled by `TickContext::handle_paste`, which wraps
+  the pasted text in `ESC [ 200 ~` / `ESC [ 201 ~` when the focused
+  pane has requested bracketed paste.
+- Copy-mode actions are parsed from KDL (`copy.enter`,
+  `copy.move.up/down/left/right`, `copy.select`, `copy.copy`).
+- `Mode::Copy` is routed through `cmdash_keybinds::Router` with default
+  keybinds: arrow keys move the cursor, `v` starts/extends the
+  selection, `y` or Enter copies and exits.
+- `CopyModeState` tracks the cursor and selection anchor in pane-local
+  visual coordinates.
+- `blit_selection` renders the selected region with reversed video.
+- `extract_selected_text` reads the selected cells from the focused
+  pane's latest snapshot and copies them to the system clipboard.
+
+**Remaining:**
+- Selection currently reads from the live grid only; scrollback-aware
+  selection is a future enhancement.
+- OSC 52 clipboard integration (child PTY → system clipboard) is
+  tracked separately in §4.5.
 
 ### 3.5 Session persistence (detach/attach)
 
@@ -384,7 +403,10 @@ encoding is used otherwise.
 - `sync_host_keyboard_flags` / `push_host_keyboard_flags` /
   `pop_host_keyboard_flags` lifecycle methods.
 - `handle_event_full` routes widget press events separately;
-  PTY panes use Kitty encoding when `focused_flags != 0`.
+  PTY panes use Kitty encoding when `focused_flags != 0` and the host
+  terminal advertises Kitty keyboard support via
+  `TermCapabilities::supports_kitty_keyboard()`; legacy encoding is
+  used otherwise.
 - `drain_close_channel` prunes `pane_keyboard_flags` on close.
 - `pop_host_keyboard_flags` called on `run()` exit.
 
@@ -401,8 +423,6 @@ encoding is used otherwise.
 - Negotiate with the host terminal via `CSI > 1 u` / `CSI < u`.
   Currently, enhancement is pushed when any pane requests it, but
   the initial negotiation sequence is not sent on startup.
-- Gate on host capability detection; fall back to legacy key encoding
-  when the host does not support Kitty keyboard protocol.
 
 ### 4.2 Bracketed paste
 
@@ -428,13 +448,15 @@ mode while any pane still needs it. Pasted content is wrapped in
 - `sync_host_bracketed_paste` enables/disables host bracketed paste
   when the union changes.
 - `prepare_paste_bytes()` wraps pasted text only when the focused pane
-  has requested bracketed paste.
+  has requested bracketed paste and the host terminal advertises
+  bracketed-paste support via
+  `TermCapabilities::supports_bracketed_paste()`; raw paste is used
+  otherwise.
 - Integration test `host_bracketed_paste_union_across_focus_changes`
   verifies the union semantics across focus changes.
 
 **Remaining:**
-- Gate on host capability detection; fall back to raw paste when the
-  host terminal does not support bracketed paste.
+- No remaining work.
 
 ### 4.3 Focus reporting
 
@@ -463,11 +485,11 @@ reported to that pane.
 - `forward_focus_event_to_focused_pane` forwards `CSI I`/`CSI O` to
   the focused pane on host focus changes.
 - `update_focus_reporting_from_snapshots` sends the initial host focus
-  state to any pane that just enabled focus reporting.
+  state to any pane that just enabled focus reporting, gated by host
+  support via `TermCapabilities::supports_focus_events()`.
 
 **Remaining:**
-- Gate on host capability detection; fall back when the host terminal
-  does not support focus events.
+- No remaining work.
 
 ### 4.4 Hyperlinks (OSC 8)
 
@@ -648,6 +670,38 @@ extensions.
 - Extend the cell attribute model.
 - Map styles to dashcompositor text rendering.
 - Add tests for underline style round-trip.
+
+### 4.20 Capability advertisement to child PTYs
+
+**Status:** ✅ Working.
+
+**Goal:** Make cmdash a transparent modern-terminal proxy by advertising
+the host terminal's supported capabilities to each child PTY, and by
+responding to capability queries from child applications. This is the
+cross-cutting foundation that lets features like Kitty keyboard,
+bracketed paste, focus reporting, and true color be negotiated rather
+than assumed. It also unblocks the host-capability fallback work
+remaining in §4.1–§4.3.
+
+**Current state:**
+- `TermCapabilities` registry captures host support for graphics
+  (Kitty/Sixel), input (Kitty keyboard, focus events, bracketed paste),
+  color (true color, 256 color), and queries (DA1/DA2).
+- Host capabilities are detected at startup from `TERM`,
+  `TERM_PROGRAM`, `COLORTERM`, and the `CMDASH_GRAPHICS` override.
+- Capabilities are advertised to child PTYs via `TERM`, `COLORTERM`,
+  and custom `CMDASH_*` environment variables (`CMDASH_GRAPHICS`,
+  `CMDASH_KITTY_KEYBOARD`, `CMDASH_FOCUS_EVENTS`,
+  `CMDASH_BRACKETED_PASTE`, `CMDASH_QUERIES`).
+- DA1/DA2 query responses are generated from `TermCapabilities` and
+  written back to the requesting child PTY.
+- Documentation is complete: see `docs/configuration.md` §3 and
+  `README.md` "Environment variables".
+
+**Remaining:**
+- Reconcile per-pane feature requests against the host capability set;
+  fall back to legacy behavior when the host does not support a
+  requested feature.
 
 ## Testing priorities
 

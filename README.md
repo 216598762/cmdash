@@ -120,6 +120,25 @@ The `--log=<path>` flag controls **where** tracing events land;
 mode), `RUST_LOG` is honored. See
 [`docs/configuration.md`](./docs/configuration.md) for details.
 
+## Environment variables
+
+cmdash reads a small set of environment variables at startup and
+advertises a matching set to every child PTY it spawns:
+
+| Variable | Purpose |
+| :--- | :--- |
+| `CMDASH_CONFIG_DIR` | Directory to load `config.kdl` from (overrides XDG default). |
+| `CMDASH_GRAPHICS` | Force the graphics protocol: `kitty`, `sixel`, `none`, `text`, or `off`. |
+| `CMDASH_KITTY_KEYBOARD` | Advertised to child PTYs: `1` if the host supports Kitty keyboard protocol. |
+| `CMDASH_FOCUS_EVENTS` | Advertised to child PTYs: `1` if the host supports focus-change reporting. |
+| `CMDASH_BRACKETED_PASTE` | Advertised to child PTYs: `1` if the host supports bracketed paste. |
+| `CMDASH_QUERIES` | Advertised to child PTYs: `1` if the host responds to DA1/DA2 queries. |
+
+`TERM`, `TERM_PROGRAM`, and `COLORTERM` are also used to detect host
+capabilities, and `RUST_LOG` controls stdout logging when `--log` is
+not used. See [`docs/configuration.md`](./docs/configuration.md) §3 for
+the full reference.
+
 ## Bracketed paste support
 
 cmdash supports the standard terminal bracketed-paste protocol. When a
