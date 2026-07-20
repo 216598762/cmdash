@@ -1165,11 +1165,15 @@ mod tests {
                             kind: PaneKind::Shell,
                             label: Some("a".into()),
                             command: None,
+
+                            scrollback_capacity: None,
                         }),
                         LayoutNode::Pane(cmdash_config::Pane {
                             kind: PaneKind::Shell,
                             label: Some("b".into()),
                             command: None,
+
+                            scrollback_capacity: None,
                         }),
                     ],
                 },
@@ -1177,6 +1181,8 @@ mod tests {
                     kind: PaneKind::Shell,
                     label: Some("c".into()),
                     command: None,
+
+                    scrollback_capacity: None,
                 }),
             ],
         };

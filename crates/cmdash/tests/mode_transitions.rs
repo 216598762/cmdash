@@ -245,6 +245,7 @@ async fn full_mode_transition_resize_real_pty() {
                 layer,
                 long_shell(),
                 Some(close_tx.clone()),
+                cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
             )
             .expect("spawn pane"),
         );

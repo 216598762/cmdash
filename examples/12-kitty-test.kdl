@@ -1,0 +1,13 @@
+// 12-kitty-test.kdl — Kitty graphics protocol verification example.
+//
+// Run with:
+//   CMDASH_GRAPHICS=kitty TERM=xterm-kitty cmdash --config=examples/12-kitty-test.kdl
+//
+// The child shell emits a tiny kitty graphics load command (a 1x1 red PNG).
+// cmdash intercepts the command and forwards it to the host terminal using the
+// Kitty graphics protocol. In a Kitty-capable terminal you should see a small
+// red square.
+
+layout {
+    pane kind=shell label="kitty-test" command="examples/graphics-test-emitter.sh kitty"
+}

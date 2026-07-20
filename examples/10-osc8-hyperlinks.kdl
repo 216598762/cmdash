@@ -1,0 +1,35 @@
+// 10-osc8-hyperlinks.kdl — OSC 8 hyperlink pass-through demonstration.
+//
+// cmdash forwards OSC 8 hyperlink sequences emitted by child panes
+// directly to the host terminal, so applications that produce
+// clickable links work transparently inside panes.
+//
+// OSC 8 framing:
+//   Open:  ESC ] 8 ; ; <uri> ESC \
+//   Close: ESC ] 8 ; ; ESC \
+//
+// This example spawns a shell that prints a few hyperlinked lines and
+// then replaces itself with the user's default shell. The actual OSC 8
+// sequences live in `examples/print-hyperlinks.sh` so the KDL stays
+// readable.
+//
+// See docs/configuration.md §6.7 for full details.
+//
+// To try it: copy this file on top of `crates/cmdash/config.kdl`
+// (which the binary embeds via `include_str!`) and rebuild, or
+// point cmdash at it with `cmdash --config=examples/10-osc8-hyperlinks.kdl`.
+//
+// NOTE: the command below references `examples/print-hyperlinks.sh`
+// with a relative path. It works when cmdash is launched from the
+// project root. If you copy this config elsewhere, adjust the path or
+// move the helper script accordingly.
+
+layout {
+    pane kind=shell label="links" command="examples/print-hyperlinks.sh"
+}
+
+keybinds {
+    bind "alt-w"  action="pane.close"
+    bind "alt-q"  action="app.close"
+    bind "ctrl-a" action="app.new-pane"
+}

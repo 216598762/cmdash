@@ -50,6 +50,7 @@ async fn pane_runner_tracks_focus_reporting_from_real_pty() {
                 r#"printf '\033[?1004h'; cat"#.to_string(),
             ],
         },
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
     )
     .expect("spawn pane runner with real pty");
 

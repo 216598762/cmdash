@@ -45,7 +45,7 @@ The tab bar is rendered in two layers:
   at row 0 with active tab highlighted (Blue bg, White bold) and
   inactive tabs styled DarkGray/Gray. Called unconditionally in
   `TickContext::run` after pane grid rendering.
-- **Phase 3b (pixel):** `graphics.update_tab_bar()` pushes dashcompositor
+- **Phase 3b (pixel):** `graphics.update_tab_bar()` pushes termcompositor
   `RectLayer` + `TextLayer` overlays that overwrite the text tab bar on
   Kitty/Sixel-capable hosts.
 - `TAB_BAR_HEIGHT` (1 row) reserves space at the top of the terminal;
@@ -80,7 +80,9 @@ The command is wired through `TickContext` during pane spawning.
 
 ### 1.4 Scrollback / alternate screen
 
-**Current state:** ✅ Implemented. `TextGrid` has a ring-buffer scrollback
+**Status:** ✅ Working.
+
+**Current state:** `TextGrid` has a ring-buffer scrollback
 (`VecDeque<Vec<Cell>>`, default capacity 1000 rows). `scroll_up_one`
 captures the top row into scrollback before shifting. `PageUp` enters
 scrollback mode; `PageDown` scrolls toward live view (only intercepted
@@ -90,13 +92,24 @@ scrollback buffer; `ESC [2J` only clears the visible screen (xterm
 semantics). `blit_grid` renders scrollback rows above the live grid
 when the viewport offset is > 0.
 
+`cmdash-pty` parses `CSI ? 47 h`/`l`, `CSI ? 1047 h`/`l`, and
+`CSI ? 1049 h`/`l` and surfaces `PaneEvent::AlternateScreen { enabled }`;
+while the alternate screen is active, scrollback capture is suppressed so
+full-screen TUIs do not pollute history. The binary tracks per-pane
+alternate-screen state in `TickContext::pane_alternate_screen` and
+disables PageUp/PageDown scrollback navigation while the focused pane is
+in the alternate screen.
+
+Per-pane scrollback capacity can be configured via KDL with
+`scrollback-capacity=<n>` on any `pane` node; the value is threaded
+through `PaneRunner::spawn_with_graphics_and_env` to `TextGrid::set_scrollback_capacity`.
+
 **Remaining:**
-- Alternate screen detection/toggle (DECSET/DECRST 1047/1049).
-- Configurable scrollback capacity via KDL.
+- No remaining work.
 
 ### 1.5 Sixel fallback verification
 
-**Status:** ✅ Unit tests verified. Manual terminal testing pending.
+**Status:** ✅ Unit tests verified. Manual terminal testing scripted.
 
 **Current state:** `GraphicsProtocol` enum (Kitty/Sixel/TextOnly) with
 `detect()` from `TERM`/`TERM_PROGRAM`/`CMDASH_GRAPHICS` env vars.
@@ -104,8 +117,17 @@ when the viewport offset is > 0.
 protocol, with TextOnly early-out. Startup logs the chosen protocol.
 11 unit tests verify detection, encoding dispatch, and tab bar behavior.
 
-**Remaining:**
-- Manual testing against `xterm` with Sixel support and `mlterm`.
+**Manual verification:**
+- `scripts/verify-sixel.sh` launches cmdash inside `xterm`, `mlterm`,
+  and/or `foot` (whichever are installed) with `CMDASH_GRAPHICS=sixel`
+  and a pane that emits a kitty graphics load command. It captures the
+  host terminal output and checks for valid Sixel DCS sequences.
+- `scripts/verify-kitty.sh` does the same for Kitty-capable terminals
+  (`kitty`, `foot`, `wezterm`) with `CMDASH_GRAPHICS=kitty` and checks
+  for valid Kitty APC-G sequences.
+- `examples/11-sixel-test.kdl` and `examples/12-kitty-test.kdl` are
+  standalone configs that run `examples/graphics-test-emitter.sh`
+  with a `sixel` or `kitty` argument respectively.
 
 **Device Attributes (DA1) query:** `query_device_attributes()` sends
 `ESC[c` to the terminal and parses the response for Sixel attribute
@@ -113,6 +135,10 @@ protocol, with TextOnly early-out. Startup logs the chosen protocol.
 bytes consumed on timeout). Gated behind `is_terminal()` so it's
 skipped in CI/non-TTY environments. Only runs when env-var detection
 yields `TextOnly` (avoids startup delay for configured users).
+
+**Remaining:**
+- Run `scripts/verify-sixel.sh` on a machine with `xterm`, `mlterm`,
+  or `foot` installed and confirm all requested terminals pass.
 
 ## Tier 2: Extensibility
 
@@ -318,24 +344,48 @@ text in the focused pane and copy it to the system clipboard via the
 
 ### 3.5 Session persistence (detach/attach)
 
+**Status:** Architecture complete; implementation not started.
+
 **Current state:** cmdash runs as a foreground process. When the
 terminal closes or the SSH session drops, all panes are killed.
 
 **Goal:** Support detach/attach like tmux, so a cmdash session survives
 terminal disconnect and can be reattached later.
 
-**Steps:**
-- Implement a server mode: cmdash forks a background process that
-  owns the PTY children and layout state.
-- The foreground process connects to the server via a Unix domain
-  socket (or named pipe on Windows).
-- `cmdash attach <session>` reconnects to a running session.
-- `cmdash detach` (or loss of the controlling terminal) disconnects
-  the frontend without killing the server.
-- This is architecturally significant — the `TickContext` render loop
-  would need to split into a backend (PTY + state) and frontend
-  (render + input) pair. Defer until the sync I/O architecture (3.1)
-  is settled.
+**Architecture:** See `docs/session-persistence-architecture.md` for the
+full design. In summary:
+- A long-lived **server** process owns the PTY children (`PaneRunner`),
+  `TextGrid` state, layout tree, tab stack, and config.
+- A short-lived **frontend** process handles crossterm input, ratatui
+  text rendering, and the local `GraphicsState` / termcompositor layer stack.
+- Frontend and server communicate over a Unix domain socket (named pipe on
+  Windows) using a `bincode`-serialized protocol.
+- On attach, the server sends a `SyncFull` snapshot; afterwards it streams
+  `FrameIncremental` deltas at the tick rate.
+- Kitty/Sixel graphics commands are forwarded to the frontend, which owns
+  the decoded image layers.
+
+**CLI surface:**
+- `cmdash` — attach to the default session, forking a server if needed.
+- `cmdash attach <session>` — attach to a named session.
+- `cmdash detach` — gracefully disconnect the current frontend.
+- `cmdash list-sessions` — list active sessions.
+- `cmdash kill-server [session]` — terminate the server and its panes.
+
+**Migration path (3 milestones):**
+1. **In-process channel split:** refactor `TickContext` into internal
+   `ServerTask` and `FrontendTask` connected by `tokio::sync::mpsc`.
+2. **Serialization validation:** replace the in-memory channel with an
+   internal Unix socket pair and force all payloads through `bincode`.
+3. **Forking and CLI:** implement daemonization, stale-socket cleanup,
+   version-mismatch handling, and the new CLI modes.
+
+**Remaining:**
+- Implement milestones 1–3.
+- Measure bandwidth at 30 Hz and optimize `FrameIncremental` deltas if
+  needed (run-length encoding, raw-output fallback for high-traffic panes).
+- Decide whether the server should idle-exit when the last pane closes
+  (v1: yes, to keep the design simple).
 
 ### 3.6 Configuration validation and error reporting
 
@@ -493,25 +543,55 @@ reported to that pane.
 
 ### 4.4 Hyperlinks (OSC 8)
 
-**Status:** Not started.
+**Status:** Partial.
 
-**Goal:** Pass through OSC 8 hyperlink sequences.
+**Current state:** `cmdash-pty` parses OSC 8 hyperlink sequences in
+`osc_dispatch` and surfaces `PaneEvent::Hyperlink { uri }`. The URI is
+interned in `TextGrid::urls` and attached to newly printed cells via the
+`link_id` field. This prepares the ground for per-cell hyperlink
+rendering and host-terminal forwarding, but the binary does not yet
+consume `PaneEvent::Hyperlink` in the tick loop or emit the corresponding
+OSC 8 sequence to the host terminal.
 
-**Steps:**
-- Preserve OSC 8 escape sequences in `cmdash-pty` output.
-- Route hyperlink metadata to dashcompositor text layers or passthrough.
-- Maintain per-pane hyperlink ID namespaces.
+**Remaining:**
+- Forward open/close hyperlink events from pane snapshots to the host
+  terminal as raw OSC 8 sequences (with URI sanitization).
+- Per-cell hyperlink rendering in the ratatui/termcompositor text layer
+  (future goal; v1 will forward to the host terminal only).
 
 ### 4.5 OSC 52 clipboard integration
 
-**Status:** Not started.
+**Status:** ✅ Working.
 
-**Goal:** Allow child PTYs to read/write the system clipboard via OSC 52.
+**Current state:** PTY-side VTE parsing intercepts OSC 52 set/query
+sequences and emits `PaneEvent::ClipboardOsc52 { clipboard, action }`.
+`PanePty` tracks pending clipboard events per-pane. Host-side,
+`TickContext` routes the events to the system clipboard according to the
+`clipboard { osc52 ... }` config policy.
 
-**Steps:**
-- Intercept OSC 52 set/query sequences from child PTYs.
-- Integrate with a clipboard crate or crossterm clipboard APIs.
-- Implement a security policy (allow/deny read vs. write; per-pane opt-in).
+**Implementation:**
+- `PaneEvent::ClipboardOsc52 { clipboard, action }` and
+  `Osc52Action::{Set, Query}` in `cmdash-pty`.
+- `collect_osc52_events()` helper in `cmdash::pane` gathers pending
+  clipboard events from pane snapshots.
+- `TickContext::update_osc52_from_snapshots()` applies the configured
+  `Osc52Policy`:
+  - `Disabled` — ignores all OSC 52 requests.
+  - `WriteOnly` — writes decoded `Set` text to the system clipboard via
+    `arboard`.
+  - `ReadWrite` — writes `Set` text and responds to `Query` requests
+    with the current system clipboard contents encoded as an OSC 52
+    sequence.
+- `TickContext::encode_osc52_response()` formats OSC 52 response
+  sequences with base64-encoded text.
+- `cmdash_config::ClipboardConfig` and `Osc52Policy` parsed from the
+  top-level `clipboard { osc52 "..." }` KDL block.
+- Unit tests in `crates/cmdash/src/main.rs` cover set/query routing and
+  response encoding.
+- Documentation in `docs/configuration.md` §4.6 and §6.8.
+
+**Remaining:**
+- No remaining work.
 
 ### 4.6 Synchronized output (BSU/ESU)
 
@@ -535,16 +615,16 @@ and bold.
 **Steps:**
 - Ensure the `vte` parser preserves extended SGR attributes.
 - Extend the internal cell attribute model.
-- Map attributes to dashcompositor text styling.
+- Map attributes to termcompositor text styling.
 
 ### 4.8 True color / 24-bit color guarantees
 
-**Status:** Working (via `ratatui`/`dashcompositor`).
+**Status:** Working (via `ratatui`/`termcompositor`).
 
 **Goal:** Ensure 24-bit color is preserved end-to-end.
 
 **Steps:**
-- Audit color handling in the `vte` → dashcompositor path.
+- Audit color handling in the `vte` → termcompositor path.
 - Add tests for 24-bit color round-trip.
 - Document host terminal true-color requirements.
 
@@ -566,7 +646,7 @@ and bold.
 **Goal:** Render font ligatures when the host font supports them.
 
 **Steps:**
-- Pass ligature hints to the dashcompositor font rasterizer.
+- Pass ligature hints to the termcompositor font rasterizer.
 - Detect ligature-friendly fonts.
 - Provide a config toggle for ligature rendering.
 
@@ -624,7 +704,7 @@ extensions.
 
 **Steps:**
 - Extend the `cmdash-pty` graphics parser.
-- Route decoded images to dashcompositor image layers.
+- Route decoded images to termcompositor image layers.
 - Maintain per-pane image ID namespaces.
 
 ### 4.16 Unicode version support
@@ -657,7 +737,7 @@ extensions.
 
 **Steps:**
 - Capture soft font definitions from child PTYs.
-- Route them to the dashcompositor font rasterizer.
+- Route them to the termcompositor font rasterizer.
 - Manage per-pane font glyph caches.
 
 ### 4.19 Overline / double underline
@@ -668,7 +748,7 @@ extensions.
 
 **Steps:**
 - Extend the cell attribute model.
-- Map styles to dashcompositor text rendering.
+- Map styles to termcompositor text rendering.
 - Add tests for underline style round-trip.
 
 ### 4.20 Capability advertisement to child PTYs
@@ -702,6 +782,415 @@ remaining in §4.1–§4.3.
 - Reconcile per-pane feature requests against the host capability set;
   fall back to legacy behavior when the host does not support a
   requested feature.
+
+## Tier 5: Adopt termcompositor v2.0.0 capabilities
+
+termcompositor was renamed from `dashcompositor` and shipped v2.0.0
+with a substantial set of new capabilities that cmdash's current
+graphics adapter (`crates/cmdash/src/graphics.rs`) does not yet use.
+The rename itself is complete — all `dashcompositor` mentions are now
+`termcompositor`, the workspace dependency points at the v2.0.0 git
+source, and the workspace MSRV was raised from 1.73 to 1.85 (the
+`kitty-encoder`, `sixel-encoder`, and `image-decoder` features require
+Rust ≥ 1.85 per upstream's feature-flag note). This tier collects every
+refactor that would let cmdash benefit from the new surface; items are
+ordered roughly by impact, with the highest-leverage perf win
+(diff-based rendering) first.
+
+The v1 graphics adapter still works unchanged against v2.0.0 because
+the rename preserved the existing API (`encode_passthrough_to_writer`,
+`LayerStack`, `ImageLayer::from_dynamic`, `CpuCompositor`, `RectLayer`,
+`TextLayer`, `encoder::encode_to_writer`). Nothing below is a blocker;
+each item is independently shippable.
+
+### 5.1 Diff-based rendering via `DirtyRegion` / `render_diff`
+
+**Status:** Not started. **Highest leverage.**
+
+**Current state:** `GraphicsState::render_and_write` composites the
+entire `LayerStack` into a fresh `FrameBuffer` every tick via
+`CpuCompositor.compose(&self.stack, &mut fb)`, then encodes the whole
+framebuffer through the kitty or sixel encoder. At 80×24 cells × 8×16
+px/cell that is a 640×384 RGBA buffer re-composited and re-encoded 30
+times per second even when nothing on screen changed.
+
+**Opportunity:** termcompositor v2.0.0 adds `DirtyRegion` and
+`LayerStack::render_diff(target, dirty)`:
+- `DirtyRegion::mark_rect(DirtyRect::new(x, y, w, h))` declares a
+  sub-rectangle dirty.
+- `DirtyRegion::mark_full()` forces a full re-render.
+- `LayerStack::render_diff(target, dirty)` composites only layers whose
+  bounding boxes intersect the dirty regions and copies just those
+  regions into `target`; the rest of the framebuffer is preserved from
+  the previous frame.
+
+**Refactor:**
+- Add a `dirty: DirtyRegion` field to `GraphicsState` and a persistent
+  `FrameBuffer` (re-allocated only on `set_cells` resize) instead of a
+  fresh one per tick.
+- Mark dirty on every layer push/remove and on every `Place`/`Delete`
+  kitty event (using the old + new bounding box).
+- In `update_tab_bar`, mark the tab bar row dirty only when the active
+  tab, label set, or bar width actually changes (the existing
+  `TODO(v2): add a dirty flag` comment in `graphics.rs` already calls
+  this out).
+- Replace the `CpuCompositor.compose` call in `render_and_write` with
+  `self.stack.render_diff(&mut self.fb, &mut self.dirty)`.
+- Keep the existing `images.is_empty() && tab_bar_layers.is_empty()`
+  early-out as the "nothing ever pushed" fast path; the dirty path is
+  the "something pushed but unchanged this tick" fast path.
+
+**Expected win:** at idle (no pane output, no tab switch), the
+compositor does zero per-pixel work and the encoder emits nothing; the
+host terminal's CPU stays flat. Under typing, only the focused pane's
+changed rows are re-composited.
+
+### 5.2 Animation loop (`animation::run` / `AnimConfig`)
+
+**Status:** Not started.
+
+**Current state:** cmdash owns its own 33 ms tick interval via
+`tokio::time::interval` in `TickContext::run` / `ServerTask::run`,
+coalescing input, close-channel drains, config reload, and the periodic
+tick into one `tokio::select!`. Delta-time is implicit (always ~33 ms).
+
+**Opportunity:** termcompositor v2.0.0 ships `animation::{run,
+run_with_config, run_with_stack, AnimConfig, AnimContext}` — a built-in
+frame loop with delta-time tracking, terminal-resize handling, and
+opt-in rendering. CLI flags `--animate` and `--fps <N>` are exposed by
+the upstream binary.
+
+**Refactor (evaluate before committing):**
+- Audit whether cmdash's mixed input/PTY/config tick can be driven by
+  `AnimContext`'s per-frame callback, or whether the input + PTY sides
+  should stay on the existing `tokio::select!` and only the *render*
+  phase should delegate to `animation::run_with_stack`.
+- Most likely split: keep `tokio::select!` for input/PTY/close/reload,
+  but replace the manual `CpuCompositor.compose` + `encode_*_to_writer`
+  pair in phase 3b with `animation::run_with_stack` so the render side
+  gets delta-time, automatic resize, and the dirty-region integration
+  for free.
+- Use `AnimConfig`'s fps knob to make the tick rate configurable
+  (currently hardcoded to 33 ms / ~30 fps).
+- Add `--fps <N>` and `--animate` CLI flags mirroring upstream.
+
+**Risk:** the animation loop is built around a single `LayerStack`;
+cmdash's session-persistence split (§3.5) puts the stack on the
+frontend and the PTY driving on the server. The animation loop fits the
+frontend side cleanly; the server side should keep its own tick.
+
+### 5.3 Layer transforms (`Transform`)
+
+**Status:** Not started.
+
+**Opportunity:** v2.0.0 adds per-layer `Transform` with rotation,
+scaling, anchor points, and bilinear interpolation, set via
+`LayerEntry::set_transform(Some(t))` and applied by `CpuCompositor`
+(dedicated `apply_transform_to_target` path with inverse mapping +
+bilinear sampling).
+
+**Refactor candidates:**
+- **Focus transition animation:** when focus moves between panes, animate
+  the newly-focused pane's image layers with a brief scale-up (e.g.
+  1.0 → 1.02 → 1.0 over 150 ms) using `Transform::new().with_scale(s)
+  .with_anchor(cx, cy)`. Requires the §5.2 animation loop for the
+  per-frame interpolation.
+- **Tab switch transition:** slide the outgoing tab's layers left/right
+  via `Transform::with_translation` while the incoming tab's layers
+  slide in from the opposite side.
+- **Pane close animation:** fade + shrink the closed pane's image layers
+  out before `close_pane` revokes the `LayerId`.
+- **Widget zoom:** Alt+click on a widget could scale it up to fill the
+  screen via a `Transform` on the widget's layer.
+
+**Note:** `Transform` applies to a single `LayerEntry`; to animate a
+whole pane (which may own multiple `ImageLayer`s from multiple kitty
+image ids), wrap the pane's layers in a `SceneGraph` (§5.4) so one
+transform cascades to all children.
+
+### 5.4 New layer types: `SolidColor`, `GradientLayer`, `BorderLayer`, `CanvasLayer`, `DropShadow`, `SceneGraph`, `ClipLayer`
+
+**Status:** Not started.
+
+**Current state:** `GraphicsState` uses only `RectLayer`, `TextLayer`,
+and `ImageLayer`. Pane borders, focus highlights, and the status bar
+are rendered as ratatui text in phase 3a; the pixel overlay in phase 3b
+only covers the tab bar.
+
+**Refactor candidates, per layer type:**
+
+- **`SolidColor`** — replace the tab bar background `RectLayer(0, 0,
+  bar_w_px, ch, TAB_BAR_BG)` with `SolidColor::new(TAB_BAR_BG)`. A
+  `SolidColor` fills the whole framebuffer, so this is only correct when
+  the bar spans the full width (which it does today). Saves the
+  per-pixel rect bounds check.
+
+- **`GradientLayer` / `GradientLayerBuilder`** — use `new_linear()` /
+  `new_radial()` builders for:
+  - Tab bar background: a subtle horizontal gradient (active tab
+    lighter, inactive tabs darker) instead of the flat `TAB_BAR_BG`.
+  - Status bar background: a vertical gradient matching the theme.
+  - Focus highlight: a radial gradient glow behind the focused pane's
+    border.
+  - The builder API (`new_linear().at(...).size(...).colors(...)`)
+    replaces the deprecated `GradientLayer::linear()` / `radial()`
+    constructors.
+
+- **`BorderLayer`** — draw per-pane borders in the pixel layer
+  (phase 3b) instead of relying on ratatui block borders in phase 3a.
+  `BorderLayer::new(x, y, w, h, color).with_border_width(px)` gives
+  pixel-precise border widths that survive the kitty/sixel round-trip;
+  ratatui's cell-grid borders snap to cell boundaries and look jagged
+  on fractional-DPI hosts. One `BorderLayer` per pane, z-order above
+  the pane's `ImageLayer`s but below the tab bar.
+
+- **`CanvasLayer`** — freeform `draw_pixel` / `draw_line` /
+  `draw_circle` / `fill_rect` / `clear` methods. Candidates:
+  - Custom widget decorations that don't fit the rect/text/image model.
+  - Scrollbar indicators on the focused pane (a thin `draw_line` on the
+    right edge showing scrollback position).
+  - A minimap overlay showing the full scrollback buffer as a 1px-per-row
+    column.
+
+- **`DropShadow`** — `DropShadow::new(inner).with_offset(x, y)
+  .with_blur(r).with_spread(p).with_glow(color, blur)`. Candidates:
+  - Focused pane: a `DropShadow` wrapper around the pane's `BorderLayer`
+    with a theme-colored glow so the focused pane reads as "lifted".
+  - Floating widgets / ZStack overlays: a drop shadow behind the
+    top-most ZStack member so it reads as floating above its siblings.
+  - Modal dialogs (future): shadow behind a centered overlay.
+
+- **`SceneGraph`** — parent-child tree with grouped transforms,
+  cascading visibility/opacity/offset, and traversal methods
+  (`parent()`, `children()`, `ancestors()`, `depth()`, `descendants()`,
+  `move_to()` with cycle detection). Candidates:
+  - Group all of a pane's `ImageLayer`s under one `SceneGraph` node so a
+    single `set_opacity` / `set_transform` / `set_visible` cascades to
+    every image the pane owns. Today `close_pane` walks
+    `pane_images[pane]` and removes each layer individually; a
+    `SceneGraph` would let one `stack.remove(pane_scene_id)` tear down
+    the whole pane.
+  - Group the tab bar's background + per-tab highlights + per-tab text
+    under one `SceneGraph` so the whole tab bar can be toggled with one
+    `set_visible` call.
+  - Use `move_to()` for re-parenting a pane's scene when a ZStack
+    member cycles to the top (§5.3 tab-switch transition).
+
+- **`ClipLayer`** — `ClipLayer::new(inner)` clips inner layer rendering
+  to a rectangular region. Candidates:
+  - Clip each pane's `SceneGraph` to the pane's rect so a transformed
+    (scaled/rotated) pane's pixels cannot bleed into a neighbour during
+    a §5.3 focus animation. Today the only thing preventing bleed is
+    that no transforms are applied; once transforms land, `ClipLayer` is
+    the correctness guard.
+  - Clip the status bar's layers to the status bar row so a wide
+    gradient cannot overflow into the pane area.
+
+### 5.5 Layer lookup by name (`find_by_name` / `find_by_name_mut`)
+
+**Status:** Not started.
+
+**Current state:** `GraphicsState` tracks the tab bar's `LayerId`s in a
+`tab_bar_layers: Vec<LayerId>` field and rebuilds the whole vec every
+frame in `update_tab_bar` (draining the old ids, pushing fresh layers).
+The per-tab highlight and text layers get names like
+`"tab_bar_tab_{idx}_bg"` and `"tab_bar_tab_{idx}_text"` but those names
+are never read back.
+
+**Opportunity:** v2.0.0 adds `LayerStack::find_by_name(name)` and
+`find_by_name_mut(name)`, which return the first entry whose name
+matches.
+
+**Refactor:**
+- Instead of draining + re-pushing every frame, push the tab bar layers
+  once and mutate them in place via `find_by_name_mut`:
+  - On a tab switch, `find_by_name_mut("tab_bar_tab_{old}_bg")` →
+    `set_color`-equivalent (or remove + re-push just the two affected
+    tabs' layers) and `find_by_name_mut("tab_bar_tab_{new}_bg")` →
+    active color.
+  - On a label change, `find_by_name_mut("tab_bar_tab_{idx}_text")` →
+    update the `TextLayer`'s text.
+- Pair with the `DirtyRegion` work in §5.1 so the in-place mutation
+  marks only the affected tab's rect dirty, not the whole bar.
+- This directly addresses the `TODO(v2): add a dirty flag` comment in
+  `update_tab_bar`.
+
+**Caveat:** `find_by_name` is O(n) over the stack; with ~5–7 tab bar
+layers + N pane image layers this is fine. If pane counts grow large,
+keep the `Vec<LayerId>` cache for the hot path and use `find_by_name`
+only for the cold tab-bar mutation path.
+
+### 5.6 Rounded corners (`RectLayer::with_border_radius`)
+
+**Status:** Not started.
+
+**Opportunity:** `RectLayer::with_border_radius(r)` clips the four
+corners to circular arcs (radius clamped to `min(w, h) / 2`).
+
+**Refactor candidates:**
+- Tab bar tab highlights: round the active tab's highlight rect with a
+  small radius (e.g. 4 px) so the active tab reads as a pill rather than
+  a sharp rectangle.
+- Widget panes: round the widget's background rect for a card-like
+  appearance.
+- Floating ZStack overlays: round the overlay's border + background for
+  a dialog/window look.
+- Status bar: optionally round the status bar's ends when it doesn't
+  span the full width.
+
+### 5.7 Accessibility metadata (`AccessibilityMetadata` / `SemanticRole`)
+
+**Status:** Not started.
+
+**Opportunity:** v2.0.0 lets any layer carry `AccessibilityMetadata`
+with `alt_text` and a `SemanticRole` (`Text`, `Button`, `Image`,
+`Container`, `Separator`, `Status`, `Navigation`, `Custom`).
+
+**Refactor:**
+- Tag the tab bar background as `SemanticRole::Navigation` with alt
+  text "Tab bar: <n> tabs, tab <i> active".
+- Tag each tab highlight as `SemanticRole::Button` with alt text
+  "Tab <n>: <label>".
+- Tag each pane's `SceneGraph` root (§5.4) as `SemanticRole::Container`
+  with alt text "Pane <label>: <kind>".
+- Tag the status bar as `SemanticRole::Status` with alt text echoing
+  the rendered mode/label/clock.
+- Tag image layers as `SemanticRole::Image` with alt text derived from
+  the kitty graphics command's id.
+
+**Payoff:** headless terminals and accessibility tools can convey the
+screen layout without rendering the visual output. Low effort, high
+accessibility value.
+
+### 5.8 Tmux passthrough helpers (`wrap_for_tmux` / `wrap_for_tmux_to_writer` / `PassthroughWriter`)
+
+**Status:** Not started.
+
+**Current state:** cmdash emits kitty graphics via
+`encode_passthrough_to_writer(&fb, writer)`, which wraps the APC-G
+payload in the kitty passthrough envelope (`ESC P ... ESC \\`). When
+cmdash runs *inside tmux*, tmux requires an additional
+`ESC P tmux; <passthrough> ESC \\` wrapper around any passthrough
+sequence it should forward to the outer terminal. cmdash does not
+detect or apply this outer wrapper today; running cmdash inside tmux
+produces garbled kitty graphics.
+
+**Opportunity:** v2.0.0 exposes `wrap_for_tmux`,
+`wrap_for_tmux_to_writer`, and a `PassthroughWriter` adapter that apply
+the tmux passthrough envelope when `TMUX` is set in the environment.
+
+**Refactor:**
+- Detect `$TMUX` at startup (alongside the existing `TERM` /
+  `TERM_PROGRAM` / `CMDASH_GRAPHICS` detection in
+  `GraphicsProtocol::detect`).
+- When tmux is detected, wrap the writer passed to
+  `encode_passthrough_to_writer` in a `PassthroughWriter` (or call
+  `wrap_for_tmux_to_writer` directly) so the kitty APC-G frames are
+  double-wrapped for tmux forwarding.
+- Add a `GraphicsProtocol::KittyInTmux` (or a separate `tmux_passthrough:
+  bool` flag on `GraphicsState`) so the Sixel path can also be wrapped
+  if needed (Sixel inside tmux has the same passthrough requirement).
+- Add an integration test that sets `TMUX=1` and verifies the encoded
+  output starts with the tmux passthrough prefix.
+
+### 5.9 Unified dispatch (`dispatch_to_writer` / `detect` / `detect_with_probe`)
+
+**Status:** Not started.
+
+**Current state:** `GraphicsState::render_and_write` manually matches on
+`self.caps.graphics` (`GraphicsProtocol::Kitty` →
+`encode_passthrough_to_writer`, `Sixel` → `encode_sixel_to_writer`,
+`TextOnly` → early-out). The protocol detection lives in cmdash's own
+`GraphicsProtocol::detect_from_env` + `query_device_attributes`,
+duplicating logic that termcompositor now ships.
+
+**Opportunity:** v2.0.0 exposes `detect()` (auto-pick protocol from
+`TERM`/`TERM_PROGRAM`) and `dispatch_to_writer(protocol, &fb, writer)`
+(a single entry point that routes to the kitty or sixel encoder based on
+the protocol), plus `detect_with_probe()` for a runtime DA1-style probe.
+
+**Refactor (evaluate for partial adoption):**
+- Replace the manual `match self.caps.graphics` in `render_and_write`
+  with `dispatch_to_writer(self.caps.graphics.into(), &fb, writer)`. The
+  `GraphicsProtocol → termcompositor::Protocol` conversion is a 3-arm
+  `From` impl.
+- Audit whether cmdash's `GraphicsProtocol::detect_from_env` +
+  `query_device_attributes` can delegate to termcompositor's `detect()`
+  / `detect_with_probe()`. cmdash's detection carries cmdash-specific
+  overrides (`CMDASH_GRAPHICS` env var, `CMDASH_*` capability env vars)
+  that upstream doesn't know about, so a full delegation is likely not
+  possible — but the DA1 probe path could call `detect_with_probe()` to
+  share the response-parsing code.
+- Keep cmdash's `TermCapabilities` struct (it tracks more than just the
+  graphics protocol: kitty keyboard, focus events, bracketed paste,
+  true color, etc.) but have its `graphics` field derive from
+  termcompositor's `detect()` where the cmdash-specific overrides don't
+  apply.
+
+### 5.10 Custom `Compositor` for focus effects
+
+**Status:** Not started.
+
+**Opportunity:** v2.0.0's `Compositor` trait (`fn compose(&self, stack,
+target)`) lets cmdash plug in a custom compositor alongside the default
+`CpuCompositor`. The default sorts visible entries by effective z-order
+and calls each layer's `render` with its opacity.
+
+**Refactor candidates:**
+- **Focus dimming compositor:** render the focused pane's layers at
+  full opacity and all other panes' layers at a reduced opacity (e.g.
+  0.7) so the focused pane reads as brighter. This requires the
+  `SceneGraph` grouping from §5.4 so the compositor can identify which
+  scene each entry belongs to.
+- **Double-buffer compositor:** a compositor that renders into two
+  framebuffers and flips, so the encoder always reads a stable frame
+  while the next frame is being composited. Pairs with the §5.1
+  dirty-region work.
+- **Concurrent compositor:** for very large framebuffers, a compositor
+  that composites non-overlapping dirty regions in parallel via
+  rayon/threads. The `Compositor` trait is `&self`, so a concurrent
+  impl is feasible; the upstream `CpuCompositor` is single-threaded by
+  design.
+
+### 5.11 `render_to_current_terminal` for auto-sized rendering
+
+**Status:** Not started.
+
+**Current state:** `GraphicsState::render_and_write` sizes the
+framebuffer from `self.cells` (set via `Self::new` / `set_cells`),
+which the binary keeps in sync with crossterm `Event::Resize`. The
+sizing logic lives in cmdash.
+
+**Opportunity:** `LayerStack::render_to_current_terminal()` auto-detects
+the terminal size via `TerminalSize::current()` and renders into a
+framebuffer of that size, returning `(FrameBuffer, TerminalSize)`.
+
+**Refactor (low priority):** cmdash's explicit `set_cells` path is
+preferred because it stays in lock-step with the layout engine's
+`relayout` (the `assert!(cells.0 > 0 && cells.1 > 0)` guard catches the
+zero-area SIGWINCH transient before it reaches the compositor).
+`render_to_current_terminal` would bypass that guard. Keep this as a
+reference / fallback path only; do not replace the `set_cells` flow.
+
+### 5.12 SVG layer (`SVGLayer`, `svg-renderer` feature)
+
+**Status:** Not started.
+
+**Opportunity:** v2.0.0 ships an opt-in `svg-renderer` feature (pulls in
+`resvg`) that enables `SVGLayer` for rendering vector SVG content into
+the framebuffer.
+
+**Refactor candidates:**
+- Native widget authors who want vector graphics (icons, charts,
+  gauges) without bundling a raster image pipeline could emit SVG and
+  let the compositor rasterize it.
+- Script widgets (§2.2) could send SVG in their frame response instead
+  of ANSI text, unlocking vector graphics for the script-widget
+  protocol. This would be a v2 protocol extension (the v1 protocol is
+  line+ANSI only per §2.2).
+- Enable the `svg-renderer` feature in the workspace `Cargo.toml`
+  `termcompositor` dep only when a config flag opts in (the `resvg`
+  transitive dep is non-trivial).
 
 ## Testing priorities
 

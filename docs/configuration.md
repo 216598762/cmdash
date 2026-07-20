@@ -24,7 +24,7 @@ cmdash is a single Rust binary (`crates/cmdash`) that emulates a
 tree of terminal panes, renders them through `ratatui` for the cell
 body, and pushes a per-instance layer out via the Kitty graphics
 protocol (or Sixel as fallback) through
-[dashcompositor](https://github.com/216598762/dashcompositor). See
+[termcompositor](https://github.com/216598762/termcompositor). See
 [`AGENTS.md`](../AGENTS.md) for the canonical project brief.
 
 ### 1.2. Running it
@@ -42,7 +42,7 @@ When you launch it:
    area. If the host reports zero-area or the call fails, cmdash
    falls back to **80 × 24** and logs a `warn!` line.
 3. The layout tree resolves against that area into a flat list of
-   leaf panes, each owning its own `dashcompositor::LayerId`.
+   leaf panes, each owning its own `termcompositor::LayerId`.
 4. Each pane spawns its own login shell.
 5. A **tick loop** runs at 33 ms cadence (~30 fps).
 
@@ -190,7 +190,7 @@ echo "Kitty keyboard:    $CMDASH_KITTY_KEYBOARD"
 
 ## 4. Top-level schema
 
-A cmdash config has **five** valid top-level KDL nodes:
+A cmdash config has **six** valid top-level KDL nodes:
 
 | Top-level | Required? | Purpose |
 |-----------|-----------|---------|
@@ -199,6 +199,7 @@ A cmdash config has **five** valid top-level KDL nodes:
 | `presets { ... }` | optional | Named layout bodies for `pane.preset.<name>`. |
 | `status_bar { ... }` | optional | Enable/configure the status bar. |
 | `theme { ... }` | optional | Customize colors and cursor style. |
+| `clipboard { ... }` | optional | Configure OSC 52 clipboard integration. |
 
 ### 4.1. Inside `layout { ... }`
 
@@ -344,6 +345,56 @@ Color values accept any of the following formats (case-insensitive):
 > config file at runtime applies the new colors immediately — no restart
 > required. If a color value is invalid, cmdash logs a warning and the field
 > falls back to its built-in default.
+
+### 4.6. Inside `clipboard { ... }`
+
+Configures how child PTYs may interact with the system clipboard via the
+OSC 52 protocol.
+
+```kdl
+clipboard {
+    osc52 "write-only"
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `osc52` | string | `"disabled"` | `"disabled"`, `"write-only"`, or `"read-write"`. |
+
+**Policies:**
+
+| Value | Meaning |
+|-------|---------|
+| `"disabled"` | Ignore all OSC 52 requests from child PTYs. |
+| `"disabled"` | OSC 52 is disabled. Set and query requests from child PTYs are ignored. This is the default. |
+| `"write-only"` | Child PTYs may write to the system clipboard, but may not read from it. |
+| `"read-write"` | Child PTYs may both read from and write to the system clipboard. |
+
+**OSC 52 sequences.** Child applications use these escape sequences to
+interact with the clipboard:
+
+```text
+# Write "hello" to the system clipboard (clipboard selection 'c')
+ESC ] 52 ; c ; aGVsbG8= ESC \
+
+# Read the system clipboard (clipboard selection 'c')
+ESC ] 52 ; c ; ? ESC \
+```
+
+When the policy is `"write-only"` or `"read-write"`, cmdash intercepts
+`Set` requests from child PTYs and writes the decoded text to the system
+clipboard. When the policy is `"read-write"`, cmdash also intercepts
+`Query` requests and responds with the current system clipboard contents
+encoded as an OSC 52 sequence.
+
+> **Security note:** `"read-write"` allows any child application to read
+> the system clipboard. Use `"write-only"` or `"read-write"` only if you
+> trust the applications running inside cmdash panes. The default is
+> `"disabled"` so clipboard access is opt-in.
+
+> **Note:** The `clipboard` block is **hot-reloadable**. Editing it in
+> your config file at runtime applies the new policy immediately — no
+> restart required.
 
 ---
 
@@ -640,6 +691,124 @@ sequence, records that the pane wants focus reporting, enables focus-change
 events on the host terminal, and from then on forwards `ESC[I` / `ESC[O` to the
 focused pane whenever the host terminal gains or loses focus.
 
+### 6.7. OSC 8 hyperlink pass-through
+
+cmdash preserves OSC 8 hyperlinks emitted by child applications. Terminals
+use OSC 8 to turn an arbitrary region of text into a clickable hyperlink
+to a URI:
+
+```text
+# Open a hyperlink
+ESC ] 8 ; ; <uri> ESC \
+
+# Close the hyperlink
+ESC ] 8 ; ; ESC \
+```
+
+Because `ratatui` does not render per-cell hyperlinks, cmdash intercepts
+`PaneEvent::Hyperlink` events from pane snapshots and forwards the raw OSC 8
+sequence directly to the host terminal. This means:
+
+- Applications that emit OSC 8 sequences (e.g. `ls` with hyperlink support,
+  modern pagers, terminal-aware build tools) work transparently inside
+  cmdash panes.
+- The URI is sanitized before forwarding: control characters are stripped so
+  a malicious or malformed URI cannot break out of the OSC 8 framing.
+- Both open (`uri: Some(...)`) and close (`uri: None`) hyperlink events are
+  forwarded.
+
+**Example — a shell that prints a hyperlink:**
+
+```kdl
+layout {
+    pane kind=shell label="links" command="sh -c 'printf \"\\033]8;;https://example.com\\033\\\\\\n\"; exec bash'"
+}
+
+keybinds {
+    bind "alt-w"  action="pane.close"
+    bind "alt-q"  action="app.close"
+}
+```
+
+In this example the shell prints an hyperlink to `https://example.com`. cmdash
+intercepts the `PaneEvent::Hyperlink`, emits the corresponding OSC 8 sequence to
+the host terminal, and the host terminal renders it as a clickable link.
+
+### 6.8. OSC 52 clipboard integration
+
+cmdash supports the OSC 52 clipboard protocol so child applications can read
+from and write to the system clipboard. The feature is controlled by the
+`clipboard { osc52 ... }` config block (see §4.6).
+
+**Writing to the clipboard.** A child application emits an OSC 52 `Set`
+sequence:
+
+```text
+ESC ] 52 ; <clipboard> ; <base64-text> ESC \
+```
+
+- `<clipboard>` is a single character selecting the clipboard:
+  `c` = clipboard, `p` = primary selection, `q` = secondary selection,
+  `s` = selection, `0`–`9` = numbered buffers.
+- `<base64-text>` is the UTF-8 text encoded as base64.
+
+When the `osc52` policy is `"write-only"` or `"read-write"`, cmdash decodes
+the base64 text and writes it to the system clipboard. When the policy is
+`"disabled"`, the request is ignored.
+
+**Reading from the clipboard.** A child application emits an OSC 52 `Query`
+sequence:
+
+```text
+ESC ] 52 ; <clipboard> ; ? ESC \
+```
+
+When the `osc52` policy is `"read-write"`, cmdash reads the current system
+clipboard contents and replies with:
+
+```text
+ESC ] 52 ; <clipboard> ; <base64-text> ESC \
+```
+
+When the policy is `"write-only"` or `"disabled"`, query requests are
+ignored.
+
+**Example — a shell that writes to the clipboard on startup:**
+
+```kdl
+layout {
+    pane kind=shell label="clipboard" command="sh -c 'printf \"\\033]52;c;%s\\033\\\\\" \"$(printf hello | base64)\"; exec bash'"
+}
+
+keybinds {
+    bind "alt-w"  action="pane.close"
+    bind "alt-q"  action="app.close"
+}
+```
+
+In this example the shell writes the text `hello` to the system clipboard
+via OSC 52. cmdash intercepts the `PaneEvent::ClipboardOsc52`, decodes the
+base64 payload, and writes it to the system clipboard when the policy
+permits writes.
+
+#### Shared clipboard backend
+
+Both copy-mode and OSC 52 write to the system clipboard through the same
+backend. The binary uses a `Clipboard` trait (defined in
+`crates/cmdash/src/clipboard.rs`) so the real `arboard`-backed implementation
+can be swapped for a mock in tests. The helper `copy_text_to_clipboard`
+takes a `&mut dyn Clipboard` and the text to copy, which means:
+
+- Copy-mode selections call `copy_text_to_clipboard(&mut *self.clipboard, text)`.
+- OSC 52 `Set` requests also call `copy_text_to_clipboard(&mut *self.clipboard, text)`.
+- Both paths therefore exercise the same injected backend, so tests can
+  verify clipboard behavior without touching the real system clipboard.
+
+The production implementation is `ArboardClipboard`, which delegates to the
+[`arboard`](https://crates.io/crates/arboard) crate. If `arboard` cannot
+open the system clipboard (for example, on a headless CI host), both
+paths fail with the same error and cmdash logs a warning.
+
 ---
 
 ## 7. Worked examples
@@ -789,6 +958,53 @@ layout {
     }
 }
 ```
+
+### 7.7. Copy-mode — select and copy text to the clipboard
+
+cmdash includes a copy-mode that lets you select text from a pane and copy it
+to the system clipboard. Enter copy-mode, move the cursor, start a selection,
+and then copy.
+
+```kdl
+layout {
+    pane kind=shell label="default"
+}
+
+keybinds {
+    bind "alt-w"   action="pane.close"
+    bind "alt-q"   action="app.close"
+
+    // Enter copy-mode from Normal mode.
+    bind "M-c"     action="copy.enter"
+
+    // Copy-mode movement (active only while in Copy mode).
+    bind "up"      action="copy.move.up"
+    bind "down"    action="copy.move.down"
+    bind "left"    action="copy.move.left"
+    bind "right"   action="copy.move.right"
+
+    // Start/extend the selection.
+    bind "v"       action="copy.select"
+
+    // Copy the selected text to the system clipboard and exit copy-mode.
+    bind "y"       action="copy.copy"
+    bind "enter"   action="copy.copy"
+}
+```
+
+**Usage:**
+
+1. Focus the pane whose text you want to copy.
+2. Press `Alt-C` to enter copy-mode.
+3. Move the cursor to one corner of the text you want with the arrow keys.
+4. Press `V` to set the selection anchor.
+5. Move the cursor to the opposite corner — the selection highlights as you
+   move.
+6. Press `Y` or **Enter** to copy the selected text to the system clipboard
+   and exit copy-mode.
+
+The copy-mode path uses the same `Clipboard` backend as OSC 52, so the text is
+written through the configured clipboard provider (see §4.6 and §6.8).
 
 ---
 

@@ -149,7 +149,7 @@ async fn script_widget_renders_frame_response() {
         // Check for non-space content.
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                if buf.get(x, y).symbol() != " " {
+                if buf[(x, y)].symbol() != " " {
                     found_content = true;
                     break;
                 }
@@ -205,12 +205,12 @@ async fn script_widget_renders_expected_marker_text() {
         // test script as plain text (no ANSI codes in this line).
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                if buf.get(x, y).symbol() == "L" {
+                if buf[(x, y)].symbol() == "L" {
                     let expected = "Line 1";
                     let mut ok = true;
                     for (i, ch) in expected.chars().enumerate() {
                         let cx = x + i as u16;
-                        if cx >= buf.area.width || buf.get(cx, y).symbol() != ch.to_string() {
+                        if cx >= buf.area.width || buf[(cx, y)].symbol() != ch.to_string() {
                             ok = false;
                             break;
                         }
@@ -268,12 +268,12 @@ async fn script_widget_border_title_matches_name() {
     let mut found_title = false;
     for y in 0..buf.area.height {
         for x in 0..buf.area.width {
-            if buf.get(x, y).symbol() == "m" {
+            if buf[(x, y)].symbol() == "m" {
                 let expected = "my-title";
                 let mut ok = true;
                 for (i, ch) in expected.chars().enumerate() {
                     let cx = x + i as u16;
-                    if cx >= buf.area.width || buf.get(cx, y).symbol() != ch.to_string() {
+                    if cx >= buf.area.width || buf[(cx, y)].symbol() != ch.to_string() {
                         ok = false;
                         break;
                     }
@@ -502,7 +502,7 @@ async fn script_widget_renders_at_offset() {
     let mut found = false;
     for y in 3..15 {
         for x in 8..45 {
-            if buf.get(x, y).symbol() != " " {
+            if buf[(x, y)].symbol() != " " {
                 found = true;
                 break;
             }

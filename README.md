@@ -4,12 +4,12 @@
 binary that hosts **real pseudoterminals** in recursive splits,
 renders their text bodies with **`ratatui`**, and composes every
 pane, widget, script process, and overlay as a **per-instance
-layer** through the [dashcompositor](https://github.com/216598762/dashcompositor)
+layer** through the [termcompositor](https://github.com/216598762/termcompositor)
 graphics layer stack. Output streams to the host terminal via the
 **Kitty graphics protocol** (preferred) or **Sixel** (fallback).
 
 cmdash owns **no** graphics path of its own — every pixel-level
-render goes through dashcompositor first. The hard rule across the
+render goes through termcompositor first. The hard rule across the
 entire codebase is **one layer per instance**: two visually adjacent
 panes are always two different layers, even when the underlying
 widget code is the same. That invariant is what makes nested
@@ -41,9 +41,9 @@ A Rust workspace that combines:
   runtime config file loading and hot-reload via filesystem watcher,
 - a **ratatui text renderer** — per-frame cell-grid blit
   (`cmdash` binary, the integrator crate),
-- a **dashcompositor layer-stack renderer** — per-instance
+- a **termcompositor layer-stack renderer** — per-instance
   `LayerId` ownership, passthrough Kitty-graphics encoder,
-  Sixel fallback (`cmdash` + [`dashcompositor`](https://github.com/216598762/dashcompositor)
+  Sixel fallback (`cmdash` + [`termcompositor`](https://github.com/216598762/termcompositor)
   git dep),
 - a **plugin model** — c-ABI-safe dynamic widgets (`cmdash-widget-sdk`,
   planned) AND any executable speaking a line-delimited frame protocol
@@ -83,7 +83,7 @@ cargo install --path crates/cmdash
 Build requirements:
 
 - A recent stable Rust toolchain (1.73 floor).
-- A C compiler and linker for the `dashcompositor` git dep.
+- A C compiler and linker for the `termcompositor` git dep.
 - A PTY-allocation host (Linux `openpty` / macOS BSD pty).
 
 ## Running cmdash
@@ -162,7 +162,7 @@ The `TickContext::run` loop iterates `self.runners` once per frame:
 - **Phase 1** — drain close-channel, poll exits, snapshot grids.
 - **Phase 2** — route kitty graphics events into `GraphicsState`.
 - **Phase 3a** — render text grids through ratatui.
-- **Phase 3b** — emit dashcompositor kitty/sixel graphics.
+- **Phase 3b** — emit termcompositor kitty/sixel graphics.
 
 `GraphicsState::set_cells((w, h))` keeps the framebuffer in sync
 with the cell grid across host resizes.

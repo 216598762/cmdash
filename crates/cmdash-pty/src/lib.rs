@@ -2,7 +2,7 @@
 //!
 //! This crate feeds bytes from a child PTY into the [`vte::Parser`]
 //! and exposes the resulting text grid plus kitty-graphics events
-//! to downstream cmdash crates (the conductor / dashcompositor
+//! to downstream cmdash crates (the conductor / termcompositor
 //! bridge).
 //!
 //! ## Design boundaries
@@ -12,13 +12,13 @@
 //!   pane in `tokio::task::spawn_blocking`.
 //! - **One [`PaneLayerId`] (opaque `u64`) per pane.** The cmdash
 //!   binary maps `PaneLayerId` to its own
-//!   `dashcompositor::LayerId`; `cmdash-pty` does NOT depend on
-//!   `dashcompositor`. AGENTS.md §"Hard rule: one layer per
+//!   `termcompositor::LayerId`; `cmdash-pty` does NOT depend on
+//!   `termcompositor`. AGENTS.md §"Hard rule: one layer per
 //!   instance" still holds - the binary enforces 1:1 between
 //!   `PaneId`s and `LayerId`s.
 //! - **No graphics emission.** Kitty graphics events surface as
 //!   structured [`PaneEvent::KittyGraphic`] records; the binary maps
-//!   them to `dashcompositor::ImageLayer`s.
+//!   them to `termcompositor::ImageLayer`s.
 //!
 //! ## Kitty graphics interception
 //!
@@ -56,8 +56,8 @@ pub const DEFAULT_SCROLLBACK_CAPACITY: usize = 1000;
 // ---------- public types ----------
 
 /// Opaque pane-layer identifier. The cmdash binary owns the
-/// mapping to its own `dashcompositor::LayerId`; this newtype
-/// stays stable across dashcompositor revs and does NOT appear
+/// mapping to its own `termcompositor::LayerId`; this newtype
+/// stays stable across termcompositor revs and does NOT appear
 /// outside this crate's API surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct PaneLayerId(pub u64);
@@ -65,7 +65,7 @@ pub struct PaneLayerId(pub u64);
 /// Cell color. Mirrors vte 0.15's old `vte::Color` shape but
 /// lives in our crate so this surface stays decoupled from vte's
 /// public API churn (AGENTS.md §"Hard rule: one layer per
-/// instance" - the cell color type must not leak dashcompositor
+/// instance" - the cell color type must not leak termcompositor
 /// concerns either).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Color {
@@ -94,6 +94,17 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub attrs: CellAttrs,
+    /// Interned hyperlink ID. `0` means no hyperlink; a
+    /// non-zero value indexes into the owning [`TextGrid`]'s
+    /// `urls` intern pool.
+    ///
+    /// v1 pass-through forwards raw OSC 8 sequences to the
+    /// host terminal and does not render hyperlinks per-cell
+    /// (ratatui 0.25 lacks hyperlink support). This field is
+    /// retained so a future cell-level hyperlink render path
+    /// can associate individual cells with their target URIs
+    /// without re-parsing the scrollback buffer.
+    pub link_id: u16,
 }
 
 impl Default for Cell {
@@ -103,6 +114,7 @@ impl Default for Cell {
             fg: Color::Default,
             bg: Color::Default,
             attrs: CellAttrs::default(),
+            link_id: 0,
         }
     }
 }
@@ -140,6 +152,19 @@ pub struct TextGrid {
     /// value indicates how many rows above the live grid to show.
     /// Clamped to `scrollback.len()`.
     scrollback_offset: usize,
+    /// Intern pool for OSC 8 hyperlink URIs. Index 0 is the
+    /// sentinel "no hyperlink" value. A non-zero `link_id` on a
+    /// [`Cell`] indexes into this vector.
+    urls: Vec<String>,
+    /// Current hyperlink ID applied to newly printed cells.
+    /// Updated when an OSC 8 open/close sequence is parsed.
+    current_link_id: u16,
+    /// Whether the child application has switched to the
+    /// alternate screen buffer (`CSI ? 47 h`, `CSI ? 1047 h`,
+    /// `CSI ? 1049 h`). While active, rows scrolled off the
+    /// top of the visible grid are NOT captured into the
+    /// scrollback buffer.
+    alternate_screen: bool,
 }
 
 impl TextGrid {
@@ -156,6 +181,9 @@ impl TextGrid {
             scrollback: VecDeque::new(),
             scrollback_capacity: DEFAULT_SCROLLBACK_CAPACITY,
             scrollback_offset: 0,
+            urls: vec![String::new()],
+            current_link_id: 0,
+            alternate_screen: false,
         }
     }
     pub fn cols(&self) -> u16 {
@@ -163,6 +191,30 @@ impl TextGrid {
     }
     pub fn rows(&self) -> u16 {
         self.rows
+    }
+    /// Intern a hyperlink URI and return its ID. ID 0 is the
+    /// sentinel "no hyperlink" value. The intern pool grows
+    /// unbounded in v1; duplicates reuse the existing ID.
+    pub fn intern_url(&mut self, url: &str) -> u16 {
+        if url.is_empty() {
+            return 0;
+        }
+        if let Some(idx) = self.urls.iter().position(|u| u == url) {
+            return idx as u16;
+        }
+        let idx = self.urls.len();
+        if idx > u16::MAX as usize {
+            // Pool exhausted; fall back to no hyperlink rather
+            // than crashing the PTY parser.
+            return 0;
+        }
+        self.urls.push(url.to_string());
+        idx as u16
+    }
+    /// Look up the interned URI for a hyperlink ID. Returns
+    /// `None` for ID 0 or out-of-bounds IDs.
+    pub fn url_for(&self, link_id: u16) -> Option<&str> {
+        self.urls.get(link_id as usize).map(String::as_str)
     }
     pub fn cursor(&self) -> (u16, u16) {
         (self.cursor_x, self.cursor_y)
@@ -236,6 +288,27 @@ impl TextGrid {
     pub fn scrollback_len(&self) -> usize {
         self.scrollback.len()
     }
+    /// Returns `true` when the child application has switched to
+    /// the alternate screen buffer.
+    pub fn in_alternate_screen(&self) -> bool {
+        self.alternate_screen
+    }
+    /// Set whether the pane is currently using the alternate
+    /// screen buffer. Called when DECSET/DECRST 47/1047/1049 is
+    /// parsed.
+    pub fn set_alternate_screen(&mut self, active: bool) {
+        self.alternate_screen = active;
+    }
+    /// Configure the maximum number of rows retained in the
+    /// scrollback buffer. A capacity of zero disables capture.
+    pub fn set_scrollback_capacity(&mut self, capacity: usize) {
+        self.scrollback_capacity = capacity;
+        // If the new capacity is smaller than the current
+        // buffer, drop oldest rows until we fit.
+        while self.scrollback.len() > self.scrollback_capacity {
+            self.scrollback.pop_front();
+        }
+    }
     /// Access a scrollback row by its index (0 = oldest).
     /// Returns `None` if out of bounds.
     pub fn scrollback_row(&self, idx: usize) -> Option<&[Cell]> {
@@ -257,7 +330,14 @@ impl TextGrid {
 
     fn put(&mut self, x: u16, y: u16, fg: Color, bg: Color, attrs: CellAttrs, ch: char) {
         let idx = self.cell_idx(x, y);
-        let next = Cell { ch, fg, bg, attrs };
+        let link_id = self.current_link_id;
+        let next = Cell {
+            ch,
+            fg,
+            bg,
+            attrs,
+            link_id,
+        };
         if self.cells[idx] != next {
             self.cells[idx] = next;
             self.mark_dirty(y);
@@ -336,8 +416,11 @@ impl TextGrid {
         }
         // Capture the top row into the scrollback ring buffer
         // BEFORE shifting cells up. If scrollback is at
-        // capacity, drop the oldest (front) row first.
-        if self.scrollback_capacity > 0 {
+        // capacity, drop the oldest (front) row first. While
+        // the child application is using the alternate screen
+        // buffer, scrollback capture is disabled so full-screen
+        // TUIs (vim, htop, less) do not pollute the history.
+        if self.scrollback_capacity > 0 && !self.alternate_screen {
             let top_row: Vec<Cell> = self.cells[..cols].to_vec();
             if self.scrollback.len() >= self.scrollback_capacity {
                 self.scrollback.pop_front();
@@ -400,6 +483,11 @@ pub enum PaneEvent {
     /// child application. `CSI ? 2004 h` enables; `CSI ? 2004 l`
     /// disables.
     BracketedPaste { enabled: bool },
+    /// Alternate screen buffer requested (enabled/disabled) by
+    /// the child application. `CSI ? 47 h`, `CSI ? 1047 h`, and
+    /// `CSI ? 1049 h` enable; their `l` counterparts disable.
+    /// While enabled, scrollback capture is suppressed.
+    AlternateScreen { enabled: bool },
     /// Focus reporting mode requested (enabled/disabled) by the
     /// child application. `CSI ? 1004 h` enables; `CSI ? 1004 l`
     /// disables.
@@ -410,6 +498,39 @@ pub enum PaneEvent {
     /// The terminal multiplexer is responsible for generating
     /// the response and writing it back to the child PTY.
     DeviceAttributesQuery { kind: DeviceAttributesKind },
+    /// OSC 8 hyperlink open/close. The URI is `None` when the
+    /// child closes the current hyperlink; otherwise it carries
+    /// the hyperlink target. cmdash forwards these to the host
+    /// terminal so hyperlinks emitted by child applications are
+    /// preserved.
+    ///
+    /// v1 forwards only the URI; the optional OSC 8 params
+    /// field (e.g. `id=...`) is discarded because cmdash does
+    /// not yet render hyperlinks per-cell.
+    Hyperlink { uri: Option<String> },
+    /// OSC 52 clipboard operation. The `clipboard` character
+    /// identifies the target buffer (`c` = clipboard, `p` =
+    /// primary, `s` = secondary, etc.). `Osc52Action::Set`
+    /// carries decoded UTF-8 text to place on the system
+    /// clipboard; `Osc52Action::Query` requests that the
+    /// terminal send the current clipboard contents back to
+    /// the child as another OSC 52 sequence.
+    ClipboardOsc52 {
+        clipboard: char,
+        action: Osc52Action,
+    },
+}
+
+/// Action payload for an OSC 52 clipboard event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Osc52Action {
+    /// Set the identified clipboard buffer to the decoded
+    /// UTF-8 text.
+    Set(String),
+    /// Query the identified clipboard buffer. The terminal
+    /// should respond with an OSC 52 sequence containing the
+    /// buffer's current contents.
+    Query,
 }
 
 /// Kind of device-attributes query a child PTY sent.
@@ -834,6 +955,16 @@ impl<'a> VtePerf<'a> {
                     self.events
                         .push(PaneEvent::FocusReporting { enabled: true });
                 }
+                if matches!(mode, 47 | 1047 | 1049) {
+                    self.grid.set_alternate_screen(true);
+                    self.events
+                        .push(PaneEvent::AlternateScreen { enabled: true });
+                    // DECSET 1049 also clears the alternate
+                    // screen on entry, matching xterm.
+                    if mode == 1049 {
+                        self.grid.clear_all();
+                    }
+                }
             }
             'l' if intermediates.contains(&b'?') => {
                 let mode = p0();
@@ -844,6 +975,11 @@ impl<'a> VtePerf<'a> {
                 if mode == 1004 {
                     self.events
                         .push(PaneEvent::FocusReporting { enabled: false });
+                }
+                if matches!(mode, 47 | 1047 | 1049) {
+                    self.grid.set_alternate_screen(false);
+                    self.events
+                        .push(PaneEvent::AlternateScreen { enabled: false });
                 }
             }
             // Device attributes queries:
@@ -954,6 +1090,70 @@ impl<'a> vte::Perform for VtePerf<'a> {
                             title: s.to_string(),
                         });
                     }
+                }
+            } else if *first == b"8" {
+                // OSC 8 hyperlink: ESC ] 8 ; params ; URI ST
+                // vte splits on semicolons, so `rest` is either
+                // `[params, uri]` or just `[uri]` when params is
+                // omitted. An empty URI closes the hyperlink.
+                //
+                // v1 pass-through forwards only the URI; the params
+                // field (e.g. `id=...`) is discarded. Full OSC 8
+                // compliance would preserve params, but cmdash v1
+                // does not render hyperlinks per-cell (ratatui 0.25
+                // lacks hyperlink support), so the extra metadata
+                // has no consumer yet.
+                let uri_bytes = rest.get(1).copied().or_else(|| rest.first().copied());
+                if let Some(uri_bytes) = uri_bytes {
+                    if let Ok(uri_str) = std::str::from_utf8(uri_bytes) {
+                        if uri_str.is_empty() {
+                            self.grid.current_link_id = 0;
+                            self.events.push(PaneEvent::Hyperlink { uri: None });
+                        } else {
+                            let id = self.grid.intern_url(uri_str);
+                            self.grid.current_link_id = id;
+                            self.events.push(PaneEvent::Hyperlink {
+                                uri: Some(uri_str.to_string()),
+                            });
+                        }
+                    }
+                }
+            } else if *first == b"52" {
+                // OSC 52 clipboard: ESC ] 52 ; <clipboard> ; <data> ST
+                // vte splits on semicolons, so `rest` is either
+                // `[clipboard, data]` or `[data]` when clipboard is omitted.
+                let clipboard = rest
+                    .first()
+                    .and_then(|b| b.first().copied())
+                    .map(|b| b as char)
+                    .unwrap_or('c');
+                let data_bytes = if rest.len() >= 2 {
+                    rest.get(1).copied()
+                } else {
+                    rest.first().copied()
+                };
+                if let Some(data) = data_bytes {
+                    if data == b"?" {
+                        self.events.push(PaneEvent::ClipboardOsc52 {
+                            clipboard,
+                            action: Osc52Action::Query,
+                        });
+                    } else if let Ok(decoded) =
+                        base64::engine::general_purpose::STANDARD.decode(data)
+                    {
+                        if let Ok(text) = String::from_utf8(decoded) {
+                            self.events.push(PaneEvent::ClipboardOsc52 {
+                                clipboard,
+                                action: Osc52Action::Set(text),
+                            });
+                        }
+                    }
+                } else {
+                    // Empty data means query.
+                    self.events.push(PaneEvent::ClipboardOsc52 {
+                        clipboard,
+                        action: Osc52Action::Query,
+                    });
                 }
             }
         }
@@ -1144,14 +1344,22 @@ impl PanePty {
 
     /// Spawn a child PTY with no additional environment
     /// variables. Convenience wrapper around
-    /// [`Self::spawn_with_env`].
+    /// [`Self::spawn_with_env`] using the default scrollback
+    /// capacity.
     pub fn spawn(
         shell: ShellSpec,
         cols: u16,
         rows: u16,
         layer_id: PaneLayerId,
     ) -> Result<(Self, PaneReader), PtyError> {
-        Self::spawn_with_env(shell, cols, rows, layer_id, Vec::new())
+        Self::spawn_with_env(
+            shell,
+            cols,
+            rows,
+            layer_id,
+            Vec::new(),
+            DEFAULT_SCROLLBACK_CAPACITY,
+        )
     }
 
     /// Spawn a child PTY, applying the supplied environment
@@ -1159,13 +1367,16 @@ impl PanePty {
     /// contains `(key, value)` pairs that are set on the
     /// `CommandBuilder` before spawning. This is how cmdash
     /// advertises host terminal capabilities (TERM, COLORTERM,
-    /// CMDASH_*) to nested shells and applications.
+    /// CMDASH_*) to nested shells and applications. The
+    /// `scrollback_capacity` argument configures the pane's
+    /// scrollback ring buffer size.
     pub fn spawn_with_env(
         shell: ShellSpec,
         cols: u16,
         rows: u16,
         layer_id: PaneLayerId,
         env_vars: Vec<(String, String)>,
+        scrollback_capacity: usize,
     ) -> Result<(Self, PaneReader), PtyError> {
         if cols == 0 || rows == 0 {
             return Err(PtyError::InvalidSize(cols, rows));
@@ -1210,7 +1421,8 @@ impl PanePty {
         let child = pair.slave.spawn_command(cmd).map_err(PtyError::Spawn)?;
         let reader = pair.master.try_clone_reader().map_err(PtyError::Spawn)?;
         let writer = pair.master.take_writer().map_err(PtyError::Spawn)?;
-        let grid = TextGrid::new(cols, rows);
+        let mut grid = TextGrid::new(cols, rows);
+        grid.set_scrollback_capacity(scrollback_capacity);
         let master = pair.master;
         debug!(
             layer_id = layer_id.0,
@@ -1532,6 +1744,7 @@ pub trait PanePtyOps {
     fn scrollback_down(&mut self, n: usize);
     fn scrollback_reset(&mut self);
     fn in_scrollback(&self) -> bool;
+    fn in_alternate_screen(&self) -> bool;
 }
 
 /// Production impl behind the trait. Uses UFCS (`PanePty::resize`) so
@@ -1580,6 +1793,9 @@ impl PanePtyOps for PanePty {
     fn in_scrollback(&self) -> bool {
         self.grid.in_scrollback()
     }
+    fn in_alternate_screen(&self) -> bool {
+        self.grid.in_alternate_screen()
+    }
 }
 
 fn build_command(shell: ShellSpec, env_vars: Vec<(String, String)>) -> CommandBuilder {
@@ -1608,6 +1824,7 @@ fn build_command(shell: ShellSpec, env_vars: Vec<(String, String)>) -> CommandBu
 
 #[cfg(test)]
 mod internal_sanity_tests {
+    #![allow(unnameable_test_items, dead_code)]
     use super::*;
 
     #[test]
@@ -2083,6 +2300,56 @@ mod internal_sanity_tests {
         )));
     }
 
+    /// OSC 8 hyperlink open sequence (`ESC ] 8 ; ; <URI> ST`)
+    /// is surfaced as a `PaneEvent::Hyperlink` with the URI,
+    /// and the URI is interned on subsequent cells.
+    #[test]
+    fn osc8_hyperlink_open_emits_event_and_interns_url() {
+        let (mut pty, _reader) = PanePty::spawn(
+            ShellSpec::Command {
+                argv: vec!["/bin/cat".to_string()],
+            },
+            10,
+            10,
+            PaneLayerId(70),
+        )
+        .expect("spawn pty");
+        pty.advance(b"\x1b]8;;https://example.com\x1b\\X")
+            .expect("advance OSC 8 open");
+        let events = pty.drain_events();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            PaneEvent::Hyperlink { uri } if uri.as_deref() == Some("https://example.com")
+        )));
+        let snap = pty.snapshot();
+        assert_eq!(snap.grid.cell(0, 0).ch, 'X');
+        assert_eq!(snap.grid.cell(0, 0).link_id, 1);
+        assert_eq!(snap.grid.url_for(1), Some("https://example.com"));
+    }
+
+    /// OSC 8 hyperlink close sequence (`ESC ] 8 ; ; ST`) is
+    /// surfaced as a `PaneEvent::Hyperlink` with `uri: None`
+    /// and stops attaching hyperlinks to new cells.
+    #[test]
+    fn osc8_hyperlink_close_emits_event_and_clears_link() {
+        let (mut pty, _reader) = PanePty::spawn(
+            ShellSpec::Command {
+                argv: vec!["/bin/cat".to_string()],
+            },
+            10,
+            10,
+            PaneLayerId(71),
+        )
+        .expect("spawn pty");
+        pty.advance(b"\x1b]8;;https://example.com\x1b\\A\x1b]8;;\x1b\\B")
+            .expect("advance OSC 8 open + close");
+        let snap = pty.snapshot();
+        assert_eq!(snap.grid.cell(0, 0).ch, 'A');
+        assert_eq!(snap.grid.cell(0, 0).link_id, 1);
+        assert_eq!(snap.grid.cell(1, 0).ch, 'B');
+        assert_eq!(snap.grid.cell(1, 0).link_id, 0);
+    }
+
     /// Non-APC escape sequences are unaffected by the
     /// pre-scan: `ESC [` (CSI), `ESC ]` (OSC), and plain
     /// bytes all reach `vte::Parser::advance`. This pins
@@ -2113,257 +2380,7 @@ mod internal_sanity_tests {
     }
 }
 
-// ------------------------------------------------------------------
-// Scrollback buffer tests
-// ------------------------------------------------------------------
+#[cfg(test)]
+mod scrollback_tests;
 
-/// `scroll_up_one` captures the top row into the scrollback
-/// ring buffer before shifting cells up. After one scroll,
-/// `scrollback_len()` is 1 and the captured row contains
-/// the character that was on row 0.
-#[test]
-fn scroll_up_one_captures_top_row_into_scrollback() {
-    let mut g = TextGrid::new(3, 3);
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'X',
-    );
-    g.scroll_up_one();
-    assert_eq!(g.scrollback_len(), 1);
-    let row = g.scrollback_row(0).expect("row 0");
-    assert_eq!(row[0].ch, 'X');
-}
 
-/// Multiple scrolls accumulate rows in the scrollback buffer
-/// in FIFO order. After 3 scrolls, `scrollback_len()` is 3
-/// and the rows are in chronological order (oldest first).
-#[test]
-fn scrollback_accumulates_rows_in_fifo_order() {
-    let mut g = TextGrid::new(2, 2);
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'A',
-    );
-    g.scroll_up_one();
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'B',
-    );
-    g.scroll_up_one();
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'C',
-    );
-    g.scroll_up_one();
-    assert_eq!(g.scrollback_len(), 3);
-    assert_eq!(g.scrollback_row(0).unwrap()[0].ch, 'A');
-    assert_eq!(g.scrollback_row(1).unwrap()[0].ch, 'B');
-    assert_eq!(g.scrollback_row(2).unwrap()[0].ch, 'C');
-}
-
-/// Scrollback ring buffer respects capacity. When the buffer
-/// is full, the oldest row is discarded on each new scroll.
-#[test]
-fn scrollback_ring_buffer_drops_oldest_at_capacity() {
-    let mut g = TextGrid::new(2, 2);
-    // Set capacity to 2 rows.
-    g.scrollback_capacity = 2;
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'A',
-    );
-    g.scroll_up_one();
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'B',
-    );
-    g.scroll_up_one();
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'C',
-    );
-    g.scroll_up_one();
-    // Oldest row 'A' was dropped; buffer has 'B' and 'C'.
-    assert_eq!(g.scrollback_len(), 2);
-    assert_eq!(g.scrollback_row(0).unwrap()[0].ch, 'B');
-    assert_eq!(g.scrollback_row(1).unwrap()[0].ch, 'C');
-}
-
-/// `scrollback_up(n)` moves the viewport offset into
-/// scrollback history. `scrollback_down(n)` returns to
-/// live view. `in_scrollback()` tracks the state.
-#[test]
-fn scrollback_up_down_and_in_scrollback() {
-    let mut g = TextGrid::new(2, 2);
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'A',
-    );
-    g.scroll_up_one();
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'B',
-    );
-    g.scroll_up_one();
-    // 2 rows in scrollback. Start in live view.
-    assert!(!g.in_scrollback());
-    assert_eq!(g.scrollback_offset(), 0);
-    // Scroll up by 1.
-    g.scrollback_up(1);
-    assert!(g.in_scrollback());
-    assert_eq!(g.scrollback_offset(), 1);
-    // Scroll up by 1 more — now at full depth.
-    g.scrollback_up(1);
-    assert_eq!(g.scrollback_offset(), 2);
-    // Scroll up beyond capacity — clamped.
-    g.scrollback_up(100);
-    assert_eq!(g.scrollback_offset(), 2);
-    // Scroll back down.
-    g.scrollback_down(1);
-    assert_eq!(g.scrollback_offset(), 1);
-    g.scrollback_down(1);
-    assert_eq!(g.scrollback_offset(), 0);
-    assert!(!g.in_scrollback());
-    // Down beyond 0 — clamped.
-    g.scrollback_down(100);
-    assert_eq!(g.scrollback_offset(), 0);
-}
-
-/// `scrollback_reset()` returns the viewport to live view
-/// from any offset.
-#[test]
-fn scrollback_reset_returns_to_live_view() {
-    let mut g = TextGrid::new(2, 2);
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'A',
-    );
-    g.scroll_up_one();
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'B',
-    );
-    g.scroll_up_one();
-    g.scrollback_up(2);
-    assert!(g.in_scrollback());
-    g.scrollback_reset();
-    assert!(!g.in_scrollback());
-    assert_eq!(g.scrollback_offset(), 0);
-}
-/// `clear_scrollback()` (ESC [3J) clears the scrollback
-/// buffer and resets the offset. `clear_all()` (ESC [2J)
-/// only clears the visible screen and does NOT touch
-/// scrollback — matching xterm / VTE semantics.
-#[test]
-fn clear_scrollback_resets_buffer_and_offset() {
-    let mut g = TextGrid::new(2, 2);
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'A',
-    );
-    g.scroll_up_one();
-    g.scrollback_up(1);
-    assert!(g.in_scrollback());
-    assert_eq!(g.scrollback_len(), 1);
-    g.clear_scrollback();
-    assert_eq!(g.scrollback_len(), 0);
-    assert_eq!(g.scrollback_offset(), 0);
-    assert!(!g.in_scrollback());
-}
-
-/// `clear_all()` (ESC [2J) clears the visible screen but
-/// does NOT clear the scrollback buffer. This is the
-/// correct xterm/VTE behavior: ESC [2J only affects the
-/// display, not the history.
-#[test]
-fn clear_all_preserves_scrollback() {
-    let mut g = TextGrid::new(2, 2);
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'A',
-    );
-    g.scroll_up_one();
-    assert_eq!(g.scrollback_len(), 1);
-    g.clear_all();
-    // Scrollback is preserved — only ESC [3J clears it.
-    assert_eq!(g.scrollback_len(), 1);
-}
-
-/// Capacity=0 disables scrollback capture entirely (the
-/// ring buffer stays empty even after many scrolls).
-#[test]
-fn scrollback_capacity_zero_disables_capture() {
-    let mut g = TextGrid::new(2, 2);
-    g.scrollback_capacity = 0;
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'A',
-    );
-    g.scroll_up_one();
-    g.put(
-        0,
-        0,
-        Color::Default,
-        Color::Default,
-        CellAttrs::default(),
-        'B',
-    );
-    g.scroll_up_one();
-    assert_eq!(g.scrollback_len(), 0);
-}

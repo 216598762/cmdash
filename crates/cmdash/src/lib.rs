@@ -2,34 +2,49 @@
 //!
 //! Text bodies render through ratatui; kitty graphics events
 //! from nested PTY children route through [`crate::graphics`]
-//! into a [`dashcompositor::LayerStack`], then are emitted after
-//! the ratatui draw via dashcompositor's kitty passthrough
+//! into a [`termcompositor::LayerStack`], then are emitted after
+//! the ratatui draw via termcompositor's kitty passthrough
 //! encoder.
 //!
 //! See AGENTS.md §"Hard rule: one layer per instance" for the
 //! layer-per-pane invariant this crate upholds.
 
+pub mod clipboard;
+pub mod frontend_task;
 pub mod graphics;
 pub mod layer_id;
 pub mod pane;
+pub mod protocol;
 pub mod render;
 pub mod script_widget;
+pub mod server_task;
 pub mod status_bar;
 pub mod tabs;
+pub mod tick_context;
 
+#[doc(hidden)]
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
+
+#[cfg(test)]
+pub(crate) mod test_helpers;
+#[cfg(test)]
+pub(crate) mod test_pty;
+
+pub use clipboard::{copy_text_to_clipboard, ArboardClipboard, Clipboard};
 pub use graphics::{
     GraphicsError, GraphicsProtocol, GraphicsState, Metrics, TabBarData, TermCapabilities,
 };
 pub use layer_id::{derive_layer_id, derive_layer_id_for_tab, SINGLE_TAB};
 pub use pane::{PaneCloseTx, PaneRunner, RunnerError};
+pub use protocol::{ConfigReload, CopyModeState, LoadedWidget, ServerConfig, WidgetFactories};
 pub use render::{
-    blit_cursor, blit_grid, copy_text_to_clipboard, extract_selected_text, pty_attrs_to_modifier,
-    pty_color_to_ratatui,
+    blit_cursor, blit_grid, extract_selected_text, pty_attrs_to_modifier, pty_color_to_ratatui,
 };
 pub use tabs::{Tab, TabStack};
 
 #[doc(hidden)]
 pub fn _cmdash_dep_smoke() {
-    // Surface dashcompositor feature-flag typos at `cargo check`.
-    let _ = core::mem::size_of::<dashcompositor::FrameBuffer>();
+    // Surface termcompositor feature-flag typos at `cargo check`.
+    let _ = core::mem::size_of::<termcompositor::FrameBuffer>();
 }

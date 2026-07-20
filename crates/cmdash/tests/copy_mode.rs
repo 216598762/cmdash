@@ -1,8 +1,9 @@
 //! Copy-mode integration tests.
 //!
 //! These tests exercise the copy-mode keybind dispatch through
-//! `cmdash_keybinds::Router` and the clipboard/text-extraction
-//! helpers exposed from `cmdash::render`.
+//! `cmdash_keybinds::Router`, the clipboard helpers exposed from
+//! `cmdash::clipboard`, and the text-extraction helpers exposed from
+//! `cmdash::render`.
 
 use cmdash_config::{KeyAction, KeyToken, Keybind, Modifiers};
 use cmdash_keybinds::{Mode, Router};
@@ -240,11 +241,12 @@ fn extract_selected_text_clamps_out_of_bounds_coordinates() {
 #[test]
 fn copy_text_to_clipboard_round_trips_text() {
     let text = "cmdash copy-mode clipboard test";
+    let mut clipboard = cmdash::clipboard::ArboardClipboard;
 
     // Attempt the copy first; if the environment has no clipboard
     // provider, `copy_text_to_clipboard` will return an error and we
     // skip the round-trip assertion.
-    if let Err(e) = cmdash::render::copy_text_to_clipboard(text) {
+    if let Err(e) = cmdash::clipboard::copy_text_to_clipboard(&mut clipboard, text) {
         eprintln!("clipboard unavailable in test environment, skipping round-trip: {e}");
         return;
     }

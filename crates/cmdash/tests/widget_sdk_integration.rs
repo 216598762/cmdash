@@ -314,12 +314,12 @@ async fn mock_widget_renders_visible_content() {
     let mut found_title = false;
     for y in 0..buf.area.height {
         for x in 0..buf.area.width {
-            if buf.get(x, y).symbol() == "M" {
+            if buf[(x, y)].symbol() == "M" {
                 let expected = "Mock Widget";
                 let mut ok = true;
                 for (i, ch) in expected.chars().enumerate() {
                     let cx = x + i as u16;
-                    if cx >= buf.area.width || buf.get(cx, y).symbol() != ch.to_string() {
+                    if cx >= buf.area.width || buf[(cx, y)].symbol() != ch.to_string() {
                         ok = false;
                         break;
                     }
@@ -406,12 +406,12 @@ async fn widget_renders_at_offset_position() {
     let mut found_at_offset = false;
     for y in 3..15 {
         for x in 8..45 {
-            if buf.get(x, y).symbol() == "M" {
+            if buf[(x, y)].symbol() == "M" {
                 let expected = "Mock";
                 let mut ok = true;
                 for (i, ch) in expected.chars().enumerate() {
                     let cx = x + i as u16;
-                    if cx >= buf.area.width || buf.get(cx, y).symbol() != ch.to_string() {
+                    if cx >= buf.area.width || buf[(cx, y)].symbol() != ch.to_string() {
                         ok = false;
                         break;
                     }

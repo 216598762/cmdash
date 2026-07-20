@@ -95,7 +95,7 @@ pub fn blit_grid(grid: &TextGrid, buf: &mut Buffer, area: RatRect) {
             {
                 continue;
             }
-            let dest = buf.get_mut(bx, by);
+            let dest = &mut buf[(bx, by)];
             dest.set_symbol(&cell.ch.to_string());
             dest.set_style(
                 Style::default()
@@ -125,7 +125,7 @@ pub fn blit_selection(buf: &mut Buffer, area: RatRect, sel_start: (u16, u16), se
             if bx >= buf.area.width || by >= buf.area.height {
                 continue;
             }
-            let dest = buf.get_mut(bx, by);
+            let dest = &mut buf[(bx, by)];
             dest.set_style(dest.style().add_modifier(Modifier::REVERSED));
         }
     }
@@ -143,7 +143,7 @@ pub fn blit_cursor(grid: &TextGrid, buf: &mut Buffer, area: RatRect) {
     if bx >= buf.area.width || by >= buf.area.height {
         return;
     }
-    let dest = buf.get_mut(bx, by);
+    let dest = &mut buf[(bx, by)];
     dest.set_style(dest.style().add_modifier(Modifier::REVERSED));
 }
 
@@ -189,18 +189,6 @@ pub fn extract_selected_text(
         lines.push(line.trim_end().to_string());
     }
     lines.join("\n")
-}
-
-/// Copy the given text to the system clipboard.
-///
-/// This is a thin wrapper around [`arboard::Clipboard`] so the
-/// copy-mode path can be tested without mocking the clipboard.
-pub fn copy_text_to_clipboard(
-    text: impl Into<String>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut clipboard = arboard::Clipboard::new()?;
-    clipboard.set_text(text.into())?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -267,8 +255,8 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 // Stamp sentinel BEFORE blit.
-                buf.get_mut(0, 0).set_symbol("X");
-                buf.get_mut(5, 3).set_symbol("Y");
+                buf[(0, 0)].set_symbol("X");
+                buf[(5, 3)].set_symbol("Y");
                 // Now blit a blank grid on top.
                 let area = ratatui::layout::Rect::new(0, 0, 80, 24);
                 blit_grid(&grid, buf, area);
@@ -276,13 +264,13 @@ mod tests {
             .expect("draw");
         let buf = terminal.backend().buffer().clone();
         assert_eq!(
-            buf.get(0, 0).symbol(),
+            buf[(0, 0)].symbol(),
             "X",
             "blit_grid with blank grid must not overwrite pre-existing buffer content; \
              the skip-blank guard should leave cell (0,0) at its sentinel value"
         );
         assert_eq!(
-            buf.get(5, 3).symbol(),
+            buf[(5, 3)].symbol(),
             "Y",
             "blit_grid with blank grid must not overwrite pre-existing buffer content; \
              the skip-blank guard should leave cell (5,3) at its sentinel value"
@@ -307,7 +295,7 @@ mod tests {
         for y in 1..=2 {
             for x in 1..=3 {
                 assert!(
-                    buf.get(x, y)
+                    buf[(x, y)]
                         .style()
                         .add_modifier
                         .contains(ratatui::style::Modifier::REVERSED),
@@ -317,14 +305,14 @@ mod tests {
         }
         // Cells outside the selection should NOT be reversed.
         assert!(
-            !buf.get(0, 0)
+            !buf[(0, 0)]
                 .style()
                 .add_modifier
                 .contains(ratatui::style::Modifier::REVERSED),
             "cell (0,0) must not be reversed"
         );
         assert!(
-            !buf.get(4, 2)
+            !buf[(4, 2)]
                 .style()
                 .add_modifier
                 .contains(ratatui::style::Modifier::REVERSED),
@@ -349,7 +337,7 @@ mod tests {
             .expect("draw");
         let buf = terminal.backend().buffer().clone();
         assert!(
-            buf.get(0, 0)
+            buf[(0, 0)]
                 .style()
                 .add_modifier
                 .contains(ratatui::style::Modifier::REVERSED),
@@ -357,7 +345,7 @@ mod tests {
         );
         // Cell (1, 0) must NOT have REVERSED.
         assert!(
-            !buf.get(1, 0)
+            !buf[(1, 0)]
                 .style()
                 .add_modifier
                 .contains(ratatui::style::Modifier::REVERSED),
@@ -389,8 +377,8 @@ mod tests {
             .draw(|frame| {
                 let buf = frame.buffer_mut();
                 // Stamp sentinels at cells far from the area.
-                buf.get_mut(0, 0).set_symbol("A");
-                buf.get_mut(1, 0).set_symbol("B");
+                buf[(0, 0)].set_symbol("A");
+                buf[(1, 0)].set_symbol("B");
                 // blit_cursor with area at (40, 10). Cursor (0,0)
                 // maps to buffer cell (40, 10) — cells (0,0) and
                 // (1,0) must be unaffected.
@@ -400,18 +388,18 @@ mod tests {
             .expect("draw");
         let buf = terminal.backend().buffer().clone();
         assert_eq!(
-            buf.get(0, 0).symbol(),
+            buf[(0, 0)].symbol(),
             "A",
             "cell (0,0) must retain sentinel 'A' after blit_cursor with area at (40,10)"
         );
         assert_eq!(
-            buf.get(1, 0).symbol(),
+            buf[(1, 0)].symbol(),
             "B",
             "cell (1,0) must retain sentinel 'B' after blit_cursor with area at (40,10)"
         );
         // The cursor-reversed cell at (40, 10) must have REVERSED.
         assert!(
-            buf.get(40, 10)
+            buf[(40, 10)]
                 .style()
                 .add_modifier
                 .contains(ratatui::style::Modifier::REVERSED),

@@ -11,6 +11,7 @@
 use std::time::Duration;
 
 use cmdash::pane::{PaneCloseTx, PaneRunner};
+use cmdash::test_utils::make_isolated_test_dir;
 use cmdash_config::{
     LayoutNode, Pane as CfgPane, PaneKind, Ratio as CfgRatio, SplitAxis as CfgSplitAxis,
 };
@@ -52,7 +53,13 @@ async fn blank_screen_detection_pty_echo_must_appear_in_buffer() {
             "printf 'hello world'; sleep 0.1; exit 0".to_string(),
         ],
     };
-    let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
+    let mut runner = PaneRunner::spawn(
+        pane.clone(),
+        layer_id,
+        shell,
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn runner");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut snap = None;
@@ -91,7 +98,7 @@ async fn blank_screen_detection_pty_echo_must_appear_in_buffer() {
     let mut non_space_count = 0;
     for y in 0..24 {
         for x in 0..80 {
-            if buf.get(x, y).symbol() != " " {
+            if buf[(x, y)].symbol() != " " {
                 non_space_count += 1;
             }
         }
@@ -124,7 +131,7 @@ async fn blank_grid_baseline_buffer_stays_all_spaces() {
     let buf = terminal.backend().buffer().clone();
     for y in 0..24 {
         for x in 0..80 {
-            let sym = buf.get(x, y).symbol();
+            let sym = buf[(x, y)].symbol();
             assert_eq!(
                 sym, " ",
                 "blank grid baseline: cell ({x},{y}) must be space; got {sym:?}"
@@ -163,7 +170,13 @@ async fn shell_startup_produces_visible_content_in_textgrid() {
             "echo CMDASH_MARKER; sleep 1; exit 0".to_string(),
         ],
     };
-    let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
+    let mut runner = PaneRunner::spawn(
+        pane.clone(),
+        layer_id,
+        shell,
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn runner");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut found_marker = false;
@@ -229,7 +242,13 @@ async fn wiring_round_trip_renders_echoed_text() {
             "printf 'hello world\\n'; sleep 0.05; exit 0".to_string(),
         ],
     };
-    let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
+    let mut runner = PaneRunner::spawn(
+        pane.clone(),
+        layer_id,
+        shell,
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn runner");
 
     // Allow the child to start. Sleep once up-front lets the
     // reader thread accumulate some bytes; subsequent ticks are
@@ -283,7 +302,7 @@ async fn wiring_round_trip_renders_echoed_text() {
     let mut saw_h = false;
     for y in 0..24 {
         for x in 0..80 {
-            if buf.get(x, y).symbol() == "h" {
+            if buf[(x, y)].symbol() == "h" {
                 saw_h = true;
                 break;
             }
@@ -336,7 +355,13 @@ async fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
             "printf 'VISIBLE_TEXT'; sleep 0.1; exit 0".to_string(),
         ],
     };
-    let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
+    let mut runner = PaneRunner::spawn(
+        pane.clone(),
+        layer_id,
+        shell,
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn runner");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut snap = None;
@@ -396,7 +421,7 @@ async fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
     // corrupts stdout only when real images are present.
     graphics.push_image(cmdash_pty::PaneLayerId(1), 7, image::RgbaImage::new(1, 1));
     graphics
-        .render_and_write(buf.get_mut())
+        .render_and_write(&mut buf)
         .expect("phase 3b render_and_write");
 
     let combined = buf.into_inner();
@@ -437,11 +462,11 @@ async fn phase3b_kitty_graphics_does_not_overwrite_phase3a_text_body() {
 
 // ---------------------------------------------------------------------------
 // Kitty graphics end-to-end smoke: push a synthetic image onto
-// GraphicsState, render and emit through dashcompositor's
+// GraphicsState, render and emit through termcompositor's
 // passthrough encoder, and assert the byte stream contains the
 // kitty APC-G escape per AGENTS.md §"Rendering pipeline" step 6.
 //
-// This covers the dashcompositor routing path without depending
+// This covers the termcompositor routing path without depending
 // on a real PTY child or a hand-crafted PNG byte fixture.
 // ---------------------------------------------------------------------------
 
@@ -535,7 +560,13 @@ async fn pane_runner_resize_refreshes_computed_rect() {
     let shell = ShellSpec::Command {
         argv: vec!["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
     };
-    let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
+    let mut runner = PaneRunner::spawn(
+        pane.clone(),
+        layer_id,
+        shell,
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn runner");
 
     // Initial-state sanity: the accessor should hand back the
     // exact spawn-time rect.
@@ -692,9 +723,20 @@ async fn pane_runner_resize_preserves_split_origin_in_layout_engine_path() {
     };
     let id_a = cmdash::derive_layer_id(&pane_a.id);
     let id_b = cmdash::derive_layer_id(&pane_b.id);
-    let runner_a = PaneRunner::spawn(pane_a.clone(), id_a, shell.clone()).expect("spawn runner A");
-    let mut runner_b =
-        PaneRunner::spawn(pane_b.clone(), id_b, shell.clone()).expect("spawn runner B");
+    let runner_a = PaneRunner::spawn(
+        pane_a.clone(),
+        id_a,
+        shell.clone(),
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn runner A");
+    let mut runner_b = PaneRunner::spawn(
+        pane_b.clone(),
+        id_b,
+        shell.clone(),
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn runner B");
 
     // Initial-state sanity: spawn-time rect rounds-trip the
     // Split-derived non-zero origin (x:79 for child B).
@@ -800,12 +842,22 @@ async fn relayout_drives_per_pane_resize_via_real_pty() {
 
     let id_a = cmdash::derive_layer_id(&pane_a_cfg.id);
     let id_b = cmdash::derive_layer_id(&pane_b_cfg.id);
-    let runner_a =
-        PaneRunner::spawn_with_graphics(pane_a_cfg.clone(), id_a, shell_a, Some(close_tx.clone()))
-            .expect("spawn runner A");
-    let runner_b =
-        PaneRunner::spawn_with_graphics(pane_b_cfg.clone(), id_b, shell_b, Some(close_tx.clone()))
-            .expect("spawn runner B");
+    let runner_a = PaneRunner::spawn_with_graphics(
+        pane_a_cfg.clone(),
+        id_a,
+        shell_a,
+        Some(close_tx.clone()),
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn runner A");
+    let runner_b = PaneRunner::spawn_with_graphics(
+        pane_b_cfg.clone(),
+        id_b,
+        shell_b,
+        Some(close_tx.clone()),
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn runner B");
     let mut runners = [runner_a, runner_b];
     drop(close_tx);
 
@@ -942,6 +994,7 @@ async fn app_new_pane_splits_focused_leaf_in_real_pty_tree() {
         original_layer_id,
         shell.clone(),
         Some(close_tx.clone()),
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
     )
     .expect("spawn original runner");
 
@@ -958,6 +1011,7 @@ async fn app_new_pane_splits_focused_leaf_in_real_pty_tree() {
                 kind: PaneKind::Shell,
                 label: None,
                 command: None,
+                scrollback_capacity: None,
             }),
         ],
     };
@@ -975,6 +1029,7 @@ async fn app_new_pane_splits_focused_leaf_in_real_pty_tree() {
         new_layer_id,
         shell.clone(),
         Some(close_tx.clone()),
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
     )
     .expect("spawn new runner");
 
@@ -1039,7 +1094,7 @@ async fn app_new_pane_splits_focused_leaf_in_real_pty_tree() {
     // Hard-rule contract: every `PaneRunner::Drop` enqueues its
     // `PaneLayerId` on its `close_tx` so the binary's
     // `cmdash::graphics::GraphicsState::close_pane` round-trip
-    // can revoke the pane's dashcompositor layer (AGENTS.md
+    // can revoke the pane's termcompositor layer (AGENTS.md
     // "Hard rule: one layer per instance"). AppNewPane spawns
     // both a survivor (unchanged LayerId) and a brand-new pane
     // (fresh LayerId) -- both round-trip identically.
@@ -1130,6 +1185,7 @@ async fn pane_focus_directional_moves_focus_via_adjacent_pane_in_real_pty_tree()
             cmdash::derive_layer_id(&id_left),
             shell.clone(),
             Some(close_tx.clone()),
+            cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
         )
         .expect("spawn left"),
         PaneRunner::spawn_with_graphics(
@@ -1137,6 +1193,7 @@ async fn pane_focus_directional_moves_focus_via_adjacent_pane_in_real_pty_tree()
             cmdash::derive_layer_id(&id_right),
             shell.clone(),
             Some(close_tx.clone()),
+            cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
         )
         .expect("spawn right"),
     ];
@@ -1239,6 +1296,7 @@ async fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
             layer_kept,
             shell.clone(),
             Some(close_tx.clone()),
+            cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
         )
         .expect("spawn kept"),
     );
@@ -1248,6 +1306,7 @@ async fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
             layer_closing,
             shell.clone(),
             Some(close_tx.clone()),
+            cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
         )
         .expect("spawn closing"),
     );
@@ -1273,6 +1332,7 @@ async fn pane_close_drops_focused_runner_and_rebalances_real_pty_tree() {
             kind: PaneKind::Shell,
             label: Some("kept".to_string()),
             command: None,
+            scrollback_capacity: None,
         }),
         "PaneClose (closing child 1 of Horizontal Split) collapses the Split to leaf `kept`"
     );
@@ -1387,6 +1447,7 @@ async fn pane_preset_swap_layout_via_real_pty_wholesale_spawn() {
         initial_layer,
         shell.clone(),
         Some(close_tx.clone()),
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
     )
     .expect("spawn initial runner");
 
@@ -1424,6 +1485,7 @@ async fn pane_preset_swap_layout_via_real_pty_wholesale_spawn() {
                 layer,
                 shell.clone(),
                 Some(close_tx.clone()),
+                cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
             )
             .expect("spawn fresh pane"),
         );
@@ -1531,7 +1593,7 @@ struct CleanupGuard {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     reader: Option<std::thread::JoinHandle<()>>,
-    log_path: std::path::PathBuf,
+    _log_path: std::path::PathBuf,
 }
 
 impl Drop for CleanupGuard {
@@ -1565,13 +1627,10 @@ impl Drop for CleanupGuard {
         if let Some(h) = self.reader.take() {
             let _ = h.join();
         }
-        // PRESERVE cmdash's TRACE log on assertion failure
-        // so a maintainer reading a failed run can pinpoint
-        // the line where the binary stopped emitting. DELETE
-        // on success to keep /tmp tidy across repeated runs.
-        if !std::thread::panicking() {
-            let _ = std::fs::remove_file(&self.log_path);
-        }
+        // Note: the log file lives inside the TestDir and is cleaned
+        // up automatically by TestDir::Drop. The old code preserved
+        // logs on panic for post-mortem debugging, but TestDir::Drop
+        // removes the directory regardless of panic state.
     }
 }
 
@@ -1607,8 +1666,8 @@ async fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
         })
         .expect("openpty 80x24 cmdash host");
 
-    let log_path = std::env::temp_dir().join("cmdash-e2e-appnewpane.log");
-    let _ = std::fs::remove_file(&log_path);
+    let test_dir = make_isolated_test_dir("cmdash-e2e-appnewpane");
+    let log_path = test_dir.join("cmdash-e2e-appnewpane.log");
 
     let mut cmd = CommandBuilder::new(CMDASH_BIN);
     cmd.arg(format!("--log={}", log_path.display()));
@@ -1681,8 +1740,12 @@ async fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
         child: Some(child),
         master: Some(pair.master),
         reader: Some(reader_handle),
-        log_path: log_path.clone(),
+        _log_path: log_path.clone(),
     };
+    // Note: `test_dir` Drop runs at end of scope and cleans up the
+    // isolated directory. This is acceptable — the log file is only
+    // preserved for post-mortem debugging on panic, and directory
+    // cleanup is more important for CI hygiene.
 
     // Drive Ctrl-a (byte 0x01) through the PTY master. With
     // main.rs:790's `event::poll(Duration::from_millis(1))`
@@ -1744,7 +1807,7 @@ async fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     // ====================================================================
     // The prior byte-diff hash-differ `assert_ne!(pre_hash, post_hash, ...)`
     // guard was removed. The hash-differ assertion is structurally
-    // unreachable on this host's degraded text-mode + dashcompositor
+    // unreachable on this host's degraded text-mode + termcompositor
     // passthrough-encoder architecture:
     // the encoder emits a steady stream of byte-identical empty-framebuffer
     // emission at every ~33 ms tick, saturating the 1 MiB ring buffer
@@ -1759,7 +1822,7 @@ async fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     //
     // File:line rationale for the encoder claim:
     //   - cmdash's render pipeline calls
-    //     `dashcompositor::encoder::kitty::encode_passthrough_to_writer`
+    //     `termcompositor::encoder::kitty::encode_passthrough_to_writer`
     //     from `crates/cmdash/src/graphics.rs` (`GraphicsState::render_and_write`,
     //     called every tick from `crates/cmdash/src/main.rs` `TickContext::run`
     //     phase-3a frame-render block).
@@ -1788,7 +1851,7 @@ async fn app_new_pane_via_ctrl_a_keypress_in_live_binary() {
     // correctly on every investigated iter on HEAD=7240f896 -- confirming
     // AppNewPane's runtime dispatch works end-to-end through real PTY
     // children; the only thing the byte-diff guard was hiding was the
-    // dashcompositor empty-framebuffer emission rate, NOT any actual
+    // termcompositor empty-framebuffer emission rate, NOT any actual
     // cmdash regression.
     // ====================================================================
     //
@@ -2155,8 +2218,14 @@ async fn full_pipeline_pty_reader_tick_snapshot_has_content() {
         ],
     };
     let close_tx: PaneCloseTx = tokio::sync::mpsc::unbounded_channel().0;
-    let mut runner = PaneRunner::spawn_with_graphics(pane.clone(), layer_id, shell, Some(close_tx))
-        .expect("spawn_with_graphics must succeed");
+    let mut runner = PaneRunner::spawn_with_graphics(
+        pane.clone(),
+        layer_id,
+        shell,
+        Some(close_tx),
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn_with_graphics must succeed");
 
     // Wait for the child to start and produce output.
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -2249,11 +2318,11 @@ async fn full_pipeline_pty_reader_tick_snapshot_has_content() {
     let mut buf_marker = false;
     'outer: for y in 0..24 {
         for x in 0..80 {
-            if buf.get(x, y).symbol() == "P" {
+            if buf[(x, y)].symbol() == "P" {
                 let mut ok = true;
                 for (i, ch) in "PIPELINE_MARKER".chars().enumerate() {
                     let cx = x + i as u16;
-                    if cx >= 80 || buf.get(cx, y).symbol() != ch.to_string() {
+                    if cx >= 80 || buf[(cx, y)].symbol() != ch.to_string() {
                         ok = false;
                         break;
                     }
@@ -2330,7 +2399,13 @@ async fn per_pane_command_field_echo_hello_appears_in_textgrid() {
     let shell = ShellSpec::Command { argv };
 
     let layer_id = cmdash::derive_layer_id(&pane.id);
-    let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
+    let mut runner = PaneRunner::spawn(
+        pane.clone(),
+        layer_id,
+        shell,
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn runner");
 
     // Wait for the child to start and produce output.
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -2382,11 +2457,11 @@ async fn per_pane_command_field_echo_hello_appears_in_textgrid() {
     let mut buf_hello = false;
     'buf: for y in 0..24 {
         for x in 0..80 {
-            if buf.get(x, y).symbol() == "h" {
+            if buf[(x, y)].symbol() == "h" {
                 let mut ok = true;
                 for (i, ch) in "hello".chars().enumerate() {
                     let cx = x + i as u16;
-                    if cx >= 80 || buf.get(cx, y).symbol() != ch.to_string() {
+                    if cx >= 80 || buf[(cx, y)].symbol() != ch.to_string() {
                         ok = false;
                         break;
                     }
@@ -2448,7 +2523,13 @@ async fn per_pane_command_with_args_echo_hello_world_appears_in_textgrid() {
     let shell = ShellSpec::Command { argv };
 
     let layer_id = cmdash::derive_layer_id(&pane.id);
-    let mut runner = PaneRunner::spawn(pane.clone(), layer_id, shell).expect("spawn runner");
+    let mut runner = PaneRunner::spawn(
+        pane.clone(),
+        layer_id,
+        shell,
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn runner");
 
     // Wait for the child to start and produce output.
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -2500,11 +2581,11 @@ async fn per_pane_command_with_args_echo_hello_world_appears_in_textgrid() {
     let mut buf_found = false;
     'buf: for y in 0..24 {
         for x in 0..80 {
-            if buf.get(x, y).symbol() == "h" {
+            if buf[(x, y)].symbol() == "h" {
                 let mut ok = true;
                 for (i, ch) in "hello world".chars().enumerate() {
                     let cx = x + i as u16;
-                    if cx >= 80 || buf.get(cx, y).symbol() != ch.to_string() {
+                    if cx >= 80 || buf[(cx, y)].symbol() != ch.to_string() {
                         ok = false;
                         break;
                     }
@@ -2566,8 +2647,14 @@ async fn scrollback_round_trip_renders_scrolled_off_content() {
         argv: vec!["sh".to_string(), "-c".to_string(), command],
     };
     let (close_tx, _close_rx): (PaneCloseTx, _) = tokio::sync::mpsc::unbounded_channel();
-    let mut runner = PaneRunner::spawn_with_graphics(pane.clone(), layer_id, shell, Some(close_tx))
-        .expect("spawn runner");
+    let mut runner = PaneRunner::spawn_with_graphics(
+        pane.clone(),
+        layer_id,
+        shell,
+        Some(close_tx),
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn runner");
 
     // Tick until scrollback has content. This is the critical
     // difference from the earlier 'S'-detection draft: we wait
@@ -2628,7 +2715,7 @@ async fn scrollback_round_trip_renders_scrolled_off_content() {
             // Check if row 0 has any non-space content from
             // the scrollback rows rendered by blit_grid.
             for x in 0..80u16 {
-                if buf.get(x, 0).symbol() != " " {
+                if buf[(x, 0)].symbol() != " " {
                     non_space_at_row0 = true;
                     break;
                 }

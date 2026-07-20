@@ -1,9 +1,9 @@
-//! cmdash-side dashcompositor adapter for kitty graphics coming
+//! cmdash-side termcompositor adapter for kitty graphics coming
 //! from nested PTY children.
 //!
 //! ## Design
 //!
-//! - One [`GraphicsState`] owns the command's [`dashcompositor::LayerStack`].
+//! - One [`GraphicsState`] owns the command's [`termcompositor::LayerStack`].
 //! - Each pane keeps `(pane_layer_id, kitty_image_id) -> LayerId`
 //!   in a flat `HashMap` keyed by a stable
 //!   [`cmdash_pty::PaneLayerId`] (1:1 with the pane — AGENTS.md
@@ -12,19 +12,19 @@
 //!   [`KittyGraphicCmd`] variant:
 //!   - `Load`: decode the RGBA payload via [`image::load_from_memory`]
 //!     and call `Self::push_image` to register the freshly-pushed
-//!     [`dashcompositor::ImageLayer`].
+//!     [`termcompositor::ImageLayer`].
 //!   - `Place`: re-create the layer at the new pixel position
-//!     while preserving the cached RGBA. (dashcompositor's
-//!     [`dashcompositor::Layer`] trait has no `set_position`, so
+//!     while preserving the cached RGBA. (termcompositor's
+//!     [`termcompositor::Layer`] trait has no `set_position`, so
 //!     a remove-then-push is the documented v1 path; the pane-side
 //!     [`PaneLayerId`] stays stable across this operation.)
 //!   - `Delete`: remove the cached entry and the layer.
 //!   - `Control`: no-op (matches vte-via-cmdash-pty semantics).
 //! - [`GraphicsState::render_and_write`] composites the stack
-//!   into a [`dashcompositor::FrameBuffer`] sized from
+//!   into a [`termcompositor::FrameBuffer`] sized from
 //!   [`Metrics`] (default `8x16` per cell) and emits through
-//!   `dashcompositor::encode_passthrough_to_writer` (Kitty)
-//!   or `dashcompositor::encoder::encode_to_writer` (Sixel
+//!   `termcompositor::encode_passthrough_to_writer` (Kitty)
+//!   or `termcompositor::encoder::encode_to_writer` (Sixel
 //!   fallback), depending on [`GraphicsProtocol`].
 //! - [`GraphicsState::close_pane`] tears down every layer that
 //!   came from a given pane (AGENTS.md §"MUST NOT" — bindings
@@ -34,8 +34,8 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use cmdash_pty::{KittyGraphicCmd, PaneLayerId};
-use dashcompositor::encoder::encode_to_writer as encode_sixel_to_writer;
-use dashcompositor::{
+use termcompositor::encoder::encode_to_writer as encode_sixel_to_writer;
+use termcompositor::{
     encode_passthrough_to_writer, Compositor, CpuCompositor, FrameBuffer, ImageLayer, LayerId,
     LayerStack, RectLayer, TextLayer,
 };
@@ -97,7 +97,7 @@ pub enum GraphicsError {
     Dispatch(String),
 }
 
-/// Per-(pane, kitty-image-id) bookkeeping: one dashcompositor
+/// Per-(pane, kitty-image-id) bookkeeping: one termcompositor
 /// layer slot plus the cached RGBA so that `Place` commands can
 /// rebuild an [`ImageLayer`] without re-decoding the payload.
 #[derive(Debug, Clone)]
@@ -598,7 +598,7 @@ pub(crate) fn parse_da1_response(bytes: &[u8]) -> Option<GraphicsProtocol> {
     }
 }
 
-/// Tab bar colors as dashcompositor `[u8; 4]` RGBA quads.
+/// Tab bar colors as termcompositor `[u8; 4]` RGBA quads.
 /// Match the ratatui text-mode colors from [`render_tab_bar`]
 /// so the pixel overlay is visually consistent with the
 /// degraded text fallback.
@@ -622,10 +622,10 @@ pub struct TabBarData<'a> {
 }
 
 /// Per-pane graphics state. Holds a shared
-/// [`dashcompositor::LayerStack`], per-pane image maps, and the
+/// [`termcompositor::LayerStack`], per-pane image maps, and the
 /// cell-pixel metrics used for framebuffer sizing.
 pub struct GraphicsState {
-    /// dashcompositor layer stack -- private; mutating is exposed
+    /// termcompositor layer stack -- private; mutating is exposed
     /// through `push_image` / `close_pane` / `render_and_write`.
     stack: LayerStack,
     /// Cell-pixel metrics for framebuffer sizing -- private;
@@ -650,7 +650,7 @@ pub struct GraphicsState {
     /// the other would not survive that check.
     images: HashMap<(PaneLayerId, u32), ImageEntry>,
     pane_images: HashMap<PaneLayerId, Vec<u32>>,
-    /// dashcompositor `LayerId`s for the current tab bar
+    /// termcompositor `LayerId`s for the current tab bar
     /// overlay. One background `RectLayer` + one `TextLayer`
     /// per tab. Rebuilt every frame by [`Self::update_tab_bar`]
     /// (old layers are removed first). Empty when no tab bar
@@ -734,12 +734,12 @@ impl GraphicsState {
     /// layout rect, so resizing wasn't a path; v2 wires host
     /// SIGWINCH (crossterm `Event::Resize`) into the binary's
     /// tick loop, which must call [`Self::set_cells`] so the
-    /// dashcompositor framebuffer pixel dimensions stay
+    /// termcompositor framebuffer pixel dimensions stay
     /// in-sync with the layout engine's cell-grid rect.
     /// Asserts the same `non-zero` invariant as [`Self::new`]
     /// -- window-snap / hide-and-restore can briefly emit
     /// `Event::Resize(0, 0)` and we must reject before a
-    /// zero-pixel composition would crash dashcompositor.
+    /// zero-pixel composition would crash termcompositor.
     pub fn set_cells(&mut self, cells: (u16, u16)) {
         assert!(
             cells.0 > 0 && cells.1 > 0,
@@ -784,7 +784,7 @@ impl GraphicsState {
         // First image load proves the host terminal supports
         // the kitty graphics protocol (nested PTY children
         // forwarded their kitty commands through it). Enables
-        // tab bar dashcompositor layers via [`Self::update_tab_bar`].
+        // tab bar termcompositor layers via [`Self::update_tab_bar`].
         self.kitty_capable = true;
         lid
     }
@@ -854,10 +854,10 @@ impl GraphicsState {
 
     /// Compose the layer stack into a framebuffer sized from
     /// `cells.0 * cell_w` by `cells.1 * cell_h` pixels, then enqueue
-    /// it through dashcompositor's kitty passthrough encoder.
+    /// it through termcompositor's kitty passthrough encoder.
     /// Uses `CpuCompositor.compose` rather than
     /// `LayerStack::render_to_current_terminal` so frame size is
-    /// driven by the binary's grid (not dashcompositor's
+    /// driven by the binary's grid (not termcompositor's
     /// `TerminalSize::current()` heuristic, which can drift on
     /// non-TTY CI).
     pub fn render_and_write<W: Write>(&self, writer: &mut W) -> Result<(), GraphicsError> {
@@ -922,7 +922,7 @@ impl GraphicsState {
     /// Tear down every layer that originated from `pane`. Called
     /// from the binary when a pane's child exits — the per-pane
     /// [`PaneLayerId`] is dropped from the maps and the
-    /// dashcompositor `LayerStack` is asked to forget each
+    /// termcompositor `LayerStack` is asked to forget each
     /// associated `LayerId`.
     pub fn close_pane(&mut self, pane: PaneLayerId) {
         if let Some(ids) = self.pane_images.remove(&pane) {
@@ -934,12 +934,12 @@ impl GraphicsState {
         }
     }
 
-    /// Rebuild the tab bar as dashcompositor layers. Removes
+    /// Rebuild the tab bar as termcompositor layers. Removes
     /// any previously-pushed tab bar layers, then pushes a
     /// background `RectLayer` (dark gray, full-width, one cell
     /// row) and one `TextLayer` per tab (active tab highlighted
     /// with blue bg + white bold; inactive tabs dim gray). Uses
-    /// dashcompositor's bundled fontdue rasterizer via the
+    /// termcompositor's bundled fontdue rasterizer via the
     /// `font-rasterizer` feature.
     ///
     /// Called once per frame from `TickContext::run` before
@@ -1282,6 +1282,7 @@ mod internal_sanity_tests {
                 argv: vec!["true".to_string()],
             },
             Some(close_tx),
+            cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
         )
         .expect("spawn_with_graphics");
 
@@ -1289,7 +1290,7 @@ mod internal_sanity_tests {
         drop(runner);
 
         // Simulate `tick_loop` phase 1: drain the close message and
-        // call `close_pane` to revoke the dashcompositor layers.
+        // call `close_pane` to revoke the termcompositor layers.
         let received = close_rx
             .try_recv()
             .expect("PaneRunner::Drop must send a close message to the channel");
@@ -1383,7 +1384,7 @@ mod internal_sanity_tests {
     }
 
     // ------------------------------------------------------------------
-    // Tab-bar dashcompositor layer tests.
+    // Tab-bar termcompositor layer tests.
     // ------------------------------------------------------------------
 
     use super::TabBarData;
@@ -1545,7 +1546,7 @@ mod internal_sanity_tests {
     /// `update_tab_bar` is a no-op when `kitty_capable` is
     /// false AND protocol is `TextOnly`. The guard
     /// (`kitty_capable || protocol != TextOnly`) gates tab bar
-    /// dashcompositor layers so non-graphics terminals never
+    /// termcompositor layers so non-graphics terminals never
     /// emit garbled APC-G/Sixel output.
     #[test]
     fn update_tab_bar_noop_when_not_kitty_capable() {
@@ -2074,5 +2075,201 @@ mod internal_sanity_tests {
             parse_da1_response(resp).is_none(),
             "DA1 response missing ? after ESC[ must return None"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Graphics state management tests: kitty image lifecycle and
+    // layer allocation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn push_image_allocates_distinct_layer_ids_per_pane() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let pane_a = PaneLayerId(1);
+        let pane_b = PaneLayerId(2);
+
+        let lid_a = g.push_image(pane_a, 7, rgba1x1());
+        let lid_b = g.push_image(pane_b, 7, rgba1x1());
+
+        assert_ne!(lid_a, lid_b, "each pane must get its own layer id");
+        assert!(g.has_image(pane_a, 7));
+        assert!(g.has_image(pane_b, 7));
+    }
+
+    #[test]
+    fn push_image_overwrites_same_pane_same_kitty_id() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let pane = PaneLayerId(1);
+
+        let lid_first = g.push_image(pane, 7, rgba1x1());
+        let lid_second = g.push_image(pane, 7, rgba1x1());
+
+        assert_ne!(lid_first, lid_second, "overwrite must allocate a new layer");
+        assert!(g.has_image(pane, 7));
+        // The images map is updated to the new layer id.
+        let entry = g.images.get(&(pane, 7)).expect("image entry exists");
+        assert_eq!(entry.layer_id, lid_second);
+    }
+
+    #[test]
+    fn push_image_same_id_twice_appends_duplicate_to_pane_images() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let pane = PaneLayerId(1);
+
+        g.push_image(pane, 7, rgba1x1());
+        g.push_image(pane, 7, rgba1x1());
+
+        let ids = g.pane_images.get(&pane).expect("pane has images");
+        assert_eq!(ids, &vec![7, 7]);
+    }
+
+    #[test]
+    fn close_pane_removes_layers_from_stack() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let pane = PaneLayerId(1);
+        let lid = g.push_image(pane, 7, rgba1x1());
+
+        g.close_pane(pane);
+
+        assert!(g.stack.get(lid).is_none());
+    }
+
+    #[test]
+    fn close_pane_only_removes_target_pane_images() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let pane_a = PaneLayerId(1);
+        let pane_b = PaneLayerId(2);
+        g.push_image(pane_a, 7, rgba1x1());
+        g.push_image(pane_b, 8, rgba1x1());
+
+        g.close_pane(pane_a);
+
+        assert!(!g.has_image(pane_a, 7));
+        assert!(g.has_image(pane_b, 8));
+        assert!(g.pane_images.contains_key(&pane_b));
+        assert!(!g.pane_images.contains_key(&pane_a));
+    }
+
+    #[test]
+    fn close_pane_then_reuse_kitty_id_on_another_pane() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let pane_a = PaneLayerId(1);
+        let pane_b = PaneLayerId(2);
+        g.push_image(pane_a, 7, rgba1x1());
+        g.close_pane(pane_a);
+
+        let lid_b = g.push_image(pane_b, 7, rgba1x1());
+
+        assert!(g.has_image(pane_b, 7));
+        assert!(g.stack.get(lid_b).is_some());
+    }
+
+    #[test]
+    fn has_image_returns_false_for_unknown_image() {
+        let g = GraphicsState::new(Metrics::default(), (80, 24));
+        assert!(!g.has_image(PaneLayerId(1), 99));
+    }
+
+    #[test]
+    fn kitty_capable_starts_false_and_set_on_first_push() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        assert!(!g.kitty_capable);
+
+        g.push_image(PaneLayerId(1), 1, rgba1x1());
+
+        assert!(g.kitty_capable);
+    }
+
+    #[test]
+    fn apply_kitty_event_load_creates_image() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let pane = PaneLayerId(1);
+        let mut data = Vec::new();
+        image::DynamicImage::ImageRgba8(rgba1x1())
+            .write_to(
+                &mut std::io::Cursor::new(&mut data),
+                image::ImageFormat::Png,
+            )
+            .expect("encode png");
+        let cmd = KittyGraphicCmd::Load {
+            id: 7,
+            placement_id: 0,
+            format: 24,
+            width: 1,
+            height: 1,
+            data,
+        };
+
+        g.apply_kitty_event(pane, &cmd);
+
+        assert!(g.has_image(pane, 7));
+        assert!(g.kitty_capable);
+    }
+
+    #[test]
+    fn apply_kitty_event_place_updates_existing_image() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let pane = PaneLayerId(1);
+        g.push_image(pane, 7, rgba1x1());
+
+        g.apply_kitty_event(pane, &place_cmd(7, 5, 10, 2));
+
+        assert!(g.has_image(pane, 7));
+    }
+
+    #[test]
+    fn apply_kitty_event_delete_removes_image() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let pane = PaneLayerId(1);
+        g.push_image(pane, 7, rgba1x1());
+
+        g.apply_kitty_event(pane, &KittyGraphicCmd::Delete { id: 7 });
+
+        assert!(!g.has_image(pane, 7));
+    }
+
+    #[test]
+    fn apply_kitty_event_unknown_place_is_noop() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let pane = PaneLayerId(1);
+
+        g.apply_kitty_event(pane, &place_cmd(99, 0, 0, 0));
+
+        assert!(!g.has_image(pane, 99));
+    }
+
+    #[test]
+    fn apply_kitty_event_invalid_load_is_noop() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let pane = PaneLayerId(1);
+        let cmd = KittyGraphicCmd::Load {
+            id: 7,
+            placement_id: 0,
+            format: 24,
+            width: 1,
+            height: 1,
+            data: vec![0xff, 0xff, 0xff],
+        };
+
+        g.apply_kitty_event(pane, &cmd);
+
+        assert!(!g.has_image(pane, 7));
+        assert!(!g.kitty_capable);
+    }
+
+    #[test]
+    fn pane_images_tracks_multiple_ids_per_pane() {
+        let mut g = GraphicsState::new(Metrics::default(), (80, 24));
+        let pane = PaneLayerId(1);
+
+        g.push_image(pane, 7, rgba1x1());
+        g.push_image(pane, 8, rgba1x1());
+        g.push_image(pane, 9, rgba1x1());
+
+        let ids = g.pane_images.get(&pane).expect("pane has images");
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&7));
+        assert!(ids.contains(&8));
+        assert!(ids.contains(&9));
     }
 }

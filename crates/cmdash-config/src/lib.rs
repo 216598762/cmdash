@@ -87,6 +87,31 @@ pub struct Config {
     /// Optional theme configuration. When `None`, the hardcoded
     /// default colors are used.
     pub theme: Option<Theme>,
+    /// Clipboard integration policy. Governs how child PTYs
+    /// may interact with the system clipboard via OSC 52.
+    pub clipboard: ClipboardConfig,
+}
+
+/// Policy for child PTY clipboard access via OSC 52.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Osc52Policy {
+    /// OSC 52 is completely disabled. Set and query requests
+    /// from child PTYs are ignored. This is the default.
+    #[default]
+    Disabled,
+    /// Child PTYs may write to the system clipboard, but may
+    /// not read from it.
+    WriteOnly,
+    /// Child PTYs may both read from and write to the system
+    /// clipboard.
+    ReadWrite,
+}
+
+/// Clipboard integration configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClipboardConfig {
+    /// OSC 52 access policy for child PTYs.
+    pub osc52: Osc52Policy,
 }
 
 /// Configuration for the optional status bar.
@@ -188,6 +213,12 @@ pub struct Pane {
     /// string is split by whitespace into argv at spawn time.
     /// `None` falls back to `ShellSpec::LoginShell`.
     pub command: Option<String>,
+    /// Per-pane scrollback capacity override. When `Some(n)`,
+    /// the pane's scrollback ring buffer retains at most `n`
+    /// rows. When `None`, the default
+    /// `cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY` is used.
+    /// Parsed from KDL as `scrollback-capacity=5000`.
+    pub scrollback_capacity: Option<usize>,
 }
 
 /// Flavor of pane. `Widget` carries a `ref_name` that maps to
@@ -306,7 +337,7 @@ pub enum KeyAction {
     /// the active cell-grid area. (M-t default keybind).
     TabNew,
     /// `tab.close` -- close the active tab. All its
-    /// `PaneRunner`s are dropped (revoking every `dashcompositor`
+    /// `PaneRunner`s are dropped (revoking every `termcompositor`
     /// `LayerId` per `AGENTS.md` Hard rule); `active_tab` is
     /// clamped to `tabs.len() - 1`. Closing the last tab
     /// quits the binary (matches the `PaneClose` last-pane
@@ -558,6 +589,10 @@ fn parse_into(source: &str, errors: &mut Vec<ConfigError>) -> Config {
                     Err(e) => errors.push(e),
                 }
             }
+            "clipboard" => match read_clipboard(n) {
+                Ok(c) => cfg.clipboard = c,
+                Err(e) => errors.push(e),
+            },
             other => {
                 errors.push(ConfigError::UnknownTopLevel(other.into()));
             }
@@ -646,6 +681,7 @@ fn read_pane(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
     let mut ref_name: Option<String> = None;
     let mut label: Option<String> = None;
     let mut command: Option<String> = None;
+    let mut scrollback_capacity: Option<usize> = None;
     for entry in n.entries() {
         let key = entry.name().map(|id| id.value());
         let raw = entry_to_string(entry);
@@ -659,6 +695,9 @@ fn read_pane(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
             (Some("ref-name"), _) => ref_name = Some(raw),
             (Some("label"), _) => label = Some(raw),
             (Some("command"), _) => command = Some(raw),
+            (Some("scrollback-capacity"), _) => {
+                scrollback_capacity = raw.parse::<usize>().ok();
+            }
             _ => {}
         }
     }
@@ -681,6 +720,7 @@ fn read_pane(n: &KdlNode) -> Result<LayoutNode, ConfigError> {
         kind,
         label,
         command,
+        scrollback_capacity,
     }))
 }
 
@@ -822,6 +862,44 @@ fn read_status_bar(n: &KdlNode) -> Result<Bar, ConfigError> {
         }
     }
     Ok(bar)
+}
+
+/// Parse a top-level `clipboard { ... }` block.
+///
+/// Recognized keys:
+/// - `osc52` (string: `"disabled"`, `"write-only"`, `"read-write"`,
+///   default `"write-only"`)
+fn read_clipboard(n: &KdlNode) -> Result<ClipboardConfig, ConfigError> {
+    let mut cfg = ClipboardConfig::default();
+    if let Some(c) = n.children() {
+        for child in c.nodes() {
+            match child.name().value() {
+                "osc52" => {
+                    let val = child
+                        .entries()
+                        .first()
+                        .map(entry_to_string)
+                        .unwrap_or_default();
+                    cfg.osc52 = match val.as_str() {
+                        "disabled" => Osc52Policy::Disabled,
+                        "write-only" => Osc52Policy::WriteOnly,
+                        "read-write" => Osc52Policy::ReadWrite,
+                        other => {
+                            return Err(ConfigError::InvalidAction(format!(
+                                "unknown osc52 policy `{other}`; expected disabled, write-only, or read-write"
+                            )));
+                        }
+                    };
+                }
+                other => {
+                    return Err(ConfigError::InvalidAction(format!(
+                        "unknown key `{other}` in clipboard block"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(cfg)
 }
 
 /// Parse a top-level `theme { ... }` block.

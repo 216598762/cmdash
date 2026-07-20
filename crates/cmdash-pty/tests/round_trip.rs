@@ -495,6 +495,7 @@ fn pty_spawn_with_env_sets_variables_in_child() {
         5,
         PaneLayerId(100),
         env_vars,
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
     )
     .expect("spawn pty with env");
     let reader = std::sync::Arc::new(std::sync::Mutex::new(reader));
@@ -527,6 +528,7 @@ fn pty_spawn_with_env_overrides_inherited_term() {
         5,
         PaneLayerId(101),
         env_vars,
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
     )
     .expect("spawn pty with env override");
     let reader = std::sync::Arc::new(std::sync::Mutex::new(reader));

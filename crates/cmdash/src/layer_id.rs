@@ -47,7 +47,7 @@ pub fn derive_layer_id(pane: &PaneId) -> PaneLayerId {
 /// each tab's id space — a v1 `pre_order=5` pane on `tab_id=0` is
 /// `LayerId(0x0_0000_0005)`; the same pane geometry on `tab_id=1`
 /// is `LayerId(0x1_0000_0005)`. The two ids never collide in
-/// `dashcompositor`'s `LayerStack` even when the resolver produces
+/// `termcompositor`'s `LayerStack` even when the resolver produces
 /// the same `pre_order` index across two separate tabs.
 ///
 /// Pin: invalid `tab_id` values (anything past `u32::MAX / 2`)
@@ -71,7 +71,7 @@ mod tests {
     //! Collision-free guarantee: two tabs with the same
     //! `pre_order` index produce distinct `PaneLayerId` values;
     //! and within a single tab two distinct panes produce
-    //! distinct `PaneLayerId` values (so dashcompositor's
+    //! distinct `PaneLayerId` values (so termcompositor's
     //! `LayerStack::render` cannot alias two panes on the
     //! same tab to a single `LayerId`).
     use super::*;
@@ -94,11 +94,13 @@ mod tests {
                     kind: PaneKind::Shell,
                     label: Some(a.into()),
                     command: None,
+                    scrollback_capacity: None,
                 }),
                 LayoutNode::Pane(cmdash_config::Pane {
                     kind: PaneKind::Shell,
                     label: Some(b.into()),
                     command: None,
+                    scrollback_capacity: None,
                 }),
             ],
         }
@@ -134,7 +136,7 @@ mod tests {
     /// same tab must each own a fresh `PaneLayerId`. Without
     /// this, a v2 multi-pane tab would alias every geometry
     /// cell to `LayerId(0x7_0000_0000)` once `pre_order=0`
-    /// is reached, and dashcompositor's `LayerStack::render`
+    /// is reached, and termcompositor's `LayerStack::render`
     /// would clobber every pane on top of the first.
     #[test]
     fn derive_layer_id_for_tab_distinguishes_panes_in_same_tab() {

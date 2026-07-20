@@ -3,7 +3,7 @@
 //! rectangles, one per leaf pane, with deterministic pane IDs.
 //!
 //! The crate outputs **cell-grid** rectangles (not pixels); the
-//! conductor / dashcompositor bridge turns cell rects into pixel
+//! conductor / termcompositor bridge turns cell rects into pixel
 //! rects for downstream layer placement. This follows AGENTS.md
 //! ("Bounds = pane rect in cells -> pixels").
 //!
@@ -140,6 +140,11 @@ pub struct ComputedPane {
     /// default `$SHELL` / `/bin/sh`. `None` falls back to
     /// `ShellSpec::LoginShell`.
     pub command: Option<String>,
+    /// Per-pane scrollback capacity override. When `Some(n)`,
+    /// the pane's scrollback ring buffer retains at most `n`
+    /// rows. When `None`, the default
+    /// `cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY` is used.
+    pub scrollback_capacity: Option<usize>,
 }
 
 /// Layout-resolution errors.
@@ -405,6 +410,7 @@ fn resolve_node(
                 kind: p.kind.clone(),
                 label: p.label.clone(),
                 command: p.command.clone(),
+                scrollback_capacity: p.scrollback_capacity,
             });
         }
         LayoutNode::Preset { .. } => {
@@ -650,19 +656,20 @@ fn clone_child(
 
 /// Update the ratio of a [`LayoutNode::Split`] node at `path` in
 /// the layout tree. The path is a sequence of child indices starting
-/// from the root. The ratio is clamped to `1..=99` to avoid zero-area
-/// children. Returns `Ok(())` on success, or [`LayoutError`] if the
-/// path is invalid or the target is not a Split.
+/// from the root; an empty path targets the root itself. The ratio
+/// is clamped to `1..=99` to avoid zero-area children. Returns
+/// `Ok(())` on success, or [`LayoutError`] if the path is invalid
+/// or the target is not a Split.
 pub fn update_split_ratio(
     root: &mut LayoutNode,
     path: &[u16],
     new_ratio: Ratio,
 ) -> Result<(), LayoutError> {
-    if path.is_empty() {
-        return Err(LayoutError::InvalidPath(0));
-    }
-    let node =
-        walk_mut(root, path).map_err(|_| LayoutError::InvalidPath(*path.last().unwrap_or(&0)))?;
+    let node = if path.is_empty() {
+        root
+    } else {
+        walk_mut(root, path).map_err(|_| LayoutError::InvalidPath(*path.last().unwrap_or(&0)))?
+    };
     match node {
         LayoutNode::Split { ratio, .. } => {
             *ratio = Ratio(new_ratio.0.clamp(1, 99));
@@ -896,6 +903,7 @@ mod internal_sanity_tests {
             kind: PaneKind::Shell,
             label: label.map(str::to_string),
             command: None,
+            scrollback_capacity: None,
         })
     }
 
@@ -956,6 +964,7 @@ mod internal_sanity_tests {
                 kind: PaneKind::Shell,
                 label: Some("a".to_string()),
                 command: None,
+                scrollback_capacity: None,
             })
         );
 
@@ -1077,11 +1086,13 @@ mod internal_sanity_tests {
                     kind: PaneKind::Shell,
                     label: Some("a".to_string()),
                     command: None,
+                    scrollback_capacity: None,
                 }),
                 LayoutNode::Pane(Pane {
                     kind: PaneKind::Shell,
                     label: Some("b".to_string()),
                     command: None,
+                    scrollback_capacity: None,
                 }),
             ],
         };
@@ -1214,11 +1225,13 @@ mod internal_sanity_tests {
                         kind: PaneKind::Shell,
                         label: Some("ovl_a".to_string()),
                         command: None,
+                        scrollback_capacity: None,
                     }),
                     LayoutNode::Pane(Pane {
                         kind: PaneKind::Shell,
                         label: Some("ovl_b".to_string()),
                         command: None,
+                        scrollback_capacity: None,
                     }),
                 ],
             },
@@ -1270,7 +1283,7 @@ mod internal_sanity_tests {
 
     /// Phase 3: a 3-member `ZStack` emits three `ComputedPanes` each
     /// sharing the same rect but with strictly increasing
-    /// `pre_orders`. The dashcompositor's `LayerStack` draws `pre_order`
+    /// `pre_orders`. The termcompositor's `LayerStack` draws `pre_order`
     /// 2 LAST, so the latest member is the topmost visible pane.
     /// Pins Phase 3's "shared rect, ordered z-stack" invariant.
     #[test]
@@ -1358,6 +1371,53 @@ mod internal_sanity_tests {
             matches!(result, Err(LayoutError::ZeroArea { w: 80, h: 0, .. })),
             "vertical Ratio(0) top child must be rejected as ZeroArea; got {:?}",
             result
+        );
+    }
+    /// `update_split_ratio` with an empty path targets the root
+    /// node. This is required for root-level split resize actions
+    /// (Alt+drag and keyboard pane resize) where the split being
+    /// adjusted is the top-level layout node.
+    #[test]
+    fn update_split_ratio_empty_path_targets_root_split() {
+        let mut root = split_h(p(Some("left")), p(Some("right")));
+        update_split_ratio(&mut root, &[], Ratio(75)).expect("empty path updates root");
+
+        // Directly verify the root split ratio was updated.
+        match &root {
+            LayoutNode::Split { ratio, .. } => assert_eq!(ratio.0, 75),
+            _ => panic!("root should still be a Split after update"),
+        }
+
+        let layout = ComputedLayout::compute(
+            &root,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+        )
+        .expect("compute after ratio update");
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(
+            layout.panes[0].rect,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 60,
+                h: 24,
+            },
+            "left pane should be 75% of width"
+        );
+        assert_eq!(
+            layout.panes[1].rect,
+            Rect {
+                x: 60,
+                y: 0,
+                w: 20,
+                h: 24,
+            },
+            "right pane should be 25% of width"
         );
     }
 

@@ -10,4 +10,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 cmdash-widget-sdk = { path = "../../crates/cmdash-widget-sdk" }
-ratatui = "0.25"
+ratatui = "0.30.2"

@@ -141,7 +141,7 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         let cell_text: String = (0..80)
-            .map(|x| buf.get(x, 0).symbol().chars().next().unwrap_or(' '))
+            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
             .collect();
         assert!(
             cell_text.contains("Normal"),
@@ -171,7 +171,7 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         let cell_text: String = (0..80)
-            .map(|x| buf.get(x, 0).symbol().chars().next().unwrap_or(' '))
+            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
             .collect();
         assert!(
             !cell_text.contains("Normal"),
@@ -201,7 +201,7 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         let cell_text: String = (0..80)
-            .map(|x| buf.get(x, 0).symbol().chars().next().unwrap_or(' '))
+            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
             .collect();
         assert!(
             cell_text.contains("editor"),
@@ -231,7 +231,7 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         let cell_text: String = (0..80)
-            .map(|x| buf.get(x, 0).symbol().chars().next().unwrap_or(' '))
+            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
             .collect();
         assert!(
             !cell_text.contains("editor"),
@@ -261,7 +261,7 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         let cell_text: String = (0..80)
-            .map(|x| buf.get(x, 0).symbol().chars().next().unwrap_or(' '))
+            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
             .collect();
         // Clock should contain a colon (HH:MM format).
         assert!(

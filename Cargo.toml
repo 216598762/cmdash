@@ -14,17 +14,24 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.73"
+rust-version = "1.85"
 license = "MIT"
 authors = ["cmdash authors"]
 repository = "https://github.com/216598762/cmdash"
 description = "Layer-based terminal multiplexer and dashboard."
 
 [workspace.dependencies]
-# dashcompositor v0.4 is not yet published on crates.io; pin to the
-# upstream git source. As soon as v0.4 lands on the registry we'll
-# switch back to a registry-style version pin.
-dashcompositor = { git = "https://github.com/216598762/dashcompositor", default-features = false, features = ["kitty-encoder", "sixel-encoder", "image-decoder", "font-rasterizer"], branch = "main" }
+# termcompositor v2.0.0 is not yet published on crates.io (the
+# upstream Cargo.toml sets `publish = true` but no version has been
+# pushed to the registry yet); pin to the upstream git source in the
+# meantime. Renamed from the former `dashcompositor` crate; v2.0.0
+# adds an animation loop, layer transforms, GradientLayer/BorderLayer/
+# CanvasLayer/DropShadow/SceneGraph/ClipLayer, diff-based rendering
+# (DirtyRegion), layer lookup by name, rounded corners, accessibility
+# metadata, and tmux passthrough helpers. The `kitty-encoder`/
+# `sixel-encoder`/`image-decoder` features require Rust >= 1.85,
+# which is why the workspace MSRV was raised from 1.73 to 1.85.
+termcompositor = { git = "https://github.com/216598762/termcompositor", default-features = false, features = ["kitty-encoder", "sixel-encoder", "image-decoder", "font-rasterizer"], branch = "main" }
 tokio = { version = "1.44.0", features = ["full"] }
 
 [profile.release]

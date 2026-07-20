@@ -1,0 +1,12 @@
+// 11-sixel-test.kdl — Sixel fallback verification example.
+//
+// Run with:
+//   CMDASH_GRAPHICS=sixel TERM=xterm-256color cmdash --config=examples/11-sixel-test.kdl
+//
+// The child shell emits a tiny kitty graphics load command (a 1x1 red PNG).
+// cmdash intercepts the kitty command and re-encodes it as Sixel for the host
+// terminal. In a Sixel-capable terminal you should see a small red square.
+
+layout {
+    pane kind=shell label="sixel-test" command="examples/graphics-test-emitter.sh sixel"
+}

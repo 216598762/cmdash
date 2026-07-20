@@ -33,8 +33,14 @@ fn spawn_runner(source: &str, area: LayoutRect, close_tx: &PaneCloseTx) -> PaneR
     let layout = ComputedLayout::compute(&root, area).expect("compute layout");
     let pane = layout.panes[0].clone();
     let layer_id = cmdash::derive_layer_id(&pane.id);
-    PaneRunner::spawn_with_graphics(pane, layer_id, long_shell(), Some(close_tx.clone()))
-        .expect("spawn runner")
+    PaneRunner::spawn_with_graphics(
+        pane,
+        layer_id,
+        long_shell(),
+        Some(close_tx.clone()),
+        cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
+    )
+    .expect("spawn runner")
 }
 
 // ===========================================================================
@@ -560,6 +566,7 @@ async fn tab_operations_with_multi_pane_tabs() {
                 layer,
                 long_shell(),
                 Some(close_tx.clone()),
+                cmdash_pty::DEFAULT_SCROLLBACK_CAPACITY,
             )
             .expect("spawn split pane"),
         );

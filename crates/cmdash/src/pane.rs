@@ -14,20 +14,20 @@
 //! pending data would freeze the renderer. One thread per pane
 //! keeps reads off the UI thread; the main loop drives `try_recv`.
 //!
-//! ## Drop + dashcompositor teardown
+//! ## Drop + termcompositor teardown
 //!
 //! When a [`PaneRunner`] is dropped, it sends its [`PaneLayerId`]
 //! into an optional close-channel if the binary registered one
 //! via [`PaneRunner::spawn_with_graphics`]. The main loop drains
 //! that channel at the start of each tick and calls
 //! [`crate::graphics::GraphicsState::close_pane`] for each id.
-//! This keeps the dashcompositor layer binding 1:1 with the live
+//! This keeps the termcompositor layer binding 1:1 with the live
 //! pane even on process exit or panic unwinding (AGENTS.md
 //! §"Hard rule").
 //!
 //! ## Why a channel, not Arc<Mutex<>>
 //!
-//! `dashcompositor::LayerStack` is not `Sync`-derivable through
+//! `termcompositor::LayerStack` is not `Sync`-derivable through
 //! its public API, so wrapping `GraphicsState` in
 //! `Arc<Mutex<..>>` triggers `clippy::arc-with-non-send-sync`.
 //! A `mpsc::Sender<PaneLayerId>` is `Send`-only (no `Sync`
@@ -82,7 +82,7 @@ pub enum RunnerError {
 ///
 /// ## Manual `Clone` impl
 ///
-/// `PaneRunner` is a runtime resource (PTY child + dashcompositor
+/// `PaneRunner` is a runtime resource (PTY child + termcompositor
 /// layer + reader thread); the trait object field
 /// `pty: Box<dyn PanePtyOps + Send>` is not `Clone` by default.
 /// The `TabStack<TabState>` integration in `cmdash::main` needs
@@ -243,22 +243,31 @@ impl PaneRunner {
         computed: ComputedPane,
         layer_id: PaneLayerId,
         shell: ShellSpec,
+        scrollback_capacity: usize,
     ) -> Result<Self, RunnerError> {
-        Self::spawn_with_graphics(computed, layer_id, shell, None)
+        Self::spawn_with_graphics(computed, layer_id, shell, None, scrollback_capacity)
     }
 
     /// Same as [`PaneRunner::spawn`] but registers an mpsc close
     /// sender. When this runner is dropped, `Drop` enqueues
     /// `self.pty.layer_id()` so a `GraphicsState`-aware main
-    /// loop can revoke the pane's dashcompositor layers on the
+    /// loop can revoke the pane's termcompositor layers on the
     /// next tick.
     pub fn spawn_with_graphics(
         computed: ComputedPane,
         layer_id: PaneLayerId,
         shell: ShellSpec,
         close_tx: Option<PaneCloseTx>,
+        scrollback_capacity: usize,
     ) -> Result<Self, RunnerError> {
-        Self::spawn_with_graphics_and_env(computed, layer_id, shell, close_tx, Vec::new())
+        Self::spawn_with_graphics_and_env(
+            computed,
+            layer_id,
+            shell,
+            close_tx,
+            Vec::new(),
+            scrollback_capacity,
+        )
     }
 
     /// Same as [`PaneRunner::spawn_with_graphics`] but applies
@@ -272,10 +281,17 @@ impl PaneRunner {
         shell: ShellSpec,
         close_tx: Option<PaneCloseTx>,
         env_vars: Vec<(String, String)>,
+        scrollback_capacity: usize,
     ) -> Result<Self, RunnerError> {
-        let (pty, reader) =
-            PanePty::spawn_with_env(shell, computed.rect.w, computed.rect.h, layer_id, env_vars)
-                .map_err(RunnerError::Spawn)?;
+        let (pty, reader) = PanePty::spawn_with_env(
+            shell,
+            computed.rect.w,
+            computed.rect.h,
+            layer_id,
+            env_vars,
+            scrollback_capacity,
+        )
+        .map_err(RunnerError::Spawn)?;
         let (tx, rx) = unbounded_channel::<Vec<u8>>();
         let reader_task = tokio::task::spawn_blocking(move || run_reader(reader, tx));
         Ok(Self {
@@ -417,6 +433,16 @@ impl PaneRunner {
         self.pty
             .as_ref()
             .map(|pty| pty.focus_reporting_enabled())
+            .unwrap_or(false)
+    }
+
+    /// Whether the child PTY is currently using the alternate
+    /// screen buffer (DECSET 47/1047/1049). Widget panes always
+    /// return `false`.
+    pub fn in_alternate_screen(&self) -> bool {
+        self.pty
+            .as_ref()
+            .map(|pty| pty.in_alternate_screen())
             .unwrap_or(false)
     }
 
@@ -641,6 +667,60 @@ pub fn collect_focus_reporting_flags(
     })
 }
 
+/// Drain `PaneEvent::AlternateScreen` events from the freshly-
+/// collected pane snapshots and merge the requested state into
+/// `out`, keyed by layer id. Widget runners are skipped because
+/// they have no PTY to switch screen buffers. Returns `true` if
+/// any entry was inserted or updated.
+///
+/// This helper is the alternate-screen twin of
+/// [`collect_focus_reporting_flags`]. The binary's
+/// `update_alternate_screen_from_snapshots` feeds results into
+/// `TickContext::pane_alternate_screen`.
+pub fn collect_alternate_screen_flags(
+    runners: &[PaneRunner],
+    snapshots: &[Option<PaneTerminalState>],
+    out: &mut HashMap<PaneLayerId, bool>,
+) -> bool {
+    collect_pane_events(runners, snapshots, out, |event| {
+        if let PaneEvent::AlternateScreen { enabled } = event {
+            Some(*enabled)
+        } else {
+            None
+        }
+    })
+}
+
+/// Drain `PaneEvent::ClipboardOsc52` events from the freshly-
+/// collected pane snapshots and return them as a list of
+/// `(layer_id, clipboard, action)` tuples. Widget runners are
+/// skipped because they have no PTY to emit OSC 52 sequences.
+///
+/// Unlike the flag-collecting helpers above, OSC 52 events are
+/// point-in-time actions rather than state changes, so they are
+/// returned directly instead of being merged into a map. The
+/// binary's `update_osc52_from_snapshots` feeds results into the
+/// host clipboard routing path.
+pub fn collect_osc52_events(
+    runners: &[PaneRunner],
+    snapshots: &[Option<PaneTerminalState>],
+) -> Vec<(PaneLayerId, char, cmdash_pty::Osc52Action)> {
+    let mut out = Vec::new();
+    for (runner, snapshot) in runners.iter().zip(snapshots.iter()) {
+        if runner.is_widget() {
+            continue;
+        }
+        if let Some(snapshot) = snapshot {
+            for event in &snapshot.pending_events {
+                if let PaneEvent::ClipboardOsc52 { clipboard, action } = event {
+                    out.push((runner.layer_id(), *clipboard, action.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
 impl Drop for PaneRunner {
     fn drop(&mut self) {
         // Best-effort: kill the child before joining the reader so
@@ -661,7 +741,7 @@ impl Drop for PaneRunner {
         // the reader thread's `read()` blocks indefinitely and
         // `handle.join()` hangs — the close notification would
         // never reach `GraphicsState`, stranding the
-        // dashcompositor layer.
+        // termcompositor layer.
         if let Some(tx) = self.close_tx.as_ref() {
             if let Err(e) = tx.send(self.stored_layer_id) {
                 debug!(error = ?e, layer_id = ?self.stored_layer_id,
@@ -801,6 +881,9 @@ mod internal_sanity_tests {
         fn scrollback_down(&mut self, _n: usize) {}
         fn scrollback_reset(&mut self) {}
         fn in_scrollback(&self) -> bool {
+            false
+        }
+        fn in_alternate_screen(&self) -> bool {
             false
         }
     }
@@ -1109,7 +1192,7 @@ mod internal_sanity_tests {
     /// the reader task is aborted. Without this ordering, a `kill()` failure
     /// that leaves the reader task blocked on `read()` would
     /// stall cleanup and the close notification would never reach
-    /// `GraphicsState`, stranding the dashcompositor layer.
+    /// `GraphicsState`, stranding the termcompositor layer.
     ///
     /// This test constructs a `PaneRunner` with a real blocking
     /// reader task (blocks on a channel `recv` that never

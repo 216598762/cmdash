@@ -7,7 +7,7 @@ layout {
 }
 
 // Default keybind surface. `alt-w` closes the focused pane (revoking
-// its dashcompositor layers via the close-channel). `alt-q` quits.
+// its termcompositor layers via the close-channel). `alt-q` quits.
 // `ctrl-a` splits the focused pane (app.new-pane).
 //
 // Tab keybinds: `M-t` new tab, `M-w` close tab, `M-1`..`M-9` switch

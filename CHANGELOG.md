@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 cmdash is a Linux PTY-driven terminal multiplexer and dashboard
 that renders text bodies with `ratatui` and composes every pane as a
-per-instance layer through `dashcompositor` (Kitty graphics protocol
+per-instance layer through `termcompositor` (Kitty graphics protocol
 preferred, Sixel fallback).
 
 The workspace has 7 crates:
@@ -54,7 +54,7 @@ The workspace has 7 crates:
   1–9), `PresetPick` (number keys for preset selection). Escape exits
   any non-Normal mode.
 - **Render pipeline** (`cmdash` binary): per-frame tick loop with
-  phase 0–3b architecture. ratatui text body + dashcompositor kitty
+  phase 0–3b architecture. ratatui text body + termcompositor kitty
   graphics. `GraphicsState` owns the `LayerStack` with per-pane image
   maps and close-channel teardown.
 - **Runtime layout mutations**: `AppNewPane` (split focused leaf),
@@ -66,7 +66,7 @@ The workspace has 7 crates:
   with the full rect (preserving Split-derived origins).
 - **Tab management**: `TabStack<TabState>` with `TabNew`, `TabClose`,
   `TabSwitch(n)` actions. Tab bar rendered as ratatui text fallback
-  (phase 3a) and dashcompositor pixel overlay (phase 3b).
+  (phase 3a) and termcompositor pixel overlay (phase 3b).
 - **CLI**: `--log=<path>` launch argument for file-based tracing
   (TRACE level forced in file mode; `RUST_LOG` honored in stdout mode).
 - **Project docs**: `README.md`, `LICENSE` (MIT), `AGENTS.md`,

@@ -1,12 +1,18 @@
 [package]
 name = "cmdash"
-description = "cmdash binary: event loop and crate glue. All graphics output routes through dashcompositor."
+description = "cmdash binary: event loop and crate glue. All graphics output routes through termcompositor."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+
+[features]
+# Expose test_utils (TestDir, make_isolated_test_dir) for integration
+# tests.  Gated behind a feature so production binaries don't ship
+# test-only helpers.
+test-utils = []
 
 [dependencies]
 cmdash-config = { version = "0.1.0", path = "../cmdash-config" }
@@ -16,18 +22,23 @@ cmdash-protocol = { version = "0.1.0", path = "../cmdash-protocol" }
 cmdash-pty = { version = "0.1.0", path = "../cmdash-pty" }
 cmdash-widget-sdk = { version = "0.1.0", path = "../cmdash-widget-sdk" }
 crossterm = "0.29.0"
-dashcompositor.workspace = true
+termcompositor.workspace = true
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 libloading = "0.8.9"
 arboard = "3.4"
+base64 = "0.22"
 notify = "7.0.0"
-ratatui = { version = "0.25", features = ["crossterm"] }
+ratatui = { version = "0.30.2", features = ["crossterm"] }
 thiserror = "2.0.18"
 tokio = { workspace = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+# Enable the test-utils feature on the lib crate so integration tests
+# in `tests/` and binary tests in `main.rs` can import
+# `cmdash::test_utils::{TestDir, make_isolated_test_dir}`.
+cmdash = { path = ".", features = ["test-utils"] }
 # `portable-pty` is a transitive dep via `cmdash-pty` but is NOT
 # re-exported by that crate's public surface, so the
 # `wiring_smoke::app_new_pane_via_ctrl_a_keypress_in_live_binary`
