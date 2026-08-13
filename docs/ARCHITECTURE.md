@@ -1,0 +1,300 @@
+# cmdash architecture
+
+## 1. Goals and constraints
+
+`cmdash` is a Linux-first terminal UI and multiplexer with a dashboard model. It must support both of these configurations:
+
+- a workspace containing terminal tabs/panes and dashboard widgets;
+- a workspace containing only dashboard widgets, with no terminal sessions running.
+
+The architecture should make the second configuration a normal case rather than a special mode. Terminal support is a widget/session provider, not the foundation of every feature.
+
+### Initial decisions
+
+The first implementation will use these boundaries:
+
+- **Terminal backend:** `crossterm` owns raw mode, input collection, resize events, and basic terminal controls. The cmdash scene/compositor remains independent of Crossterm's frame lifecycle.
+- **Terminal emulator:** use one `alacritty_terminal` instance per session. Kitty graphics will be integrated through a cmdash-owned adapter and `SessionGraphicsStore`; emulator graphics support must be verified before Phase 5.
+- **Workspace scope:** start with one active workspace. The state model should leave room for saved workspaces later without making them part of the first runtime contract.
+- **Plugin ABI:** use a versioned native ABI with C-compatible host-facing data and explicit capability/version negotiation. The host must not pass Rust trait objects across the dynamic-library boundary.
+- **Initial terminal capabilities:** require ANSI/VT text, cursor movement, Unicode cell output, basic colors, alternate-screen support, keyboard input, and resize handling. Treat truecolor, mouse, bracketed paste, keyboard enhancement, and Kitty graphics as optional capabilities.
+- **Fallback behavior:** downgrade optional color/input features when unavailable and omit unsupported graphics with a visible diagnostic or placeholder. Capability mismatches must never emit malformed output or corrupt text/layout.
+
+### Non-negotiable invariants
+
+- A terminal session owns its PTY, terminal-emulator state, scrollback, cursor, selection, and graphics state.
+- A tab switch changes which retained session scene is composed; it must not destroy the hidden session's visual state.
+- Graphics resources are namespaced by session (and, where useful, by widget instance), so image IDs from one session cannot address another session's images.
+- Widgets do not write terminal escape sequences directly to stdout. They emit model updates and renderable scene data through the application pipeline.
+- The UI thread is the sole owner of terminal rendering and frame submission. Background work communicates through messages.
+- A backend capability mismatch must produce a controlled fallback, not malformed terminal output.
+
+## 2. Conceptual model
+
+```text
+Application
+└── Workspace(s)
+    └── Layout tree
+        ├── WidgetInstance: dashboard, clock, monitor, ...
+        └── WidgetInstance: terminal surface
+            └── Session: PTY + emulator + retained render state
+                └── Tab(s) / pane contents, depending on chosen UX model
+```
+
+The terms below are deliberately separate:
+
+- **Workspace:** a saved arrangement and its runtime state.
+- **Layout node:** a split, stack, tab group, overlay, or leaf in a workspace layout tree.
+- **Widget type:** an implementation registered in the widget catalog.
+- **Widget instance:** one configured and stateful use of a widget type.
+- **Surface:** a rectangular region assigned to a widget instance by layout.
+- **Session:** a stateful producer of terminal content. A session normally maps to one PTY and one terminal-emulator instance.
+- **Scene:** retained, backend-neutral visual output for a surface for the current frame.
+- **Frame:** the complete scene tree/composition result submitted to the terminal backend.
+
+A terminal tab should be modeled as a separate `Session` unless the chosen multiplexer semantics explicitly require a tab group to share one emulator. Separate sessions are the safer default because it guarantees PTY, scrollback, and graphics isolation.
+
+## 3. Proposed layers
+
+### 3.1 Application shell
+
+Owns process startup, configuration loading, signal/shutdown handling, logging, and dependency wiring. It should not contain widget-specific rendering logic.
+
+### 3.2 Runtime and event coordinator
+
+Runs the main event loop and routes:
+
+- keyboard, mouse, resize, paste, and terminal capability events;
+- PTY output and child-process lifecycle events;
+- timers, filesystem/watch events, and widget messages;
+- commands such as focus, split, close, reload, and switch tab.
+
+The coordinator updates application state and schedules a frame. It does not render partial output from event handlers.
+
+### 3.3 Application state and commands
+
+Contains workspace layout, focus, keymaps, widget configuration, session registry, and command handling. Commands should be serializable where possible so they can later support scripting or a command palette.
+
+Suggested state ownership:
+
+```text
+AppState
+├── workspaces: WorkspaceState
+├── focused_surface: SurfaceId
+├── widget_registry: WidgetCatalog
+├── sessions: SessionRegistry
+└── backend_capabilities: Capabilities
+
+SessionState
+├── pty_handle / child lifecycle
+├── terminal_emulator
+├── scrollback and viewport state
+├── selection and input mode
+├── graphics_store: SessionGraphicsStore
+└── render_cache / dirty regions
+```
+
+### 3.4 Widget API and plugin boundary
+
+Widgets should have a small lifecycle-oriented interface, conceptually similar to:
+
+- receive application/runtime messages;
+- update their own state;
+- handle input when focused;
+- measure or accept a `Surface` rectangle;
+- produce a backend-neutral `Scene`;
+- optionally request timers, redraws, or external capabilities.
+
+Dynamic plugins are an early product requirement, so this boundary must be designed before widget implementations spread across the codebase. The host will expose the versioned, capability-based native contract described above rather than passing Rust trait objects directly across a shared-library boundary. The plugin manager must document plugin lifecycle, permissions, threading, and failure isolation, and reject unsupported ABI versions before loading widget code.
+
+The plugin API should avoid exposing `stdout`, raw terminal escape sequences, or a concrete terminal backend. A plugin communicates through messages and backend-neutral scene data. Built-in widgets should use the same host-facing contract wherever practical so they exercise the plugin boundary continuously.
+
+Widget categories can include:
+
+- pure display widgets (clock, CPU, logs, metrics);
+- interactive widgets (file browser, command palette);
+- session widgets (terminal emulator surfaces);
+- container/layout widgets (split, tab group, overlay).
+
+Container widgets should compose child widget instances rather than reimplement their behavior.
+
+## 4. Full render pipeline
+
+The render path is retained and frame-oriented:
+
+```text
+OS / PTY / input
+       │
+       ▼
+Event collector ──► Command router ──► AppState / SessionState
+                                      │
+                                      ▼
+                              Widget update + dirty tracking
+                                      │
+                                      ▼
+                         Layout engine assigns surfaces/clip rects
+                                      │
+                                      ▼
+                      Each visible widget builds a backend-neutral Scene
+                                      │
+                                      ▼
+                    Compositor orders, clips, and merges visible scenes
+                                      │
+                                      ▼
+                    Terminal backend diffs/submits the complete Frame
+```
+
+A frame should follow these rules:
+
+1. Drain or batch available events so a burst of PTY output does not submit one frame per byte.
+2. Apply commands and state updates before layout.
+3. Recompute layout only when dimensions or layout-affecting state changes.
+4. Render every visible surface from its retained state into a clipped scene.
+5. Composite by z-order, applying focus decorations and overlays at the end.
+6. Compare with the previous frame where safe, clear invalidated regions, and submit the backend-specific output.
+7. Keep hidden sessions alive but do not include their scenes or graphics placements in the submitted frame.
+
+The backend may optimize the final submission, but the logical frame must represent the complete visible dashboard. This prevents stale graphics or text from leaking across tab switches.
+
+## 5. Terminal sessions and graphics isolation
+
+### 5.1 Session boundary
+
+A terminal widget owns a `SessionId`. The session contains its own:
+
+- PTY and child process;
+- terminal parser and emulator grid;
+- alternate screen, modes, cursor, scrollback, and selection;
+- title/current-directory metadata;
+- protocol-specific graphics state;
+- scene/render cache and dirty tracking.
+
+Switching tabs changes focus/visibility in the layout. It does not transfer emulator state or graphics resources between sessions.
+
+### 5.2 Kitty graphics model
+
+Kitty graphics must be treated as terminal-emulator state, not as a global backend cache. The planned flow is:
+
+```text
+PTY bytes
+  │
+  ▼
+Escape parser / terminal emulator
+  │  parses Kitty graphics commands and text/grid mutations
+  ▼
+SessionGraphicsStore(session_id)
+  ├── image data/resources, keyed by session-scoped IDs
+  ├── placements and z-order
+  ├── cell/ pixel anchors and clipping metadata
+  └── visibility/invalidations
+  │
+  ▼
+SessionScene(session_id, surface)
+  ├── text/cell layers
+  └── image placement layers
+  │
+  ▼
+Compositor includes it only if the session is visible
+```
+
+When a user switches away from a tab:
+
+- the old tab's scene is removed from the composed frame and its rectangle is invalidated/cleared;
+- its emulator and `SessionGraphicsStore` remain in memory (subject to an explicit future resource policy);
+- no image data is reinterpreted as belonging to the newly selected tab.
+
+When the user returns:
+
+- the retained emulator state and placements are rendered into a fresh scene for the current surface size;
+- the backend receives the visible frame and any required Kitty placement commands for that session's image resources;
+- if the terminal backend cannot safely retain/reuse an image, the session can replay/re-upload from its store without changing logical state.
+
+This is why a global image map or a single terminal emulator shared by tabs is explicitly out of scope.
+
+### 5.3 Other graphics protocols
+
+The scene model should allow Kitty first, then add protocol adapters such as sixel or iTerm-style images if their support is justified. Text and layout must remain correct when graphics are unavailable. Protocol handling belongs behind a capability-aware adapter, not in dashboard widgets.
+
+A practical initial implementation can use a mature terminal parser/emulator crate and add a narrowly scoped graphics-state adapter if the selected emulator does not expose the required protocol. The adapter must have conformance tests based on captured escape sequences.
+
+### 5.4 Resource policy
+
+Initial behavior should retain graphics in memory while a session is alive, whether it is visible or hidden. Later, add configurable limits:
+
+- maximum decoded bytes per session;
+- maximum number of image resources and placements;
+- LRU eviction only when a session can replay or re-request data safely;
+- explicit cleanup when a session closes.
+
+Eviction must never silently change the terminal's logical state. If an image cannot be restored, the scene should show a deliberate placeholder and report a diagnostic rather than corrupting adjacent text.
+
+## 6. Rendering and backend boundaries
+
+Use three representations:
+
+1. **Widget/session model:** mutable state and protocol semantics.
+2. **Scene:** immutable frame-local primitives such as cells, spans, borders, rectangles, image placements, and overlays.
+3. **Backend submission:** terminal-specific cursor movement, color encoding, clear operations, and graphics escape sequences.
+
+The scene should carry clipping and ownership metadata. Every image placement should include its owning `SessionId` or a derived resource namespace so the compositor can reject cross-session references during development.
+
+The first backend can target a single local terminal, but the interface should keep these concerns separate. The first interaction model prioritizes terminal tabs; pane splitting can be added after the tab/session and scene contracts are stable:
+
+- terminal input/output and raw mode;
+- layout and cell rendering;
+- graphics protocol submission;
+- capability detection.
+
+Candidate crates are cataloged in [External library candidates](DEPENDENCIES.md). The current shortlist is:
+
+| Concern | Candidate direction |
+| --- | --- |
+| Terminal I/O and raw mode | `crossterm` |
+| Layout and cell-oriented widgets | `ratatui` primitives behind the retained scene boundary |
+| Async runtime | `tokio` |
+| PTY management | `portable-pty`, with narrow `nix` adapters if needed |
+| Escape parsing | Parser APIs exposed by `alacritty_terminal`, with `vte` only if a narrow adapter is required |
+| Terminal emulation | `alacritty_terminal`, one instance per session |
+| Kitty/image output | Cmdash-owned session adapter; evaluate `little-kitty` or `kitty-graphics-protocol` before Phase 5 |
+| Dynamic plugins | Versioned native ABI; evaluate `abi_stable` versus a hand-defined C ABI during the prototype |
+| Errors/logging | `thiserror`, `anyhow`, `tracing`, `tracing-subscriber` |
+| Config/serialization | `serde` + `toml` |
+
+The selected crates still require version pinning and a focused API/protocol check when the Cargo package is created. Avoid adding a crate solely to bypass a small, well-tested adapter boundary, and do not let a graphics or plugin helper become a global state owner.
+
+## 7. Concurrency and lifecycle
+
+The UI/coordinator task owns `AppState` and all frame composition. Per-session I/O tasks read from PTYs and send bounded messages containing output bytes, resize acknowledgements, and process events. Widget workers may send state updates but cannot mutate UI state directly.
+
+Important lifecycle behavior:
+
+- PTY output is backpressured or batched to avoid starving input and rendering.
+- Resize events update the session emulator and PTY dimensions in a defined order.
+- Closing a session cancels its I/O task, waits for child cleanup, then releases graphics resources.
+- Shutdown restores terminal modes even after a panic/error path where the backend supports it.
+
+## 8. Modularity strategy
+
+Dynamic plugins are an early requirement, with compile-time feature flags still used for optional host functionality:
+
+- `terminal` enables PTY/session functionality;
+- graphics protocols can be independently enabled where dependencies justify it;
+- built-in and external widgets register versioned capabilities and TOML configuration schemas;
+- a workspace config chooses which widget types and instances are present;
+- plugin loading, health, permissions, and shutdown are managed by a host-side plugin manager.
+
+The plugin manager must reject unsupported ABI versions, isolate failures to the affected widget where possible, and ensure a plugin cannot write directly to the terminal backend. Native dynamic loading should not rely on Rust's unstable ABI; use a stable, versioned boundary or an explicitly chosen portable runtime.
+
+## 9. Testing strategy
+
+The core should be testable without a real terminal:
+
+- layout tests for split/tab/overlay geometry and clipping;
+- scene/compositor tests proving hidden sessions contribute no primitives;
+- session isolation tests using two emulators with colliding Kitty image IDs;
+- parser conformance tests for text, alternate screen, resize, and graphics sequences;
+- frame golden tests for cell output and invalidation;
+- PTY integration tests for shell startup, input, output, resize, and clean shutdown;
+- capability tests for terminals with and without Kitty graphics support.
+
+A key regression test: write a Kitty image with ID `1` in tab A, write a different image with ID `1` in tab B, switch A → B → A, and verify that each tab restores its own image without cross-contamination.
