@@ -8,6 +8,7 @@ use ratatui::layout::Rect;
 
 use crate::{
     config::{AppConfig, WidgetInstanceConfig},
+    plugin::PluginRegistry,
     scene::{CellStyle, Color, Scene},
     state::WidgetId,
 };
@@ -95,6 +96,7 @@ pub enum WidgetError {
     DuplicateWidgetId(WidgetId),
     InvalidConfiguration(String),
     InitializationFailed { kind: String, reason: String },
+    Plugin(String),
 }
 
 impl fmt::Display for WidgetError {
@@ -107,6 +109,7 @@ impl fmt::Display for WidgetError {
             Self::InitializationFailed { kind, reason } => {
                 write!(formatter, "failed to initialize {kind:?} widget: {reason}")
             }
+            Self::Plugin(message) => formatter.write_str(message),
         }
     }
 }
@@ -130,6 +133,9 @@ impl WidgetRegistry {
             .expect("built-in widget types are unique");
         registry
             .register("clock", clock_widget_factory)
+            .expect("built-in widget types are unique");
+        registry
+            .register("system", system_widget_factory)
             .expect("built-in widget types are unique");
         registry
     }
@@ -181,13 +187,29 @@ impl WidgetRuntime {
     }
 
     pub fn from_config(registry: &WidgetRegistry, config: &AppConfig) -> Result<Self, WidgetError> {
+        Self::from_config_with_plugins(registry, None, config)
+    }
+
+    pub fn from_config_with_plugins(
+        registry: &WidgetRegistry,
+        plugins: Option<&PluginRegistry>,
+        config: &AppConfig,
+    ) -> Result<Self, WidgetError> {
         let mut instances = BTreeMap::new();
         for widget_config in &config.workspace.widgets {
             let id = WidgetId::new(widget_config.id);
             if instances.contains_key(&id) {
                 return Err(WidgetError::DuplicateWidgetId(id));
             }
-            let mut widget = registry.instantiate(widget_config)?;
+            let mut widget = if registry.contains(&widget_config.kind) {
+                registry.instantiate(widget_config)?
+            } else if let Some(plugins) = plugins {
+                plugins
+                    .instantiate(widget_config)
+                    .map_err(|error| WidgetError::Plugin(error.to_string()))?
+            } else {
+                return Err(WidgetError::UnknownWidgetType(widget_config.kind.clone()));
+            };
             let kind = widget.kind().to_owned();
             widget
                 .initialize()
@@ -395,6 +417,51 @@ impl Widget for ClockWidget {
     }
 }
 
+struct SystemWidget {
+    title: String,
+    text: String,
+}
+
+impl Widget for SystemWidget {
+    fn kind(&self) -> &str {
+        "system"
+    }
+
+    fn render(&self, area: Rect, focused: bool) -> Scene {
+        let background = Color::rgb(27, 45, 44);
+        let foreground = Color::rgb(220, 252, 231);
+        let accent = if focused {
+            Color::rgb(250, 204, 21)
+        } else {
+            Color::rgb(110, 231, 183)
+        };
+        let mut scene = Scene::new(area);
+        scene.fill(area, CellStyle::new(foreground, background));
+        scene.border(area, &self.title, CellStyle::new(accent, background));
+        if area.height > 2 {
+            scene.text(
+                area.x.saturating_add(2),
+                area.y.saturating_add(1),
+                &self.text,
+                CellStyle::new(foreground, background),
+            );
+        }
+        scene
+    }
+}
+
+fn system_widget_factory(config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>, WidgetError> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    Ok(Box::new(SystemWidget {
+        title: config
+            .title
+            .clone()
+            .unwrap_or_else(|| " system ".to_owned()),
+        text: format!("{os} / {arch}"),
+    }))
+}
+
 fn clock_widget_factory(config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>, WidgetError> {
     let format = match config.format.as_deref().unwrap_or("HH:MM:SS") {
         "HH:MM" => ClockFormat::HoursMinutes,
@@ -483,6 +550,27 @@ mod tests {
         assert_eq!(report.changed(), &[WidgetId::new(4)]);
         assert_eq!(scenes[&WidgetId::new(4)].cell_at(2, 1).unwrap().symbol, '0');
         assert_eq!(scenes[&WidgetId::new(4)].cell_at(9, 1).unwrap().symbol, '3');
+    }
+
+    #[test]
+    fn system_widget_renders_platform_information() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 5
+            type = "system"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let areas = BTreeMap::from([(WidgetId::new(5), Rect::new(0, 0, 24, 4))]);
+        let scenes = runtime.render(&areas, None);
+
+        assert_eq!(
+            scenes[&WidgetId::new(5)].cell_at(2, 1).unwrap().symbol,
+            std::env::consts::OS.chars().next().unwrap()
+        );
     }
 
     #[test]

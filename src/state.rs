@@ -6,6 +6,7 @@ use crate::{
     backend::BackendCapabilities,
     command::{Command, CommandEffect, FocusCommand, OverlayCommand, SurfaceCommand},
     config::{AppConfig, ConfigError},
+    layout::{LayoutError, LayoutTree},
     scene::{CellStyle, Scene},
     widget::{WidgetError, WidgetRegistry, WidgetRuntime, WidgetUpdateReport},
 };
@@ -284,6 +285,7 @@ pub enum CommandError {
 pub enum AppStateConfigError {
     InvalidConfig(ConfigError),
     Widget(WidgetError),
+    Layout(LayoutError),
 }
 
 impl fmt::Display for AppStateConfigError {
@@ -291,6 +293,7 @@ impl fmt::Display for AppStateConfigError {
         match self {
             Self::InvalidConfig(error) => write!(formatter, "invalid config: {error}"),
             Self::Widget(error) => write!(formatter, "widget setup failed: {error}"),
+            Self::Layout(error) => write!(formatter, "layout setup failed: {error}"),
         }
     }
 }
@@ -302,6 +305,7 @@ pub struct AppState {
     focus: FocusState,
     backend_capabilities: BackendCapabilities,
     widget_runtime: WidgetRuntime,
+    layout: LayoutTree,
     quit_requested: bool,
     redraw_requested: bool,
 }
@@ -313,6 +317,7 @@ impl AppState {
             focus: FocusState::default(),
             backend_capabilities,
             widget_runtime: WidgetRuntime::empty(),
+            layout: LayoutTree::from_config(None, [], []).expect("empty layout is valid"),
             quit_requested: false,
             redraw_requested: true,
         }
@@ -323,16 +328,39 @@ impl AppState {
         registry: &WidgetRegistry,
         config: &AppConfig,
     ) -> Result<Self, AppStateConfigError> {
+        Self::from_config_with_plugins(backend_capabilities, registry, None, config)
+    }
+
+    pub fn from_config_with_plugins(
+        backend_capabilities: BackendCapabilities,
+        registry: &WidgetRegistry,
+        plugins: Option<&crate::plugin::PluginRegistry>,
+        config: &AppConfig,
+    ) -> Result<Self, AppStateConfigError> {
         config
             .validate()
             .map_err(AppStateConfigError::InvalidConfig)?;
-        let widget_runtime =
-            WidgetRuntime::from_config(registry, config).map_err(AppStateConfigError::Widget)?;
+        let widget_runtime = WidgetRuntime::from_config_with_plugins(registry, plugins, config)
+            .map_err(AppStateConfigError::Widget)?;
+        let widget_ids = config
+            .workspace
+            .widgets
+            .iter()
+            .map(|widget| WidgetId::new(widget.id));
+        let overlay_ids = config
+            .workspace
+            .overlays
+            .iter()
+            .map(|overlay| OverlayId::new(overlay.id));
+        let layout =
+            LayoutTree::from_config(config.workspace.layout.as_ref(), widget_ids, overlay_ids)
+                .map_err(AppStateConfigError::Layout)?;
         let mut state = Self {
             workspace: WorkspaceState::new(WorkspaceId::new(1), config.workspace.name.clone()),
             focus: FocusState::default(),
             backend_capabilities,
             widget_runtime,
+            layout,
             quit_requested: false,
             redraw_requested: true,
         };
@@ -340,8 +368,47 @@ impl AppState {
         for widget in &config.workspace.widgets {
             let widget_id = WidgetId::new(widget.id);
             let surface = Surface::new(SurfaceId::new(widget.id), Rect::new(0, 0, 1, 1))
-                .with_widget(widget_id);
+                .with_widget(widget_id)
+                .with_visible(state.layout.visible_widget_ids().contains(&widget_id));
             state.workspace.surfaces.insert(surface.id(), surface);
+        }
+        for overlay_config in &config.workspace.overlays {
+            let overlay_id = OverlayId::new(overlay_config.id);
+            let overlay_area = Rect::new(
+                overlay_config.x,
+                overlay_config.y,
+                overlay_config.width,
+                overlay_config.height,
+            );
+            let mut overlay = Overlay::new(overlay_id, overlay_area)
+                .with_z_index(overlay_config.z_index)
+                .with_visible(
+                    overlay_config.visible
+                        && (config.workspace.layout.is_none()
+                            || state.layout.visible_overlay_ids().contains(&overlay_id)),
+                );
+            if let Some(title) = &overlay_config.title {
+                overlay = overlay.with_primitive(OverlayPrimitive::Border {
+                    area: overlay_area,
+                    title: title.clone(),
+                    style: CellStyle::new(
+                        crate::scene::Color::rgb(216, 180, 254),
+                        crate::scene::Color::rgb(38, 28, 58),
+                    ),
+                });
+            }
+            if let Some(text) = &overlay_config.text {
+                overlay = overlay.with_primitive(OverlayPrimitive::Text {
+                    x: overlay_config.x.saturating_add(1),
+                    y: overlay_config.y.saturating_add(1),
+                    text: text.clone(),
+                    style: CellStyle::new(
+                        crate::scene::Color::rgb(245, 232, 255),
+                        crate::scene::Color::rgb(38, 28, 58),
+                    ),
+                });
+            }
+            state.workspace.overlays.insert(overlay_id, overlay);
         }
         Ok(state)
     }
@@ -352,6 +419,10 @@ impl AppState {
 
     pub fn widget_runtime(&self) -> &WidgetRuntime {
         &self.widget_runtime
+    }
+
+    pub fn layout(&self) -> &LayoutTree {
+        &self.layout
     }
 
     pub fn update_widgets(&mut self, now: SystemTime) -> WidgetUpdateReport {
@@ -754,6 +825,44 @@ mod tests {
             Some(WidgetId::new(7))
         );
         assert_eq!(scenes[&surface_id].cell_at(2, 1).unwrap().symbol, 'h');
+    }
+
+    #[test]
+    fn configured_layout_controls_visible_tabs_and_overlays() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "text"
+            text = "first"
+            [[workspace.widgets]]
+            id = 2
+            type = "text"
+            text = "second"
+            [[workspace.overlays]]
+            id = 4
+            text = "notice"
+            [workspace.layout]
+            type = "stack"
+            children = [
+              { type = "tabs", active = 1, children = [
+                { type = "leaf", widget = 1 },
+                { type = "leaf", widget = 2 }
+              ] },
+              { type = "overlay", overlay = 4 }
+            ]
+            "#,
+        )
+        .unwrap();
+        let state =
+            AppState::from_config(capabilities(), &WidgetRegistry::builtins(), &config).unwrap();
+
+        assert!(!state.workspace().surfaces()[&SurfaceId::new(1)].visible());
+        assert!(state.workspace().surfaces()[&SurfaceId::new(2)].visible());
+        assert!(state.workspace().overlays()[&OverlayId::new(4)].visible());
+        assert_eq!(state.layout().visible_widget_ids(), [WidgetId::new(2)]);
+        assert_eq!(state.layout().visible_overlay_ids(), [OverlayId::new(4)]);
     }
 
     #[test]

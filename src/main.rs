@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, io,
     path::PathBuf,
     time::{Duration, SystemTime},
@@ -7,9 +7,9 @@ use std::{
 
 use cmdash::{
     AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend, Surface, SurfaceCommand,
-    WidgetRegistry,
+    SurfaceId, WidgetRegistry,
     dashboard::{
-        configured_widget_surface_areas, render_static_dashboard_shell_with_metrics_and_health,
+        render_static_dashboard_shell_with_metrics_and_health,
         render_static_dashboard_surface_scenes, static_dashboard_surface_areas,
     },
     input::command_for_key,
@@ -35,6 +35,34 @@ id = 2
 type = "clock"
 title = " clock "
 format = "HH:MM:SS"
+
+[[workspace.widgets]]
+id = 3
+type = "system"
+title = " system "
+
+[[workspace.overlays]]
+id = 9
+x = 2
+y = 4
+width = 30
+height = 4
+z_index = 10
+title = " notice "
+text = "Phase 2 widget host"
+
+[workspace.layout]
+type = "stack"
+children = [
+  { type = "tabs", active = 0, children = [
+    { type = "columns", children = [
+      { type = "leaf", widget = 1 },
+      { type = "leaf", widget = 2 },
+      { type = "leaf", widget = 3 }
+    ] }
+  ] },
+  { type = "overlay", overlay = 9 }
+]
 "#;
 
 fn main() -> io::Result<()> {
@@ -169,9 +197,36 @@ fn sync_dashboard_surfaces(state: &mut AppState, area: Rect) -> io::Result<()> {
     let surface_areas: BTreeMap<_, _> = if state.widget_runtime().is_empty() {
         static_dashboard_surface_areas(area).into_iter().collect()
     } else {
-        let surface_ids: Vec<_> = state.workspace().surfaces().keys().copied().collect();
-        configured_widget_surface_areas(area, &surface_ids)
+        state
+            .layout()
+            .widget_areas(area)
+            .into_iter()
+            .map(|(widget_id, widget_area)| (SurfaceId::new(widget_id.get()), widget_area))
+            .collect()
     };
+    let visible_surface_ids: BTreeSet<_> = surface_areas.keys().copied().collect();
+    let hidden_surface_ids: Vec<_> = state
+        .workspace()
+        .surfaces()
+        .keys()
+        .copied()
+        .filter(|id| !visible_surface_ids.contains(id))
+        .collect();
+    for id in hidden_surface_ids {
+        if state
+            .workspace()
+            .surfaces()
+            .get(&id)
+            .is_some_and(|surface| surface.visible())
+        {
+            state
+                .dispatch(Command::Surface(SurfaceCommand::SetVisible {
+                    id,
+                    visible: false,
+                }))
+                .map_err(|error| io::Error::other(format!("surface sync rejected: {error:?}")))?;
+        }
+    }
 
     for (id, surface_area) in surface_areas {
         let existing = state.workspace().surfaces().contains_key(&id);

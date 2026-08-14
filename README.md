@@ -25,4 +25,4 @@ cmdash is licensed under the [MIT License](LICENSE).
 
 ## Status
 
-Phase 2 in progress. The project has a Rust package, a backend-neutral retained scene, a Crossterm submission backend, GitHub Actions checks, and a configuration-driven widget runtime with text and UTC clock widgets. Widgets now have lifecycle hooks, update reports, health status, and clean shutdown; `--config <path>` / `-c <path>` loads user-provided TOML while no arguments use the embedded example. Layout trees, terminal sessions, and plugins remain future work.
+Phase 2 complete. The project has a backend-neutral retained scene, a configuration-driven layout tree with columns, tabs, stacks, and overlays, and a widget runtime with lifecycle hooks, health reporting, clean shutdown, text, UTC clock, and system-information widgets. A versioned C-compatible plugin host contract is exercised by an external-widget fixture, while `--config <path>` / `-c <path>` loads user-provided TOML. Dynamic library loading and terminal sessions remain future work.

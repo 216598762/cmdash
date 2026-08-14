@@ -6,7 +6,7 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::state::WidgetId;
+use crate::state::{OverlayId, WidgetId};
 
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
 
@@ -53,8 +53,63 @@ impl AppConfig {
                 return Err(ConfigError::DuplicateWidgetId(id));
             }
         }
+
+        let mut overlay_ids = BTreeSet::new();
+        for overlay in &self.workspace.overlays {
+            let id = OverlayId::new(overlay.id);
+            if !overlay_ids.insert(id) {
+                return Err(ConfigError::DuplicateOverlayId(id));
+            }
+            if overlay.width == 0 || overlay.height == 0 {
+                return Err(ConfigError::InvalidOverlayArea(id));
+            }
+        }
+        if let Some(layout) = &self.workspace.layout {
+            validate_layout(layout, &ids, &overlay_ids)?;
+        }
         Ok(())
     }
+}
+
+fn validate_layout(
+    layout: &LayoutConfig,
+    widgets: &BTreeSet<WidgetId>,
+    overlays: &BTreeSet<OverlayId>,
+) -> Result<(), ConfigError> {
+    match layout {
+        LayoutConfig::Leaf { widget } => {
+            let id = WidgetId::new(*widget);
+            if !widgets.contains(&id) {
+                return Err(ConfigError::LayoutWidgetNotFound(id));
+            }
+        }
+        LayoutConfig::Columns { children } | LayoutConfig::Stack { children } => {
+            if children.is_empty() {
+                return Err(ConfigError::EmptyLayoutChildren);
+            }
+            for child in children {
+                validate_layout(child, widgets, overlays)?;
+            }
+        }
+        LayoutConfig::Tabs { active, children } => {
+            if children.is_empty() {
+                return Err(ConfigError::EmptyLayoutChildren);
+            }
+            if *active >= children.len() {
+                return Err(ConfigError::InvalidActiveTab(*active));
+            }
+            for child in children {
+                validate_layout(child, widgets, overlays)?;
+            }
+        }
+        LayoutConfig::Overlay { overlay } => {
+            let id = OverlayId::new(*overlay);
+            if !overlays.contains(&id) {
+                return Err(ConfigError::LayoutOverlayNotFound(id));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,6 +139,63 @@ impl std::error::Error for ConfigFileError {}
 pub struct WorkspaceConfig {
     pub name: String,
     pub widgets: Vec<WidgetInstanceConfig>,
+    pub layout: Option<LayoutConfig>,
+    pub overlays: Vec<OverlayConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum LayoutConfig {
+    Leaf {
+        widget: u64,
+    },
+    Columns {
+        children: Vec<LayoutConfig>,
+    },
+    Tabs {
+        #[serde(default)]
+        active: usize,
+        children: Vec<LayoutConfig>,
+    },
+    Stack {
+        children: Vec<LayoutConfig>,
+    },
+    Overlay {
+        overlay: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct OverlayConfig {
+    pub id: u64,
+    #[serde(default)]
+    pub x: u16,
+    #[serde(default)]
+    pub y: u16,
+    #[serde(default = "default_overlay_width")]
+    pub width: u16,
+    #[serde(default = "default_overlay_height")]
+    pub height: u16,
+    #[serde(default)]
+    pub z_index: i16,
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+fn default_overlay_width() -> u16 {
+    24
+}
+
+fn default_overlay_height() -> u16 {
+    5
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl<'de> Deserialize<'de> for WorkspaceConfig {
@@ -97,12 +209,18 @@ impl<'de> Deserialize<'de> for WorkspaceConfig {
             name: String,
             #[serde(default)]
             widgets: Vec<WidgetInstanceConfig>,
+            #[serde(default)]
+            layout: Option<LayoutConfig>,
+            #[serde(default)]
+            overlays: Vec<OverlayConfig>,
         }
 
         let raw = RawWorkspaceConfig::deserialize(deserializer)?;
         Ok(Self {
             name: raw.name,
             widgets: raw.widgets,
+            layout: raw.layout,
+            overlays: raw.overlays,
         })
     }
 }
@@ -112,6 +230,8 @@ impl Default for WorkspaceConfig {
         Self {
             name: default_workspace_name(),
             widgets: Vec::new(),
+            layout: None,
+            overlays: Vec::new(),
         }
     }
 }
@@ -140,6 +260,12 @@ pub enum ConfigError {
     EmptyWorkspaceName,
     EmptyWidgetType,
     DuplicateWidgetId(WidgetId),
+    DuplicateOverlayId(OverlayId),
+    InvalidOverlayArea(OverlayId),
+    LayoutWidgetNotFound(WidgetId),
+    LayoutOverlayNotFound(OverlayId),
+    EmptyLayoutChildren,
+    InvalidActiveTab(usize),
 }
 
 impl fmt::Display for ConfigError {
@@ -155,6 +281,20 @@ impl fmt::Display for ConfigError {
             Self::EmptyWorkspaceName => formatter.write_str("workspace name cannot be empty"),
             Self::EmptyWidgetType => formatter.write_str("widget type cannot be empty"),
             Self::DuplicateWidgetId(id) => write!(formatter, "duplicate widget id {}", id.get()),
+            Self::DuplicateOverlayId(id) => write!(formatter, "duplicate overlay id {}", id.get()),
+            Self::InvalidOverlayArea(id) => {
+                write!(formatter, "overlay {} has an empty area", id.get())
+            }
+            Self::LayoutWidgetNotFound(id) => {
+                write!(formatter, "layout references missing widget {}", id.get())
+            }
+            Self::LayoutOverlayNotFound(id) => {
+                write!(formatter, "layout references missing overlay {}", id.get())
+            }
+            Self::EmptyLayoutChildren => formatter.write_str("layout nodes must have children"),
+            Self::InvalidActiveTab(index) => {
+                write!(formatter, "active tab index {index} is out of range")
+            }
         }
     }
 }
@@ -219,6 +359,40 @@ mod tests {
 
         assert!(matches!(error, ConfigFileError::Read { .. }));
         assert!(error.to_string().contains("could not read config"));
+    }
+
+    #[test]
+    fn validates_layout_tabs_and_overlay_references() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "text"
+            [[workspace.widgets]]
+            id = 2
+            type = "clock"
+            [[workspace.overlays]]
+            id = 9
+            text = "notice"
+            [workspace.layout]
+            type = "stack"
+            children = [
+              { type = "tabs", active = 0, children = [
+                { type = "leaf", widget = 1 },
+                { type = "leaf", widget = 2 }
+              ] },
+              { type = "overlay", overlay = 9 }
+            ]
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            config.workspace.layout,
+            Some(LayoutConfig::Stack { .. })
+        ));
+        assert_eq!(config.workspace.overlays[0].id, 9);
     }
 
     #[test]

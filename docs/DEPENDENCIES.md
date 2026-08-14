@@ -10,7 +10,7 @@ This is an evaluation list and initial direction, not a dependency lockfile. The
 | Terminal emulator | `alacritty_terminal` | One emulator per session; Kitty graphics require a cmdash-owned adapter and explicit verification before Phase 5. |
 | PTY and async runtime | `portable-pty` + `tokio` | Per-session I/O tasks communicate with the UI/coordinator through bounded messages. |
 | Layout primitives | `ratatui` + `unicode-width` | Use Ratatui layout/text primitives behind the backend-neutral scene boundary and track narrow/wide cell occupancy explicitly. |
-| Plugin boundary | Versioned native ABI | C-compatible host data, capability negotiation, and no Rust trait objects across the library boundary. |
+| Plugin boundary | Versioned native ABI | Active v1 host descriptor contract with C-compatible data and capability negotiation; dynamic loading remains a later gate. |
 | Workspace scope | One active workspace | Add saved/multiple workspace behavior only after the core runtime contracts are stable. |
 | Graphics fallback | Capability-aware omission/placeholder | Unsupported graphics must not corrupt text or layout. |
 

@@ -4,6 +4,8 @@ pub mod compositor;
 pub mod config;
 pub mod dashboard;
 pub mod input;
+pub mod layout;
+pub mod plugin;
 pub mod scene;
 pub mod state;
 pub mod widget;
@@ -12,10 +14,15 @@ pub use backend::{Backend, BackendCapabilities, CrosstermBackend, OutputMetrics}
 pub use command::{Command, CommandEffect, FocusCommand, OverlayCommand, SurfaceCommand};
 pub use compositor::{CellSpan, Compositor, FrameDiff};
 pub use config::{
-    AppConfig, CURRENT_CONFIG_VERSION, ConfigError, ConfigFileError, WidgetInstanceConfig,
-    WorkspaceConfig,
+    AppConfig, CURRENT_CONFIG_VERSION, ConfigError, ConfigFileError, LayoutConfig, OverlayConfig,
+    WidgetInstanceConfig, WorkspaceConfig,
 };
 pub use input::command_for_key;
+pub use layout::{LayoutError, LayoutNode, LayoutTree};
+pub use plugin::{
+    ExternalTextPlugin, PLUGIN_ABI_VERSION, PluginDescriptorV1, PluginError, PluginHostV1,
+    PluginModule, PluginRegistry,
+};
 pub use scene::{Cell, CellStyle, CellWidth, Color, Scene};
 pub use state::{
     AppState, AppStateConfigError, CommandError, FocusState, FocusTarget, Overlay, OverlayId,

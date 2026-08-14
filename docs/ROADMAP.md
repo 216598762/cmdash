@@ -43,16 +43,16 @@ This roadmap is intentionally staged so the rendering and session ownership cont
 - [x] Define the initial widget model, registry, and backend-independent widget runtime.
 - [x] Parse and validate version-1 TOML widget-instance configuration.
 - [x] Integrate widget registration and configuration-driven instances into the application shell, with the static dashboard retained as a fallback.
-- [ ] Add a layout tree with leaf widgets, tab groups, and overlays; defer pane splits until the tab model is validated.
-- [ ] Define the versioned plugin host contract and load a minimal external widget.
-- [x] Add at least two non-terminal widgets, including text and a clock, exercising the same host-facing contract.
+- [x] Add a layout tree with leaf widgets, tab groups, and overlays; defer pane splits until the tab model is validated.
+- [x] Define the versioned plugin host contract and exercise it with a minimal external-widget fixture; dynamic-library loading remains deferred.
+- [x] Add non-terminal widgets including text, a UTC clock, and system information, exercising the same host-facing contract.
 - [x] Start the application shell from a widget-only TOML configuration without enabling terminal sessions.
 - [x] Load user-provided widget-only TOML configuration through `--config` / `-c`, with the embedded config as the no-argument fallback.
 - [x] Add focus routing, widget health reporting, and widget lifecycle cleanup.
 
-**Exit criteria:** users can run a useful dashboard with no PTY, shell, or terminal-emulation dependency in the active workspace.
+**Exit criteria (met):** users can run a useful, layout-driven dashboard with no PTY, shell, or terminal-emulation dependency in the active workspace.
 
-The next Phase 2 slice is the layout tree: model leaf widgets, tab groups, and overlays as configuration-driven layout nodes before adding terminal sessions or dynamic plugins.
+The next milestone is Phase 3: add one isolated terminal session as an optional widget/provider while preserving this layout and plugin boundary.
 
 ## Phase 3 — One isolated terminal session
 
