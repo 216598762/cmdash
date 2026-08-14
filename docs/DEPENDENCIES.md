@@ -12,7 +12,7 @@ This is an evaluation list and initial direction, not a dependency lockfile. The
 | Layout primitives | `ratatui` + `unicode-width` | Use Ratatui layout/text primitives behind the backend-neutral scene boundary and track narrow/wide cell occupancy explicitly. |
 | Plugin boundary | Versioned native ABI | Active v1 host descriptor contract with C-compatible data and capability negotiation; dynamic loading remains a later gate. |
 | Workspace scope | One active workspace | Add saved/multiple workspace behavior only after the core runtime contracts are stable. |
-| Graphics fallback | Capability-aware omission/placeholder | Unsupported graphics are omitted; visible Kitty placements are replayed only when the backend advertises support. |
+| Graphics fallback | Capability-aware omission/placeholder | Unsupported or over-limit graphics are omitted with in-app degraded diagnostics; visible Kitty layers are replayed only when supported. |
 
 
 ## Selection priorities
@@ -34,11 +34,11 @@ These are the strongest candidates for the first executable once the package ske
 | PTYs | [`portable-pty`](https://crates.io/crates/portable-pty) | Spawn shells/processes, read/write PTY streams, resize sessions | Active v0.9 integration; continue validating Linux process lifecycle, signal handling, and shutdown semantics. |
 | Async runtime | [`tokio`](https://crates.io/crates/tokio) | Event coordination, PTY I/O tasks, timers, bounded channels, cancellation | Selected initial direction; keep frame composition on one coordinator/UI owner. |
 | Serialization | [`serde`](https://crates.io/crates/serde) | Versioned widget/application configuration types | Active in the initial widget configuration model; avoid serializing live PTY/emulator state in the first release. |
-| Configuration format | [`toml`](https://crates.io/crates/toml) | Initial hand-authored workspace and widget configuration | Active version-1 parser; keep schema/version migration explicit. |
+| Configuration format | [`toml`](https://crates.io/crates/toml) | Initial hand-authored workspace and widget configuration | Active version-1 parser with safe metadata-polled reload; keep schema/version migration explicit. |
 | Diagnostics | [`tracing`](https://crates.io/crates/tracing) + [`tracing-subscriber`](https://crates.io/crates/tracing-subscriber) | Structured logs for sessions, plugins, frame timing, and protocol failures | Strong candidates; configure logs away from the terminal UI by default. |
 | Error types | [`thiserror`](https://crates.io/crates/thiserror) + [`anyhow`](https://crates.io/crates/anyhow) | Typed library errors and application-level context | Strong candidates; use typed errors at plugin/session boundaries. |
 | User paths | [`directories`](https://crates.io/crates/directories) | XDG-compatible config, cache, data, and plugin discovery paths | Strong candidate; confirm exact Linux/XDG behavior needed by the app. |
-| CLI | [`clap`](https://crates.io/crates/clap) | Startup flags, config path, diagnostics mode, and version output | Useful once the executable exists; not needed by the rendering core. |
+| CLI | [`clap`](https://crates.io/crates/clap) | Startup flags, config path, diagnostics mode, and version output | Still a future option; current `--config` / `-c` parsing remains dependency-free. |
 
 ## Terminal backend and input
 
@@ -111,7 +111,7 @@ Useful for Linux-specific process, signal, file-descriptor, and PTY operations t
 
 Provides image widgets and protocol backends for Sixel, Kitty, iTerm2, and Unicode fallback rendering. It may help dashboard widgets display ordinary images and can serve as a reference implementation.
 
-**Boundary:** it should not automatically become the source of truth for terminal-originated Kitty images. Session graphics still need a `SessionGraphicsStore` owned by the terminal emulator/session layer.
+**Boundary:** it should not automatically become the source of truth for terminal-originated Kitty images. Session graphics remain owned by `SessionGraphicsStore` and are exposed to the retained scene as session-qualified image layers.
 
 ### `little-kitty`
 

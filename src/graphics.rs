@@ -92,6 +92,55 @@ impl GraphicsSubmission {
     pub fn terminal_image_id(&self) -> u32 {
         terminal_image_id(self.resource)
     }
+
+    pub fn clipped_to(&self, clip: Rect) -> Option<Self> {
+        let area = intersect(self.placement.area(), clip)?;
+        Some(Self {
+            resource: self.resource,
+            format: self.format,
+            encoded_payload: self.encoded_payload.clone(),
+            placement: GraphicsPlacement {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: area.height,
+                ..self.placement
+            },
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphicsLimits {
+    pub max_decoded_bytes: usize,
+    pub max_resources: usize,
+    pub max_placements: usize,
+}
+
+impl Default for GraphicsLimits {
+    fn default() -> Self {
+        Self {
+            max_decoded_bytes: 4 * 1024 * 1024,
+            max_resources: 256,
+            max_placements: 1024,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphicsDiagnostic {
+    image: Option<u32>,
+    message: String,
+}
+
+impl GraphicsDiagnostic {
+    pub const fn image(&self) -> Option<u32> {
+        self.image
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,14 +178,24 @@ pub struct SessionGraphicsStore {
     session: SessionId,
     resources: BTreeMap<u32, GraphicsResource>,
     placements: BTreeMap<u32, GraphicsPlacement>,
+    limits: GraphicsLimits,
+    decoded_bytes: usize,
+    diagnostics: Vec<GraphicsDiagnostic>,
 }
 
 impl SessionGraphicsStore {
-    pub const fn new(session: SessionId) -> Self {
+    pub fn new(session: SessionId) -> Self {
+        Self::with_limits(session, GraphicsLimits::default())
+    }
+
+    pub fn with_limits(session: SessionId, limits: GraphicsLimits) -> Self {
         Self {
             session,
             resources: BTreeMap::new(),
             placements: BTreeMap::new(),
+            limits,
+            decoded_bytes: 0,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -156,6 +215,28 @@ impl SessionGraphicsStore {
         self.resources
             .get(&image)
             .map(|resource| resource.decoded_payload.as_slice())
+    }
+
+    pub const fn limits(&self) -> GraphicsLimits {
+        self.limits
+    }
+
+    pub fn diagnostics(&self) -> &[GraphicsDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn clear_diagnostics(&mut self) {
+        self.diagnostics.clear();
+    }
+
+    fn diagnose(&mut self, image: Option<u32>, message: impl Into<String>) {
+        if self.diagnostics.len() >= 16 {
+            self.diagnostics.remove(0);
+        }
+        self.diagnostics.push(GraphicsDiagnostic {
+            image,
+            message: message.into(),
+        });
     }
 
     pub fn apply_kitty_command(
@@ -194,6 +275,54 @@ impl SessionGraphicsStore {
                     })
                     .transpose()?
                     .unwrap_or(32);
+                if !matches!(format, 24 | 32 | 100) {
+                    self.diagnose(
+                        Some(image),
+                        format!("unsupported Kitty graphics format {format}"),
+                    );
+                    return Ok(());
+                }
+                if decoded_payload.len() > self.limits.max_decoded_bytes {
+                    self.diagnose(
+                        Some(image),
+                        format!(
+                            "graphics payload exceeds {} byte limit",
+                            self.limits.max_decoded_bytes
+                        ),
+                    );
+                    return Ok(());
+                }
+                let previous_bytes = self
+                    .resources
+                    .get(&image)
+                    .map_or(0, |resource| resource.decoded_payload.len());
+                let projected_bytes = self
+                    .decoded_bytes
+                    .saturating_sub(previous_bytes)
+                    .saturating_add(decoded_payload.len());
+                if projected_bytes > self.limits.max_decoded_bytes {
+                    self.diagnose(
+                        Some(image),
+                        format!(
+                            "session graphics store exceeds {} byte limit",
+                            self.limits.max_decoded_bytes
+                        ),
+                    );
+                    return Ok(());
+                }
+                if !self.resources.contains_key(&image)
+                    && self.resources.len() >= self.limits.max_resources
+                {
+                    self.diagnose(
+                        Some(image),
+                        format!(
+                            "session graphics store exceeds {} resource limit",
+                            self.limits.max_resources
+                        ),
+                    );
+                    return Ok(());
+                }
+                self.decoded_bytes = projected_bytes;
                 self.resources.insert(
                     image,
                     GraphicsResource {
@@ -204,10 +333,21 @@ impl SessionGraphicsStore {
                 );
             }
             Some(b'p') | Some(b'P') => {
-                let resource = self
-                    .resources
-                    .get(&image)
-                    .ok_or(GraphicsError::InvalidImageId)?;
+                if !self.resources.contains_key(&image) {
+                    return Err(GraphicsError::InvalidImageId);
+                }
+                if !self.placements.contains_key(&image)
+                    && self.placements.len() >= self.limits.max_placements
+                {
+                    self.diagnose(
+                        Some(image),
+                        format!(
+                            "session graphics store exceeds {} placement limit",
+                            self.limits.max_placements
+                        ),
+                    );
+                    return Ok(());
+                }
                 let placement = GraphicsPlacement {
                     resource: GraphicsResourceId::new(self.session, image),
                     x: parameter_u16(&values, "x", 0)?,
@@ -216,19 +356,23 @@ impl SessionGraphicsStore {
                     height: parameter_u16(&values, "r", 1)?.max(1),
                     z_index: parameter_i16(&values, "z", 0)?,
                 };
-                let _ = resource;
                 self.placements.insert(image, placement);
             }
             Some(b'd') | Some(b'D') => match values.get("d").map(String::as_str) {
                 Some("a") => {
                     self.resources.clear();
                     self.placements.clear();
+                    self.decoded_bytes = 0;
                 }
                 Some("p") => {
                     self.placements.clear();
                 }
                 _ if image != 0 => {
-                    self.resources.remove(&image);
+                    if let Some(resource) = self.resources.remove(&image) {
+                        self.decoded_bytes = self
+                            .decoded_bytes
+                            .saturating_sub(resource.decoded_payload.len());
+                    }
                     self.placements.remove(&image);
                 }
                 _ => return Err(GraphicsError::InvalidParameter("d".to_owned())),
@@ -435,5 +579,33 @@ mod tests {
         store.apply_kitty_command(b"a=d,i=1", b"").unwrap();
         assert_eq!(store.resource_count(), 0);
         assert_eq!(store.placement_count(), 0);
+        assert_eq!(store.decoded_bytes(1), None);
+    }
+
+    #[test]
+    fn limits_record_diagnostics_without_corrupting_existing_resources() {
+        let limits = GraphicsLimits {
+            max_decoded_bytes: 2,
+            max_resources: 1,
+            max_placements: 1,
+        };
+        let mut store = SessionGraphicsStore::with_limits(SessionId::new(5), limits);
+        store.apply_kitty_command(b"a=T,f=24,i=1", b"AQID").unwrap();
+        assert_eq!(store.resource_count(), 0);
+        assert_eq!(store.diagnostics().len(), 1);
+
+        store.apply_kitty_command(b"a=T,f=24,i=1", b"AQ").unwrap();
+        assert_eq!(store.resource_count(), 1);
+        store.apply_kitty_command(b"a=T,f=24,i=2", b"AQ").unwrap();
+        assert_eq!(store.resource_count(), 1);
+        assert!(store.diagnostics().len() >= 2);
+    }
+
+    #[test]
+    fn unsupported_formats_are_reported_and_ignored() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(6));
+        store.apply_kitty_command(b"a=T,f=1,i=1", b"AQID").unwrap();
+        assert_eq!(store.resource_count(), 0);
+        assert!(store.diagnostics()[0].message().contains("unsupported"));
     }
 }

@@ -78,21 +78,21 @@ The next milestone is Phase 3: add one isolated terminal session as an optional 
 
 - [x] Verify the selected emulator/parser's Kitty graphics extension point and add a cmdash-owned APC adapter because the emulator does not own a graphics store.
 - [x] Implement `SessionGraphicsStore` with session-scoped resource and placement ownership.
-- [ ] Convert graphics state into scene image layers with clipping and surface transforms.
+- [x] Convert graphics state into retained scene image layers with clipping and surface transforms.
 - [x] Submit Kitty graphics through the backend only for visible placements, using session-qualified terminal image IDs.
 - [x] Implement tab-switch invalidation and graphics restore/replay behavior.
 - [x] Add captured-sequence parser coverage and the A/B image-ID collision test.
-- [x] Retain decoded graphics in memory for the lifetime of each live session; resource limits and diagnostics for oversized or unsupported graphics remain future work.
+- [x] Retain decoded graphics in memory for the lifetime of each live session with bounded resources and degraded health diagnostics.
 
-**Exit criteria:** a Kitty image rendered in one tab is hidden, preserved, and restored independently when the user changes tabs.
+**Exit criteria (met):** a Kitty image rendered in one tab is hidden, preserved, and restored independently when the user changes tabs.
 
 ## Phase 6 — Usable dashboard product
 
-- [ ] Add configuration reload or a safe restart workflow.
-- [ ] Add command palette, discoverable keybindings, and status/help UI.
-- [ ] Add useful built-in widgets and per-widget configuration.
+- [x] Add validated file-backed configuration reload with safe replacement and rejection of invalid updates.
+- [x] Add a command palette, discoverable keybindings, and status/help UI.
+- [x] Add useful built-in widgets and per-widget configuration.
 - [ ] Improve mouse support, selection/copy, URLs, and notifications as prioritized.
-- [ ] Add logging/diagnostics that do not pollute the rendered terminal.
+- [x] Add in-app diagnostics that do not pollute the rendered terminal or PTY output.
 
 **Exit criteria:** a user can configure a dashboard, launch terminal sessions optionally, understand keybindings, and recover from widget/session failures.
 

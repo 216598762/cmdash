@@ -7,11 +7,14 @@ pub fn command_for_key(key: KeyEvent) -> Option<Command> {
         return match key.code {
             KeyCode::PageDown => Some(Command::Tab(TabCommand::Next)),
             KeyCode::PageUp => Some(Command::Tab(TabCommand::Previous)),
+            KeyCode::Char('p') => Some(Command::TogglePalette),
+            KeyCode::Char('r') => Some(Command::ReloadConfig),
             _ => None,
         };
     }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => Some(Command::Quit),
+        KeyCode::Char('?') => Some(Command::ToggleHelp),
         KeyCode::Tab => Some(Command::Focus(FocusCommand::Next)),
         KeyCode::BackTab => Some(Command::Focus(FocusCommand::Previous)),
         _ => None,
@@ -44,6 +47,22 @@ mod tests {
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL)),
             Some(Command::Tab(TabCommand::Previous))
+        );
+    }
+
+    #[test]
+    fn help_palette_and_reload_keys_are_discoverable_commands() {
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
+            Some(Command::ToggleHelp)
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            Some(Command::TogglePalette)
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Some(Command::ReloadConfig)
         );
     }
 

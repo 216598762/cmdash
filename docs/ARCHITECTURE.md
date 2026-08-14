@@ -14,11 +14,11 @@ The architecture should make the second configuration a normal case rather than 
 The first implementation will use these boundaries:
 
 - **Terminal backend:** `crossterm` owns raw mode, input collection, resize events, and basic terminal controls. The cmdash scene/compositor remains independent of Crossterm's frame lifecycle.
-- **Terminal emulator:** use one `alacritty_terminal` instance per session. Kitty graphics will be integrated through a cmdash-owned adapter and `SessionGraphicsStore`; emulator graphics support must be verified before Phase 5.
+- **Terminal emulator:** use one `alacritty_terminal` instance per session. Kitty APC sequences are intercepted by a cmdash-owned adapter and `SessionGraphicsStore`; retained image layers flow through `Scene` and `Compositor`.
 - **Workspace scope:** start with one active workspace. The state model should leave room for saved workspaces later without making them part of the first runtime contract.
 - **Plugin ABI:** use a versioned native ABI with C-compatible host-facing data and explicit capability/version negotiation. The host must not pass Rust trait objects across the dynamic-library boundary.
 - **Initial terminal capabilities:** require ANSI/VT text, cursor movement, Unicode cell output, basic colors, alternate-screen support, keyboard input, and resize handling. Treat truecolor, mouse, bracketed paste, keyboard enhancement, and Kitty graphics as optional capabilities.
-- **Fallback behavior:** downgrade optional color/input features when unavailable and omit unsupported graphics with a visible diagnostic or placeholder. Capability mismatches must never emit malformed output or corrupt text/layout.
+- **Fallback behavior:** downgrade optional color/input features when unavailable and omit unsupported or over-limit graphics with an in-app degraded diagnostic. Capability mismatches must never emit malformed output or corrupt text/layout.
 
 ### Non-negotiable invariants
 
@@ -151,8 +151,9 @@ A frame should follow these rules:
 3. Recompute layout only when dimensions or layout-affecting state changes.
 4. Render every visible surface from its retained state into a clipped scene.
 5. Composite by z-order, applying focus decorations and overlays at the end.
-6. Compare with the previous frame where safe, clear invalidated regions, and submit the backend-specific output.
+6. Compare with the previous frame where safe, clear invalidated regions, diff retained image layers, and submit the backend-specific output.
 7. Keep hidden sessions alive but do not include their scenes or graphics placements in the submitted frame.
+8. Submit only current visible image layers and delete stale session-qualified image IDs.
 
 The backend may optimize the final submission, but the logical frame must represent the complete visible dashboard. This prevents stale graphics or text from leaking across tab switches.
 
@@ -180,7 +181,7 @@ PTY bytes
   │
   ▼
 Escape parser / terminal emulator
-  │  parses Kitty graphics commands and text/grid mutations
+  │  cmdash intercepts Kitty APC graphics; text/grid bytes continue to the emulator
   ▼
 SessionGraphicsStore(session_id)
   ├── image data/resources, keyed by session-scoped IDs
@@ -237,6 +238,8 @@ Use three representations:
 2. **Scene:** immutable frame-local primitives such as cells, spans, borders, rectangles, image placements, and overlays.
 3. **Backend submission:** terminal-specific cursor movement, color encoding, clear operations, and graphics escape sequences.
 
+Image layers are diffed as part of `FrameDiff`; stale physical image IDs are explicitly deleted before visible current layers are replayed.
+
 The scene should carry clipping and ownership metadata. Every image placement should include its owning `SessionId` or a derived resource namespace so the compositor can reject cross-session references during development.
 
 The first backend can target a single local terminal, but the interface should keep these concerns separate. The first interaction model prioritizes terminal tabs; pane splitting can be added after the tab/session and scene contracts are stable:
@@ -256,7 +259,7 @@ Candidate crates are cataloged in [External library candidates](DEPENDENCIES.md)
 | PTY management | `portable-pty`, with narrow `nix` adapters if needed |
 | Escape parsing | Parser APIs exposed by `alacritty_terminal`, with `vte` only if a narrow adapter is required |
 | Terminal emulation | `alacritty_terminal`, one instance per session |
-| Kitty/image output | Cmdash-owned session adapter; evaluate `little-kitty` or `kitty-graphics-protocol` before Phase 5 |
+| Kitty/image output | Cmdash-owned session adapter and retained `Scene` image layers; evaluate a protocol crate only for broader formats |
 | Dynamic plugins | Versioned native ABI; evaluate `abi_stable` versus a hand-defined C ABI during the prototype |
 | Errors/logging | `thiserror`, `anyhow`, `tracing`, `tracing-subscriber` |
 | Config/serialization | `serde` + `toml` |

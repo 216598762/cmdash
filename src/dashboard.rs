@@ -90,6 +90,20 @@ pub fn render_static_dashboard_shell_with_metrics_and_health(
     metrics: OutputMetrics,
     widget_health: Option<&str>,
 ) -> Scene {
+    render_static_dashboard_shell_with_metrics_health_and_diagnostic(
+        area,
+        metrics,
+        widget_health,
+        None,
+    )
+}
+
+pub fn render_static_dashboard_shell_with_metrics_health_and_diagnostic(
+    area: Rect,
+    metrics: OutputMetrics,
+    widget_health: Option<&str>,
+    diagnostic: Option<&str>,
+) -> Scene {
     let mut scene = Scene::new(area);
     scene.fill(area, CellStyle::new(TEXT, BACKGROUND));
 
@@ -115,9 +129,14 @@ pub fn render_static_dashboard_shell_with_metrics_and_health(
     } else {
         "Tab / Shift+Tab  focus    q / Esc  quit    •    retained frame".to_owned()
     };
-    let footer_text = widget_health.map_or(footer_text.clone(), |health| {
-        format!("{footer_text}    •    widgets: {health}")
-    });
+    let footer_text = match widget_health {
+        Some(health) => format!("{footer_text}    •    widgets: {health}"),
+        None => footer_text,
+    };
+    let footer_text = match diagnostic {
+        Some(diagnostic) => format!("{footer_text}    •    {diagnostic}"),
+        None => footer_text,
+    };
     scene.text(
         footer.x.saturating_add(1),
         footer.y,

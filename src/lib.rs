@@ -7,6 +7,7 @@ pub mod graphics;
 pub mod input;
 pub mod layout;
 pub mod plugin;
+pub mod reload;
 pub mod scene;
 pub mod session;
 pub mod state;
@@ -22,7 +23,8 @@ pub use config::{
     WidgetInstanceConfig, WorkspaceConfig,
 };
 pub use graphics::{
-    GraphicsError, GraphicsPlacement, GraphicsResourceId, GraphicsSubmission, SessionGraphicsStore,
+    GraphicsDiagnostic, GraphicsError, GraphicsLimits, GraphicsPlacement, GraphicsResourceId,
+    GraphicsSubmission, SessionGraphicsStore,
 };
 pub use input::command_for_key;
 pub use layout::{LayoutError, LayoutNode, LayoutTree};
@@ -30,6 +32,7 @@ pub use plugin::{
     ExternalTextPlugin, PLUGIN_ABI_VERSION, PluginDescriptorV1, PluginError, PluginHostV1,
     PluginModule, PluginRegistry,
 };
+pub use reload::{ConfigReloader, ReloadError};
 pub use scene::{Cell, CellStyle, CellWidth, Color, Scene};
 pub use session::{SessionError, TerminalSession, TerminalSize};
 pub use state::{

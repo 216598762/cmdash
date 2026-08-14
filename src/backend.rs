@@ -94,7 +94,11 @@ pub trait Backend {
     fn submit(&mut self, scene: &Scene) -> Result<(), Self::Error>;
     fn submit_diff(&mut self, diff: &FrameDiff) -> Result<(), Self::Error>;
 
-    fn submit_graphics(&mut self, _graphics: &[GraphicsSubmission]) -> Result<(), Self::Error> {
+    fn submit_graphics(
+        &mut self,
+        _graphics: &[GraphicsSubmission],
+        _removed: &[u32],
+    ) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -228,9 +232,16 @@ impl<W: Write> Backend for CrosstermBackend<W> {
         Ok(())
     }
 
-    fn submit_graphics(&mut self, graphics: &[GraphicsSubmission]) -> Result<(), Self::Error> {
+    fn submit_graphics(
+        &mut self,
+        graphics: &[GraphicsSubmission],
+        removed: &[u32],
+    ) -> Result<(), Self::Error> {
         if !self.capabilities.kitty_graphics {
             return Ok(());
+        }
+        for image_id in removed {
+            write!(self.writer, "\x1b_Ga=d,d=i,i={image_id};\x1b\\")?;
         }
         for submission in graphics {
             let physical_id = submission.terminal_image_id();
@@ -487,7 +498,7 @@ mod tests {
             kitty_graphics: true,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
-        backend.submit_graphics(&graphics).unwrap();
+        backend.submit_graphics(&graphics, &[]).unwrap();
 
         let output = backend.writer();
         assert!(output.windows(4).any(|window| window == b"a=T,"));

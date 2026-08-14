@@ -1,6 +1,8 @@
 use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
 
+use crate::graphics::GraphicsSubmission;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Color {
     pub red: u8,
@@ -71,6 +73,7 @@ impl Cell {
 pub struct Scene {
     area: Rect,
     cells: Vec<Cell>,
+    image_layers: Vec<GraphicsSubmission>,
 }
 
 impl Scene {
@@ -80,6 +83,7 @@ impl Scene {
         Self {
             area,
             cells: vec![Cell::blank(style); cell_count],
+            image_layers: Vec::new(),
         }
     }
 
@@ -89,6 +93,18 @@ impl Scene {
 
     pub fn cell_at(&self, x: u16, y: u16) -> Option<&Cell> {
         self.index(x, y).map(|index| &self.cells[index])
+    }
+
+    pub fn image_layers(&self) -> &[GraphicsSubmission] {
+        &self.image_layers
+    }
+
+    pub fn add_image_layer(&mut self, submission: GraphicsSubmission) {
+        if let Some(submission) = submission.clipped_to(self.area) {
+            self.image_layers.push(submission);
+            self.image_layers
+                .sort_by_key(|layer| layer.placement().z_index());
+        }
     }
 
     pub fn set(&mut self, x: u16, y: u16, symbol: char, style: CellStyle) {
@@ -146,6 +162,16 @@ impl Scene {
                 self.clear_cell_occupancy(x, y);
             }
         }
+        for image in &source.image_layers {
+            if let Some(image) = image
+                .clipped_to(clip)
+                .and_then(|image| image.clipped_to(self.area))
+            {
+                self.image_layers.push(image);
+            }
+        }
+        self.image_layers
+            .sort_by_key(|layer| layer.placement().z_index());
         for y in y_start..y_end {
             for x in x_start..x_end {
                 if let Some(cell) = source.cell_at(x, y).copied() {
@@ -323,6 +349,25 @@ mod tests {
         assert_eq!(destination.cell_at(1, 0).unwrap().symbol, 'b');
         assert_eq!(destination.cell_at(2, 0).unwrap().symbol, 'c');
         assert_eq!(destination.cell_at(3, 0).unwrap().symbol, ' ');
+    }
+
+    #[test]
+    fn image_layers_are_clipped_and_blitted_with_the_scene() {
+        let mut source = Scene::new(Rect::new(0, 0, 8, 4));
+        let mut store = crate::SessionGraphicsStore::new(crate::SessionId::new(1));
+        store.apply_kitty_command(b"a=T,f=24,i=1", b"AQID").unwrap();
+        store
+            .apply_kitty_command(b"a=p,i=1,x=2,y=1,c=5,r=2", b"")
+            .unwrap();
+        source.add_image_layer(store.visible_submissions(source.area())[0].clone());
+        let mut destination = Scene::new(Rect::new(0, 0, 8, 4));
+        destination.blit(&source, Rect::new(3, 1, 2, 1));
+
+        assert_eq!(destination.image_layers().len(), 1);
+        assert_eq!(
+            destination.image_layers()[0].placement().area(),
+            Rect::new(3, 1, 2, 1)
+        );
     }
 
     #[test]

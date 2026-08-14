@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, fmt, time::SystemTime};
 
-use crossterm::event::{KeyEvent, MouseEvent};
+use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::{
@@ -311,6 +311,7 @@ pub struct AppState {
     quit_requested: bool,
     redraw_requested: bool,
     pending_invalidations: Vec<Rect>,
+    diagnostics: Vec<String>,
 }
 
 impl AppState {
@@ -324,6 +325,7 @@ impl AppState {
             quit_requested: false,
             redraw_requested: true,
             pending_invalidations: Vec::new(),
+            diagnostics: Vec::new(),
         }
     }
 
@@ -368,6 +370,7 @@ impl AppState {
             quit_requested: false,
             redraw_requested: true,
             pending_invalidations: Vec::new(),
+            diagnostics: Vec::new(),
         };
 
         for widget in &config.workspace.widgets {
@@ -430,6 +433,33 @@ impl AppState {
         &self.layout
     }
 
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+
+    pub fn latest_diagnostic(&self) -> Option<&str> {
+        self.diagnostics.last().map(String::as_str)
+    }
+
+    pub fn record_diagnostic(&mut self, message: impl Into<String>) {
+        if self.diagnostics.len() >= 8 {
+            self.diagnostics.remove(0);
+        }
+        self.diagnostics.push(message.into());
+    }
+
+    pub fn reload_config(
+        &mut self,
+        registry: &WidgetRegistry,
+        config: &AppConfig,
+    ) -> Result<(), AppStateConfigError> {
+        let next = Self::from_config(self.backend_capabilities, registry, config)?;
+        self.shutdown_widgets();
+        *self = next;
+        self.record_diagnostic("configuration reloaded");
+        Ok(())
+    }
+
     pub fn update_widgets(&mut self, now: SystemTime) -> WidgetUpdateReport {
         let report = self.widget_runtime.update(now);
         if report.requests_redraw() || !report.failed().is_empty() {
@@ -477,6 +507,29 @@ impl AppState {
         }
         self.widget_runtime.handle_paste(widget_id, text)?;
         Ok(true)
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<bool, String> {
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            let target = self
+                .workspace
+                .surfaces
+                .values()
+                .filter(|surface| surface.visible())
+                .find(|surface| {
+                    let area = surface.area();
+                    mouse.column >= area.x
+                        && mouse.row >= area.y
+                        && mouse.column < area.x.saturating_add(area.width)
+                        && mouse.row < area.y.saturating_add(area.height)
+                })
+                .map(|surface| surface.id());
+            if let Some(target) = target {
+                self.dispatch(Command::Focus(FocusCommand::Surface(target)))
+                    .map_err(|error| format!("mouse focus rejected: {error:?}"))?;
+            }
+        }
+        self.handle_focused_mouse(mouse)
     }
 
     pub fn handle_focused_mouse(&mut self, mouse: MouseEvent) -> Result<bool, String> {
@@ -604,7 +657,25 @@ impl AppState {
                 self.quit_requested = true;
                 CommandEffect::Quit
             }
-            Command::RequestRedraw => CommandEffect::Redraw,
+            Command::RequestRedraw | Command::ReloadConfig => CommandEffect::Redraw,
+            Command::ToggleHelp => {
+                self.toggle_runtime_overlay(
+                    OverlayId::new(u64::MAX),
+                    Rect::new(2, 2, 54, 8),
+                    " help ",
+                    "Tab / Shift+Tab  focus\nCtrl+PageUp / Ctrl+PageDown  switch tabs\nCtrl+P  command palette\nCtrl+R  reload config    ?  toggle help",
+                );
+                CommandEffect::Redraw
+            }
+            Command::TogglePalette => {
+                self.toggle_runtime_overlay(
+                    OverlayId::new(u64::MAX - 1),
+                    Rect::new(3, 3, 58, 9),
+                    " command palette ",
+                    "q / Esc       quit\nTab           next focus\nCtrl+PageUp   previous tab\nCtrl+PageDown next tab\nCtrl+R        reload TOML configuration",
+                );
+                CommandEffect::Redraw
+            }
             Command::Focus(command) => {
                 self.apply_focus(command)?;
                 CommandEffect::Redraw
@@ -627,6 +698,39 @@ impl AppState {
             self.redraw_requested = true;
         }
         Ok(effect)
+    }
+
+    fn toggle_runtime_overlay(&mut self, id: OverlayId, area: Rect, title: &str, text: &str) {
+        if let Some(overlay) = self.workspace.overlays.get_mut(&id) {
+            *overlay = overlay.clone().with_visible(!overlay.visible());
+            return;
+        }
+        let style = CellStyle::new(
+            crate::scene::Color::rgb(245, 232, 255),
+            crate::scene::Color::rgb(38, 28, 58),
+        );
+        let overlay = Overlay::new(id, area)
+            .with_z_index(i16::MAX)
+            .with_dismissible(true)
+            .with_primitive(OverlayPrimitive::Fill { area, style })
+            .with_primitive(OverlayPrimitive::Border {
+                area,
+                title: title.to_owned(),
+                style: CellStyle::new(
+                    crate::scene::Color::rgb(216, 180, 254),
+                    crate::scene::Color::rgb(38, 28, 58),
+                ),
+            });
+        let mut overlay = overlay;
+        for (offset, line) in text.lines().enumerate() {
+            overlay = overlay.with_primitive(OverlayPrimitive::Text {
+                x: area.x.saturating_add(2),
+                y: area.y.saturating_add(1 + offset as u16),
+                text: line.to_owned(),
+                style,
+            });
+        }
+        self.workspace.overlays.insert(id, overlay);
     }
 
     fn apply_tab(&mut self, command: TabCommand) {
@@ -1085,6 +1189,65 @@ mod tests {
         assert!(invalidated.contains(&Rect::new(4, 5, 20, 8)));
         assert!(!state.workspace().surfaces()[&SurfaceId::new(1)].visible());
         assert!(state.workspace().surfaces()[&SurfaceId::new(2)].visible());
+    }
+
+    #[test]
+    fn help_and_palette_commands_create_toggleable_runtime_overlays() {
+        let mut state = AppState::new(capabilities());
+        state.dispatch(Command::ToggleHelp).unwrap();
+        assert!(
+            state
+                .workspace()
+                .overlays()
+                .contains_key(&OverlayId::new(u64::MAX))
+        );
+        assert!(state.workspace().overlays()[&OverlayId::new(u64::MAX)].visible());
+        state.dispatch(Command::ToggleHelp).unwrap();
+        assert!(!state.workspace().overlays()[&OverlayId::new(u64::MAX)].visible());
+
+        state.dispatch(Command::TogglePalette).unwrap();
+        assert!(
+            state
+                .workspace()
+                .overlays()
+                .contains_key(&OverlayId::new(u64::MAX - 1))
+        );
+    }
+
+    #[test]
+    fn mouse_down_focuses_the_surface_under_the_pointer() {
+        let mut state = AppState::new(capabilities());
+        let surface = Surface::new(SurfaceId::new(4), Rect::new(2, 3, 10, 5));
+        state
+            .dispatch(Command::Surface(SurfaceCommand::Add(surface)))
+            .unwrap();
+        let handled = state
+            .handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 4,
+                row: 5,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            })
+            .unwrap();
+
+        assert!(!handled);
+        assert_eq!(
+            state.focus().target(),
+            Some(FocusTarget::Surface(surface.id()))
+        );
+    }
+
+    #[test]
+    fn valid_config_reload_replaces_state_atomically() {
+        let first = AppConfig::parse("version = 1\n[workspace]\nname = \"first\"\n").unwrap();
+        let second = AppConfig::parse("version = 1\n[workspace]\nname = \"second\"\n").unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &first).unwrap();
+
+        state.reload_config(&registry, &second).unwrap();
+
+        assert_eq!(state.workspace().name(), "second");
+        assert_eq!(state.latest_diagnostic(), Some("configuration reloaded"));
     }
 
     #[test]

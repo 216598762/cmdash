@@ -409,9 +409,12 @@ impl WidgetRuntime {
         self.instances
             .iter()
             .filter_map(|(&id, entry)| {
-                areas
-                    .get(&id)
-                    .map(|&area| (id, entry.widget.render(area, focused == Some(id))))
+                let area = *areas.get(&id)?;
+                let mut scene = entry.widget.render(area, focused == Some(id));
+                for graphics in entry.widget.graphics(area) {
+                    scene.add_image_layer(graphics);
+                }
+                Some((id, scene))
             })
             .collect()
     }
@@ -588,11 +591,13 @@ impl Widget for TerminalWidget {
     }
 
     fn health(&self) -> WidgetHealth {
-        self.session
-            .failure()
-            .map_or(WidgetHealth::Healthy, |error| {
-                WidgetHealth::Failed(error.to_owned())
-            })
+        if let Some(error) = self.session.failure() {
+            WidgetHealth::Failed(error.to_owned())
+        } else if let Some(diagnostic) = self.session.graphics_diagnostics().last() {
+            WidgetHealth::Degraded(diagnostic.message().to_owned())
+        } else {
+            WidgetHealth::Healthy
+        }
     }
 
     fn render(&self, area: Rect, focused: bool) -> Scene {

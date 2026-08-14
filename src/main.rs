@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
@@ -9,10 +9,11 @@ use cmdash::{
     AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend, Surface, SurfaceCommand,
     SurfaceId, WidgetRegistry,
     dashboard::{
-        render_static_dashboard_shell_with_metrics_and_health,
+        render_static_dashboard_shell_with_metrics_health_and_diagnostic,
         render_static_dashboard_surface_scenes, static_dashboard_surface_areas,
     },
     input::command_for_key,
+    reload::ConfigReloader,
 };
 use crossterm::event::{self, Event};
 use ratatui::layout::Rect;
@@ -68,25 +69,53 @@ children = [
 fn main() -> io::Result<()> {
     let mut backend = CrosstermBackend::new(io::stdout());
     let args: Vec<_> = env::args().skip(1).collect();
-    let config = load_config(&args)?;
+    let config_path = config_path(&args)?;
+    let config = load_config(config_path.as_deref())?;
     let registry = WidgetRegistry::builtins();
     let mut state = AppState::from_config(backend.capabilities(), &registry, &config)
         .map_err(|error| io::Error::other(format!("application config rejected: {error}")))?;
     let mut compositor = Compositor::new();
+    let mut reloader = config_path
+        .map(ConfigReloader::new)
+        .transpose()
+        .map_err(|error| io::Error::other(error.to_string()))?;
     backend.enter()?;
 
-    let run_result = run(&mut backend, &mut state, &mut compositor);
+    let run_result = run(
+        &mut backend,
+        &mut state,
+        &mut compositor,
+        &registry,
+        reloader.as_mut(),
+    );
     state.shutdown_widgets();
     let leave_result = backend.leave();
 
     run_result.and(leave_result)
 }
 
-fn run<B>(backend: &mut B, state: &mut AppState, compositor: &mut Compositor) -> io::Result<()>
+fn run<B>(
+    backend: &mut B,
+    state: &mut AppState,
+    compositor: &mut Compositor,
+    registry: &WidgetRegistry,
+    mut reloader: Option<&mut ConfigReloader>,
+) -> io::Result<()>
 where
     B: Backend<Error = io::Error>,
 {
     loop {
+        if let Some(reloader) = reloader.as_deref_mut() {
+            match reloader.poll() {
+                Ok(Some(config)) => {
+                    if let Err(error) = state.reload_config(registry, &config) {
+                        state.record_diagnostic(format!("config reload rejected: {error}"));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => state.record_diagnostic(format!("config reload failed: {error}")),
+            }
+        }
         state.update_widgets(SystemTime::now());
         for invalidation in state.take_surface_invalidations() {
             compositor.invalidate(invalidation);
@@ -95,10 +124,11 @@ where
         sync_dashboard_surfaces(state, area)?;
         let widget_health =
             (!state.widget_runtime().is_empty()).then(|| state.widget_runtime().health_summary());
-        let base = render_static_dashboard_shell_with_metrics_and_health(
+        let base = render_static_dashboard_shell_with_metrics_health_and_diagnostic(
             area,
             backend.metrics(),
             widget_health.as_deref(),
+            state.latest_diagnostic(),
         );
         let surface_scenes = if state.widget_runtime().is_empty() {
             render_static_dashboard_surface_scenes(area, state.focus())
@@ -108,9 +138,9 @@ where
         let scene = compositor.compose(area, state, &base, &surface_scenes);
         let diff = compositor.diff(&scene);
         backend.submit_diff(&diff)?;
-        backend.submit_graphics(&state.visible_graphics())?;
+        backend.submit_graphics(diff.graphics(), diff.removed_graphics())?;
 
-        if dispatch_available_events(state)? {
+        if dispatch_available_events(state, registry, reloader.as_deref_mut())? {
             break;
         }
     }
@@ -118,10 +148,10 @@ where
     Ok(())
 }
 
-fn load_config(args: &[String]) -> io::Result<AppConfig> {
-    match config_path(args)? {
+fn load_config(path: Option<&Path>) -> io::Result<AppConfig> {
+    match path {
         Some(path) => {
-            AppConfig::load_file(&path).map_err(|error| io::Error::other(format!("{error}")))
+            AppConfig::load_file(path).map_err(|error| io::Error::other(format!("{error}")))
         }
         None => AppConfig::parse(DEFAULT_CONFIG).map_err(|error| {
             io::Error::other(format!("embedded default config rejected: {error}"))
@@ -156,7 +186,11 @@ fn config_path(args: &[String]) -> io::Result<Option<PathBuf>> {
     Ok(path)
 }
 
-fn dispatch_available_events(state: &mut AppState) -> io::Result<bool> {
+fn dispatch_available_events(
+    state: &mut AppState,
+    registry: &WidgetRegistry,
+    reloader: Option<&mut ConfigReloader>,
+) -> io::Result<bool> {
     if !event::poll(Duration::from_millis(250))? {
         return Ok(false);
     }
@@ -167,24 +201,51 @@ fn dispatch_available_events(state: &mut AppState) -> io::Result<bool> {
         events.push(event::read()?);
     }
 
-    dispatch_event_batch(state, events)
+    dispatch_event_batch(state, registry, reloader, events)
 }
 
-fn dispatch_event_batch<I>(state: &mut AppState, events: I) -> io::Result<bool>
+fn dispatch_event_batch<I>(
+    state: &mut AppState,
+    registry: &WidgetRegistry,
+    mut reloader: Option<&mut ConfigReloader>,
+    events: I,
+) -> io::Result<bool>
 where
     I: IntoIterator<Item = Event>,
 {
     for event in events.into_iter().take(MAX_EVENTS_PER_BATCH) {
-        if dispatch_event(state, event)? {
+        if dispatch_event(state, registry, reloader.as_deref_mut(), event)? {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn dispatch_event(state: &mut AppState, event: Event) -> io::Result<bool> {
+fn dispatch_event(
+    state: &mut AppState,
+    registry: &WidgetRegistry,
+    reloader: Option<&mut ConfigReloader>,
+    event: Event,
+) -> io::Result<bool> {
     match event {
         Event::Key(key) => match command_for_key(key) {
+            Some(Command::ReloadConfig) => {
+                if let Some(reloader) = reloader {
+                    match reloader.reload() {
+                        Ok(config) => {
+                            if let Err(error) = state.reload_config(registry, &config) {
+                                state.record_diagnostic(format!("config reload rejected: {error}"));
+                            }
+                        }
+                        Err(error) => {
+                            state.record_diagnostic(format!("config reload failed: {error}"));
+                        }
+                    }
+                } else {
+                    state.record_diagnostic("Ctrl+R requires --config <path>");
+                }
+                Ok(false)
+            }
             Some(command) => {
                 let effect = state
                     .dispatch(command)
@@ -201,7 +262,7 @@ fn dispatch_event(state: &mut AppState, event: Event) -> io::Result<bool> {
             .map_err(|error| io::Error::other(format!("widget paste rejected: {error}")))
             .map(|_| false),
         Event::Mouse(mouse) => state
-            .handle_focused_mouse(mouse)
+            .handle_mouse(mouse)
             .map_err(|error| io::Error::other(format!("widget mouse input rejected: {error}")))
             .map(|_| false),
         _ => Ok(false),
@@ -327,7 +388,9 @@ mod tests {
         }
 
         let events = (0..MAX_EVENTS_PER_BATCH + 1).map(|_| tab_event());
-        assert!(!dispatch_event_batch(&mut state, events).unwrap());
+        assert!(
+            !dispatch_event_batch(&mut state, &WidgetRegistry::builtins(), None, events,).unwrap()
+        );
         assert_eq!(
             state.focus().target(),
             Some(FocusTarget::Surface(SurfaceId::new(2)))
@@ -342,7 +405,9 @@ mod tests {
             tab_event(),
         ];
 
-        assert!(dispatch_event_batch(&mut state, events).unwrap());
+        assert!(
+            dispatch_event_batch(&mut state, &WidgetRegistry::builtins(), None, events,).unwrap()
+        );
         assert!(state.quit_requested());
         assert_eq!(state.focus().target(), None);
     }

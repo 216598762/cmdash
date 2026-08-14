@@ -25,4 +25,4 @@ cmdash is licensed under the [MIT License](LICENSE).
 
 ## Status
 
-Phase 5 in progress. The project has a backend-neutral retained scene, a configuration-driven layout tree, lifecycle-aware dashboard widgets, and optional terminal widgets backed by `portable-pty` and `alacritty_terminal`. Terminal modes, colors, cursor/scrollback, paste/mouse routing, resize, shutdown, retained sessions, tab invalidation, and session-scoped Kitty graphics replay are covered; scene image layers and graphics resource limits remain future work. `Ctrl+PageUp` / `Ctrl+PageDown` switch configured tabs, while `--config <path>` / `-c <path>` loads user-provided TOML.
+Phase 6 in progress. The project has a backend-neutral retained scene with session-scoped Kitty image layers, bounded graphics resources, lifecycle-aware dashboard widgets, optional terminal sessions, validated config reload, and an in-app command palette/help surface. `Ctrl+PageUp` / `Ctrl+PageDown` switch configured tabs, `Ctrl+P` opens the palette, `?` opens help, and `--config <path>` / `-c <path>` enables safe TOML reload with `Ctrl+R`.

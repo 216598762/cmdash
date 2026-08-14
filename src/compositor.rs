@@ -42,6 +42,8 @@ pub struct FrameDiff {
     invalidated: Vec<Rect>,
     changes: Vec<CellChange>,
     spans: Vec<CellSpan>,
+    graphics: Vec<crate::graphics::GraphicsSubmission>,
+    removed_graphics: Vec<u32>,
 }
 
 impl FrameDiff {
@@ -65,8 +67,16 @@ impl FrameDiff {
         &self.spans
     }
 
+    pub fn graphics(&self) -> &[crate::graphics::GraphicsSubmission] {
+        &self.graphics
+    }
+
+    pub fn removed_graphics(&self) -> &[u32] {
+        &self.removed_graphics
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
+        self.changes.is_empty() && self.graphics.is_empty() && self.removed_graphics.is_empty()
     }
 }
 
@@ -149,6 +159,28 @@ impl Compositor {
             .filter_map(|area| intersect(area, viewport))
             .collect();
         let previous = self.previous.as_ref();
+        let graphics_changed = full_redraw
+            || previous.is_none_or(|previous| previous.image_layers() != current.image_layers());
+        let graphics = if graphics_changed {
+            current.image_layers().to_vec()
+        } else {
+            Vec::new()
+        };
+        let current_graphics = current
+            .image_layers()
+            .iter()
+            .map(|image| (image.terminal_image_id(), image))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let removed_graphics = previous
+            .into_iter()
+            .flat_map(|previous| previous.image_layers())
+            .filter(|image| {
+                current_graphics
+                    .get(&image.terminal_image_id())
+                    .is_none_or(|current| *current != *image)
+            })
+            .map(|image| image.terminal_image_id())
+            .collect();
         let mut changes = Vec::new();
 
         for (index, cell) in current.cells().iter().enumerate() {
@@ -177,6 +209,8 @@ impl Compositor {
             invalidated,
             changes,
             spans,
+            graphics,
+            removed_graphics,
         }
     }
 }
@@ -415,6 +449,27 @@ mod tests {
         assert_eq!(diff.invalidated_regions(), &[Rect::new(1, 0, 2, 1)]);
         assert_eq!(diff.changes().len(), 2);
         assert!(diff.changes().iter().all(|change| change.y == 0));
+    }
+
+    #[test]
+    fn image_layer_changes_are_part_of_frame_diffs_and_remove_stale_ids() {
+        let mut store = crate::SessionGraphicsStore::new(crate::SessionId::new(1));
+        store.apply_kitty_command(b"a=T,f=24,i=1", b"AQID").unwrap();
+        store.apply_kitty_command(b"a=p,i=1,x=0,y=0", b"").unwrap();
+        let mut first_scene = Scene::new(Rect::new(0, 0, 4, 2));
+        first_scene.add_image_layer(store.visible_submissions(first_scene.area())[0].clone());
+        let mut compositor = Compositor::new();
+        let first = compositor.diff(&first_scene);
+        assert_eq!(first.graphics().len(), 1);
+
+        let second_scene = Scene::new(Rect::new(0, 0, 4, 2));
+        let second = compositor.diff(&second_scene);
+        assert!(!second.is_empty());
+        assert_eq!(second.graphics().len(), 0);
+        assert_eq!(
+            second.removed_graphics(),
+            &[first.graphics()[0].terminal_image_id()]
+        );
     }
 
     #[test]

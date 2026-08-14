@@ -195,6 +195,10 @@ impl TerminalSession {
         self.graphics.visible_submissions(surface)
     }
 
+    pub fn graphics_diagnostics(&self) -> &[crate::graphics::GraphicsDiagnostic] {
+        self.graphics.diagnostics()
+    }
+
     pub fn poll_output(&mut self) -> Result<bool, SessionError> {
         if self.closed {
             return Ok(false);

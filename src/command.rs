@@ -6,6 +6,9 @@ use crate::state::{Overlay, OverlayId, Surface, SurfaceId};
 pub enum Command {
     Quit,
     RequestRedraw,
+    ReloadConfig,
+    ToggleHelp,
+    TogglePalette,
     Focus(FocusCommand),
     Tab(TabCommand),
     Surface(SurfaceCommand),
