@@ -40,6 +40,31 @@ pub fn static_dashboard_surface_areas(area: Rect) -> [(SurfaceId, Rect); 2] {
     ]
 }
 
+pub fn configured_widget_surface_areas(
+    area: Rect,
+    surface_ids: &[SurfaceId],
+) -> BTreeMap<SurfaceId, Rect> {
+    let content = dashboard_sections(area)[1];
+    if surface_ids.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let count = surface_ids.len() as u16;
+    let base_width = content.width / count;
+    let remainder = content.width % count;
+    let mut x = content.x;
+    surface_ids
+        .iter()
+        .enumerate()
+        .map(|(index, &id)| {
+            let width = base_width + u16::from(index < remainder as usize);
+            let surface_area = Rect::new(x, content.y, width, content.height);
+            x = x.saturating_add(width);
+            (id, surface_area)
+        })
+        .collect()
+}
+
 pub fn render_static_dashboard(area: Rect) -> Scene {
     render_static_dashboard_with_focus(area, FocusState::default())
 }
@@ -76,11 +101,11 @@ pub fn render_static_dashboard_shell_with_metrics(area: Rect, metrics: OutputMet
     scene.fill(footer, CellStyle::new(MUTED, BACKGROUND));
     let footer_text = if metrics.bytes_saved > 0 {
         format!(
-            "Tab / Shift+Tab  focus    q / Esc  quit    •    saved {} B    •    Phase 1",
+            "Tab / Shift+Tab  focus    q / Esc  quit    •    saved {} B    •    retained output",
             metrics.bytes_saved
         )
     } else {
-        "Tab / Shift+Tab  focus    q / Esc  quit    •    static frame    •    Phase 1".to_owned()
+        "Tab / Shift+Tab  focus    q / Esc  quit    •    retained frame".to_owned()
     };
     scene.text(
         footer.x.saturating_add(1),
@@ -224,5 +249,17 @@ mod tests {
         assert_eq!(areas[0].0, WORKSPACE_SURFACE_ID);
         assert_eq!(areas[1].0, BACKEND_SURFACE_ID);
         assert!(areas[0].1.width > areas[1].1.width);
+    }
+
+    #[test]
+    fn configured_widget_layout_distributes_the_content_area() {
+        let ids = [SurfaceId::new(1), SurfaceId::new(2), SurfaceId::new(3)];
+        let areas = configured_widget_surface_areas(Rect::new(0, 0, 80, 24), &ids);
+
+        assert_eq!(areas.len(), 3);
+        assert_eq!(areas[&ids[0]].x, 0);
+        assert_eq!(areas[&ids[0]].y, 3);
+        assert_eq!(areas[&ids[0]].height, 20);
+        assert_eq!(areas[&ids[2]].x + areas[&ids[2]].width, 80);
     }
 }

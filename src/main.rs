@@ -1,10 +1,11 @@
-use std::{io, time::Duration};
+use std::{collections::BTreeMap, io, time::Duration};
 
 use cmdash::{
-    AppState, Backend, Command, Compositor, CrosstermBackend, Surface, SurfaceCommand,
+    AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend, Surface, SurfaceCommand,
+    WidgetRegistry,
     dashboard::{
-        render_static_dashboard_shell_with_metrics, render_static_dashboard_surface_scenes,
-        static_dashboard_surface_areas,
+        configured_widget_surface_areas, render_static_dashboard_shell_with_metrics,
+        render_static_dashboard_surface_scenes, static_dashboard_surface_areas,
     },
     input::command_for_key,
 };
@@ -12,10 +13,32 @@ use crossterm::event::{self, Event};
 use ratatui::layout::Rect;
 
 const MAX_EVENTS_PER_BATCH: usize = 32;
+const DEFAULT_CONFIG: &str = r#"
+version = 1
+
+[workspace]
+name = "default"
+
+[[workspace.widgets]]
+id = 1
+type = "text"
+title = " workspace "
+text = "Dashboard widgets are configuration-driven."
+
+[[workspace.widgets]]
+id = 2
+type = "text"
+title = " status "
+text = "No terminal sessions are running."
+"#;
 
 fn main() -> io::Result<()> {
     let mut backend = CrosstermBackend::new(io::stdout());
-    let mut state = AppState::new(backend.capabilities());
+    let config = AppConfig::parse(DEFAULT_CONFIG)
+        .map_err(|error| io::Error::other(format!("default config rejected: {error:?}")))?;
+    let registry = WidgetRegistry::builtins();
+    let mut state = AppState::from_config(backend.capabilities(), &registry, &config)
+        .map_err(|error| io::Error::other(format!("application config rejected: {error:?}")))?;
     let mut compositor = Compositor::new();
     backend.enter()?;
 
@@ -33,7 +56,11 @@ where
         let area = backend.size()?;
         sync_dashboard_surfaces(state, area)?;
         let base = render_static_dashboard_shell_with_metrics(area, backend.metrics());
-        let surface_scenes = render_static_dashboard_surface_scenes(area, state.focus());
+        let surface_scenes = if state.widget_runtime().is_empty() {
+            render_static_dashboard_surface_scenes(area, state.focus())
+        } else {
+            state.widget_surface_scenes()
+        };
         let scene = compositor.compose(area, state, &base, &surface_scenes);
         let diff = compositor.diff(&scene);
         backend.submit_diff(&diff)?;
@@ -88,7 +115,14 @@ fn dispatch_event(state: &mut AppState, event: Event) -> io::Result<bool> {
 }
 
 fn sync_dashboard_surfaces(state: &mut AppState, area: Rect) -> io::Result<()> {
-    for (id, surface_area) in static_dashboard_surface_areas(area) {
+    let surface_areas: BTreeMap<_, _> = if state.widget_runtime().is_empty() {
+        static_dashboard_surface_areas(area).into_iter().collect()
+    } else {
+        let surface_ids: Vec<_> = state.workspace().surfaces().keys().copied().collect();
+        configured_widget_surface_areas(area, &surface_ids)
+    };
+
+    for (id, surface_area) in surface_areas {
         let existing = state.workspace().surfaces().contains_key(&id);
         let should_show = existing
             && surface_area.width > 0

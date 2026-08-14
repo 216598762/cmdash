@@ -25,4 +25,4 @@ cmdash is licensed under the [MIT License](LICENSE).
 
 ## Status
 
-Initial package phase. The project now has a Rust package, a backend-neutral retained scene, a Crossterm submission backend, a static dashboard contract with unit tests, and GitHub Actions checks for formatting, linting, compilation, and tests. Terminal sessions, widgets, plugins, and dynamic layout behavior remain future work.
+Phase 2 in progress. The project has a Rust package, a backend-neutral retained scene, a Crossterm submission backend, a static dashboard contract, GitHub Actions checks, and an initial versioned TOML widget configuration/runtime with a built-in text widget. End-to-end shell integration, layout trees, terminal sessions, and plugins remain future work.

@@ -12,7 +12,7 @@ This roadmap is intentionally staged so the rendering and session ownership cont
 - [x] Create the initial Cargo package with formatting and test commands.
 - [x] Add CI and linting workflows for formatting, checks, Clippy, and tests.
 - [x] Use TOML as the initial hand-authored configuration format.
-- [ ] Define a stable widget/session terminology and plugin configuration schema.
+- [ ] Define the stable plugin configuration schema and dynamic-plugin terminology.
 
 **Exit criteria:** a documented package/plugin boundary and a small executable that enters/leaves raw mode safely, or a deliberate decision to defer raw mode until Phase 1.
 
@@ -40,11 +40,14 @@ This roadmap is intentionally staged so the rendering and session ownership cont
 
 ## Phase 2 — Modular widget runtime
 
-- [ ] Implement widget registration and configuration-driven widget instances.
+- [x] Define the initial widget model, registry, and backend-independent widget runtime.
+- [x] Parse and validate version-1 TOML widget-instance configuration.
+- [x] Integrate widget registration and configuration-driven instances into the application shell, with the static dashboard retained as a fallback.
 - [ ] Add a layout tree with leaf widgets, tab groups, and overlays; defer pane splits until the tab model is validated.
 - [ ] Define the versioned plugin host contract and load a minimal external widget.
 - [ ] Add at least two non-terminal widgets, such as a clock and system information panel, exercising the same host-facing contract.
-- [ ] Ensure a widget-only TOML configuration starts and runs normally.
+- [x] Start the application shell from a widget-only TOML configuration without enabling terminal sessions.
+- [ ] Load user-provided widget-only TOML configuration from the application boundary.
 - [ ] Add focus routing, plugin health reporting, and widget lifecycle cleanup.
 
 **Exit criteria:** users can run a useful dashboard with no PTY, shell, or terminal-emulation dependency in the active workspace.

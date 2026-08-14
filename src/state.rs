@@ -5,7 +5,9 @@ use ratatui::layout::Rect;
 use crate::{
     backend::BackendCapabilities,
     command::{Command, CommandEffect, FocusCommand, OverlayCommand, SurfaceCommand},
+    config::{AppConfig, ConfigError},
     scene::{CellStyle, Scene},
+    widget::{WidgetError, WidgetRegistry, WidgetRuntime},
 };
 
 macro_rules! id_type {
@@ -279,10 +281,16 @@ pub enum CommandError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AppStateConfigError {
+    InvalidConfig(ConfigError),
+    Widget(WidgetError),
+}
+
 pub struct AppState {
     workspace: WorkspaceState,
     focus: FocusState,
     backend_capabilities: BackendCapabilities,
+    widget_runtime: WidgetRuntime,
     quit_requested: bool,
     redraw_requested: bool,
 }
@@ -293,13 +301,78 @@ impl AppState {
             workspace: WorkspaceState::new(WorkspaceId::new(1), "default"),
             focus: FocusState::default(),
             backend_capabilities,
+            widget_runtime: WidgetRuntime::empty(),
             quit_requested: false,
             redraw_requested: true,
         }
     }
 
+    pub fn from_config(
+        backend_capabilities: BackendCapabilities,
+        registry: &WidgetRegistry,
+        config: &AppConfig,
+    ) -> Result<Self, AppStateConfigError> {
+        config
+            .validate()
+            .map_err(AppStateConfigError::InvalidConfig)?;
+        let widget_runtime =
+            WidgetRuntime::from_config(registry, config).map_err(AppStateConfigError::Widget)?;
+        let mut state = Self {
+            workspace: WorkspaceState::new(WorkspaceId::new(1), config.workspace.name.clone()),
+            focus: FocusState::default(),
+            backend_capabilities,
+            widget_runtime,
+            quit_requested: false,
+            redraw_requested: true,
+        };
+
+        for widget in &config.workspace.widgets {
+            let widget_id = WidgetId::new(widget.id);
+            let surface = Surface::new(SurfaceId::new(widget.id), Rect::new(0, 0, 1, 1))
+                .with_widget(widget_id);
+            state.workspace.surfaces.insert(surface.id(), surface);
+        }
+        Ok(state)
+    }
+
     pub fn workspace(&self) -> &WorkspaceState {
         &self.workspace
+    }
+
+    pub fn widget_runtime(&self) -> &WidgetRuntime {
+        &self.widget_runtime
+    }
+
+    pub fn widget_surface_scenes(&self) -> BTreeMap<SurfaceId, Scene> {
+        let mut areas = BTreeMap::new();
+        let mut surface_ids = BTreeMap::new();
+        for (&surface_id, surface) in &self.workspace.surfaces {
+            if let Some(widget_id) = surface.widget()
+                && surface.visible()
+            {
+                areas.insert(widget_id, surface.area());
+                surface_ids.insert(widget_id, surface_id);
+            }
+        }
+
+        let focused_widget = match self.focus.target() {
+            Some(FocusTarget::Surface(surface_id)) => self
+                .workspace
+                .surfaces
+                .get(&surface_id)
+                .and_then(|surface| surface.widget()),
+            Some(FocusTarget::Overlay(_)) | None => None,
+        };
+        self.widget_runtime
+            .render(&areas, focused_widget)
+            .into_iter()
+            .filter_map(|(widget_id, scene)| {
+                surface_ids
+                    .get(&widget_id)
+                    .copied()
+                    .map(|surface_id| (surface_id, scene))
+            })
+            .collect()
     }
 
     pub const fn focus(&self) -> FocusState {
@@ -624,6 +697,40 @@ mod tests {
             state.focus().target(),
             Some(FocusTarget::Surface(second.id()))
         );
+    }
+
+    #[test]
+    fn config_creates_widget_surfaces_and_renders_through_app_state() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [workspace]
+            name = "configured"
+            [[workspace.widgets]]
+            id = 7
+            type = "text"
+            title = " greeting "
+            text = "hello"
+            "#,
+        )
+        .unwrap();
+        let mut state =
+            AppState::from_config(capabilities(), &WidgetRegistry::builtins(), &config).unwrap();
+        let surface_id = SurfaceId::new(7);
+        state
+            .dispatch(Command::Surface(SurfaceCommand::SetArea {
+                id: surface_id,
+                area: Rect::new(0, 0, 16, 4),
+            }))
+            .unwrap();
+
+        let scenes = state.widget_surface_scenes();
+        assert_eq!(state.workspace().name(), "configured");
+        assert_eq!(
+            state.workspace().surfaces()[&surface_id].widget(),
+            Some(WidgetId::new(7))
+        );
+        assert_eq!(scenes[&surface_id].cell_at(2, 1).unwrap().symbol, 'h');
     }
 
     #[test]
