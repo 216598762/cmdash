@@ -7,6 +7,9 @@ pub fn command_for_key(key: KeyEvent) -> Option<Command> {
         return match key.code {
             KeyCode::PageDown => Some(Command::Tab(TabCommand::Next)),
             KeyCode::PageUp => Some(Command::Tab(TabCommand::Previous)),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Some(Command::CopySelection)
+            }
             KeyCode::Char('p') => Some(Command::TogglePalette),
             KeyCode::Char('r') => Some(Command::ReloadConfig),
             _ => None,
@@ -55,6 +58,13 @@ mod tests {
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
             Some(Command::ToggleHelp)
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            Some(Command::CopySelection)
         );
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),

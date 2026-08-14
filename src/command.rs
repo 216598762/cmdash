@@ -7,6 +7,7 @@ pub enum Command {
     Quit,
     RequestRedraw,
     ReloadConfig,
+    CopySelection,
     ToggleHelp,
     TogglePalette,
     Focus(FocusCommand),

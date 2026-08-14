@@ -25,4 +25,4 @@ cmdash is licensed under the [MIT License](LICENSE).
 
 ## Status
 
-Phase 6 in progress. The project has a backend-neutral retained scene with session-scoped Kitty image layers, bounded graphics resources, lifecycle-aware dashboard widgets, optional terminal sessions, validated config reload, and an in-app command palette/help surface. `Ctrl+PageUp` / `Ctrl+PageDown` switch configured tabs, `Ctrl+P` opens the palette, `?` opens help, and `--config <path>` / `-c <path>` enables safe TOML reload with `Ctrl+R`.
+Phase 7 in progress. The project has retained session-scoped graphics, bounded resource diagnostics, validated config reload, terminal selection/copy through OSC 52, URL-aware notifications, a command palette/help surface, and validated plugin manifest metadata. `Ctrl+PageUp` / `Ctrl+PageDown` switch tabs, `Ctrl+P` opens the palette, `?` opens help, `Ctrl+Shift+C` copies a selection, and `--config <path>` / `-c <path>` enables safe reload with `Ctrl+R`.

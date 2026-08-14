@@ -312,6 +312,7 @@ pub struct AppState {
     redraw_requested: bool,
     pending_invalidations: Vec<Rect>,
     diagnostics: Vec<String>,
+    pending_clipboard: Option<String>,
 }
 
 impl AppState {
@@ -326,6 +327,7 @@ impl AppState {
             redraw_requested: true,
             pending_invalidations: Vec::new(),
             diagnostics: Vec::new(),
+            pending_clipboard: None,
         }
     }
 
@@ -371,6 +373,7 @@ impl AppState {
             redraw_requested: true,
             pending_invalidations: Vec::new(),
             diagnostics: Vec::new(),
+            pending_clipboard: None,
         };
 
         for widget in &config.workspace.widgets {
@@ -532,6 +535,31 @@ impl AppState {
         self.handle_focused_mouse(mouse)
     }
 
+    pub fn copy_focused_selection(&mut self) -> bool {
+        let Some(FocusTarget::Surface(surface_id)) = self.focus.target() else {
+            return false;
+        };
+        let Some(surface) = self.workspace.surfaces.get(&surface_id).copied() else {
+            return false;
+        };
+        let Some(widget_id) = surface.widget() else {
+            return false;
+        };
+        let Some(text) = self
+            .widget_runtime
+            .copy_selection(widget_id, surface.area())
+        else {
+            return false;
+        };
+        self.pending_clipboard = Some(text.clone());
+        self.record_diagnostic(crate::notification::copy_notification(&text));
+        true
+    }
+
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.pending_clipboard.take()
+    }
+
     pub fn handle_focused_mouse(&mut self, mouse: MouseEvent) -> Result<bool, String> {
         let Some(FocusTarget::Surface(surface_id)) = self.focus.target() else {
             return Ok(false);
@@ -583,7 +611,9 @@ impl AppState {
     }
 
     pub fn shutdown_widgets(&mut self) {
-        self.widget_runtime.shutdown();
+        for error in self.widget_runtime.shutdown() {
+            self.record_diagnostic(format!("widget shutdown failed: {error}"));
+        }
     }
 
     pub fn widget_surface_scenes(&self) -> BTreeMap<SurfaceId, Scene> {
@@ -658,6 +688,10 @@ impl AppState {
                 CommandEffect::Quit
             }
             Command::RequestRedraw | Command::ReloadConfig => CommandEffect::Redraw,
+            Command::CopySelection => {
+                self.copy_focused_selection();
+                CommandEffect::Redraw
+            }
             Command::ToggleHelp => {
                 self.toggle_runtime_overlay(
                     OverlayId::new(u64::MAX),
@@ -1212,6 +1246,20 @@ mod tests {
                 .overlays()
                 .contains_key(&OverlayId::new(u64::MAX - 1))
         );
+    }
+
+    #[test]
+    fn copy_requests_are_queued_for_the_backend() {
+        let config =
+            AppConfig::parse("version = 1\n[[workspace.widgets]]\nid = 1\ntype = \"text\"\n")
+                .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(SurfaceId::new(1))))
+            .unwrap();
+        assert!(!state.copy_focused_selection());
+        assert_eq!(state.take_clipboard(), None);
     }
 
     #[test]

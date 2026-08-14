@@ -107,6 +107,10 @@ pub trait Widget: Send {
         Ok(WidgetUpdate::Unchanged)
     }
 
+    fn copy_selection(&self, _area: Rect) -> Option<String> {
+        None
+    }
+
     fn handle_mouse(
         &mut self,
         _mouse: MouseEvent,
@@ -115,7 +119,9 @@ pub trait Widget: Send {
         Ok(WidgetUpdate::Unchanged)
     }
 
-    fn shutdown(&mut self) {}
+    fn shutdown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub type WidgetFactory = fn(&WidgetInstanceConfig) -> Result<Box<dyn Widget>, WidgetError>;
@@ -353,6 +359,12 @@ impl WidgetRuntime {
         entry.widget.handle_paste(text)
     }
 
+    pub fn copy_selection(&self, id: WidgetId, area: Rect) -> Option<String> {
+        self.instances
+            .get(&id)
+            .and_then(|entry| entry.widget.copy_selection(area))
+    }
+
     pub fn handle_mouse(
         &mut self,
         id: WidgetId,
@@ -383,10 +395,15 @@ impl WidgetRuntime {
         }
     }
 
-    pub fn shutdown(&mut self) {
+    pub fn shutdown(&mut self) -> Vec<String> {
+        let mut failures = Vec::new();
         for entry in self.instances.values_mut() {
-            entry.widget.shutdown();
+            if let Err(error) = entry.widget.shutdown() {
+                entry.health = WidgetHealth::Failed(error.clone());
+                failures.push(error);
+            }
         }
+        failures
     }
 
     pub fn graphics(&self, areas: &BTreeMap<WidgetId, Rect>) -> Vec<GraphicsSubmission> {
@@ -619,6 +636,10 @@ impl Widget for TerminalWidget {
         self.session.graphics(area)
     }
 
+    fn copy_selection(&self, area: Rect) -> Option<String> {
+        self.session.selected_text(area)
+    }
+
     fn handles_input(&self) -> bool {
         true
     }
@@ -652,14 +673,23 @@ impl Widget for TerminalWidget {
         mouse: MouseEvent,
         origin: (u16, u16),
     ) -> Result<WidgetUpdate, String> {
+        let position = (
+            mouse.column.saturating_sub(origin.0),
+            mouse.row.saturating_sub(origin.1),
+        );
+        match mouse.kind {
+            crossterm::event::MouseEventKind::Down(_) => self.session.begin_selection(position),
+            crossterm::event::MouseEventKind::Drag(_) => self.session.update_selection(position),
+            _ => {}
+        }
         self.session
             .write_mouse(mouse, origin)
             .map(|_| WidgetUpdate::Unchanged)
             .map_err(|error| error.to_string())
     }
 
-    fn shutdown(&mut self) {
-        let _ = self.session.shutdown();
+    fn shutdown(&mut self) -> Result<(), String> {
+        self.session.shutdown().map_err(|error| error.to_string())
     }
 }
 
@@ -834,7 +864,7 @@ mod tests {
                 .unwrap(),
             WidgetUpdate::Unchanged
         );
-        runtime.shutdown();
+        let _ = runtime.shutdown();
     }
 
     #[test]

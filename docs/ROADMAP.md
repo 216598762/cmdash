@@ -91,18 +91,21 @@ The next milestone is Phase 3: add one isolated terminal session as an optional 
 - [x] Add validated file-backed configuration reload with safe replacement and rejection of invalid updates.
 - [x] Add a command palette, discoverable keybindings, and status/help UI.
 - [x] Add useful built-in widgets and per-widget configuration.
-- [ ] Improve mouse support, selection/copy, URLs, and notifications as prioritized.
+- [x] Improve mouse focus/drag handling and terminal selection/copy through OSC 52.
+- [x] Add URL-aware copy notifications and in-app status notifications.
 - [x] Add in-app diagnostics that do not pollute the rendered terminal or PTY output.
 
-**Exit criteria:** a user can configure a dashboard, launch terminal sessions optionally, understand keybindings, and recover from widget/session failures.
+**Exit criteria (met):** a user can configure a dashboard, launch terminal sessions optionally, understand keybindings, and recover from widget/session failures.
 
 ## Phase 7 — Extensibility and hardening
 
-- [ ] Stabilize the widget API, dynamic-plugin contract, and configuration schema.
+- [x] Define plugin manifest metadata with ABI, capability, widget-type, and version validation.
+- [ ] Stabilize the widget API, dynamic-plugin contract, and full configuration schema.
 - [ ] Add feature-gated protocol support such as sixel if demand warrants it.
 - [ ] Add pane splitting only after tabs and session restoration are stable.
-- [ ] Add fuzzing for escape/protocol parsing and stress tests for high-output sessions.
-- [ ] Add resource quotas, crash diagnostics, upgrade/migration handling, and release packaging.
+- [x] Add bounded parser stress coverage for escape/protocol input.
+- [x] Enforce graphics resource quotas and surface widget/session shutdown failures as diagnostics.
+- [ ] Add fuzzing, upgrade/migration handling, and release packaging.
 
 **Exit criteria:** documented extension points, repeatable builds/tests, and controlled behavior under malformed input and resource pressure.
 

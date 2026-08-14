@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use ratatui::layout::Rect;
+use serde::Deserialize;
 
 use crate::{
     config::WidgetInstanceConfig,
@@ -10,6 +11,94 @@ use crate::{
 
 pub const PLUGIN_ABI_VERSION: u32 = 1;
 pub const PLUGIN_WIDGET_TYPE_MAX: usize = 32;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct PluginManifestV1 {
+    pub name: String,
+    pub version: String,
+    pub abi_version: u32,
+    #[serde(default)]
+    pub capabilities: u64,
+    pub widgets: Vec<PluginWidgetManifest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct PluginWidgetManifest {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub capabilities: u64,
+}
+
+impl PluginManifestV1 {
+    pub fn parse(source: &str) -> Result<Self, PluginManifestError> {
+        let manifest: Self = toml::from_str(source)
+            .map_err(|error| PluginManifestError::Parse(error.to_string()))?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn validate(&self) -> Result<(), PluginManifestError> {
+        if self.name.trim().is_empty() || self.version.trim().is_empty() {
+            return Err(PluginManifestError::MissingIdentity);
+        }
+        if self.abi_version != PLUGIN_ABI_VERSION {
+            return Err(PluginManifestError::AbiMismatch {
+                expected: PLUGIN_ABI_VERSION,
+                actual: self.abi_version,
+            });
+        }
+        if self.widgets.is_empty() {
+            return Err(PluginManifestError::NoWidgets);
+        }
+        let mut kinds = std::collections::BTreeSet::new();
+        for widget in &self.widgets {
+            if widget.kind.is_empty() || widget.kind.len() > PLUGIN_WIDGET_TYPE_MAX {
+                return Err(PluginManifestError::InvalidWidgetType(widget.kind.clone()));
+            }
+            if !kinds.insert(&widget.kind) {
+                return Err(PluginManifestError::DuplicateWidgetType(
+                    widget.kind.clone(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PluginManifestError {
+    Parse(String),
+    MissingIdentity,
+    AbiMismatch { expected: u32, actual: u32 },
+    NoWidgets,
+    InvalidWidgetType(String),
+    DuplicateWidgetType(String),
+}
+
+impl std::fmt::Display for PluginManifestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(message) => write!(formatter, "plugin manifest parse error: {message}"),
+            Self::MissingIdentity => formatter.write_str("plugin manifest needs name and version"),
+            Self::AbiMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "plugin manifest ABI mismatch: expected {expected}, got {actual}"
+                )
+            }
+            Self::NoWidgets => formatter.write_str("plugin manifest declares no widgets"),
+            Self::InvalidWidgetType(kind) => {
+                write!(formatter, "invalid plugin widget type {kind:?}")
+            }
+            Self::DuplicateWidgetType(kind) => {
+                write!(formatter, "duplicate plugin widget type {kind:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PluginManifestError {}
 
 pub mod capabilities {
     pub const RENDER_SCENE: u64 = 1 << 0;
@@ -109,6 +198,28 @@ impl PluginRegistry {
 
     pub fn host(&self) -> PluginHostV1 {
         self.host
+    }
+
+    pub fn validate_manifest(
+        &self,
+        manifest: &PluginManifestV1,
+    ) -> Result<(), PluginManifestError> {
+        manifest.validate()?;
+        if manifest.capabilities & !self.host.capability_bits != 0 {
+            return Err(PluginManifestError::InvalidWidgetType(format!(
+                "manifest capabilities {:#x} exceed host capabilities {:#x}",
+                manifest.capabilities, self.host.capability_bits
+            )));
+        }
+        for widget in &manifest.widgets {
+            if widget.capabilities & !self.host.capability_bits != 0 {
+                return Err(PluginManifestError::InvalidWidgetType(format!(
+                    "widget {} requests unsupported capabilities",
+                    widget.kind
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn load<M>(&mut self, module: M) -> Result<(), PluginError>
@@ -316,6 +427,33 @@ mod tests {
         );
 
         assert_eq!(scenes[&WidgetId::new(7)].cell_at(2, 1).unwrap().symbol, 'r');
+    }
+
+    #[test]
+    fn manifests_validate_abi_identity_and_capabilities() {
+        let manifest = PluginManifestV1::parse(
+            r#"
+            name = "example"
+            version = "1.0"
+            abi_version = 1
+            capabilities = 1
+            [[widgets]]
+            type = "example-widget"
+            capabilities = 1
+            "#,
+        )
+        .unwrap();
+        let registry = PluginRegistry::new(PluginHostV1::dashboard_defaults());
+        registry.validate_manifest(&manifest).unwrap();
+        assert_eq!(manifest.widgets[0].kind, "example-widget");
+    }
+
+    #[test]
+    fn malformed_plugin_manifests_are_rejected_before_loading_code() {
+        assert!(matches!(
+            PluginManifestV1::parse("name = \"missing\""),
+            Err(PluginManifestError::Parse(_))
+        ));
     }
 
     #[test]

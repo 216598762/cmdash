@@ -93,6 +93,12 @@ struct SessionOutput {
     receiver: Receiver<io::Result<Vec<u8>>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Selection {
+    anchor: (u16, u16),
+    active: (u16, u16),
+}
+
 pub struct TerminalSession {
     term: Term<VoidListener>,
     processor: Processor,
@@ -105,6 +111,7 @@ pub struct TerminalSession {
     failure: Option<String>,
     graphics: SessionGraphicsStore,
     graphics_input: Vec<u8>,
+    selection: Option<Selection>,
 }
 
 impl TerminalSession {
@@ -172,6 +179,7 @@ impl TerminalSession {
             failure: None,
             graphics: SessionGraphicsStore::new(session_id),
             graphics_input: Vec::new(),
+            selection: None,
         })
     }
 
@@ -197,6 +205,50 @@ impl TerminalSession {
 
     pub fn graphics_diagnostics(&self) -> &[crate::graphics::GraphicsDiagnostic] {
         self.graphics.diagnostics()
+    }
+
+    pub fn begin_selection(&mut self, position: (u16, u16)) {
+        self.selection = Some(Selection {
+            anchor: position,
+            active: position,
+        });
+    }
+
+    pub fn update_selection(&mut self, position: (u16, u16)) {
+        if let Some(selection) = &mut self.selection {
+            selection.active = position;
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn selected_text(&self, area: Rect) -> Option<String> {
+        let selection = self.selection?;
+        if selection.anchor == selection.active {
+            return None;
+        }
+        let scene = self.render(area, false);
+        let left = selection.anchor.0.min(selection.active.0);
+        let right = selection.anchor.0.max(selection.active.0);
+        let top = selection.anchor.1.min(selection.active.1);
+        let bottom = selection.anchor.1.max(selection.active.1);
+        let mut lines = Vec::new();
+        for row in top..=bottom {
+            let mut line = String::new();
+            for column in left..=right {
+                let x = area.x.saturating_add(column);
+                let y = area.y.saturating_add(row);
+                if let Some(cell) = scene.cell_at(x, y)
+                    && cell.width != crate::scene::CellWidth::Continuation
+                {
+                    line.push(cell.symbol);
+                }
+            }
+            lines.push(line.trim_end().to_owned());
+        }
+        Some(lines.join("\n"))
     }
 
     pub fn poll_output(&mut self) -> Result<bool, SessionError> {
@@ -340,6 +392,23 @@ impl TerminalSession {
             if let Some(cell) = scene.cell_at(x, y).copied() {
                 let cursor_style = CellStyle::new(cell.style.background, cell.style.foreground);
                 scene.set(x, y, cell.symbol, cursor_style);
+            }
+        }
+        if let Some(selection) = self.selection {
+            let left = selection.anchor.0.min(selection.active.0);
+            let right = selection.anchor.0.max(selection.active.0);
+            let top = selection.anchor.1.min(selection.active.1);
+            let bottom = selection.anchor.1.max(selection.active.1);
+            for row in top..=bottom {
+                for column in left..=right {
+                    let x = area.x.saturating_add(column);
+                    let y = area.y.saturating_add(row);
+                    if let Some(cell) = scene.cell_at(x, y).copied() {
+                        let selected_style =
+                            CellStyle::new(cell.style.background, cell.style.foreground);
+                        scene.set(x, y, cell.symbol, selected_style);
+                    }
+                }
             }
         }
         scene
@@ -728,6 +797,25 @@ mod tests {
     }
 
     #[test]
+    fn selection_tracks_dragged_cells_and_copies_visible_text() {
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &["-c", "printf 'copy me'; sleep 5"],
+            TerminalSize::new(20, 4),
+        )
+        .unwrap();
+        wait_for_output(&mut session);
+        let area = Rect::new(0, 0, 20, 4);
+        session.begin_selection((0, 0));
+        session.update_selection((6, 0));
+
+        assert_eq!(session.selected_text(area).as_deref(), Some("copy me"));
+        session.clear_selection();
+        assert_eq!(session.selected_text(area), None);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
     fn paste_and_mouse_encoding_use_terminal_protocol_sequences() {
         assert_eq!(
             mouse_bytes(
@@ -766,6 +854,21 @@ mod tests {
             vec![(b"a=T,f=24,i=1".to_vec(), b"AQID".to_vec())]
         );
         assert!(remainder.is_empty());
+    }
+
+    #[test]
+    fn parser_handles_repeated_graphics_and_text_without_unbounded_pending_state() {
+        let mut input = Vec::new();
+        for index in 1..=256u32 {
+            input.extend_from_slice(b"text");
+            input.extend_from_slice(format!("\x1b_Ga=T,f=24,i={index};AQID\x1b\\").as_bytes());
+        }
+        let (plain, commands, remainder) = extract_kitty_commands(&input);
+        assert!(remainder.is_empty());
+        assert_eq!(plain.len(), 256 * 4);
+        assert_eq!(commands.len(), 256);
+        assert_eq!(commands[0].0, b"a=T,f=24,i=1");
+        assert_eq!(commands[255].0, b"a=T,f=24,i=256");
     }
 
     #[test]

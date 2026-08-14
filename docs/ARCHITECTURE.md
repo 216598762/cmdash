@@ -16,7 +16,7 @@ The first implementation will use these boundaries:
 - **Terminal backend:** `crossterm` owns raw mode, input collection, resize events, and basic terminal controls. The cmdash scene/compositor remains independent of Crossterm's frame lifecycle.
 - **Terminal emulator:** use one `alacritty_terminal` instance per session. Kitty APC sequences are intercepted by a cmdash-owned adapter and `SessionGraphicsStore`; retained image layers flow through `Scene` and `Compositor`.
 - **Workspace scope:** start with one active workspace. The state model should leave room for saved workspaces later without making them part of the first runtime contract.
-- **Plugin ABI:** use a versioned native ABI with C-compatible host-facing data and explicit capability/version negotiation. The host must not pass Rust trait objects across the dynamic-library boundary.
+- **Plugin ABI:** use a versioned native ABI with C-compatible host-facing data and explicit capability/version negotiation. Plugin manifests are validated before code loading, and the host must not pass Rust trait objects across the dynamic-library boundary.
 - **Initial terminal capabilities:** require ANSI/VT text, cursor movement, Unicode cell output, basic colors, alternate-screen support, keyboard input, and resize handling. Treat truecolor, mouse, bracketed paste, keyboard enhancement, and Kitty graphics as optional capabilities.
 - **Fallback behavior:** downgrade optional color/input features when unavailable and omit unsupported or over-limit graphics with an in-app degraded diagnostic. Capability mismatches must never emit malformed output or corrupt text/layout.
 
@@ -51,6 +51,7 @@ The terms below are deliberately separate:
 - **Session:** a stateful producer of terminal content. A session normally maps to one PTY and one terminal-emulator instance.
 - **Scene:** retained, backend-neutral visual output for a surface for the current frame.
 - **Frame:** the complete scene tree/composition result submitted to the terminal backend.
+- **Notification:** bounded user-facing status or recovery information rendered in the dashboard UI rather than written to the PTY.
 
 A terminal tab should be modeled as a separate `Session` unless the chosen multiplexer semantics explicitly require a tab group to share one emulator. Separate sessions are the safer default because it guarantees PTY, scrollback, and graphics isolation.
 
@@ -64,7 +65,7 @@ Owns process startup, configuration loading, signal/shutdown handling, logging, 
 
 Runs the main event loop and routes:
 
-- keyboard, mouse, resize, paste, and terminal capability events;
+- keyboard, mouse, resize, paste, selection/copy, and terminal capability events;
 - PTY output and child-process lifecycle events;
 - timers, filesystem/watch events, and widget messages;
 - commands such as focus, split, close, reload, and switch tab.
@@ -287,7 +288,7 @@ Dynamic plugins are an early requirement, with compile-time feature flags still 
 - a workspace config chooses which widget types and instances are present;
 - plugin loading, health, permissions, and shutdown are managed by a host-side plugin manager.
 
-The plugin manager must reject unsupported ABI versions, isolate failures to the affected widget where possible, and ensure a plugin cannot write directly to the terminal backend. Native dynamic loading should not rely on Rust's unstable ABI; use a stable, versioned boundary or an explicitly chosen portable runtime.
+The plugin manager must validate manifests, reject unsupported ABI versions/capabilities, isolate failures to the affected widget where possible, and ensure a plugin cannot write directly to the terminal backend. Native dynamic loading should not rely on Rust's unstable ABI; use a stable, versioned boundary or an explicitly chosen portable runtime.
 
 ## 9. Testing strategy
 

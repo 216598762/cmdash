@@ -117,6 +117,9 @@ where
             }
         }
         state.update_widgets(SystemTime::now());
+        if let Some(text) = state.take_clipboard() {
+            backend.submit_clipboard(&text)?;
+        }
         for invalidation in state.take_surface_invalidations() {
             compositor.invalidate(invalidation);
         }
@@ -229,6 +232,10 @@ fn dispatch_event(
 ) -> io::Result<bool> {
     match event {
         Event::Key(key) => match command_for_key(key) {
+            Some(Command::CopySelection) => {
+                state.copy_focused_selection();
+                Ok(false)
+            }
             Some(Command::ReloadConfig) => {
                 if let Some(reloader) = reloader {
                     match reloader.reload() {

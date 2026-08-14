@@ -101,6 +101,10 @@ pub trait Backend {
     ) -> Result<(), Self::Error> {
         Ok(())
     }
+
+    fn submit_clipboard(&mut self, _text: &str) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 pub struct CrosstermBackend<W: Write> {
@@ -267,6 +271,14 @@ impl<W: Write> Backend for CrosstermBackend<W> {
         self.writer.flush()
     }
 
+    fn submit_clipboard(&mut self, text: &str) -> Result<(), Self::Error> {
+        let encoded = encode_base64(text.as_bytes());
+        write!(self.writer, "\x1b]52;c;")?;
+        self.writer.write_all(&encoded)?;
+        self.writer.write_all(b"\x07")?;
+        self.writer.flush()
+    }
+
     fn submit_diff(&mut self, diff: &FrameDiff) -> Result<(), Self::Error> {
         if diff.is_empty() {
             self.frames_skipped += 1;
@@ -283,6 +295,30 @@ impl<W: Write> Backend for CrosstermBackend<W> {
         self.bytes_saved += naive_bytes.saturating_sub(optimized_bytes);
         Ok(())
     }
+}
+
+fn encode_base64(bytes: &[u8]) -> Vec<u8> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0] as u32;
+        let second = chunk.get(1).copied().unwrap_or(0) as u32;
+        let third = chunk.get(2).copied().unwrap_or(0) as u32;
+        let combined = (first << 16) | (second << 8) | third;
+        output.push(TABLE[((combined >> 18) & 63) as usize]);
+        output.push(TABLE[((combined >> 12) & 63) as usize]);
+        output.push(if chunk.len() > 1 {
+            TABLE[((combined >> 6) & 63) as usize]
+        } else {
+            b'='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[(combined & 63) as usize]
+        } else {
+            b'='
+        });
+    }
+    output
 }
 
 fn write_cell<W: Write>(writer: &mut W, x: u16, y: u16, cell: Cell) -> io::Result<()> {
@@ -481,6 +517,19 @@ mod tests {
             .filter(|window| *window == glyph)
             .count();
         assert_eq!(occurrences, 1);
+    }
+
+    #[test]
+    fn clipboard_submission_uses_osc52_base64() {
+        let mut backend = CrosstermBackend::new(Vec::<u8>::new());
+        backend.submit_clipboard("copy").unwrap();
+        assert!(backend.writer().windows(4).any(|window| window == b"52;c"));
+        assert!(
+            backend
+                .writer()
+                .windows(8)
+                .any(|window| window == b"Y29weQ==")
+        );
     }
 
     #[test]

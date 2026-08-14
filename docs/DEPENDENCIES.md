@@ -10,7 +10,7 @@ This is an evaluation list and initial direction, not a dependency lockfile. The
 | Terminal emulator | `alacritty_terminal` | One emulator per session; Kitty APC sequences are intercepted by a cmdash-owned session adapter because graphics resources are not global emulator state. |
 | PTY and async runtime | `portable-pty` + `tokio` | Per-session I/O tasks communicate with the UI/coordinator through bounded messages. |
 | Layout primitives | `ratatui` + `unicode-width` | Use Ratatui layout/text primitives behind the backend-neutral scene boundary and track narrow/wide cell occupancy explicitly. |
-| Plugin boundary | Versioned native ABI | Active v1 host descriptor contract with C-compatible data and capability negotiation; dynamic loading remains a later gate. |
+| Plugin boundary | Versioned native ABI | Active v1 host descriptor plus TOML manifest validation with C-compatible data and capability negotiation; dynamic loading remains a later gate. |
 | Workspace scope | One active workspace | Add saved/multiple workspace behavior only after the core runtime contracts are stable. |
 | Graphics fallback | Capability-aware omission/placeholder | Unsupported or over-limit graphics are omitted with in-app degraded diagnostics; visible Kitty layers are replayed only when supported. |
 
@@ -35,7 +35,7 @@ These are the strongest candidates for the first executable once the package ske
 | Async runtime | [`tokio`](https://crates.io/crates/tokio) | Event coordination, PTY I/O tasks, timers, bounded channels, cancellation | Selected initial direction; keep frame composition on one coordinator/UI owner. |
 | Serialization | [`serde`](https://crates.io/crates/serde) | Versioned widget/application configuration types | Active in the initial widget configuration model; avoid serializing live PTY/emulator state in the first release. |
 | Configuration format | [`toml`](https://crates.io/crates/toml) | Initial hand-authored workspace and widget configuration | Active version-1 parser with safe metadata-polled reload; keep schema/version migration explicit. |
-| Diagnostics | [`tracing`](https://crates.io/crates/tracing) + [`tracing-subscriber`](https://crates.io/crates/tracing-subscriber) | Structured logs for sessions, plugins, frame timing, and protocol failures | Strong candidates; configure logs away from the terminal UI by default. |
+| Diagnostics | [`tracing`](https://crates.io/crates/tracing) + [`tracing-subscriber`](https://crates.io/crates/tracing-subscriber) | Structured logs for sessions, plugins, frame timing, and protocol failures | Future structured logger; current recovery diagnostics are bounded and rendered in-app. |
 | Error types | [`thiserror`](https://crates.io/crates/thiserror) + [`anyhow`](https://crates.io/crates/anyhow) | Typed library errors and application-level context | Strong candidates; use typed errors at plugin/session boundaries. |
 | User paths | [`directories`](https://crates.io/crates/directories) | XDG-compatible config, cache, data, and plugin discovery paths | Strong candidate; confirm exact Linux/XDG behavior needed by the app. |
 | CLI | [`clap`](https://crates.io/crates/clap) | Startup flags, config path, diagnostics mode, and version output | Still a future option; current `--config` / `-c` parsing remains dependency-free. |
@@ -175,11 +175,11 @@ A WASM runtime remains a later option if stronger isolation or language neutrali
 - [`serde_json`](https://crates.io/crates/serde_json) — useful for diagnostics, plugin manifests, IPC, or machine-readable state even if TOML remains the user format.
 - [`url`](https://crates.io/crates/url) — only if widgets support URL-aware links/actions.
 
-Plugin discovery should use a manifest with an ABI/API version, widget types, capabilities, required permissions, and human-readable metadata. Loading a plugin must not execute arbitrary code merely because an unrelated file appears in the config directory.
+Plugin discovery uses a validated manifest shape with ABI/API version, widget types, capabilities, required permissions, and human-readable metadata. The current host validates this metadata without loading dynamic code; loading a plugin must not execute arbitrary code merely because an unrelated file appears in the config directory.
 
 ## Testing and quality
 
-- [`proptest`](https://crates.io/crates/proptest) — property tests for layout invariants, clipping, resource namespaces, and parser state transitions.
+- [`proptest`](https://crates.io/crates/proptest) — a future property-test dependency for layout invariants, clipping, resource namespaces, and parser state transitions; deterministic parser stress coverage is active now.
 - [`insta`](https://crates.io/crates/insta) — snapshot tests for scenes, layout trees, diagnostics, and serialized config.
 - [`assert_cmd`](https://crates.io/crates/assert_cmd) — executable-level tests for CLI behavior and failure modes.
 - [`tempfile`](https://crates.io/crates/tempfile) — isolated config, plugin, and PTY fixture directories.

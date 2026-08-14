@@ -6,6 +6,7 @@ pub mod dashboard;
 pub mod graphics;
 pub mod input;
 pub mod layout;
+pub mod notification;
 pub mod plugin;
 pub mod reload;
 pub mod scene;
@@ -28,9 +29,10 @@ pub use graphics::{
 };
 pub use input::command_for_key;
 pub use layout::{LayoutError, LayoutNode, LayoutTree};
+pub use notification::{copy_notification, extract_urls};
 pub use plugin::{
     ExternalTextPlugin, PLUGIN_ABI_VERSION, PluginDescriptorV1, PluginError, PluginHostV1,
-    PluginModule, PluginRegistry,
+    PluginManifestError, PluginManifestV1, PluginModule, PluginRegistry, PluginWidgetManifest,
 };
 pub use reload::{ConfigReloader, ReloadError};
 pub use scene::{Cell, CellStyle, CellWidth, Color, Scene};
