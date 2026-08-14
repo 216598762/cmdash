@@ -1,11 +1,11 @@
 use std::{collections::BTreeMap, fmt, time::SystemTime};
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 
 use crate::{
     backend::BackendCapabilities,
-    command::{Command, CommandEffect, FocusCommand, OverlayCommand, SurfaceCommand},
+    command::{Command, CommandEffect, FocusCommand, OverlayCommand, SurfaceCommand, TabCommand},
     config::{AppConfig, ConfigError},
     layout::{LayoutError, LayoutTree},
     scene::{CellStyle, Scene},
@@ -456,6 +456,49 @@ impl AppState {
         Ok(true)
     }
 
+    pub fn handle_focused_paste(&mut self, text: &str) -> Result<bool, String> {
+        let Some(FocusTarget::Surface(surface_id)) = self.focus.target() else {
+            return Ok(false);
+        };
+        let Some(widget_id) = self
+            .workspace
+            .surfaces
+            .get(&surface_id)
+            .and_then(|surface| surface.widget())
+        else {
+            return Ok(false);
+        };
+        if !self.widget_runtime.handles_input(widget_id) {
+            return Ok(false);
+        }
+        self.widget_runtime.handle_paste(widget_id, text)?;
+        Ok(true)
+    }
+
+    pub fn handle_focused_mouse(&mut self, mouse: MouseEvent) -> Result<bool, String> {
+        let Some(FocusTarget::Surface(surface_id)) = self.focus.target() else {
+            return Ok(false);
+        };
+        let Some(surface) = self.workspace.surfaces.get(&surface_id).copied() else {
+            return Ok(false);
+        };
+        let Some(widget_id) = surface.widget() else {
+            return Ok(false);
+        };
+        let area = surface.area();
+        if mouse.column < area.x
+            || mouse.row < area.y
+            || mouse.column >= area.x.saturating_add(area.width)
+            || mouse.row >= area.y.saturating_add(area.height)
+            || !self.widget_runtime.handles_input(widget_id)
+        {
+            return Ok(false);
+        }
+        self.widget_runtime
+            .handle_mouse(widget_id, mouse, (area.x, area.y))?;
+        Ok(true)
+    }
+
     pub fn resize_widget_surfaces(
         &mut self,
         areas: &BTreeMap<SurfaceId, Rect>,
@@ -547,6 +590,10 @@ impl AppState {
                 self.apply_focus(command)?;
                 CommandEffect::Redraw
             }
+            Command::Tab(command) => {
+                self.apply_tab(command);
+                CommandEffect::Redraw
+            }
             Command::Surface(command) => {
                 self.apply_surface(command)?;
                 CommandEffect::Redraw
@@ -561,6 +608,28 @@ impl AppState {
             self.redraw_requested = true;
         }
         Ok(effect)
+    }
+
+    fn apply_tab(&mut self, command: TabCommand) {
+        let forward = matches!(command, TabCommand::Next);
+        if self.layout.switch_tabs(forward) {
+            let visible = self.layout.visible_widget_ids();
+            for surface in self.workspace.surfaces.values_mut() {
+                if let Some(widget_id) = surface.widget() {
+                    *surface = surface.with_visible(visible.contains(&widget_id));
+                }
+            }
+            if let Some(FocusTarget::Surface(surface_id)) = self.focus.target()
+                && self
+                    .workspace
+                    .surfaces
+                    .get(&surface_id)
+                    .and_then(|surface| surface.widget())
+                    .is_some_and(|widget_id| !visible.contains(&widget_id))
+            {
+                self.focus.clear();
+            }
+        }
     }
 
     fn apply_focus(&mut self, command: FocusCommand) -> Result<(), CommandError> {
@@ -727,7 +796,7 @@ mod tests {
     use super::*;
     use crate::{
         Color,
-        command::{Command, FocusCommand, OverlayCommand, SurfaceCommand},
+        command::{Command, FocusCommand, OverlayCommand, SurfaceCommand, TabCommand},
     };
 
     fn capabilities() -> BackendCapabilities {
@@ -904,7 +973,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let state =
+        let mut state =
             AppState::from_config(capabilities(), &WidgetRegistry::builtins(), &config).unwrap();
 
         assert!(!state.workspace().surfaces()[&SurfaceId::new(1)].visible());
@@ -912,6 +981,9 @@ mod tests {
         assert!(state.workspace().overlays()[&OverlayId::new(4)].visible());
         assert_eq!(state.layout().visible_widget_ids(), [WidgetId::new(2)]);
         assert_eq!(state.layout().visible_overlay_ids(), [OverlayId::new(4)]);
+        state.dispatch(Command::Tab(TabCommand::Next)).unwrap();
+        assert_eq!(state.layout().visible_widget_ids(), [WidgetId::new(1)]);
+        assert!(!state.workspace().surfaces()[&SurfaceId::new(2)].visible());
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 
 use crate::{
@@ -95,6 +95,18 @@ pub trait Widget: Send {
     }
 
     fn resize(&mut self, _size: TerminalSize) -> Result<WidgetUpdate, String> {
+        Ok(WidgetUpdate::Unchanged)
+    }
+
+    fn handle_paste(&mut self, _text: &str) -> Result<WidgetUpdate, String> {
+        Ok(WidgetUpdate::Unchanged)
+    }
+
+    fn handle_mouse(
+        &mut self,
+        _mouse: MouseEvent,
+        _origin: (u16, u16),
+    ) -> Result<WidgetUpdate, String> {
         Ok(WidgetUpdate::Unchanged)
     }
 
@@ -326,6 +338,27 @@ impl WidgetRuntime {
         self.instances
             .get(&id)
             .is_some_and(|entry| entry.widget.handles_input())
+    }
+
+    pub fn handle_paste(&mut self, id: WidgetId, text: &str) -> Result<WidgetUpdate, String> {
+        let entry = self
+            .instances
+            .get_mut(&id)
+            .ok_or_else(|| format!("widget {} is not registered", id.get()))?;
+        entry.widget.handle_paste(text)
+    }
+
+    pub fn handle_mouse(
+        &mut self,
+        id: WidgetId,
+        mouse: MouseEvent,
+        origin: (u16, u16),
+    ) -> Result<WidgetUpdate, String> {
+        let entry = self
+            .instances
+            .get_mut(&id)
+            .ok_or_else(|| format!("widget {} is not registered", id.get()))?;
+        entry.widget.handle_mouse(mouse, origin)
     }
 
     pub fn resize(&mut self, id: WidgetId, size: TerminalSize) -> Result<WidgetUpdate, String> {
@@ -578,6 +611,24 @@ impl Widget for TerminalWidget {
         self.session
             .resize(size)
             .map(|_| WidgetUpdate::Redraw)
+            .map_err(|error| error.to_string())
+    }
+
+    fn handle_paste(&mut self, text: &str) -> Result<WidgetUpdate, String> {
+        self.session
+            .write_paste(text)
+            .map(|_| WidgetUpdate::Unchanged)
+            .map_err(|error| error.to_string())
+    }
+
+    fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        origin: (u16, u16),
+    ) -> Result<WidgetUpdate, String> {
+        self.session
+            .write_mouse(mouse, origin)
+            .map(|_| WidgetUpdate::Unchanged)
             .map_err(|error| error.to_string())
     }
 

@@ -8,10 +8,10 @@ use std::{
 use alacritty_terminal::{
     event::VoidListener,
     grid::Dimensions,
-    term::{Config, Term, cell::Flags},
+    term::{Config, Term, TermMode, cell::Flags},
     vte::ansi::{Color as AnsiColor, NamedColor, Processor},
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::layout::Rect;
 
@@ -184,6 +184,14 @@ impl TerminalSession {
                 }
             }
         }
+        if self
+            .child
+            .try_wait()
+            .map_err(|error| SessionError::Io(error.to_string()))?
+            .is_some()
+        {
+            self.closed = true;
+        }
         Ok(changed)
     }
 
@@ -201,6 +209,34 @@ impl TerminalSession {
         let bytes = key_bytes(key)
             .ok_or_else(|| SessionError::Io(format!("unsupported key event {:?}", key.code)))?;
         self.write_bytes(&bytes)
+    }
+
+    pub fn write_paste(&mut self, text: &str) -> Result<(), SessionError> {
+        let bytes = paste_bytes(text, self.term.mode().contains(TermMode::BRACKETED_PASTE));
+        self.write_bytes(&bytes)
+    }
+
+    pub fn write_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        origin: (u16, u16),
+    ) -> Result<(), SessionError> {
+        let bytes = mouse_bytes(mouse, origin)
+            .ok_or_else(|| SessionError::Io("unsupported mouse event".to_owned()))?;
+        self.write_bytes(&bytes)
+    }
+
+    pub fn cursor_position(&self) -> (u16, u16) {
+        let cursor = self.term.grid().cursor.point;
+        (cursor.column.0 as u16, cursor.line.0 as u16)
+    }
+
+    pub fn alternate_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    pub fn scrollback_lines(&self) -> usize {
+        self.term.grid().history_size()
     }
 
     pub fn resize(&mut self, size: TerminalSize) -> Result<(), SessionError> {
@@ -342,6 +378,42 @@ fn key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+    } else {
+        text.as_bytes().to_vec()
+    }
+}
+
+fn mouse_bytes(mouse: MouseEvent, origin: (u16, u16)) -> Option<Vec<u8>> {
+    let x = mouse.column.saturating_sub(origin.0).saturating_add(1);
+    let y = mouse.row.saturating_sub(origin.1).saturating_add(1);
+    let modifiers = mouse.modifiers;
+    let modifier_bits = u16::from(modifiers.contains(KeyModifiers::SHIFT)) * 4
+        + u16::from(modifiers.contains(KeyModifiers::ALT)) * 8
+        + u16::from(modifiers.contains(KeyModifiers::CONTROL)) * 16;
+    let (button, suffix) = match mouse.kind {
+        MouseEventKind::Down(button) => (mouse_button(button) + modifier_bits, 'M'),
+        MouseEventKind::Up(button) => (mouse_button(button) + modifier_bits, 'm'),
+        MouseEventKind::Drag(button) => (32 + mouse_button(button) + modifier_bits, 'M'),
+        MouseEventKind::Moved => (35 + modifier_bits, 'M'),
+        MouseEventKind::ScrollUp => (64 + modifier_bits, 'M'),
+        MouseEventKind::ScrollDown => (65 + modifier_bits, 'M'),
+        MouseEventKind::ScrollLeft => (66 + modifier_bits, 'M'),
+        MouseEventKind::ScrollRight => (67 + modifier_bits, 'M'),
+    };
+    Some(format!("\x1b[<{button};{x};{y}{suffix}").into_bytes())
+}
+
+fn mouse_button(button: MouseButton) -> u16 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
 fn color_to_scene(color: AnsiColor, fallback: Color) -> Color {
     match color {
         AnsiColor::Spec(rgb) => Color::rgb(rgb.r, rgb.g, rgb.b),
@@ -448,6 +520,60 @@ mod tests {
     }
 
     #[test]
+    fn separate_sessions_retain_independent_terminal_state() {
+        let mut first = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &["-c", "printf 'first'; sleep 5"],
+            TerminalSize::new(20, 4),
+        )
+        .unwrap();
+        let mut second = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &["-c", "printf 'second'; sleep 5"],
+            TerminalSize::new(20, 4),
+        )
+        .unwrap();
+        wait_for_output(&mut first);
+        wait_for_output(&mut second);
+
+        assert_eq!(
+            first
+                .render(Rect::new(0, 0, 20, 4), false)
+                .cell_at(0, 0)
+                .unwrap()
+                .symbol,
+            'f'
+        );
+        assert_eq!(
+            second
+                .render(Rect::new(0, 0, 20, 4), false)
+                .cell_at(0, 0)
+                .unwrap()
+                .symbol,
+            's'
+        );
+        first.shutdown().unwrap();
+        second.shutdown().unwrap();
+    }
+
+    #[test]
+    fn exited_processes_are_reported_without_a_forced_kill() {
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &["-c", "exit 0"],
+            TerminalSize::new(20, 4),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !session.is_closed() && Instant::now() < deadline {
+            let _ = session.poll_output().unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(session.is_closed());
+        session.shutdown().unwrap();
+    }
+
+    #[test]
     fn terminal_session_resizes_and_rejects_invalid_sizes() {
         let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(40, 8)).unwrap();
 
@@ -458,6 +584,71 @@ mod tests {
             Err(SessionError::InvalidSize(TerminalSize::new(1, 0)))
         );
         session.shutdown().unwrap();
+        assert!(session.is_closed());
+    }
+
+    #[test]
+    fn terminal_modes_and_styles_are_reported_from_emulator_output() {
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &[
+                "-c",
+                "printf '\\033[?1049h\\033[31mred'; read value; printf '\\033[?1049lMAIN'; sleep 5",
+            ],
+            TerminalSize::new(40, 8),
+        )
+        .unwrap();
+        wait_for_output(&mut session);
+        let scene = session.render(Rect::new(0, 0, 40, 8), false);
+
+        assert!(session.alternate_screen());
+        assert_eq!(session.cursor_position(), (3, 0));
+        assert_eq!(scene.cell_at(0, 0).unwrap().symbol, 'r');
+        assert_eq!(
+            scene.cell_at(0, 0).unwrap().style.foreground,
+            Color::rgb(205, 49, 49)
+        );
+        session.write_bytes(b"\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.alternate_screen() && Instant::now() < deadline {
+            let _ = session.poll_output().unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!session.alternate_screen());
+        let main_scene = session.render(Rect::new(0, 0, 40, 8), false);
+        assert_eq!(main_scene.cell_at(0, 0).unwrap().symbol, 'M');
+        session.shutdown().unwrap();
+
+        let mut scrollback = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &["-c", "yes x | head -n 20; sleep 5"],
+            TerminalSize::new(40, 8),
+        )
+        .unwrap();
+        wait_for_output(&mut scrollback);
+        assert!(scrollback.scrollback_lines() > 0);
+        scrollback.shutdown().unwrap();
+    }
+
+    #[test]
+    fn paste_and_mouse_encoding_use_terminal_protocol_sequences() {
+        assert_eq!(
+            mouse_bytes(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 4,
+                    row: 5,
+                    modifiers: KeyModifiers::NONE,
+                },
+                (2, 3),
+            ),
+            Some(b"\x1b[<0;3;3M".to_vec())
+        );
+        assert_eq!(
+            paste_bytes("paste", true),
+            b"\x1b[200~paste\x1b[201~".to_vec()
+        );
+        assert_eq!(paste_bytes("paste", false), b"paste".to_vec());
     }
 
     #[test]

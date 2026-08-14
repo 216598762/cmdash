@@ -7,8 +7,15 @@ pub enum Command {
     Quit,
     RequestRedraw,
     Focus(FocusCommand),
+    Tab(TabCommand),
     Surface(SurfaceCommand),
     Overlay(OverlayCommand),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TabCommand {
+    Next,
+    Previous,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

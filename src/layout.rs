@@ -90,6 +90,30 @@ impl LayoutTree {
         place_widgets(&self.root, area, &mut placements);
         placements
     }
+
+    pub fn switch_tabs(&mut self, forward: bool) -> bool {
+        switch_tabs_in_node(&mut self.root, forward)
+    }
+}
+
+fn switch_tabs_in_node(node: &mut LayoutNode, forward: bool) -> bool {
+    match node {
+        LayoutNode::Tabs { active, children } if children.len() > 1 => {
+            if forward {
+                *active = (*active + 1) % children.len();
+            } else {
+                *active = (*active + children.len() - 1) % children.len();
+            }
+            true
+        }
+        LayoutNode::Columns(children) | LayoutNode::Stack(children) => children
+            .iter_mut()
+            .any(|child| switch_tabs_in_node(child, forward)),
+        LayoutNode::Tabs { children, .. } => children
+            .iter_mut()
+            .any(|child| switch_tabs_in_node(child, forward)),
+        LayoutNode::Leaf(_) | LayoutNode::Overlay(_) => false,
+    }
 }
 
 fn convert_node(
@@ -271,6 +295,26 @@ mod tests {
         );
         assert!(!areas.contains_key(&WidgetId::new(1)));
         assert_eq!(areas[&WidgetId::new(2)].width, 10);
+    }
+
+    #[test]
+    fn switching_tabs_changes_visible_widgets_and_preserves_the_tree() {
+        let config = LayoutConfig::Tabs {
+            active: 0,
+            children: vec![
+                LayoutConfig::Leaf { widget: 1 },
+                LayoutConfig::Leaf { widget: 2 },
+            ],
+        };
+        let mut tree =
+            LayoutTree::from_config(Some(&config), [WidgetId::new(1), WidgetId::new(2)], [])
+                .unwrap();
+
+        assert_eq!(tree.visible_widget_ids(), [WidgetId::new(1)]);
+        assert!(tree.switch_tabs(true));
+        assert_eq!(tree.visible_widget_ids(), [WidgetId::new(2)]);
+        assert!(tree.switch_tabs(false));
+        assert_eq!(tree.visible_widget_ids(), [WidgetId::new(1)]);
     }
 
     #[test]

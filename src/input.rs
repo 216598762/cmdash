@@ -1,8 +1,15 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::command::{Command, FocusCommand};
+use crate::command::{Command, FocusCommand, TabCommand};
 
 pub fn command_for_key(key: KeyEvent) -> Option<Command> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::PageDown => Some(Command::Tab(TabCommand::Next)),
+            KeyCode::PageUp => Some(Command::Tab(TabCommand::Previous)),
+            _ => None,
+        };
+    }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => Some(Command::Quit),
         KeyCode::Tab => Some(Command::Focus(FocusCommand::Next)),
@@ -25,6 +32,18 @@ mod tests {
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
             Some(Command::Focus(FocusCommand::Previous))
+        );
+    }
+
+    #[test]
+    fn control_page_keys_switch_tabs() {
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL)),
+            Some(Command::Tab(TabCommand::Next))
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL)),
+            Some(Command::Tab(TabCommand::Previous))
         );
     }
 

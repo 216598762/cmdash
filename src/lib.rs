@@ -12,7 +12,9 @@ pub mod state;
 pub mod widget;
 
 pub use backend::{Backend, BackendCapabilities, CrosstermBackend, OutputMetrics};
-pub use command::{Command, CommandEffect, FocusCommand, OverlayCommand, SurfaceCommand};
+pub use command::{
+    Command, CommandEffect, FocusCommand, OverlayCommand, SurfaceCommand, TabCommand,
+};
 pub use compositor::{CellSpan, Compositor, FrameDiff};
 pub use config::{
     AppConfig, CURRENT_CONFIG_VERSION, ConfigError, ConfigFileError, LayoutConfig, OverlayConfig,

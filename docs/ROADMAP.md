@@ -57,17 +57,17 @@ The next milestone is Phase 3: add one isolated terminal session as an optional 
 ## Phase 3 — One isolated terminal session
 
 - [x] Spawn a child process through `portable-pty` and route output into one `alacritty_terminal` instance.
-- [x] Route focused keyboard and resize input to the terminal widget; paste and mouse input remain future work.
-- [ ] Complete normal/alternate screen, colors, cursor state, scrollback, and clean-close coverage.
+- [x] Route focused keyboard, paste, mouse, and resize input to the terminal widget.
+- [x] Cover normal/alternate screen, colors, cursor state, scrollback, and clean-close behavior.
 - [x] Make terminal functionality an optional widget/provider rather than a shell-wide assumption.
 - [x] Add PTY lifecycle, emulator output, input encoding, resize, and shutdown tests.
 
-**Exit criteria:** a terminal widget behaves predictably inside any layout surface and can coexist with non-terminal widgets.
+**Exit criteria (met):** a terminal widget behaves predictably inside any layout surface and can coexist with non-terminal widgets.
 
 ## Phase 4 — Tabs and retained session state
 
-- [ ] Implement the initial tab model with one `Session` per terminal tab.
-- [ ] Keep inactive sessions alive while excluding them from the visible scene.
+- [x] Implement the initial tab model with one retained terminal session per terminal-widget tab and Ctrl+PageUp/PageDown switching.
+- [x] Keep inactive sessions alive while excluding them from the visible scene.
 - [ ] Clear/invalidate the old surface on focus or tab changes.
 - [ ] Preserve per-session scrollback, modes, cursor, selection, and render cache across switches.
 - [ ] Add regression tests for two sessions with identical terminal image IDs and independent output.

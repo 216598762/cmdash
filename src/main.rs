@@ -192,6 +192,14 @@ fn dispatch_event(state: &mut AppState, event: Event) -> io::Result<bool> {
                 .map_err(|error| io::Error::other(format!("widget input rejected: {error}")))
                 .map(|_| false),
         },
+        Event::Paste(text) => state
+            .handle_focused_paste(&text)
+            .map_err(|error| io::Error::other(format!("widget paste rejected: {error}")))
+            .map(|_| false),
+        Event::Mouse(mouse) => state
+            .handle_focused_mouse(mouse)
+            .map_err(|error| io::Error::other(format!("widget mouse input rejected: {error}")))
+            .map(|_| false),
         _ => Ok(false),
     }
 }
