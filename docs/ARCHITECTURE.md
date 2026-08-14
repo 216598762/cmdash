@@ -173,7 +173,7 @@ Switching tabs changes focus/visibility in the layout. It does not transfer emul
 
 ### 5.2 Kitty graphics model
 
-Kitty graphics must be treated as terminal-emulator state, not as a global backend cache. The planned flow is:
+Kitty graphics are treated as terminal-session state, not as a global backend cache. `alacritty_terminal` remains the text/parser owner, while cmdash intercepts Kitty APC sequences and retains resources and placements in a session-owned adapter. The current flow is:
 
 ```text
 PTY bytes
@@ -206,7 +206,8 @@ When a user switches away from a tab:
 When the user returns:
 
 - the retained emulator state and placements are rendered into a fresh scene for the current surface size;
-- the backend receives the visible frame and any required Kitty placement commands for that session's image resources;
+- the backend receives the visible frame and replayable Kitty upload/placement commands only for that session's visible resources;
+- session-qualified terminal image IDs prevent identical source IDs in different tabs from colliding;
 - if the terminal backend cannot safely retain/reuse an image, the session can replay/re-upload from its store without changing logical state.
 
 This is why a global image map or a single terminal emulator shared by tabs is explicitly out of scope.
@@ -291,7 +292,7 @@ The core should be testable without a real terminal:
 
 - layout tests for split/tab/overlay geometry and clipping;
 - scene/compositor tests proving hidden sessions contribute no primitives;
-- session isolation tests using two emulators with colliding Kitty image IDs;
+- session isolation tests using two emulators/stores with colliding Kitty image IDs;
 - parser conformance tests for text, alternate screen, resize, and graphics sequences;
 - frame golden tests for cell output and invalidation;
 - PTY integration tests for shell startup, input, output, resize, and clean shutdown;

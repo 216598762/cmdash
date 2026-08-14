@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 
 use crate::{
     config::{AppConfig, WidgetInstanceConfig},
+    graphics::GraphicsSubmission,
     plugin::PluginRegistry,
     scene::{CellStyle, Color, Scene},
     session::{TerminalSession, TerminalSize},
@@ -85,6 +86,10 @@ pub trait Widget: Send {
     }
 
     fn render(&self, area: Rect, focused: bool) -> Scene;
+
+    fn graphics(&self, _area: Rect) -> Vec<GraphicsSubmission> {
+        Vec::new()
+    }
 
     fn handles_input(&self) -> bool {
         false
@@ -384,6 +389,18 @@ impl WidgetRuntime {
         }
     }
 
+    pub fn graphics(&self, areas: &BTreeMap<WidgetId, Rect>) -> Vec<GraphicsSubmission> {
+        areas
+            .iter()
+            .flat_map(|(&id, &area)| {
+                self.instances
+                    .get(&id)
+                    .into_iter()
+                    .flat_map(move |entry| entry.widget.graphics(area))
+            })
+            .collect()
+    }
+
     pub fn render(
         &self,
         areas: &BTreeMap<WidgetId, Rect>,
@@ -593,6 +610,10 @@ impl Widget for TerminalWidget {
         scene
     }
 
+    fn graphics(&self, area: Rect) -> Vec<GraphicsSubmission> {
+        self.session.graphics(area)
+    }
+
     fn handles_input(&self) -> bool {
         true
     }
@@ -638,11 +659,16 @@ impl Widget for TerminalWidget {
 }
 
 fn terminal_widget_factory(config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>, WidgetError> {
-    let session = TerminalSession::spawn(config.command.as_deref(), TerminalSize::new(80, 24))
-        .map_err(|error| WidgetError::InitializationFailed {
-            kind: "terminal".to_owned(),
-            reason: error.to_string(),
-        })?;
+    let session = TerminalSession::spawn_with_session_id(
+        crate::state::SessionId::new(config.id),
+        config.command.as_deref(),
+        &[],
+        TerminalSize::new(80, 24),
+    )
+    .map_err(|error| WidgetError::InitializationFailed {
+        kind: "terminal".to_owned(),
+        reason: error.to_string(),
+    })?;
     Ok(Box::new(TerminalWidget {
         title: config
             .title

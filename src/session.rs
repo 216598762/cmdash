@@ -15,7 +15,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::layout::Rect;
 
-use crate::scene::{CellStyle, Color, Scene};
+use crate::{
+    graphics::{GraphicsError, GraphicsSubmission, SessionGraphicsStore},
+    scene::{CellStyle, Color, Scene},
+    state::SessionId,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalSize {
@@ -57,6 +61,7 @@ pub enum SessionError {
     Io(String),
     Resize(String),
     Closed,
+    Graphics(String),
 }
 
 impl fmt::Display for SessionError {
@@ -75,6 +80,9 @@ impl fmt::Display for SessionError {
             Self::Io(message) => write!(formatter, "terminal session I/O failed: {message}"),
             Self::Resize(message) => write!(formatter, "terminal session resize failed: {message}"),
             Self::Closed => formatter.write_str("terminal session is closed"),
+            Self::Graphics(message) => {
+                write!(formatter, "Kitty graphics parsing failed: {message}")
+            }
         }
     }
 }
@@ -95,14 +103,25 @@ pub struct TerminalSession {
     size: TerminalSize,
     closed: bool,
     failure: Option<String>,
+    graphics: SessionGraphicsStore,
+    graphics_input: Vec<u8>,
 }
 
 impl TerminalSession {
     pub fn spawn(command: Option<&str>, size: TerminalSize) -> Result<Self, SessionError> {
-        Self::spawn_with_args(command, &[], size)
+        Self::spawn_with_session_id(allocate_session_id(), command, &[], size)
     }
 
     pub fn spawn_with_args(
+        command: Option<&str>,
+        args: &[&str],
+        size: TerminalSize,
+    ) -> Result<Self, SessionError> {
+        Self::spawn_with_session_id(allocate_session_id(), command, args, size)
+    }
+
+    pub fn spawn_with_session_id(
+        session_id: SessionId,
         command: Option<&str>,
         args: &[&str],
         size: TerminalSize,
@@ -151,6 +170,8 @@ impl TerminalSession {
             size,
             closed: false,
             failure: None,
+            graphics: SessionGraphicsStore::new(session_id),
+            graphics_input: Vec::new(),
         })
     }
 
@@ -166,6 +187,14 @@ impl TerminalSession {
         self.failure.as_deref()
     }
 
+    pub fn session_id(&self) -> SessionId {
+        self.graphics.session()
+    }
+
+    pub fn graphics(&self, surface: Rect) -> Vec<GraphicsSubmission> {
+        self.graphics.visible_submissions(surface)
+    }
+
     pub fn poll_output(&mut self) -> Result<bool, SessionError> {
         if self.closed {
             return Ok(false);
@@ -174,8 +203,12 @@ impl TerminalSession {
         while let Ok(result) = self.output.receiver.try_recv() {
             match result {
                 Ok(bytes) => {
-                    self.processor.advance(&mut self.term, &bytes);
-                    changed = true;
+                    let plain = self.consume_output(&bytes)?;
+                    if !plain.is_empty() {
+                        self.processor.advance(&mut self.term, &plain);
+                        changed = true;
+                    }
+                    changed = changed || !bytes.is_empty();
                 }
                 Err(error) => {
                     let message = error.to_string();
@@ -193,6 +226,18 @@ impl TerminalSession {
             self.closed = true;
         }
         Ok(changed)
+    }
+
+    fn consume_output(&mut self, bytes: &[u8]) -> Result<Vec<u8>, SessionError> {
+        self.graphics_input.extend_from_slice(bytes);
+        let (plain, commands, remainder) = extract_kitty_commands(&self.graphics_input);
+        self.graphics_input = remainder;
+        for (parameters, payload) in commands {
+            self.graphics
+                .apply_kitty_command(&parameters, &payload)
+                .map_err(|error: GraphicsError| SessionError::Graphics(error.to_string()))?;
+        }
+        Ok(plain)
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
@@ -316,6 +361,54 @@ impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
+}
+
+fn allocate_session_id() -> SessionId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+    SessionId::new(NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+type KittyCommand = (Vec<u8>, Vec<u8>);
+type KittyExtraction = (Vec<u8>, Vec<KittyCommand>, Vec<u8>);
+
+fn extract_kitty_commands(buffer: &[u8]) -> KittyExtraction {
+    const PREFIX: &[u8] = b"\x1b_G";
+    const TERMINATOR: &[u8] = b"\x1b\\";
+    let mut plain = Vec::new();
+    let mut commands = Vec::new();
+    let mut index = 0;
+    while index < buffer.len() {
+        if !buffer[index..].starts_with(PREFIX) {
+            plain.push(buffer[index]);
+            index += 1;
+            continue;
+        }
+        let command_start = index + PREFIX.len();
+        let Some(terminator_offset) = find_bytes(&buffer[command_start..], TERMINATOR) else {
+            break;
+        };
+        let end = command_start + terminator_offset;
+        let Some(separator) = buffer[command_start..end]
+            .iter()
+            .position(|byte| *byte == b';')
+        else {
+            plain.extend_from_slice(&buffer[index..end + TERMINATOR.len()]);
+            index = end + TERMINATOR.len();
+            continue;
+        };
+        let parameters = buffer[command_start..command_start + separator].to_vec();
+        let payload = buffer[command_start + separator + 1..end].to_vec();
+        commands.push((parameters, payload));
+        index = end + TERMINATOR.len();
+    }
+    (plain, commands, buffer[index..].to_vec())
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn default_command() -> CommandBuilder {
@@ -649,6 +742,26 @@ mod tests {
             b"\x1b[200~paste\x1b[201~".to_vec()
         );
         assert_eq!(paste_bytes("paste", false), b"paste".to_vec());
+    }
+
+    #[test]
+    fn kitty_apc_commands_are_removed_from_text_and_survive_chunk_boundaries() {
+        let first = b"before\x1b_Ga=T,f=24,i=1;AQ";
+        let second = b"ID\x1b\\after";
+        let (plain_first, commands_first, remainder) = extract_kitty_commands(first);
+        assert_eq!(plain_first, b"before");
+        assert!(commands_first.is_empty());
+        assert_eq!(remainder, first[6..]);
+
+        let mut combined = remainder;
+        combined.extend_from_slice(second);
+        let (plain_second, commands_second, remainder) = extract_kitty_commands(&combined);
+        assert_eq!(plain_second, b"after");
+        assert_eq!(
+            commands_second,
+            vec![(b"a=T,f=24,i=1".to_vec(), b"AQID".to_vec())]
+        );
+        assert!(remainder.is_empty());
     }
 
     #[test]

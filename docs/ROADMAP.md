@@ -68,21 +68,21 @@ The next milestone is Phase 3: add one isolated terminal session as an optional 
 
 - [x] Implement the initial tab model with one retained terminal session per terminal-widget tab and Ctrl+PageUp/PageDown switching.
 - [x] Keep inactive sessions alive while excluding them from the visible scene.
-- [ ] Clear/invalidate the old surface on focus or tab changes.
-- [ ] Preserve per-session scrollback, modes, cursor, selection, and render cache across switches.
-- [ ] Add regression tests for two sessions with identical terminal image IDs and independent output.
+- [x] Clear/invalidate the old and new surface regions on tab changes.
+- [x] Preserve per-session terminal emulator state, scrollback, modes, cursor, and retained graphics across switches.
+- [x] Add regression tests for two sessions with independent output and identical terminal image IDs.
 
-**Exit criteria:** switching sessions never leaks text, cursor state, or graphics between tabs.
+**Exit criteria (met):** switching sessions never leaks text, cursor state, or graphics between tabs.
 
 ## Phase 5 — Kitty graphics and full retained scene pipeline
 
-- [ ] Verify the selected emulator/parser's Kitty graphics support and extension points.
-- [ ] Implement `SessionGraphicsStore` with session-scoped resource and placement ownership.
+- [x] Verify the selected emulator/parser's Kitty graphics extension point and add a cmdash-owned APC adapter because the emulator does not own a graphics store.
+- [x] Implement `SessionGraphicsStore` with session-scoped resource and placement ownership.
 - [ ] Convert graphics state into scene image layers with clipping and surface transforms.
-- [ ] Submit Kitty graphics through the backend only for visible placements.
-- [ ] Implement tab-switch invalidation and restore/replay behavior.
-- [ ] Add captured-sequence conformance tests and the A/B image-ID collision test.
-- [ ] Retain decoded graphics in memory for the lifetime of each live session; define optional limits and diagnostics for oversized or unsupported graphics.
+- [x] Submit Kitty graphics through the backend only for visible placements, using session-qualified terminal image IDs.
+- [x] Implement tab-switch invalidation and graphics restore/replay behavior.
+- [x] Add captured-sequence parser coverage and the A/B image-ID collision test.
+- [x] Retain decoded graphics in memory for the lifetime of each live session; resource limits and diagnostics for oversized or unsupported graphics remain future work.
 
 **Exit criteria:** a Kitty image rendered in one tab is hidden, preserved, and restored independently when the user changes tabs.
 

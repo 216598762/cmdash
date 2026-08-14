@@ -3,6 +3,7 @@ pub mod command;
 pub mod compositor;
 pub mod config;
 pub mod dashboard;
+pub mod graphics;
 pub mod input;
 pub mod layout;
 pub mod plugin;
@@ -19,6 +20,9 @@ pub use compositor::{CellSpan, Compositor, FrameDiff};
 pub use config::{
     AppConfig, CURRENT_CONFIG_VERSION, ConfigError, ConfigFileError, LayoutConfig, OverlayConfig,
     WidgetInstanceConfig, WorkspaceConfig,
+};
+pub use graphics::{
+    GraphicsError, GraphicsPlacement, GraphicsResourceId, GraphicsSubmission, SessionGraphicsStore,
 };
 pub use input::command_for_key;
 pub use layout::{LayoutError, LayoutNode, LayoutTree};

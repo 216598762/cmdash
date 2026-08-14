@@ -7,6 +7,7 @@ use crate::{
     backend::BackendCapabilities,
     command::{Command, CommandEffect, FocusCommand, OverlayCommand, SurfaceCommand, TabCommand},
     config::{AppConfig, ConfigError},
+    graphics::GraphicsSubmission,
     layout::{LayoutError, LayoutTree},
     scene::{CellStyle, Scene},
     widget::{WidgetError, WidgetRegistry, WidgetRuntime, WidgetUpdateReport},
@@ -309,6 +310,7 @@ pub struct AppState {
     layout: LayoutTree,
     quit_requested: bool,
     redraw_requested: bool,
+    pending_invalidations: Vec<Rect>,
 }
 
 impl AppState {
@@ -321,6 +323,7 @@ impl AppState {
             layout: LayoutTree::from_config(None, [], []).expect("empty layout is valid"),
             quit_requested: false,
             redraw_requested: true,
+            pending_invalidations: Vec::new(),
         }
     }
 
@@ -364,6 +367,7 @@ impl AppState {
             layout,
             quit_requested: false,
             redraw_requested: true,
+            pending_invalidations: Vec::new(),
         };
 
         for widget in &config.workspace.widgets {
@@ -561,6 +565,21 @@ impl AppState {
             .collect()
     }
 
+    pub fn visible_graphics(&self) -> Vec<GraphicsSubmission> {
+        let areas: BTreeMap<_, _> = self
+            .workspace
+            .surfaces
+            .values()
+            .filter(|surface| surface.visible())
+            .filter_map(|surface| surface.widget().map(|widget| (widget, surface.area())))
+            .collect();
+        self.widget_runtime.graphics(&areas)
+    }
+
+    pub fn take_surface_invalidations(&mut self) -> Vec<Rect> {
+        std::mem::take(&mut self.pending_invalidations)
+    }
+
     pub const fn focus(&self) -> FocusState {
         self.focus
     }
@@ -612,6 +631,13 @@ impl AppState {
 
     fn apply_tab(&mut self, command: TabCommand) {
         let forward = matches!(command, TabCommand::Next);
+        let old_areas: Vec<_> = self
+            .workspace
+            .surfaces
+            .values()
+            .filter(|surface| surface.visible())
+            .map(|surface| surface.area())
+            .collect();
         if self.layout.switch_tabs(forward) {
             let visible = self.layout.visible_widget_ids();
             for surface in self.workspace.surfaces.values_mut() {
@@ -629,10 +655,19 @@ impl AppState {
             {
                 self.focus.clear();
             }
+            self.pending_invalidations.extend(old_areas);
+            self.pending_invalidations.extend(
+                self.workspace
+                    .surfaces
+                    .values()
+                    .filter(|surface| surface.visible())
+                    .map(|surface| surface.area()),
+            );
         }
     }
 
     fn apply_focus(&mut self, command: FocusCommand) -> Result<(), CommandError> {
+        let old_surface = self.focused_surface_area();
         match command {
             FocusCommand::Surface(id) => {
                 let surface = self
@@ -660,7 +695,27 @@ impl AppState {
             FocusCommand::Previous => self.navigate_focus(false),
             FocusCommand::Clear => self.focus.clear(),
         }
+        let new_surface = self.focused_surface_area();
+        if old_surface != new_surface {
+            if let Some(area) = old_surface {
+                self.pending_invalidations.push(area);
+            }
+            if let Some(area) = new_surface {
+                self.pending_invalidations.push(area);
+            }
+        }
         Ok(())
+    }
+
+    fn focused_surface_area(&self) -> Option<Rect> {
+        match self.focus.target() {
+            Some(FocusTarget::Surface(id)) => self
+                .workspace
+                .surfaces
+                .get(&id)
+                .map(|surface| surface.area()),
+            Some(FocusTarget::Overlay(_)) | None => None,
+        }
     }
 
     fn navigate_focus(&mut self, forward: bool) {
@@ -984,6 +1039,52 @@ mod tests {
         state.dispatch(Command::Tab(TabCommand::Next)).unwrap();
         assert_eq!(state.layout().visible_widget_ids(), [WidgetId::new(1)]);
         assert!(!state.workspace().surfaces()[&SurfaceId::new(2)].visible());
+    }
+
+    #[test]
+    fn tab_switches_invalidate_old_and_new_surface_regions() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "text"
+            [[workspace.widgets]]
+            id = 2
+            type = "text"
+            [workspace.layout]
+            type = "tabs"
+            active = 0
+            children = [
+              { type = "leaf", widget = 1 },
+              { type = "leaf", widget = 2 }
+            ]
+            "#,
+        )
+        .unwrap();
+        let mut state =
+            AppState::from_config(capabilities(), &WidgetRegistry::builtins(), &config).unwrap();
+        state
+            .dispatch(Command::Surface(SurfaceCommand::SetArea {
+                id: SurfaceId::new(1),
+                area: Rect::new(2, 3, 20, 8),
+            }))
+            .unwrap();
+        state
+            .dispatch(Command::Surface(SurfaceCommand::SetArea {
+                id: SurfaceId::new(2),
+                area: Rect::new(4, 5, 20, 8),
+            }))
+            .unwrap();
+        let _ = state.take_surface_invalidations();
+
+        state.dispatch(Command::Tab(TabCommand::Next)).unwrap();
+
+        let invalidated = state.take_surface_invalidations();
+        assert!(invalidated.contains(&Rect::new(2, 3, 20, 8)));
+        assert!(invalidated.contains(&Rect::new(4, 5, 20, 8)));
+        assert!(!state.workspace().surfaces()[&SurfaceId::new(1)].visible());
+        assert!(state.workspace().surfaces()[&SurfaceId::new(2)].visible());
     }
 
     #[test]

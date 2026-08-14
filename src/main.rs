@@ -88,6 +88,9 @@ where
 {
     loop {
         state.update_widgets(SystemTime::now());
+        for invalidation in state.take_surface_invalidations() {
+            compositor.invalidate(invalidation);
+        }
         let area = backend.size()?;
         sync_dashboard_surfaces(state, area)?;
         let widget_health =
@@ -105,6 +108,7 @@ where
         let scene = compositor.compose(area, state, &base, &surface_scenes);
         let diff = compositor.diff(&scene);
         backend.submit_diff(&diff)?;
+        backend.submit_graphics(&state.visible_graphics())?;
 
         if dispatch_available_events(state)? {
             break;

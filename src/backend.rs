@@ -14,6 +14,7 @@ use ratatui::layout::Rect;
 
 use crate::{
     compositor::{CellSpan, FrameDiff},
+    graphics::GraphicsSubmission,
     scene::{Cell, CellStyle, CellWidth, Color, Scene},
 };
 
@@ -92,6 +93,10 @@ pub trait Backend {
     fn leave(&mut self) -> Result<(), Self::Error>;
     fn submit(&mut self, scene: &Scene) -> Result<(), Self::Error>;
     fn submit_diff(&mut self, diff: &FrameDiff) -> Result<(), Self::Error>;
+
+    fn submit_graphics(&mut self, _graphics: &[GraphicsSubmission]) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 pub struct CrosstermBackend<W: Write> {
@@ -121,6 +126,11 @@ impl<W: Write> CrosstermBackend<W> {
 
     pub fn writer(&self) -> &W {
         &self.writer.inner
+    }
+
+    pub fn with_capabilities(mut self, capabilities: BackendCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     pub const fn metrics(&self) -> OutputMetrics {
@@ -216,6 +226,34 @@ impl<W: Write> Backend for CrosstermBackend<W> {
         self.writer.flush()?;
         self.frames_submitted += 1;
         Ok(())
+    }
+
+    fn submit_graphics(&mut self, graphics: &[GraphicsSubmission]) -> Result<(), Self::Error> {
+        if !self.capabilities.kitty_graphics {
+            return Ok(());
+        }
+        for submission in graphics {
+            let physical_id = submission.terminal_image_id();
+            write!(
+                self.writer,
+                "\x1b_Ga=T,f={},i={},m=0;",
+                submission.format(),
+                physical_id
+            )?;
+            self.writer.write_all(submission.encoded_payload())?;
+            self.writer.write_all(b"\x1b\\")?;
+            let placement = submission.placement();
+            write!(
+                self.writer,
+                "\x1b_Ga=p,i={},x={},y={},c={},r={};\x1b\\",
+                physical_id,
+                placement.x(),
+                placement.y(),
+                placement.width(),
+                placement.height()
+            )?;
+        }
+        self.writer.flush()
     }
 
     fn submit_diff(&mut self, diff: &FrameDiff) -> Result<(), Self::Error> {
@@ -354,7 +392,7 @@ fn to_crossterm_color(color: Color) -> crossterm::style::Color {
 mod tests {
     use super::*;
     use crate::{
-        Compositor,
+        Compositor, SessionGraphicsStore, SessionId,
         scene::{CellStyle, Color},
     };
 
@@ -432,6 +470,29 @@ mod tests {
             .filter(|window| *window == glyph)
             .count();
         assert_eq!(occurrences, 1);
+    }
+
+    #[test]
+    fn kitty_graphics_are_replayed_only_when_the_backend_supports_them() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(7));
+        store.apply_kitty_command(b"a=T,f=24,i=1", b"AQID").unwrap();
+        store
+            .apply_kitty_command(b"a=p,i=1,x=0,y=0,c=2,r=1", b"")
+            .unwrap();
+        let graphics = store.visible_submissions(Rect::new(0, 0, 4, 2));
+        let capabilities = BackendCapabilities {
+            truecolor: true,
+            mouse: true,
+            bracketed_paste: true,
+            kitty_graphics: true,
+        };
+        let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
+        backend.submit_graphics(&graphics).unwrap();
+
+        let output = backend.writer();
+        assert!(output.windows(4).any(|window| window == b"a=T,"));
+        assert!(output.windows(4).any(|window| window == b"a=p,"));
+        assert!(output.windows(3).any(|window| window == b"AQI"));
     }
 
     #[test]

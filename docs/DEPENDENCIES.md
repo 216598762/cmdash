@@ -7,12 +7,12 @@ This is an evaluation list and initial direction, not a dependency lockfile. The
 | Concern | Initial direction | Boundary or gate |
 | --- | --- | --- |
 | Terminal backend | `crossterm` | Owns raw mode, input, resize, and basic controls; cmdash owns retained scenes and frame composition. |
-| Terminal emulator | `alacritty_terminal` | One emulator per session; Kitty graphics require a cmdash-owned adapter and explicit verification before Phase 5. |
+| Terminal emulator | `alacritty_terminal` | One emulator per session; Kitty APC sequences are intercepted by a cmdash-owned session adapter because graphics resources are not global emulator state. |
 | PTY and async runtime | `portable-pty` + `tokio` | Per-session I/O tasks communicate with the UI/coordinator through bounded messages. |
 | Layout primitives | `ratatui` + `unicode-width` | Use Ratatui layout/text primitives behind the backend-neutral scene boundary and track narrow/wide cell occupancy explicitly. |
 | Plugin boundary | Versioned native ABI | Active v1 host descriptor contract with C-compatible data and capability negotiation; dynamic loading remains a later gate. |
 | Workspace scope | One active workspace | Add saved/multiple workspace behavior only after the core runtime contracts are stable. |
-| Graphics fallback | Capability-aware omission/placeholder | Unsupported graphics must not corrupt text or layout. |
+| Graphics fallback | Capability-aware omission/placeholder | Unsupported graphics are omitted; visible Kitty placements are replayed only when the backend advertises support. |
 
 
 ## Selection priorities
@@ -85,9 +85,9 @@ Do not add all of these up front. The selected terminal emulator may already pro
 
 ### `alacritty_terminal`
 
-**Active at v0.26.** This is a full terminal-emulation implementation extracted from Alacritty and provides the grid state, alternate screen, modes, cursor, scrollback, and parsing that cmdash needs. The current session slice uses its grid/parser behind the backend-neutral scene boundary; full mode coverage remains a Phase 3 test gate.
+**Active at v0.26.** This is a full terminal-emulation implementation extracted from Alacritty and provides the grid state, alternate screen, modes, cursor, scrollback, and parsing that cmdash needs. Cmdash uses its parser/grid behind the backend-neutral scene boundary and intercepts Kitty APC sequences before they reach the text emulator; session graphics remain owned by cmdash.
 
-**Critical gate:** verify current Kitty graphics support and extension points before Phase 5. If graphics are not exposed sufficiently, add a narrowly scoped cmdash-owned adapter or revisit the emulator choice; do not create a global graphics cache.
+**Phase 5 result:** the selected emulator exposes the parser boundary needed to intercept APC sequences, but does not expose a session-owned Kitty graphics store. Cmdash therefore strips Kitty APC commands before feeding text to the emulator and retains resources/placements in a `SessionGraphicsStore`; no global graphics cache is used.
 
 ### `vte`
 
@@ -115,7 +115,7 @@ Provides image widgets and protocol backends for Sixel, Kitty, iTerm2, and Unico
 
 ### `little-kitty`
 
-A low-level Kitty graphics protocol interface candidate. Evaluate it for encoding/submission of image data and placements after confirming how well its ownership model maps to session-scoped resources.
+A low-level Kitty graphics protocol interface candidate. The current Phase 5 slice uses a narrow local encoder because it only needs replay of captured, session-owned APC payloads; evaluate `little-kitty` later if broader upload/format support is required.
 
 ### `kitty-graphics-protocol`
 
@@ -192,7 +192,7 @@ The most valuable first regression test remains: two tabs each use graphics imag
 
 1. Add and pin `crossterm`, `ratatui`, `portable-pty`, `tokio`, `serde`, `toml`, `tracing`, and `directories` as the package skeleton requires them.
 2. Integrate `alacritty_terminal` behind the per-session emulator boundary and verify the APIs needed for grid, alternate screen, cursor, scrollback, and resize behavior.
-3. Verify Kitty support and choose the smallest suitable cmdash-owned adapter using `little-kitty`, `kitty-graphics-protocol`, or a local implementation; keep this behind the Phase 5 gate.
+3. Verify Kitty support and choose the smallest suitable cmdash-owned adapter using `little-kitty`, `kitty-graphics-protocol`, or a local implementation; the current Phase 5 slice uses a local adapter with session-qualified IDs and visible-placement replay.
 4. Prototype the versioned native plugin ABI with `abi_stable` or a hand-defined C ABI; evaluate Wasmtime only if isolation or language neutrality justifies it.
 5. Add `notify`, `proptest`, `insta`, benchmarks, and other support crates as actual features require them.
 
