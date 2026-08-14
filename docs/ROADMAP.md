@@ -20,7 +20,7 @@ This roadmap is intentionally staged so the rendering and session ownership cont
 
 - [x] Implement startup/shutdown with panic-safe terminal restoration.
 - [x] Add backend capability detection, resize handling, and input collection.
-- [ ] Add bounded event batching.
+- [x] Add bounded event batching with a maximum of 32 events per loop iteration.
 - [x] Define `AppState`, commands, typed IDs, surfaces, scene primitives, and backend traits.
 - [x] Render a static frame containing text, borders, and clipping through the backend contract.
 - [x] Define backend-neutral focus state and overlay primitives with focus decoration.
@@ -36,7 +36,7 @@ This roadmap is intentionally staged so the rendering and session ownership cont
 - [x] Handle Unicode display widths, wide-glyph continuation cells, clipping, and single-emission span output.
 - [x] Add regression tests for composition, clipping, invalidation, diff suppression, span grouping, style caching, metrics, and Unicode widths.
 
-**Exit criteria:** a static dashboard can render and update without any terminal session feature enabled.
+**Exit criteria (met):** a static dashboard renders and updates without any terminal session feature enabled.
 
 ## Phase 2 — Modular widget runtime
 
