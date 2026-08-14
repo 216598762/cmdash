@@ -9,7 +9,7 @@ This is an evaluation list and initial direction, not a dependency lockfile. The
 | Terminal backend | `crossterm` | Owns raw mode, input, resize, and basic controls; cmdash owns retained scenes and frame composition. |
 | Terminal emulator | `alacritty_terminal` | One emulator per session; Kitty graphics require a cmdash-owned adapter and explicit verification before Phase 5. |
 | PTY and async runtime | `portable-pty` + `tokio` | Per-session I/O tasks communicate with the UI/coordinator through bounded messages. |
-| Layout primitives | `ratatui` | Use layout/text primitives behind the backend-neutral scene boundary, not its default terminal-frame ownership. |
+| Layout primitives | `ratatui` + `unicode-width` | Use Ratatui layout/text primitives behind the backend-neutral scene boundary and track narrow/wide cell occupancy explicitly. |
 | Plugin boundary | Versioned native ABI | C-compatible host data, capability negotiation, and no Rust trait objects across the library boundary. |
 | Workspace scope | One active workspace | Add saved/multiple workspace behavior only after the core runtime contracts are stable. |
 | Graphics fallback | Capability-aware omission/placeholder | Unsupported graphics must not corrupt text or layout. |
@@ -70,7 +70,7 @@ Provides terminal layout, text/style primitives, widgets, and backend integratio
 
 Useful adjacent crates to evaluate only if needed:
 
-- [`unicode-width`](https://crates.io/crates/unicode-width) — cell width calculation;
+- [`unicode-width`](https://crates.io/crates/unicode-width) — selected for Unicode display-width calculation and wide-cell continuation tracking;
 - [`unicode-segmentation`](https://crates.io/crates/unicode-segmentation) — grapheme-aware text handling;
 - [`unicode-truncate`](https://crates.io/crates/unicode-truncate) — width-aware truncation;
 - [`compact_str`](https://crates.io/crates/compact_str) — compact short-string storage if profiling shows text allocation pressure.

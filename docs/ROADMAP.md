@@ -9,7 +9,8 @@ This roadmap is intentionally staged so the rendering and session ownership cont
 - [x] Choose the initial Rust stack: `crossterm`, `alacritty_terminal`, `portable-pty`, `ratatui` primitives behind the scene boundary, and `tokio`.
 - [x] Require ANSI/VT text, cursor movement, Unicode cells, basic colors, alternate screen, keyboard input, and resize; degrade optional features and omit unsupported graphics without corrupting text/layout.
 - [x] Use a versioned native plugin ABI with C-compatible host data, capability negotiation, and no Rust trait objects across the shared-library boundary.
-- [ ] Create the Cargo workspace/package, CI, formatting, linting, and test commands.
+- [x] Create the initial Cargo package with formatting and test commands.
+- [x] Add CI and linting workflows for formatting, checks, Clippy, and tests.
 - [x] Use TOML as the initial hand-authored configuration format.
 - [ ] Define a stable widget/session terminology and plugin configuration schema.
 
@@ -17,11 +18,23 @@ This roadmap is intentionally staged so the rendering and session ownership cont
 
 ## Phase 1 — Application shell and backend contract
 
-- [ ] Implement startup/shutdown and panic-safe terminal restoration.
-- [ ] Add capability detection, resize handling, input collection, and bounded event batching.
-- [ ] Define `AppState`, commands, IDs, surfaces, scene primitives, and backend traits.
-- [ ] Render a static frame containing text, borders, clipping, focus, and overlays.
-- [ ] Add unit tests for frame composition and invalidation.
+- [x] Implement startup/shutdown with panic-safe terminal restoration.
+- [x] Add backend capability detection, resize handling, and input collection.
+- [ ] Add bounded event batching.
+- [x] Define `AppState`, commands, typed IDs, surfaces, scene primitives, and backend traits.
+- [x] Render a static frame containing text, borders, and clipping through the backend contract.
+- [x] Define backend-neutral focus state and overlay primitives with focus decoration.
+- [x] Route Tab/Shift+Tab keyboard commands through `AppState` and cycle visible surfaces.
+- [x] Compose visible surfaces and overlays in z-order with viewport and layer clipping.
+- [x] Add initial unit tests for scene composition and backend submission.
+- [x] Retain the previous frame and emit changed-cell diffs, including full redraws for the first frame and viewport changes.
+- [x] Add explicit invalidation rectangles that force affected cells into the next frame diff.
+- [x] Group contiguous changed cells into same-row terminal spans.
+- [x] Merge adjacent spans only when their cell styles are compatible.
+- [x] Cache the active terminal style across compatible runs to avoid redundant style sequences.
+- [x] Track optimized, naive, and saved terminal bytes and report savings in the dashboard footer.
+- [x] Handle Unicode display widths, wide-glyph continuation cells, clipping, and single-emission span output.
+- [x] Add regression tests for composition, clipping, invalidation, diff suppression, span grouping, style caching, metrics, and Unicode widths.
 
 **Exit criteria:** a static dashboard can render and update without any terminal session feature enabled.
 

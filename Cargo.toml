@@ -1,0 +1,13 @@
+[package]
+name = "cmdash"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "A modular terminal dashboard and multiplexer"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+crossterm = "0.29"
+ratatui = { version = "0.29", default-features = false }
+unicode-width = "0.2"

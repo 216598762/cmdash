@@ -25,4 +25,4 @@ cmdash is licensed under the [MIT License](LICENSE).
 
 ## Status
 
-Architecture and Phase 0 decision phase. The initial backend, emulator, plugin boundary, and workspace scope are recorded; no application code exists yet. The next step is to create the Rust package and validate the backend contract with a static dashboard.
+Initial package phase. The project now has a Rust package, a backend-neutral retained scene, a Crossterm submission backend, a static dashboard contract with unit tests, and GitHub Actions checks for formatting, linting, compilation, and tests. Terminal sessions, widgets, plugins, and dynamic layout behavior remain future work.
