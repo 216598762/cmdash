@@ -82,6 +82,14 @@ pub fn render_static_dashboard_shell(area: Rect) -> Scene {
 }
 
 pub fn render_static_dashboard_shell_with_metrics(area: Rect, metrics: OutputMetrics) -> Scene {
+    render_static_dashboard_shell_with_metrics_and_health(area, metrics, None)
+}
+
+pub fn render_static_dashboard_shell_with_metrics_and_health(
+    area: Rect,
+    metrics: OutputMetrics,
+    widget_health: Option<&str>,
+) -> Scene {
     let mut scene = Scene::new(area);
     scene.fill(area, CellStyle::new(TEXT, BACKGROUND));
 
@@ -107,6 +115,9 @@ pub fn render_static_dashboard_shell_with_metrics(area: Rect, metrics: OutputMet
     } else {
         "Tab / Shift+Tab  focus    q / Esc  quit    •    retained frame".to_owned()
     };
+    let footer_text = widget_health.map_or(footer_text.clone(), |health| {
+        format!("{footer_text}    •    widgets: {health}")
+    });
     scene.text(
         footer.x.saturating_add(1),
         footer.y,

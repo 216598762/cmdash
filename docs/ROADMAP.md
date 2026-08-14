@@ -45,12 +45,14 @@ This roadmap is intentionally staged so the rendering and session ownership cont
 - [x] Integrate widget registration and configuration-driven instances into the application shell, with the static dashboard retained as a fallback.
 - [ ] Add a layout tree with leaf widgets, tab groups, and overlays; defer pane splits until the tab model is validated.
 - [ ] Define the versioned plugin host contract and load a minimal external widget.
-- [ ] Add at least two non-terminal widgets, such as a clock and system information panel, exercising the same host-facing contract.
+- [x] Add at least two non-terminal widgets, including text and a clock, exercising the same host-facing contract.
 - [x] Start the application shell from a widget-only TOML configuration without enabling terminal sessions.
-- [ ] Load user-provided widget-only TOML configuration from the application boundary.
-- [ ] Add focus routing, plugin health reporting, and widget lifecycle cleanup.
+- [x] Load user-provided widget-only TOML configuration through `--config` / `-c`, with the embedded config as the no-argument fallback.
+- [x] Add focus routing, widget health reporting, and widget lifecycle cleanup.
 
 **Exit criteria:** users can run a useful dashboard with no PTY, shell, or terminal-emulation dependency in the active workspace.
+
+The next Phase 2 slice is the layout tree: model leaf widgets, tab groups, and overlays as configuration-driven layout nodes before adding terminal sessions or dynamic plugins.
 
 ## Phase 3 — One isolated terminal session
 

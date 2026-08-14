@@ -1,10 +1,15 @@
-use std::{collections::BTreeMap, io, time::Duration};
+use std::{
+    collections::BTreeMap,
+    env, io,
+    path::PathBuf,
+    time::{Duration, SystemTime},
+};
 
 use cmdash::{
     AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend, Surface, SurfaceCommand,
     WidgetRegistry,
     dashboard::{
-        configured_widget_surface_areas, render_static_dashboard_shell_with_metrics,
+        configured_widget_surface_areas, render_static_dashboard_shell_with_metrics_and_health,
         render_static_dashboard_surface_scenes, static_dashboard_surface_areas,
     },
     input::command_for_key,
@@ -27,22 +32,23 @@ text = "Dashboard widgets are configuration-driven."
 
 [[workspace.widgets]]
 id = 2
-type = "text"
-title = " status "
-text = "No terminal sessions are running."
+type = "clock"
+title = " clock "
+format = "HH:MM:SS"
 "#;
 
 fn main() -> io::Result<()> {
     let mut backend = CrosstermBackend::new(io::stdout());
-    let config = AppConfig::parse(DEFAULT_CONFIG)
-        .map_err(|error| io::Error::other(format!("default config rejected: {error:?}")))?;
+    let args: Vec<_> = env::args().skip(1).collect();
+    let config = load_config(&args)?;
     let registry = WidgetRegistry::builtins();
     let mut state = AppState::from_config(backend.capabilities(), &registry, &config)
-        .map_err(|error| io::Error::other(format!("application config rejected: {error:?}")))?;
+        .map_err(|error| io::Error::other(format!("application config rejected: {error}")))?;
     let mut compositor = Compositor::new();
     backend.enter()?;
 
     let run_result = run(&mut backend, &mut state, &mut compositor);
+    state.shutdown_widgets();
     let leave_result = backend.leave();
 
     run_result.and(leave_result)
@@ -53,9 +59,16 @@ where
     B: Backend<Error = io::Error>,
 {
     loop {
+        state.update_widgets(SystemTime::now());
         let area = backend.size()?;
         sync_dashboard_surfaces(state, area)?;
-        let base = render_static_dashboard_shell_with_metrics(area, backend.metrics());
+        let widget_health =
+            (!state.widget_runtime().is_empty()).then(|| state.widget_runtime().health_summary());
+        let base = render_static_dashboard_shell_with_metrics_and_health(
+            area,
+            backend.metrics(),
+            widget_health.as_deref(),
+        );
         let surface_scenes = if state.widget_runtime().is_empty() {
             render_static_dashboard_surface_scenes(area, state.focus())
         } else {
@@ -71,6 +84,44 @@ where
     }
 
     Ok(())
+}
+
+fn load_config(args: &[String]) -> io::Result<AppConfig> {
+    match config_path(args)? {
+        Some(path) => {
+            AppConfig::load_file(&path).map_err(|error| io::Error::other(format!("{error}")))
+        }
+        None => AppConfig::parse(DEFAULT_CONFIG).map_err(|error| {
+            io::Error::other(format!("embedded default config rejected: {error}"))
+        }),
+    }
+}
+
+fn config_path(args: &[String]) -> io::Result<Option<PathBuf>> {
+    let mut path = None;
+    let mut arguments = args.iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--config" | "-c" => {
+                let value = arguments.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--config requires a TOML path")
+                })?;
+                if path.replace(PathBuf::from(value)).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "configuration path was provided more than once",
+                    ));
+                }
+            }
+            unknown => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown argument {unknown:?}; use --config <path>"),
+                ));
+            }
+        }
+    }
+    Ok(path)
 }
 
 fn dispatch_available_events(state: &mut AppState) -> io::Result<bool> {
@@ -221,5 +272,24 @@ mod tests {
         assert!(dispatch_event_batch(&mut state, events).unwrap());
         assert!(state.quit_requested());
         assert_eq!(state.focus().target(), None);
+    }
+
+    #[test]
+    fn config_path_accepts_short_and_long_options() {
+        assert_eq!(
+            config_path(&["--config".to_owned(), "dashboard.toml".to_owned()]).unwrap(),
+            Some(PathBuf::from("dashboard.toml"))
+        );
+        assert_eq!(
+            config_path(&["-c".to_owned(), "dashboard.toml".to_owned()]).unwrap(),
+            Some(PathBuf::from("dashboard.toml"))
+        );
+        assert_eq!(config_path(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn config_path_rejects_missing_values_and_unknown_arguments() {
+        assert!(config_path(&["--config".to_owned()]).is_err());
+        assert!(config_path(&["--verbose".to_owned()]).is_err());
     }
 }

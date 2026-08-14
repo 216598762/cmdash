@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt, time::SystemTime};
 
 use ratatui::layout::Rect;
 
@@ -7,7 +7,7 @@ use crate::{
     command::{Command, CommandEffect, FocusCommand, OverlayCommand, SurfaceCommand},
     config::{AppConfig, ConfigError},
     scene::{CellStyle, Scene},
-    widget::{WidgetError, WidgetRegistry, WidgetRuntime},
+    widget::{WidgetError, WidgetRegistry, WidgetRuntime, WidgetUpdateReport},
 };
 
 macro_rules! id_type {
@@ -286,6 +286,17 @@ pub enum AppStateConfigError {
     Widget(WidgetError),
 }
 
+impl fmt::Display for AppStateConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(error) => write!(formatter, "invalid config: {error}"),
+            Self::Widget(error) => write!(formatter, "widget setup failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AppStateConfigError {}
+
 pub struct AppState {
     workspace: WorkspaceState,
     focus: FocusState,
@@ -341,6 +352,18 @@ impl AppState {
 
     pub fn widget_runtime(&self) -> &WidgetRuntime {
         &self.widget_runtime
+    }
+
+    pub fn update_widgets(&mut self, now: SystemTime) -> WidgetUpdateReport {
+        let report = self.widget_runtime.update(now);
+        if report.requests_redraw() || !report.failed().is_empty() {
+            self.redraw_requested = true;
+        }
+        report
+    }
+
+    pub fn shutdown_widgets(&mut self) {
+        self.widget_runtime.shutdown();
     }
 
     pub fn widget_surface_scenes(&self) -> BTreeMap<SurfaceId, Scene> {
