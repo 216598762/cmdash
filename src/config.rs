@@ -251,6 +251,8 @@ pub struct WidgetInstanceConfig {
     pub text: Option<String>,
     #[serde(default)]
     pub format: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

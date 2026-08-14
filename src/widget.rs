@@ -4,12 +4,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 
 use crate::{
     config::{AppConfig, WidgetInstanceConfig},
     plugin::PluginRegistry,
     scene::{CellStyle, Color, Scene},
+    session::{TerminalSession, TerminalSize},
     state::WidgetId,
 };
 
@@ -84,6 +86,18 @@ pub trait Widget: Send {
 
     fn render(&self, area: Rect, focused: bool) -> Scene;
 
+    fn handles_input(&self) -> bool {
+        false
+    }
+
+    fn handle_key(&mut self, _key: KeyEvent) -> Result<WidgetUpdate, String> {
+        Ok(WidgetUpdate::Unchanged)
+    }
+
+    fn resize(&mut self, _size: TerminalSize) -> Result<WidgetUpdate, String> {
+        Ok(WidgetUpdate::Unchanged)
+    }
+
     fn shutdown(&mut self) {}
 }
 
@@ -136,6 +150,9 @@ impl WidgetRegistry {
             .expect("built-in widget types are unique");
         registry
             .register("system", system_widget_factory)
+            .expect("built-in widget types are unique");
+        registry
+            .register("terminal", terminal_widget_factory)
             .expect("built-in widget types are unique");
         registry
     }
@@ -286,6 +303,46 @@ impl WidgetRuntime {
             }
         }
         report
+    }
+
+    pub fn handle_key(&mut self, id: WidgetId, key: KeyEvent) -> Result<WidgetUpdate, String> {
+        let entry = self
+            .instances
+            .get_mut(&id)
+            .ok_or_else(|| format!("widget {} is not registered", id.get()))?;
+        match entry.widget.handle_key(key) {
+            Ok(update) => {
+                entry.health = entry.widget.health();
+                Ok(update)
+            }
+            Err(error) => {
+                entry.health = WidgetHealth::Failed(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    pub fn handles_input(&self, id: WidgetId) -> bool {
+        self.instances
+            .get(&id)
+            .is_some_and(|entry| entry.widget.handles_input())
+    }
+
+    pub fn resize(&mut self, id: WidgetId, size: TerminalSize) -> Result<WidgetUpdate, String> {
+        let entry = self
+            .instances
+            .get_mut(&id)
+            .ok_or_else(|| format!("widget {} is not registered", id.get()))?;
+        match entry.widget.resize(size) {
+            Ok(update) => {
+                entry.health = entry.widget.health();
+                Ok(update)
+            }
+            Err(error) => {
+                entry.health = WidgetHealth::Failed(error.clone());
+                Err(error)
+            }
+        }
     }
 
     pub fn shutdown(&mut self) {
@@ -450,6 +507,100 @@ impl Widget for SystemWidget {
     }
 }
 
+struct TerminalWidget {
+    title: String,
+    session: TerminalSession,
+}
+
+impl Widget for TerminalWidget {
+    fn kind(&self) -> &str {
+        "terminal"
+    }
+
+    fn initialize(&mut self) -> Result<(), String> {
+        self.session
+            .poll_output()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn update(&mut self, _now: SystemTime) -> Result<WidgetUpdate, String> {
+        self.session
+            .poll_output()
+            .map(|changed| {
+                if changed {
+                    WidgetUpdate::Redraw
+                } else {
+                    WidgetUpdate::Unchanged
+                }
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn health(&self) -> WidgetHealth {
+        self.session
+            .failure()
+            .map_or(WidgetHealth::Healthy, |error| {
+                WidgetHealth::Failed(error.to_owned())
+            })
+    }
+
+    fn render(&self, area: Rect, focused: bool) -> Scene {
+        let mut scene = self.session.render(area, focused);
+        let color = if focused {
+            Color::rgb(250, 204, 21)
+        } else {
+            Color::rgb(216, 180, 254)
+        };
+        scene.border(
+            area,
+            &self.title,
+            CellStyle::new(color, Color::rgb(18, 22, 30)),
+        );
+        scene
+    }
+
+    fn handles_input(&self) -> bool {
+        true
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Result<WidgetUpdate, String> {
+        self.session
+            .write_key(key)
+            .map(|_| WidgetUpdate::Unchanged)
+            .map_err(|error| error.to_string())
+    }
+
+    fn resize(&mut self, size: TerminalSize) -> Result<WidgetUpdate, String> {
+        if self.session.size() == size {
+            return Ok(WidgetUpdate::Unchanged);
+        }
+        self.session
+            .resize(size)
+            .map(|_| WidgetUpdate::Redraw)
+            .map_err(|error| error.to_string())
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.session.shutdown();
+    }
+}
+
+fn terminal_widget_factory(config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>, WidgetError> {
+    let session = TerminalSession::spawn(config.command.as_deref(), TerminalSize::new(80, 24))
+        .map_err(|error| WidgetError::InitializationFailed {
+            kind: "terminal".to_owned(),
+            reason: error.to_string(),
+        })?;
+    Ok(Box::new(TerminalWidget {
+        title: config
+            .title
+            .clone()
+            .unwrap_or_else(|| " terminal ".to_owned()),
+        session,
+    }))
+}
+
 fn system_widget_factory(config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>, WidgetError> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
@@ -571,6 +722,37 @@ mod tests {
             scenes[&WidgetId::new(5)].cell_at(2, 1).unwrap().symbol,
             std::env::consts::OS.chars().next().unwrap()
         );
+    }
+
+    #[test]
+    fn terminal_widget_owns_a_session_and_accepts_input() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 6
+            type = "terminal"
+            command = "sh"
+            "#,
+        )
+        .unwrap();
+        let mut runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let id = WidgetId::new(6);
+
+        assert!(runtime.handles_input(id));
+        assert_eq!(
+            runtime
+                .handle_key(
+                    id,
+                    KeyEvent::new(
+                        crossterm::event::KeyCode::Char('x'),
+                        crossterm::event::KeyModifiers::NONE
+                    )
+                )
+                .unwrap(),
+            WidgetUpdate::Unchanged
+        );
+        runtime.shutdown();
     }
 
     #[test]

@@ -187,7 +187,10 @@ fn dispatch_event(state: &mut AppState, event: Event) -> io::Result<bool> {
                     .map_err(|error| io::Error::other(format!("command rejected: {error:?}")))?;
                 Ok(matches!(effect, cmdash::CommandEffect::Quit))
             }
-            None => Ok(false),
+            None => state
+                .handle_focused_key(key)
+                .map_err(|error| io::Error::other(format!("widget input rejected: {error}")))
+                .map(|_| false),
         },
         _ => Ok(false),
     }
@@ -228,7 +231,7 @@ fn sync_dashboard_surfaces(state: &mut AppState, area: Rect) -> io::Result<()> {
         }
     }
 
-    for (id, surface_area) in surface_areas {
+    for (&id, &surface_area) in &surface_areas {
         let existing = state.workspace().surfaces().contains_key(&id);
         let should_show = existing
             && surface_area.width > 0
@@ -274,6 +277,9 @@ fn sync_dashboard_surfaces(state: &mut AppState, area: Rect) -> io::Result<()> {
         }
     }
 
+    state
+        .resize_widget_surfaces(&surface_areas)
+        .map_err(|error| io::Error::other(format!("widget resize rejected: {error}")))?;
     Ok(())
 }
 

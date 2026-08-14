@@ -56,11 +56,11 @@ The next milestone is Phase 3: add one isolated terminal session as an optional 
 
 ## Phase 3 — One isolated terminal session
 
-- [ ] Spawn a child process through a PTY and route output into one emulator instance.
-- [ ] Route keyboard, paste, resize, and basic mouse input to the focused session.
-- [ ] Support normal/alternate screen, colors, cursor state, scrollback, and clean close.
-- [ ] Make terminal functionality an optional widget/provider rather than a shell-wide assumption.
-- [ ] Add PTY lifecycle and emulator behavior tests.
+- [x] Spawn a child process through `portable-pty` and route output into one `alacritty_terminal` instance.
+- [x] Route focused keyboard and resize input to the terminal widget; paste and mouse input remain future work.
+- [ ] Complete normal/alternate screen, colors, cursor state, scrollback, and clean-close coverage.
+- [x] Make terminal functionality an optional widget/provider rather than a shell-wide assumption.
+- [x] Add PTY lifecycle, emulator output, input encoding, resize, and shutdown tests.
 
 **Exit criteria:** a terminal widget behaves predictably inside any layout surface and can coexist with non-terminal widgets.
 

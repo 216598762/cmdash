@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fmt, time::SystemTime};
 
+use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 
 use crate::{
@@ -431,6 +432,54 @@ impl AppState {
             self.redraw_requested = true;
         }
         report
+    }
+
+    pub fn handle_focused_key(&mut self, key: KeyEvent) -> Result<bool, String> {
+        let Some(FocusTarget::Surface(surface_id)) = self.focus.target() else {
+            return Ok(false);
+        };
+        let Some(widget_id) = self
+            .workspace
+            .surfaces
+            .get(&surface_id)
+            .and_then(|surface| surface.widget())
+        else {
+            return Ok(false);
+        };
+        if !self.widget_runtime.handles_input(widget_id) {
+            return Ok(false);
+        }
+        let update = self.widget_runtime.handle_key(widget_id, key)?;
+        if update == crate::widget::WidgetUpdate::Redraw {
+            self.redraw_requested = true;
+        }
+        Ok(true)
+    }
+
+    pub fn resize_widget_surfaces(
+        &mut self,
+        areas: &BTreeMap<SurfaceId, Rect>,
+    ) -> Result<(), String> {
+        let resize_requests: Vec<_> = areas
+            .iter()
+            .filter_map(|(&surface_id, &area)| {
+                let surface = self.workspace.surfaces.get(&surface_id)?;
+                let widget_id = surface.widget()?;
+                (self.widget_runtime.widget_kind(widget_id) == Some("terminal")
+                    && area.width >= 2
+                    && area.height > 0)
+                    .then_some((
+                        widget_id,
+                        crate::session::TerminalSize::new(area.width, area.height),
+                    ))
+            })
+            .collect();
+        for (widget_id, size) in resize_requests {
+            if self.widget_runtime.resize(widget_id, size)? == crate::widget::WidgetUpdate::Redraw {
+                self.redraw_requested = true;
+            }
+        }
+        Ok(())
     }
 
     pub fn shutdown_widgets(&mut self) {

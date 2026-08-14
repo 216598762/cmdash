@@ -25,4 +25,4 @@ cmdash is licensed under the [MIT License](LICENSE).
 
 ## Status
 
-Phase 2 complete. The project has a backend-neutral retained scene, a configuration-driven layout tree with columns, tabs, stacks, and overlays, and a widget runtime with lifecycle hooks, health reporting, clean shutdown, text, UTC clock, and system-information widgets. A versioned C-compatible plugin host contract is exercised by an external-widget fixture, while `--config <path>` / `-c <path>` loads user-provided TOML. Dynamic library loading and terminal sessions remain future work.
+Phase 3 in progress. The project has a backend-neutral retained scene, a configuration-driven layout tree, lifecycle-aware dashboard widgets, and an optional terminal widget backed by `portable-pty` and `alacritty_terminal`. Focused keyboard input, PTY output parsing, resize, and shutdown are covered; paste/mouse routing and complete terminal mode coverage remain future work. `--config <path>` / `-c <path>` loads user-provided TOML.

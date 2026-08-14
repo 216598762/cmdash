@@ -274,6 +274,7 @@ mod tests {
             title: Some(" plugin ".to_owned()),
             text: Some("loaded".to_owned()),
             format: None,
+            command: None,
         }
     }
 

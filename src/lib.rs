@@ -7,6 +7,7 @@ pub mod input;
 pub mod layout;
 pub mod plugin;
 pub mod scene;
+pub mod session;
 pub mod state;
 pub mod widget;
 
@@ -24,6 +25,7 @@ pub use plugin::{
     PluginModule, PluginRegistry,
 };
 pub use scene::{Cell, CellStyle, CellWidth, Color, Scene};
+pub use session::{SessionError, TerminalSession, TerminalSize};
 pub use state::{
     AppState, AppStateConfigError, CommandError, FocusState, FocusTarget, Overlay, OverlayId,
     OverlayPrimitive, SessionId, Surface, SurfaceId, WidgetId, WorkspaceId, WorkspaceState,

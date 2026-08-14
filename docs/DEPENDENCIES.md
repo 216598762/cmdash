@@ -31,7 +31,7 @@ These are the strongest candidates for the first executable once the package ske
 | Area | Candidate | Intended use | Status / risk |
 | --- | --- | --- | --- |
 | Terminal I/O | [`crossterm`](https://crates.io/crates/crossterm) | Raw mode, keyboard/mouse input, resize events, cursor and basic terminal control | Selected initial backend; graphics submission and retained scene output remain behind a cmdash-owned boundary. |
-| PTYs | [`portable-pty`](https://crates.io/crates/portable-pty) | Spawn shells/processes, read/write PTY streams, resize sessions | Selected initial direction; validate Linux process lifecycle, signal handling, and shutdown semantics. |
+| PTYs | [`portable-pty`](https://crates.io/crates/portable-pty) | Spawn shells/processes, read/write PTY streams, resize sessions | Active v0.9 integration; continue validating Linux process lifecycle, signal handling, and shutdown semantics. |
 | Async runtime | [`tokio`](https://crates.io/crates/tokio) | Event coordination, PTY I/O tasks, timers, bounded channels, cancellation | Selected initial direction; keep frame composition on one coordinator/UI owner. |
 | Serialization | [`serde`](https://crates.io/crates/serde) | Versioned widget/application configuration types | Active in the initial widget configuration model; avoid serializing live PTY/emulator state in the first release. |
 | Configuration format | [`toml`](https://crates.io/crates/toml) | Initial hand-authored workspace and widget configuration | Active version-1 parser; keep schema/version migration explicit. |
@@ -81,11 +81,11 @@ Do not add all of these up front. The selected terminal emulator may already pro
 
 ### `portable-pty`
 
-The leading PTY process-management candidate. It should own OS-specific PTY setup while cmdash owns session identity, message routing, resize ordering, and lifecycle policy.
+**Active at v0.9.** It owns OS-specific PTY setup while cmdash owns session identity, output polling, input routing, resize ordering, and lifecycle policy.
 
 ### `alacritty_terminal`
 
-**Selected initial emulator direction.** This is a full terminal-emulation implementation extracted from Alacritty and provides the grid state, alternate screen, modes, cursor, scrollback, and parsing that cmdash needs.
+**Active at v0.26.** This is a full terminal-emulation implementation extracted from Alacritty and provides the grid state, alternate screen, modes, cursor, scrollback, and parsing that cmdash needs. The current session slice uses its grid/parser behind the backend-neutral scene boundary; full mode coverage remains a Phase 3 test gate.
 
 **Critical gate:** verify current Kitty graphics support and extension points before Phase 5. If graphics are not exposed sufficiently, add a narrowly scoped cmdash-owned adapter or revisit the emulator choice; do not create a global graphics cache.
 
