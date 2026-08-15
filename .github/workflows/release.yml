@@ -49,6 +49,7 @@ jobs:
           mkdir -p "dist/${archive}"
           cp "${binary}" README.md LICENSE "dist/${archive}/"
           cp -R docs "dist/${archive}/docs"
+          cp -R config "dist/${archive}/config"
           tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
           sha256sum "dist/${archive}.tar.gz" > "dist/${archive}.tar.gz.sha256"
         shell: bash

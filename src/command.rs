@@ -1,6 +1,9 @@
 use ratatui::layout::Rect;
 
-use crate::state::{Overlay, OverlayId, Surface, SurfaceId};
+use crate::{
+    config::SplitDirection,
+    state::{Overlay, OverlayId, Surface, SurfaceId},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
@@ -43,9 +46,11 @@ pub enum FocusDirection {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PaneCommand {
+    Split(SplitDirection),
     Grow,
     Shrink,
     Close,
+    Merge,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

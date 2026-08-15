@@ -19,58 +19,27 @@ use crossterm::event::{self, Event};
 use ratatui::layout::Rect;
 
 const MAX_EVENTS_PER_BATCH: usize = 32;
-const DEFAULT_CONFIG: &str = r#"
-version = 1
-
-[workspace]
-name = "default"
-
-[[workspace.widgets]]
-id = 1
-type = "text"
-title = " workspace "
-text = "Dashboard widgets are configuration-driven."
-
-[[workspace.widgets]]
-id = 2
-type = "clock"
-title = " clock "
-format = "HH:MM:SS"
-
-[[workspace.widgets]]
-id = 3
-type = "system"
-title = " system "
-
-[[workspace.overlays]]
-id = 9
-x = 2
-y = 4
-width = 30
-height = 4
-z_index = 10
-title = " notice "
-text = "Phase 2 widget host"
-
-[workspace.layout]
-type = "stack"
-children = [
-  { type = "tabs", active = 0, children = [
-    { type = "columns", children = [
-      { type = "leaf", widget = 1 },
-      { type = "leaf", widget = 2 },
-      { type = "leaf", widget = 3 }
-    ] }
-  ] },
-  { type = "overlay", overlay = 9 }
-]
-"#;
+const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
 
 fn main() -> io::Result<()> {
     let mut backend = CrosstermBackend::new(io::stdout());
     let args: Vec<_> = env::args().skip(1).collect();
-    let config_path = config_path(&args)?;
-    let config = load_config(config_path.as_deref())?;
+    if args.iter().any(|argument| argument == "--migrate-config") {
+        let path = config_path(&args)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--migrate-config requires --config <path>",
+            )
+        })?;
+        let migrations =
+            AppConfig::rewrite_file(&path).map_err(|error| io::Error::other(format!("{error}")))?;
+        for migration in migrations {
+            println!("migrated: {}", migration.warning());
+        }
+        return Ok(());
+    }
+    let explicit_config_path = config_path(&args)?;
+    let (config_path, config) = load_config(explicit_config_path.as_deref())?;
     let config_path_for_report = config_path.clone();
     let registry = WidgetRegistry::builtins();
     let mut state = AppState::from_config(backend.capabilities(), &registry, &config)
@@ -157,6 +126,8 @@ where
         let diff = compositor.diff(&scene);
         backend.submit_diff(&diff)?;
         backend.submit_graphics(diff.graphics(), diff.removed_graphics())?;
+        #[cfg(feature = "sixel")]
+        backend.submit_sixel(diff.sixel())?;
 
         if dispatch_available_events(state, registry, reloader.as_deref_mut())? {
             break;
@@ -166,15 +137,31 @@ where
     Ok(())
 }
 
-fn load_config(path: Option<&Path>) -> io::Result<AppConfig> {
-    match path {
-        Some(path) => {
-            AppConfig::load_file(path).map_err(|error| io::Error::other(format!("{error}")))
-        }
-        None => AppConfig::parse(DEFAULT_CONFIG).map_err(|error| {
-            io::Error::other(format!("embedded default config rejected: {error}"))
-        }),
+fn load_config(path: Option<&Path>) -> io::Result<(Option<PathBuf>, AppConfig)> {
+    if let Some(path) = path {
+        let config =
+            AppConfig::load_file(path).map_err(|error| io::Error::other(format!("{error}")))?;
+        return Ok((Some(path.to_path_buf()), config));
     }
+
+    let candidates = [
+        env::var_os("CMDASH_CONFIG").map(PathBuf::from),
+        env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+            .map(|directory| directory.join("cmdash/config.toml")),
+        Some(PathBuf::from("config/default.toml")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.is_file() {
+            let config = AppConfig::load_file(&candidate)
+                .map_err(|error| io::Error::other(format!("{error}")))?;
+            return Ok((Some(candidate), config));
+        }
+    }
+    let config = AppConfig::parse(DEFAULT_CONFIG)
+        .map_err(|error| io::Error::other(format!("embedded default config rejected: {error}")))?;
+    Ok((None, config))
 }
 
 fn config_path(args: &[String]) -> io::Result<Option<PathBuf>> {
@@ -182,6 +169,7 @@ fn config_path(args: &[String]) -> io::Result<Option<PathBuf>> {
     let mut arguments = args.iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--migrate-config" => {}
             "--config" | "-c" => {
                 let value = arguments.next().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "--config requires a TOML path")

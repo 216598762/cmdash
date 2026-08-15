@@ -5,6 +5,59 @@
 //! small encoder without changing the default build or the retained scene ABI.
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SixelSubmission {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    encoded: Vec<u8>,
+}
+
+impl SixelSubmission {
+    pub fn new(x: u16, y: u16, image: SixelImage<'_>) -> Result<Self, SixelError> {
+        let width = image.width;
+        let height = image.height;
+        let encoded = encode_rgb(image)?;
+        Ok(Self {
+            x,
+            y,
+            width,
+            height,
+            encoded,
+        })
+    }
+
+    pub const fn x(&self) -> u16 {
+        self.x
+    }
+
+    pub const fn y(&self) -> u16 {
+        self.y
+    }
+
+    pub const fn width(&self) -> u16 {
+        self.width
+    }
+
+    pub const fn height(&self) -> u16 {
+        self.height
+    }
+
+    pub fn encoded(&self) -> &[u8] {
+        &self.encoded
+    }
+
+    pub fn clipped_to(&self, clip: ratatui::layout::Rect) -> Option<Self> {
+        let right = self.x.saturating_add(self.width);
+        let bottom = self.y.saturating_add(self.height);
+        let clip_right = clip.x.saturating_add(clip.width);
+        let clip_bottom = clip.y.saturating_add(clip.height);
+        (self.x >= clip.x && self.y >= clip.y && right <= clip_right && bottom <= clip_bottom)
+            .then(|| self.clone())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SixelImage<'a> {
     pub width: u16,
     pub height: u16,

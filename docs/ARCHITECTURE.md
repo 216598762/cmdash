@@ -218,7 +218,7 @@ This is why a global image map or a single terminal emulator shared by tabs is e
 
 The scene model should allow Kitty first, then add protocol adapters such as sixel or iTerm-style images if their support is justified. Text and layout must remain correct when graphics are unavailable. Protocol handling belongs behind a capability-aware adapter, not in dashboard widgets.
 
-A practical initial implementation can use a mature terminal parser/emulator crate and add a narrowly scoped graphics-state adapter if the selected emulator does not expose the required protocol. The adapter must have conformance tests based on captured escape sequences.
+A practical initial implementation can use a mature terminal parser/emulator crate and add a narrowly scoped graphics-state adapter if the selected emulator does not expose the required protocol. The adapter must have conformance tests based on captured escape sequences. The opt-in sixel path now uses the same retained scene boundary: dashboard submissions are clipped, diffed, and emitted only after backend capability negotiation.
 
 ### 5.4 Resource policy
 
@@ -243,7 +243,7 @@ Image layers are diffed as part of `FrameDiff`; stale physical image IDs are exp
 
 The scene should carry clipping and ownership metadata. Every image placement should include its owning `SessionId` or a derived resource namespace so the compositor can reject cross-session references during development.
 
-The first backend can target a single local terminal, but the interface should keep these concerns separate. The first interaction model prioritizes retained terminal tabs. Configuration-driven horizontal and vertical pane splits are supported, and the command layer now provides directional pane focus, ratio adjustment, and focused-pane shutdown while preserving retained session ownership:
+The first backend can target a single local terminal, but the interface should keep these concerns separate. The first interaction model prioritizes retained terminal tabs. Configuration-driven horizontal and vertical pane splits are supported, and the command layer now creates new terminal sessions, provides directional pane focus, ratio adjustment, merge/close lifecycle operations, and persists mutable layout state through safe reload while preserving retained session ownership:
 
 - terminal input/output and raw mode;
 - layout and cell rendering;
@@ -260,7 +260,7 @@ Candidate crates are cataloged in [External library candidates](DEPENDENCIES.md)
 | PTY management | `portable-pty`, with narrow `nix` adapters if needed |
 | Escape parsing | Parser APIs exposed by `alacritty_terminal`, with `vte` only if a narrow adapter is required |
 | Terminal emulation | `alacritty_terminal`, one instance per session |
-| Kitty/image output | Cmdash-owned session adapter and retained `Scene` image layers; optional dependency-free sixel encoder for dashboard RGB images |
+| Kitty/image output | Cmdash-owned session adapter and retained `Scene` image layers; optional dependency-free sixel encoder/submission path for dashboard RGB images |
 | Dynamic plugins | Versioned manifest plus opt-in Wasmtime host with no imports | Isolates plugin faults and keeps terminal/filesystem capabilities explicit |
 | Errors/logging | `thiserror`, `anyhow`, `tracing`, `tracing-subscriber` |
 | Config/serialization | `serde` + `toml` |
@@ -301,7 +301,8 @@ The core should be testable without a real terminal:
 - frame golden tests for cell output and invalidation;
 - PTY integration tests for shell startup, input, output, resize, and clean shutdown;
 - capability tests for terminals with and without Kitty or opt-in sixel support;
-- fuzz targets for TOML migration, plugin manifests, and Kitty APC chunking;
-- release archive and checksum checks on tagged builds.
+- fuzz targets and retained seed corpora for TOML migration, plugin manifests, Kitty APC chunking, and sixel encoding;
+- pane lifecycle tests for independent PTYs, nested layout persistence, and safe reload;
+- release archive, checksum, feature-variant, and startup checks on tagged builds.
 
 A key regression test: write a Kitty image with ID `1` in tab A, write a different image with ID `1` in tab B, switch A → B → A, and verify that each tab restores its own image without cross-contamination.

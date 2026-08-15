@@ -46,6 +46,8 @@ pub use plugin::{
 pub use reload::{ConfigReloader, ReloadError};
 pub use scene::{Cell, CellStyle, CellWidth, Color, Scene};
 pub use session::{SessionError, TerminalSession, TerminalSize, kitty_stream_stats};
+#[cfg(feature = "sixel")]
+pub use sixel::{SixelError, SixelImage, SixelSubmission, encode_rgb};
 pub use state::{
     AppState, AppStateConfigError, CommandError, FocusState, FocusTarget, Overlay, OverlayId,
     OverlayPrimitive, SessionId, Surface, SurfaceId, WidgetId, WorkspaceId, WorkspaceState,

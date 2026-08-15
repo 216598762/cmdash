@@ -120,6 +120,29 @@ impl AppConfig {
         Ok((value.to_string(), migrations))
     }
 
+    pub fn rewrite_file(path: impl AsRef<Path>) -> Result<Vec<ConfigMigration>, ConfigFileError> {
+        let path = path.as_ref();
+        let source = fs::read_to_string(path).map_err(|error| ConfigFileError::Read {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        let (rewritten, migrations) =
+            Self::migrate_source(&source).map_err(ConfigFileError::Invalid)?;
+        if migrations.is_empty() {
+            return Ok(migrations);
+        }
+        let temporary = path.with_extension("toml.cmdash-migrate");
+        fs::write(&temporary, rewritten).map_err(|error| ConfigFileError::Write {
+            path: temporary.clone(),
+            message: error.to_string(),
+        })?;
+        fs::rename(&temporary, path).map_err(|error| ConfigFileError::Write {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        Ok(migrations)
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.version != CURRENT_CONFIG_VERSION {
             return Err(ConfigError::UnsupportedVersion(self.version));
@@ -212,6 +235,7 @@ fn validate_layout(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfigFileError {
     Read { path: PathBuf, message: String },
+    Write { path: PathBuf, message: String },
     Invalid(ConfigError),
 }
 
@@ -222,6 +246,13 @@ impl fmt::Display for ConfigFileError {
                 write!(
                     formatter,
                     "could not read config {}: {message}",
+                    path.display()
+                )
+            }
+            Self::Write { path, message } => {
+                write!(
+                    formatter,
+                    "could not rewrite config {}: {message}",
                     path.display()
                 )
             }
@@ -554,6 +585,31 @@ mod tests {
         let (_, legacy) = AppConfig::parse_with_migrations("version = 0\n").unwrap();
         assert_eq!(legacy, [ConfigMigration::LegacyVersion { from: 0, to: 1 }]);
         assert!(missing[0].warning().contains("assumed"));
+    }
+
+    #[test]
+    fn checked_in_default_configuration_is_valid() {
+        let config = AppConfig::parse(include_str!("../config/default.toml")).unwrap();
+
+        assert_eq!(config.workspace.widgets.len(), 3);
+        assert!(config.workspace.layout.is_some());
+    }
+
+    #[test]
+    fn rewrite_file_updates_legacy_versions_atomically() {
+        let path = std::env::temp_dir().join(format!(
+            "cmdash-migrate-{}-{}.toml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::write(&path, "[workspace]\nname = \"legacy\"\n").unwrap();
+
+        let migrations = AppConfig::rewrite_file(&path).unwrap();
+        let rewritten = fs::read_to_string(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(migrations, [ConfigMigration::AddedVersion]);
+        assert!(rewritten.contains("version = 1"));
     }
 
     #[test]

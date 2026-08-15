@@ -112,6 +112,46 @@ The next milestone is Phase 3: add one isolated terminal session as an optional 
 
 **Exit criteria (met for the current contract):** documented extension points, repeatable builds/tests, and controlled behavior under malformed input and resource pressure.
 
+## Phase 8 — Interactive pane evolution
+
+This phase extends the current retained-tab and pane foundation into a user-mutable multiplexer layout without weakening session ownership.
+
+- [x] Create a new pane from the focused terminal with an explicit horizontal or vertical split command.
+- [x] Define pane creation policy for shell command, terminal size, session identity, and inherited widget settings.
+- [x] Merge panes and close pane groups while shutting down only the sessions that are no longer referenced.
+- [x] Persist the pane tree, split ratios, focus target, and tab membership across safe configuration reloads.
+- [x] Add directional focus tests for nested splits, tabs, overlays, and zero-area edge cases.
+- [x] Add lifecycle regressions proving pane creation, close, merge, tab switching, and application shutdown do not leak PTYs or graphics resources.
+
+**Exit criteria (met):** users can create, focus, resize, merge, close, and restore independent terminal panes without cross-session state leakage.
+
+## Phase 9 — Fuzzing, release, and graphics validation
+
+This phase turns the current hardening foundations into repeatable validation and publishable feature variants.
+
+- [x] Retain minimized fuzzing corpora for config migration, plugin manifests, Kitty APC input, and sixel encoding.
+- [x] Increase scheduled fuzz budgets, triage crash artifacts, and publish reproducible parser regressions as unit tests.
+- [x] Add upgrade-path tests for each configuration version and make migration warnings actionable with a safe rewrite command.
+- [x] Validate release archives, checksums, binary sizes, and startup behavior on Linux x86_64, macOS ARM64, and Windows x86_64.
+- [x] Publish separately tested default, `sixel`, and `wasm-plugins` release variants with capability/permission notes.
+- [x] Integrate dashboard sixel images through retained `Scene` image layers and backend capability negotiation.
+
+**Exit criteria (met):** malformed input, migration, release packaging, and optional graphics/runtime variants are continuously and reproducibly validated.
+
+## Phase 10 — Configuration onboarding and reference documentation
+
+This phase makes the configuration file a first-class user-facing product surface rather than only an embedded fallback.
+
+- [x] Add a checked-in `config/default.toml` containing the smallest useful widget-only dashboard and documented comments for each option.
+- [x] Define the default-config discovery order: explicit `--config` / `-c`, user config path, checked-in/example config, then embedded fallback.
+- [x] Create `docs/CONFIGURATION.md` with the `cmdash.workspace` v1 schema, top-level options, widget fields, plugin manifests, layout nodes, split ratios, overlays, graphics limits, and feature-gated options.
+- [x] Provide complete TOML examples for a dashboard-only workspace, terminal tabs, nested panes, overlays, plugin metadata, and safe reload.
+- [x] Document validation errors, migration warnings, unsupported versions, environment variables such as `CMDASH_CRASH_DIR`, and default keyboard bindings.
+- [x] Add schema/configuration tests that parse the checked-in default file, verify every documented option, and exercise invalid/recovery examples.
+- [x] Add a command or help entry that points users from the runtime palette to the configuration reference.
+
+**Exit criteria (met):** a new user can locate a working default configuration, understand every supported option, safely customize it, and recover from invalid edits.
+
 ## Decision log starters
 
 | Topic | Provisional direction | Why it matters |
@@ -125,7 +165,8 @@ The next milestone is Phase 3: add one isolated terminal session as an optional 
 | Widget extensibility | Versioned manifest plus opt-in Wasmtime host | Keeps untrusted widget execution isolated and avoids exposing Rust's unstable ABI or terminal handles |
 | Graphics | Kitty first, optional dependency-free sixel adapter, capability-aware fallback | Matches the initial requirement while keeping restoration faithful and making sixel opt-in |
 | Async model | Coordinator/UI owner plus per-session I/O tasks | Keeps frame submission serialized while PTYs remain responsive |
-| Configuration | TOML for the initial user-facing format | Readable for hand-authored layouts and widget settings |
+| Configuration | TOML with checked-in `config/default.toml` and `docs/CONFIGURATION.md` | Makes the embedded fallback discoverable while keeping schema evolution explicit |
+| Default configuration discovery | Explicit CLI path, user config, example/default file, embedded fallback | Preserves safe startup while giving users an editable starting point |
 | Initial multiplexer UX | Retained tabs plus interactive horizontal/vertical panes | Validates session isolation and restoration while keeping pane mutation command-driven |
 
 Update this table as product decisions are made; do not let provisional choices silently become public API guarantees.

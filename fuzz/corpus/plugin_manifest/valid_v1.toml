@@ -1,0 +1,8 @@
+manifest_version = 1
+name = "seed"
+version = "1.0.0"
+abi_version = 1
+capabilities = 1
+[[widgets]]
+type = "seed-widget"
+capabilities = 1

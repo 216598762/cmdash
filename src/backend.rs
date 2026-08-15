@@ -106,6 +106,14 @@ pub trait Backend {
         Ok(())
     }
 
+    #[cfg(feature = "sixel")]
+    fn submit_sixel(
+        &mut self,
+        _sixel: &[crate::sixel::SixelSubmission],
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     fn submit_clipboard(&mut self, _text: &str) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -271,6 +279,18 @@ impl<W: Write> Backend for CrosstermBackend<W> {
                 placement.width(),
                 placement.height()
             )?;
+        }
+        self.writer.flush()
+    }
+
+    #[cfg(feature = "sixel")]
+    fn submit_sixel(&mut self, sixel: &[crate::sixel::SixelSubmission]) -> Result<(), Self::Error> {
+        if !self.capabilities.sixel {
+            return Ok(());
+        }
+        for image in sixel {
+            queue!(self.writer, MoveTo(image.x(), image.y()))?;
+            self.writer.write_all(image.encoded())?;
         }
         self.writer.flush()
     }

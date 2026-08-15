@@ -56,9 +56,10 @@ jobs:
 
       - name: Run bounded fuzz smoke tests
         run: |
-          cargo fuzz run config_parse -- -runs=250
-          cargo fuzz run plugin_manifest -- -runs=250
-          cargo fuzz run kitty_stream -- -runs=250
+          cargo fuzz run config_parse fuzz/corpus/config_parse -- -runs=1000
+          cargo fuzz run plugin_manifest fuzz/corpus/plugin_manifest -- -runs=1000
+          cargo fuzz run kitty_stream fuzz/corpus/kitty_stream -- -runs=1000
+          cargo fuzz run sixel_rgb -- -runs=1000
 
       - name: Upload fuzz artifacts
         if: always()
@@ -67,6 +68,23 @@ jobs:
           name: cmdash-fuzz-artifacts
           path: fuzz/artifacts
           if-no-files-found: ignore
+
+  feature-variants:
+    name: Validate optional release variants
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build sixel variant
+        run: cargo build --locked --release --features sixel
+
+      - name: Build WASM plugin variant
+        run: cargo build --locked --release --features wasm-plugins
 
   msrv:
     name: Check Rust MSRV

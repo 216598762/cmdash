@@ -34,7 +34,7 @@ These are the strongest candidates for the first executable once the package ske
 | PTYs | [`portable-pty`](https://crates.io/crates/portable-pty) | Spawn shells/processes, read/write PTY streams, resize sessions | Active v0.9 integration; continue validating Linux process lifecycle, signal handling, and shutdown semantics. |
 | Async runtime | [`tokio`](https://crates.io/crates/tokio) | Event coordination, PTY I/O tasks, timers, bounded channels, cancellation | Selected initial direction; keep frame composition on one coordinator/UI owner. |
 | Serialization | [`serde`](https://crates.io/crates/serde) | Versioned widget/application configuration types | Active in the initial widget configuration model; avoid serializing live PTY/emulator state in the first release. |
-| Configuration format | [`toml`](https://crates.io/crates/toml) | Initial hand-authored workspace and widget configuration | Active version-1 parser with safe metadata-polled reload; keep schema/version migration explicit. |
+| Configuration format | [`toml`](https://crates.io/crates/toml) | Initial hand-authored workspace and widget configuration | Active version-1 parser with checked-in `config/default.toml`, safe metadata-polled reload, atomic migration rewrite, and explicit schema/version handling. |
 | Diagnostics | [`tracing`](https://crates.io/crates/tracing) + [`tracing-subscriber`](https://crates.io/crates/tracing-subscriber) | Structured logs for sessions, plugins, frame timing, and protocol failures | Future structured logger; current recovery diagnostics are bounded and rendered in-app. |
 | Error types | [`thiserror`](https://crates.io/crates/thiserror) + [`anyhow`](https://crates.io/crates/anyhow) | Typed library errors and application-level context | Strong candidates; use typed errors at plugin/session boundaries. |
 | User paths | [`directories`](https://crates.io/crates/directories) | XDG-compatible config, cache, data, and plugin discovery paths | Strong candidate; confirm exact Linux/XDG behavior needed by the app. |
@@ -182,8 +182,8 @@ Plugin discovery uses a validated manifest shape with ABI/API version, widget ty
 - [`assert_cmd`](https://crates.io/crates/assert_cmd) — executable-level tests for CLI behavior and failure modes.
 - [`tempfile`](https://crates.io/crates/tempfile) — isolated config, plugin, and PTY fixture directories.
 - [`criterion`](https://crates.io/crates/criterion) — benchmark frame composition, high-volume PTY output, and graphics-store operations.
-- `cargo-fuzz` — fuzz escape/protocol parsing, config migration, and plugin-manifest handling; this is a development tool rather than a runtime dependency.
-- The optional `sixel` feature currently uses a local, dependency-free 16-color quantizing encoder; add an image/quantization dependency only after profiling demonstrates the need.
+- `cargo-fuzz` — fuzz escape/protocol parsing, config migration, plugin-manifest handling, and sixel encoding; minimized seed corpora are checked in under `fuzz/corpus/`. This is a development tool rather than a runtime dependency.
+- The optional `sixel` feature uses a local, dependency-free 16-color quantizing encoder whose submissions flow through retained `Scene` image layers and capability-aware backend output; add an image/quantization dependency only after profiling demonstrates the need.
 - Wasmtime is optional and should not be enabled for the default binary or fuzz harness unless a plugin-runtime test requires it.
 
 The most valuable first regression test remains: two tabs each use graphics image ID `1`, produce different images, switch A → B → A, and verify that the retained scenes and submitted placements remain isolated.

@@ -23,6 +23,17 @@ pub fn command_for_key(key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Left => return Some(Command::Pane(PaneCommand::Shrink)),
             KeyCode::Right => return Some(Command::Pane(PaneCommand::Grow)),
+            KeyCode::Char('h') => {
+                return Some(Command::Pane(PaneCommand::Split(
+                    crate::config::SplitDirection::Horizontal,
+                )));
+            }
+            KeyCode::Char('v') => {
+                return Some(Command::Pane(PaneCommand::Split(
+                    crate::config::SplitDirection::Vertical,
+                )));
+            }
+            KeyCode::Char('m') => return Some(Command::Pane(PaneCommand::Merge)),
             KeyCode::Char('w') => return Some(Command::Pane(PaneCommand::Close)),
             _ => {}
         }
@@ -122,6 +133,31 @@ mod tests {
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT
             )),
             Some(Command::Pane(PaneCommand::Close))
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Some(Command::Pane(PaneCommand::Split(
+                crate::config::SplitDirection::Horizontal
+            )))
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Some(Command::Pane(PaneCommand::Split(
+                crate::config::SplitDirection::Vertical
+            )))
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(
+                KeyCode::Char('m'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Some(Command::Pane(PaneCommand::Merge))
         );
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)),

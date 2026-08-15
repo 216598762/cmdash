@@ -2,6 +2,8 @@ use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
 
 use crate::graphics::GraphicsSubmission;
+#[cfg(feature = "sixel")]
+use crate::sixel::SixelSubmission;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Color {
@@ -74,6 +76,8 @@ pub struct Scene {
     area: Rect,
     cells: Vec<Cell>,
     image_layers: Vec<GraphicsSubmission>,
+    #[cfg(feature = "sixel")]
+    sixel_layers: Vec<SixelSubmission>,
 }
 
 impl Scene {
@@ -84,6 +88,8 @@ impl Scene {
             area,
             cells: vec![Cell::blank(style); cell_count],
             image_layers: Vec::new(),
+            #[cfg(feature = "sixel")]
+            sixel_layers: Vec::new(),
         }
     }
 
@@ -104,6 +110,18 @@ impl Scene {
             self.image_layers.push(submission);
             self.image_layers
                 .sort_by_key(|layer| layer.placement().z_index());
+        }
+    }
+
+    #[cfg(feature = "sixel")]
+    pub fn sixel_layers(&self) -> &[SixelSubmission] {
+        &self.sixel_layers
+    }
+
+    #[cfg(feature = "sixel")]
+    pub fn add_sixel_layer(&mut self, submission: SixelSubmission) {
+        if let Some(submission) = submission.clipped_to(self.area) {
+            self.sixel_layers.push(submission);
         }
     }
 
@@ -172,6 +190,15 @@ impl Scene {
         }
         self.image_layers
             .sort_by_key(|layer| layer.placement().z_index());
+        #[cfg(feature = "sixel")]
+        for image in &source.sixel_layers {
+            if let Some(image) = image
+                .clipped_to(clip)
+                .and_then(|image| image.clipped_to(self.area))
+            {
+                self.sixel_layers.push(image);
+            }
+        }
         for y in y_start..y_end {
             for x in x_start..x_end {
                 if let Some(cell) = source.cell_at(x, y).copied() {
@@ -368,6 +395,29 @@ mod tests {
             destination.image_layers()[0].placement().area(),
             Rect::new(3, 1, 2, 1)
         );
+    }
+
+    #[cfg(feature = "sixel")]
+    #[test]
+    fn sixel_layers_are_retained_and_conservatively_clipped() {
+        let image = crate::sixel::SixelSubmission::new(
+            1,
+            1,
+            crate::sixel::SixelImage {
+                width: 2,
+                height: 1,
+                rgb: &[255, 255, 255, 0, 0, 0],
+            },
+        )
+        .unwrap();
+        let mut scene = Scene::new(Rect::new(0, 0, 8, 4));
+        scene.add_sixel_layer(image);
+        assert_eq!(scene.sixel_layers().len(), 1);
+
+        let mut clipped = Scene::new(Rect::new(0, 0, 8, 4));
+        clipped.blit(&scene, Rect::new(1, 1, 2, 1));
+        assert_eq!(clipped.sixel_layers().len(), 1);
+        assert!(clipped.sixel_layers()[0].encoded().starts_with(b"\x1bPq"));
     }
 
     #[test]

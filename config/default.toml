@@ -1,0 +1,46 @@
+# cmdash default configuration (schema version 1)
+# Copy this file to ~/.config/cmdash/config.toml and customize it.
+version = 1
+
+[workspace]
+name = "default"
+
+[[workspace.widgets]]
+id = 1
+type = "text"
+title = " workspace "
+text = "Dashboard widgets are configuration-driven."
+
+[[workspace.widgets]]
+id = 2
+type = "clock"
+title = " clock "
+format = "HH:MM:SS"
+
+[[workspace.widgets]]
+id = 3
+type = "system"
+title = " system "
+
+[[workspace.overlays]]
+id = 9
+x = 2
+y = 4
+width = 30
+height = 4
+z_index = 10
+title = " notice "
+text = "Phase 2 widget host"
+
+[workspace.layout]
+type = "stack"
+children = [
+  { type = "tabs", active = 0, children = [
+    { type = "columns", children = [
+      { type = "leaf", widget = 1 },
+      { type = "leaf", widget = 2 },
+      { type = "leaf", widget = 3 }
+    ] }
+  ] },
+  { type = "overlay", overlay = 9 }
+]

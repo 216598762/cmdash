@@ -108,8 +108,28 @@ impl LayoutTree {
         adjust_split(&mut self.root, widget, delta)
     }
 
-    pub fn hide_widget(&mut self, widget: WidgetId) -> bool {
-        self.hidden_widgets.insert(widget)
+    pub fn split_widget(
+        &mut self,
+        widget: WidgetId,
+        direction: SplitDirection,
+        new_widget: WidgetId,
+    ) -> bool {
+        if widget == new_widget || contains_widget(&self.root, new_widget) {
+            return false;
+        }
+        split_leaf(&mut self.root, widget, direction, new_widget)
+    }
+
+    pub fn remove_widget(&mut self, widget: WidgetId) -> bool {
+        let removed = remove_leaf(&mut self.root, widget);
+        if removed {
+            self.hidden_widgets.remove(&widget);
+        }
+        removed
+    }
+
+    pub fn to_config(&self) -> LayoutConfig {
+        node_to_config(&self.root)
     }
 
     pub fn is_hidden(&self, widget: WidgetId) -> bool {
@@ -360,6 +380,101 @@ fn adjust_split(node: &mut LayoutNode, widget: WidgetId, delta: i16) -> bool {
             .iter_mut()
             .any(|child| adjust_split(child, widget, delta)),
         LayoutNode::Leaf(_) | LayoutNode::Overlay(_) => false,
+    }
+}
+
+fn split_leaf(
+    node: &mut LayoutNode,
+    widget: WidgetId,
+    direction: SplitDirection,
+    new_widget: WidgetId,
+) -> bool {
+    match node {
+        LayoutNode::Leaf(id) if *id == widget => {
+            *node = LayoutNode::Split {
+                direction,
+                ratios: vec![50, 50],
+                children: vec![LayoutNode::Leaf(widget), LayoutNode::Leaf(new_widget)],
+            };
+            true
+        }
+        LayoutNode::Columns(children)
+        | LayoutNode::Stack(children)
+        | LayoutNode::Split { children, .. }
+        | LayoutNode::Tabs { children, .. } => children
+            .iter_mut()
+            .any(|child| split_leaf(child, widget, direction, new_widget)),
+        LayoutNode::Leaf(_) | LayoutNode::Overlay(_) => false,
+    }
+}
+
+fn remove_leaf(node: &mut LayoutNode, widget: WidgetId) -> bool {
+    match node {
+        LayoutNode::Leaf(id) => *id == widget,
+        LayoutNode::Columns(children)
+        | LayoutNode::Stack(children)
+        | LayoutNode::Split { children, .. } => {
+            let Some(index) = children
+                .iter()
+                .position(|child| matches!(child, LayoutNode::Leaf(id) if *id == widget))
+            else {
+                return children.iter_mut().any(|child| remove_leaf(child, widget));
+            };
+            children.remove(index);
+            if children.len() == 1 {
+                let replacement = children.remove(0);
+                *node = replacement;
+            }
+            true
+        }
+        LayoutNode::Tabs { active, children } => {
+            let Some(index) = children
+                .iter()
+                .position(|child| matches!(child, LayoutNode::Leaf(id) if *id == widget))
+            else {
+                return children.iter_mut().any(|child| remove_leaf(child, widget));
+            };
+            children.remove(index);
+            if *active >= children.len() && !children.is_empty() {
+                *active = children.len() - 1;
+            }
+            if children.len() == 1 {
+                let replacement = children.remove(0);
+                *node = replacement;
+            }
+            true
+        }
+        LayoutNode::Overlay(_) => false,
+    }
+}
+
+fn node_to_config(node: &LayoutNode) -> LayoutConfig {
+    match node {
+        LayoutNode::Leaf(widget) => LayoutConfig::Leaf {
+            widget: widget.get(),
+        },
+        LayoutNode::Columns(children) => LayoutConfig::Columns {
+            children: children.iter().map(node_to_config).collect(),
+        },
+        LayoutNode::Tabs { active, children } => LayoutConfig::Tabs {
+            active: *active,
+            children: children.iter().map(node_to_config).collect(),
+        },
+        LayoutNode::Stack(children) => LayoutConfig::Stack {
+            children: children.iter().map(node_to_config).collect(),
+        },
+        LayoutNode::Split {
+            direction,
+            ratios,
+            children,
+        } => LayoutConfig::Split {
+            direction: *direction,
+            ratios: ratios.clone(),
+            children: children.iter().map(node_to_config).collect(),
+        },
+        LayoutNode::Overlay(overlay) => LayoutConfig::Overlay {
+            overlay: overlay.get(),
+        },
     }
 }
 

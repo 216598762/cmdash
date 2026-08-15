@@ -318,6 +318,11 @@ pub struct AppState {
     pending_invalidations: Vec<Rect>,
     diagnostics: Vec<String>,
     pending_clipboard: Option<String>,
+    config: AppConfig,
+    widget_registry: WidgetRegistry,
+    runtime_pane_ids: std::collections::BTreeSet<u64>,
+    layout_dirty: bool,
+    next_widget_id: u64,
 }
 
 impl AppState {
@@ -333,6 +338,15 @@ impl AppState {
             pending_invalidations: Vec::new(),
             diagnostics: Vec::new(),
             pending_clipboard: None,
+            config: AppConfig {
+                version: crate::config::CURRENT_CONFIG_VERSION,
+                workspace: crate::config::WorkspaceConfig::default(),
+                plugins: Vec::new(),
+            },
+            widget_registry: WidgetRegistry::builtins(),
+            runtime_pane_ids: std::collections::BTreeSet::new(),
+            layout_dirty: false,
+            next_widget_id: 1,
         }
     }
 
@@ -379,6 +393,18 @@ impl AppState {
             pending_invalidations: Vec::new(),
             diagnostics: Vec::new(),
             pending_clipboard: None,
+            config: config.clone(),
+            widget_registry: registry.clone(),
+            runtime_pane_ids: std::collections::BTreeSet::new(),
+            layout_dirty: false,
+            next_widget_id: config
+                .workspace
+                .widgets
+                .iter()
+                .map(|widget| widget.id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
         };
 
         for widget in &config.workspace.widgets {
@@ -461,7 +487,38 @@ impl AppState {
         registry: &WidgetRegistry,
         config: &AppConfig,
     ) -> Result<(), AppStateConfigError> {
-        let next = Self::from_config(self.backend_capabilities, registry, config)?;
+        let previous_focus = self.focus.target();
+        let mut candidate = config.clone();
+        for widget in &self.config.workspace.widgets {
+            if self.runtime_pane_ids.contains(&widget.id)
+                && !candidate
+                    .workspace
+                    .widgets
+                    .iter()
+                    .any(|next| next.id == widget.id)
+            {
+                candidate.workspace.widgets.push(widget.clone());
+            }
+        }
+        if self.layout_dirty {
+            let mut with_runtime_layout = candidate.clone();
+            with_runtime_layout.workspace.layout = Some(self.layout.to_config());
+            if with_runtime_layout.validate().is_ok() {
+                candidate = with_runtime_layout;
+            }
+        }
+        let mut next = Self::from_config(self.backend_capabilities, registry, &candidate)?;
+        if let Some(FocusTarget::Surface(surface_id)) = previous_focus
+            && next
+                .workspace
+                .surfaces
+                .get(&surface_id)
+                .is_some_and(|surface| surface.visible())
+        {
+            next.focus.set(FocusTarget::Surface(surface_id));
+        }
+        next.runtime_pane_ids = self.runtime_pane_ids.clone();
+        next.layout_dirty = self.layout_dirty;
         self.shutdown_widgets();
         *self = next;
         self.record_diagnostic("configuration reloaded");
@@ -711,7 +768,7 @@ impl AppState {
                     OverlayId::new(u64::MAX - 1),
                     Rect::new(3, 3, 58, 9),
                     " command palette ",
-                    "q / Esc       quit\nTab           next focus\nAlt+Arrow     directional pane focus\nCtrl+Shift+←/→ resize pane ratio\nCtrl+Shift+W  close focused pane\nCtrl+PageUp   previous tab\nCtrl+PageDown next tab\nCtrl+R        reload TOML configuration",
+                    "q / Esc       quit\nTab           next focus\nAlt+Arrow     directional pane focus\nCtrl+Shift+H/V split focused terminal\nCtrl+Shift+←/→ resize pane ratio\nCtrl+Shift+W close  Ctrl+Shift+M merge\nCtrl+PageUp   previous tab\nCtrl+PageDown next tab\nCtrl+R        reload; docs/CONFIGURATION.md",
                 );
                 CommandEffect::Redraw
             }
@@ -810,6 +867,7 @@ impl AppState {
                     .filter(|surface| surface.visible())
                     .map(|surface| surface.area()),
             );
+            self.persist_runtime_layout();
         }
     }
 
@@ -919,6 +977,7 @@ impl AppState {
             return Err(CommandError::PaneNotFound(WidgetId::new(0)));
         };
         match command {
+            PaneCommand::Split(direction) => self.split_pane(surface_id, widget_id, direction)?,
             PaneCommand::Grow | PaneCommand::Shrink => {
                 let delta = if matches!(command, PaneCommand::Grow) {
                     10
@@ -928,25 +987,96 @@ impl AppState {
                 if !self.layout.adjust_split_for_widget(widget_id, delta) {
                     return Err(CommandError::NoSplitForPane(widget_id));
                 }
+                self.persist_runtime_layout();
                 self.redraw_requested = true;
             }
-            PaneCommand::Close => {
-                if !self.layout.hide_widget(widget_id) {
-                    return Err(CommandError::PaneNotFound(widget_id));
-                }
-                if let Err(error) = self.widget_runtime.shutdown_widget(widget_id) {
-                    self.record_diagnostic(format!("pane shutdown failed: {error}"));
-                }
-                if let Some(surface) = self.workspace.surfaces.get_mut(&surface_id) {
-                    *surface = surface.with_visible(false);
-                }
-                self.focus.clear();
-                self.pending_invalidations
-                    .push(self.workspace.surfaces[&surface_id].area());
-                self.redraw_requested = true;
+            PaneCommand::Close | PaneCommand::Merge => {
+                self.close_pane(surface_id, widget_id)?;
             }
         }
         Ok(())
+    }
+
+    fn split_pane(
+        &mut self,
+        surface_id: SurfaceId,
+        widget_id: WidgetId,
+        direction: crate::config::SplitDirection,
+    ) -> Result<(), CommandError> {
+        if self.widget_runtime.widget_kind(widget_id) != Some("terminal") {
+            return Err(CommandError::PaneNotFound(widget_id));
+        }
+        let new_id = WidgetId::new(self.next_widget_id);
+        self.next_widget_id = self.next_widget_id.saturating_add(1);
+        let source = self
+            .config
+            .workspace
+            .widgets
+            .iter()
+            .find(|widget| widget.id == widget_id.get())
+            .cloned()
+            .ok_or(CommandError::PaneNotFound(widget_id))?;
+        let new_config = crate::config::WidgetInstanceConfig {
+            id: new_id.get(),
+            kind: source.kind,
+            title: source.title,
+            text: source.text,
+            format: source.format,
+            command: source.command,
+            settings: source.settings,
+        };
+        self.widget_runtime
+            .add_from_config(&self.widget_registry, &new_config)
+            .map_err(|_| CommandError::PaneNotFound(new_id))?;
+        if !self.layout.split_widget(widget_id, direction, new_id) {
+            let _ = self.widget_runtime.shutdown_widget(new_id);
+            return Err(CommandError::NoSplitForPane(widget_id));
+        }
+        let area = self.workspace.surfaces[&surface_id].area();
+        let new_surface = Surface::new(SurfaceId::new(new_id.get()), area).with_widget(new_id);
+        self.workspace
+            .surfaces
+            .insert(new_surface.id(), new_surface);
+        self.config.workspace.widgets.push(new_config);
+        self.runtime_pane_ids.insert(new_id.get());
+        self.persist_runtime_layout();
+        self.focus.set(FocusTarget::Surface(new_surface.id()));
+        self.pending_invalidations.push(area);
+        self.redraw_requested = true;
+        Ok(())
+    }
+
+    fn close_pane(
+        &mut self,
+        surface_id: SurfaceId,
+        widget_id: WidgetId,
+    ) -> Result<(), CommandError> {
+        if self.layout.visible_widget_ids().len() <= 1 {
+            return Err(CommandError::NoSplitForPane(widget_id));
+        }
+        let area = self.workspace.surfaces[&surface_id].area();
+        if !self.layout.remove_widget(widget_id) {
+            return Err(CommandError::PaneNotFound(widget_id));
+        }
+        if let Err(error) = self.widget_runtime.shutdown_widget(widget_id) {
+            self.record_diagnostic(format!("pane shutdown failed: {error}"));
+        }
+        self.workspace.surfaces.remove(&surface_id);
+        self.config
+            .workspace
+            .widgets
+            .retain(|widget| widget.id != widget_id.get());
+        self.runtime_pane_ids.remove(&widget_id.get());
+        self.persist_runtime_layout();
+        self.focus.clear();
+        self.pending_invalidations.push(area);
+        self.redraw_requested = true;
+        Ok(())
+    }
+
+    fn persist_runtime_layout(&mut self) {
+        self.config.workspace.layout = Some(self.layout.to_config());
+        self.layout_dirty = true;
     }
 
     fn navigate_focus(&mut self, forward: bool) {
@@ -1082,7 +1212,7 @@ mod tests {
     use super::*;
     use crate::{
         Color,
-        command::{Command, FocusCommand, OverlayCommand, SurfaceCommand, TabCommand},
+        command::{Command, FocusCommand, OverlayCommand, PaneCommand, SurfaceCommand, TabCommand},
     };
 
     fn capabilities() -> BackendCapabilities {
@@ -1407,6 +1537,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.focus().target(), None);
+    }
+
+    #[test]
+    fn focused_terminal_can_create_close_and_restore_an_independent_pane() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 10
+            type = "terminal"
+            command = "sh"
+            [workspace.layout]
+            type = "leaf"
+            widget = 10
+            "#,
+        )
+        .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        let original = SurfaceId::new(10);
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(original)))
+            .unwrap();
+
+        state
+            .dispatch(Command::Pane(PaneCommand::Split(
+                crate::config::SplitDirection::Vertical,
+            )))
+            .unwrap();
+        let created = state.focus().target().unwrap();
+        let created_surface = match created {
+            FocusTarget::Surface(id) => id,
+            FocusTarget::Overlay(_) => panic!("pane creation must focus the new surface"),
+        };
+        assert_ne!(created_surface, original);
+        assert_eq!(state.layout().visible_widget_ids().len(), 2);
+        assert_eq!(state.widget_runtime().widget_ids().count(), 2);
+
+        state.reload_config(&registry, &config).unwrap();
+        assert!(state.workspace().surfaces().contains_key(&created_surface));
+        assert_eq!(state.layout().visible_widget_ids().len(), 2);
+        assert_eq!(
+            state.focus().target(),
+            Some(FocusTarget::Surface(created_surface))
+        );
+
+        state.dispatch(Command::Pane(PaneCommand::Close)).unwrap();
+        assert_eq!(state.layout().visible_widget_ids(), [WidgetId::new(10)]);
+        assert_eq!(state.widget_runtime().widget_ids().count(), 1);
+        assert!(!state.workspace().surfaces().contains_key(&created_surface));
+        state.shutdown_widgets();
     }
 
     #[test]

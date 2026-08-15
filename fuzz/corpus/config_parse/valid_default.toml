@@ -1,0 +1,7 @@
+version = 1
+[workspace]
+name = "fuzz-seed"
+[[workspace.widgets]]
+id = 1
+type = "text"
+text = "seed"

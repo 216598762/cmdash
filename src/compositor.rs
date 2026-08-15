@@ -44,6 +44,8 @@ pub struct FrameDiff {
     spans: Vec<CellSpan>,
     graphics: Vec<crate::graphics::GraphicsSubmission>,
     removed_graphics: Vec<u32>,
+    #[cfg(feature = "sixel")]
+    sixel: Vec<crate::sixel::SixelSubmission>,
 }
 
 impl FrameDiff {
@@ -75,8 +77,22 @@ impl FrameDiff {
         &self.removed_graphics
     }
 
+    #[cfg(feature = "sixel")]
+    pub fn sixel(&self) -> &[crate::sixel::SixelSubmission] {
+        &self.sixel
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.changes.is_empty() && self.graphics.is_empty() && self.removed_graphics.is_empty()
+        self.changes.is_empty() && self.graphics.is_empty() && self.removed_graphics.is_empty() && {
+            #[cfg(feature = "sixel")]
+            {
+                self.sixel.is_empty()
+            }
+            #[cfg(not(feature = "sixel"))]
+            {
+                true
+            }
+        }
     }
 }
 
@@ -161,6 +177,15 @@ impl Compositor {
         let previous = self.previous.as_ref();
         let graphics_changed = full_redraw
             || previous.is_none_or(|previous| previous.image_layers() != current.image_layers());
+        #[cfg(feature = "sixel")]
+        let sixel_changed = full_redraw
+            || previous.is_none_or(|previous| previous.sixel_layers() != current.sixel_layers());
+        #[cfg(feature = "sixel")]
+        let sixel = if sixel_changed {
+            current.sixel_layers().to_vec()
+        } else {
+            Vec::new()
+        };
         let graphics = if graphics_changed {
             current.image_layers().to_vec()
         } else {
@@ -211,6 +236,8 @@ impl Compositor {
             spans,
             graphics,
             removed_graphics,
+            #[cfg(feature = "sixel")]
+            sixel,
         }
     }
 }

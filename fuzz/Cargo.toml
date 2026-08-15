@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-cmdash = { path = ".." }
+cmdash = { path = "..", features = ["sixel"] }
 
 [[bin]]
 name = "config_parse"
@@ -28,6 +28,13 @@ bench = false
 [[bin]]
 name = "kitty_stream"
 path = "fuzz_targets/kitty_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sixel_rgb"
+path = "fuzz_targets/sixel_rgb.rs"
 test = false
 doc = false
 bench = false

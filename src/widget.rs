@@ -7,6 +7,8 @@ use std::{
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 
+#[cfg(feature = "sixel")]
+use crate::sixel::SixelSubmission;
 use crate::{
     config::{AppConfig, WidgetInstanceConfig},
     graphics::GraphicsSubmission,
@@ -91,6 +93,11 @@ pub trait Widget: Send {
         Vec::new()
     }
 
+    #[cfg(feature = "sixel")]
+    fn sixel(&self, _area: Rect) -> Vec<SixelSubmission> {
+        Vec::new()
+    }
+
     fn handles_input(&self) -> bool {
         false
     }
@@ -153,7 +160,7 @@ impl fmt::Display for WidgetError {
 
 impl std::error::Error for WidgetError {}
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct WidgetRegistry {
     factories: BTreeMap<String, WidgetFactory>,
 }
@@ -258,6 +265,25 @@ impl WidgetRuntime {
             instances.insert(id, WidgetEntry { widget, health });
         }
         Ok(Self { instances })
+    }
+
+    pub fn add_from_config(
+        &mut self,
+        registry: &WidgetRegistry,
+        config: &WidgetInstanceConfig,
+    ) -> Result<(), WidgetError> {
+        let id = WidgetId::new(config.id);
+        if self.instances.contains_key(&id) {
+            return Err(WidgetError::DuplicateWidgetId(id));
+        }
+        let mut widget = registry.instantiate(config)?;
+        let kind = widget.kind().to_owned();
+        widget
+            .initialize()
+            .map_err(|reason| WidgetError::InitializationFailed { kind, reason })?;
+        let health = widget.health();
+        self.instances.insert(id, WidgetEntry { widget, health });
+        Ok(())
     }
 
     pub fn widget_ids(&self) -> impl Iterator<Item = WidgetId> + '_ {
@@ -425,6 +451,19 @@ impl WidgetRuntime {
             .collect()
     }
 
+    #[cfg(feature = "sixel")]
+    pub fn sixel(&self, areas: &BTreeMap<WidgetId, Rect>) -> Vec<SixelSubmission> {
+        areas
+            .iter()
+            .flat_map(|(&id, &area)| {
+                self.instances
+                    .get(&id)
+                    .into_iter()
+                    .flat_map(move |entry| entry.widget.sixel(area))
+            })
+            .collect()
+    }
+
     pub fn render(
         &self,
         areas: &BTreeMap<WidgetId, Rect>,
@@ -437,6 +476,10 @@ impl WidgetRuntime {
                 let mut scene = entry.widget.render(area, focused == Some(id));
                 for graphics in entry.widget.graphics(area) {
                     scene.add_image_layer(graphics);
+                }
+                #[cfg(feature = "sixel")]
+                for sixel in entry.widget.sixel(area) {
+                    scene.add_sixel_layer(sixel);
                 }
                 Some((id, scene))
             })

@@ -14,4 +14,4 @@ Validate a downloaded archive with:
 sha256sum --check cmdash-vX.Y.Z-TARGET.tar.gz.sha256
 ```
 
-The default release is built without optional protocol/runtime features. Build variants such as `--features sixel` or `--features wasm-plugins` should be published separately only after their target-specific capability and size checks pass.
+The default release is built without optional protocol/runtime features. CI validates separate `sixel` and `wasm-plugins` release builds; publish those variants separately only after their target-specific capability, permission, startup, and size checks pass. The sixel variant emits retained scene submissions only when sixel capability detection succeeds, while the WASM variant keeps modules import-free and WASI-free.

@@ -2,7 +2,9 @@
 /target/
 /fuzz/target/
 /fuzz/artifacts/
-/fuzz/corpus/
+/fuzz/corpus/*
+!/fuzz/corpus/*/
+!/fuzz/corpus/*/*
 
 # IDE/editor files
 .vscode/
