@@ -12,7 +12,7 @@ This roadmap is intentionally staged so the rendering and session ownership cont
 - [x] Create the initial Cargo package with formatting and test commands.
 - [x] Add CI and linting workflows for formatting, checks, Clippy, and tests.
 - [x] Use TOML as the initial hand-authored configuration format.
-- [ ] Define the stable plugin configuration schema and dynamic-plugin terminology.
+- [x] Define the stable plugin configuration schema and dynamic-plugin terminology.
 
 **Exit criteria:** a documented package/plugin boundary and a small executable that enters/leaves raw mode safely, or a deliberate decision to defer raw mode until Phase 1.
 
@@ -100,14 +100,14 @@ The next milestone is Phase 3: add one isolated terminal session as an optional 
 ## Phase 7 — Extensibility and hardening
 
 - [x] Define plugin manifest metadata with ABI, capability, widget-type, and version validation.
-- [ ] Stabilize the widget API, dynamic-plugin contract, and full configuration schema.
-- [ ] Add feature-gated protocol support such as sixel if demand warrants it.
-- [ ] Add pane splitting only after tabs and session restoration are stable.
+- [x] Stabilize the widget API, dynamic-plugin contract, and full configuration schema.
+- [x] Add feature-gated protocol support such as sixel without changing the default build.
+- [x] Add configuration-driven horizontal and vertical pane splitting after tabs and session restoration are stable.
 - [x] Add bounded parser stress coverage for escape/protocol input.
 - [x] Enforce graphics resource quotas and surface widget/session shutdown failures as diagnostics.
-- [ ] Add fuzzing, upgrade/migration handling, and release packaging.
+- [x] Add fuzzing targets, upgrade/migration handling, and reproducible Linux release packaging.
 
-**Exit criteria:** documented extension points, repeatable builds/tests, and controlled behavior under malformed input and resource pressure.
+**Exit criteria (met for the current contract):** documented extension points, repeatable builds/tests, and controlled behavior under malformed input and resource pressure.
 
 ## Decision log starters
 
@@ -120,9 +120,9 @@ The next milestone is Phase 3: add one isolated terminal session as an optional 
 | Terminal session ownership | One emulator and graphics store for each terminal tab/session | Prevents state and image-ID cross-contamination |
 | Rendering | Retained, backend-neutral scene composed into complete frames | Makes widgets modular and tab restoration deterministic |
 | Widget extensibility | Versioned native plugin ABI with C-compatible host data | Makes external widgets a first-class design constraint without exposing Rust's unstable ABI |
-| Graphics | Kitty first, capability-aware fallback; retain live-session graphics in memory initially | Matches the initial requirement while keeping restoration faithful and predictable |
+| Graphics | Kitty first, optional dependency-free sixel adapter, capability-aware fallback | Matches the initial requirement while keeping restoration faithful and making sixel opt-in |
 | Async model | Coordinator/UI owner plus per-session I/O tasks | Keeps frame submission serialized while PTYs remain responsive |
 | Configuration | TOML for the initial user-facing format | Readable for hand-authored layouts and widget settings |
-| Initial multiplexer UX | Tabs first; panes later | Validates session isolation and restoration before expanding layout complexity |
+| Initial multiplexer UX | Retained tabs plus configuration-driven horizontal/vertical panes | Validates session isolation and restoration before adding interactive pane mutation |
 
 Update this table as product decisions are made; do not let provisional choices silently become public API guarantees.

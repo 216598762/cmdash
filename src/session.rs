@@ -445,6 +445,15 @@ fn allocate_session_id() -> SessionId {
 type KittyCommand = (Vec<u8>, Vec<u8>);
 type KittyExtraction = (Vec<u8>, Vec<KittyCommand>, Vec<u8>);
 
+/// Returns `(plain_bytes, kitty_commands, pending_bytes)` for parser stress tooling.
+///
+/// The parser itself remains session-owned; this bounded summary lets fuzz
+/// targets exercise chunking and terminator handling without constructing a PTY.
+pub fn kitty_stream_stats(buffer: &[u8]) -> (usize, usize, usize) {
+    let (plain, commands, remainder) = extract_kitty_commands(buffer);
+    (plain.len(), commands.len(), remainder.len())
+}
+
 fn extract_kitty_commands(buffer: &[u8]) -> KittyExtraction {
     const PREFIX: &[u8] = b"\x1b_G";
     const TERMINATOR: &[u8] = b"\x1b\\";

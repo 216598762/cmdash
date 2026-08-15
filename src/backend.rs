@@ -60,6 +60,7 @@ pub struct BackendCapabilities {
     pub mouse: bool,
     pub bracketed_paste: bool,
     pub kitty_graphics: bool,
+    pub sixel: bool,
 }
 
 impl BackendCapabilities {
@@ -79,6 +80,9 @@ impl BackendCapabilities {
             mouse: true,
             bracketed_paste: true,
             kitty_graphics: terminal_hint.contains("kitty") || program_hint.contains("kitty"),
+            sixel: cfg!(feature = "sixel")
+                && (terminal_hint.contains("sixel")
+                    || std::env::var("CMDASH_SIXEL").is_ok_and(|value| value == "1")),
         }
     }
 }
@@ -545,6 +549,7 @@ mod tests {
             mouse: true,
             bracketed_paste: true,
             kitty_graphics: true,
+            sixel: false,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
         backend.submit_graphics(&graphics, &[]).unwrap();

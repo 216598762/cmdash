@@ -280,6 +280,7 @@ mod tests {
             mouse: true,
             bracketed_paste: true,
             kitty_graphics: false,
+            sixel: false,
         }
     }
 

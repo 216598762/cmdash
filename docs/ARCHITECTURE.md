@@ -44,7 +44,7 @@ Application
 The terms below are deliberately separate:
 
 - **Workspace:** a saved arrangement and its runtime state.
-- **Layout node:** a split, stack, tab group, overlay, or leaf in a workspace layout tree.
+- **Layout node:** a horizontal/vertical split, stack, tab group, overlay, or leaf in a workspace layout tree.
 - **Widget type:** an implementation registered in the widget catalog.
 - **Widget instance:** one configured and stateful use of a widget type.
 - **Surface:** a rectangular region assigned to a widget instance by layout.
@@ -243,7 +243,7 @@ Image layers are diffed as part of `FrameDiff`; stale physical image IDs are exp
 
 The scene should carry clipping and ownership metadata. Every image placement should include its owning `SessionId` or a derived resource namespace so the compositor can reject cross-session references during development.
 
-The first backend can target a single local terminal, but the interface should keep these concerns separate. The first interaction model prioritizes terminal tabs; pane splitting can be added after the tab/session and scene contracts are stable:
+The first backend can target a single local terminal, but the interface should keep these concerns separate. The first interaction model prioritizes retained terminal tabs. Configuration-driven horizontal and vertical pane splits are now supported after validating the tab/session and scene contracts; interactive pane mutation remains a later command-layer extension:
 
 - terminal input/output and raw mode;
 - layout and cell rendering;
@@ -260,7 +260,7 @@ Candidate crates are cataloged in [External library candidates](DEPENDENCIES.md)
 | PTY management | `portable-pty`, with narrow `nix` adapters if needed |
 | Escape parsing | Parser APIs exposed by `alacritty_terminal`, with `vte` only if a narrow adapter is required |
 | Terminal emulation | `alacritty_terminal`, one instance per session |
-| Kitty/image output | Cmdash-owned session adapter and retained `Scene` image layers; evaluate a protocol crate only for broader formats |
+| Kitty/image output | Cmdash-owned session adapter and retained `Scene` image layers; optional dependency-free sixel encoder for dashboard RGB images |
 | Dynamic plugins | Versioned native ABI; evaluate `abi_stable` versus a hand-defined C ABI during the prototype |
 | Errors/logging | `thiserror`, `anyhow`, `tracing`, `tracing-subscriber` |
 | Config/serialization | `serde` + `toml` |
@@ -288,18 +288,20 @@ Dynamic plugins are an early requirement, with compile-time feature flags still 
 - a workspace config chooses which widget types and instances are present;
 - plugin loading, health, permissions, and shutdown are managed by a host-side plugin manager.
 
-The plugin manager must validate manifests, reject unsupported ABI versions/capabilities, isolate failures to the affected widget where possible, and ensure a plugin cannot write directly to the terminal backend. Native dynamic loading should not rely on Rust's unstable ABI; use a stable, versioned boundary or an explicitly chosen portable runtime.
+The plugin manager must validate manifests, reject unsupported ABI/API versions and capabilities, isolate failures to the affected widget where possible, and ensure a plugin cannot write directly to the terminal backend. Native dynamic loading should not rely on Rust's unstable ABI; use the stabilized C-compatible v1 descriptor/manifest boundary or an explicitly chosen portable runtime. The current configuration contract is `cmdash.workspace` v1, with named plugin manifests and a string-valued widget settings map; legacy/missing config versions are reported through explicit migration records.
 
 ## 9. Testing strategy
 
 The core should be testable without a real terminal:
 
-- layout tests for split/tab/overlay geometry and clipping;
+- layout tests for horizontal/vertical split, tab, overlay geometry, and clipping;
 - scene/compositor tests proving hidden sessions contribute no primitives;
 - session isolation tests using two emulators/stores with colliding Kitty image IDs;
 - parser conformance tests for text, alternate screen, resize, and graphics sequences;
 - frame golden tests for cell output and invalidation;
 - PTY integration tests for shell startup, input, output, resize, and clean shutdown;
-- capability tests for terminals with and without Kitty graphics support.
+- capability tests for terminals with and without Kitty or opt-in sixel support;
+- fuzz targets for TOML migration, plugin manifests, and Kitty APC chunking;
+- release archive and checksum checks on tagged builds.
 
 A key regression test: write a Kitty image with ID `1` in tab A, write a different image with ID `1` in tab B, switch A → B → A, and verify that each tab restores its own image without cross-contamination.

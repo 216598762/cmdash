@@ -7,6 +7,10 @@ description = "A modular terminal dashboard and multiplexer"
 license = "MIT"
 readme = "README.md"
 
+[features]
+default = []
+sixel = []
+
 [dependencies]
 alacritty_terminal = { version = "0.26", default-features = false }
 crossterm = "0.29"

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     path::{Path, PathBuf},
 };
@@ -9,21 +9,65 @@ use serde::Deserialize;
 use crate::state::{OverlayId, WidgetId};
 
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
+pub const LEGACY_CONFIG_VERSION: u32 = 0;
+pub const CONFIG_SCHEMA: &str = "cmdash.workspace";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct AppConfig {
     pub version: u32,
     #[serde(default)]
     pub workspace: WorkspaceConfig,
+    #[serde(default)]
+    pub plugins: Vec<PluginConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigMigration {
+    AddedVersion,
+    LegacyVersion { from: u32, to: u32 },
 }
 
 impl AppConfig {
     pub fn parse(source: &str) -> Result<Self, ConfigError> {
-        let config: Self =
-            toml::from_str(source).map_err(|error| ConfigError::Parse(error.to_string()))?;
+        Self::parse_with_migrations(source).map(|(config, _)| config)
+    }
 
+    pub fn parse_with_migrations(
+        source: &str,
+    ) -> Result<(Self, Vec<ConfigMigration>), ConfigError> {
+        #[derive(Deserialize)]
+        struct RawAppConfig {
+            #[serde(default)]
+            version: Option<u32>,
+            #[serde(default)]
+            workspace: WorkspaceConfig,
+            #[serde(default)]
+            plugins: Vec<PluginConfig>,
+        }
+
+        let raw: RawAppConfig =
+            toml::from_str(source).map_err(|error| ConfigError::Parse(error.to_string()))?;
+        let (source_version, migration) = match raw.version {
+            None => (CURRENT_CONFIG_VERSION, Some(ConfigMigration::AddedVersion)),
+            Some(LEGACY_CONFIG_VERSION) => (
+                CURRENT_CONFIG_VERSION,
+                Some(ConfigMigration::LegacyVersion {
+                    from: LEGACY_CONFIG_VERSION,
+                    to: CURRENT_CONFIG_VERSION,
+                }),
+            ),
+            Some(version) => (version, None),
+        };
+        if source_version != CURRENT_CONFIG_VERSION {
+            return Err(ConfigError::UnsupportedVersion(source_version));
+        }
+        let config = Self {
+            version: CURRENT_CONFIG_VERSION,
+            workspace: raw.workspace,
+            plugins: raw.plugins,
+        };
         config.validate()?;
-        Ok(config)
+        Ok((config, migration.into_iter().collect()))
     }
 
     pub fn load_file(path: impl AsRef<Path>) -> Result<Self, ConfigFileError> {
@@ -67,6 +111,16 @@ impl AppConfig {
         if let Some(layout) = &self.workspace.layout {
             validate_layout(layout, &ids, &overlay_ids)?;
         }
+
+        let mut plugin_names = BTreeSet::new();
+        for plugin in &self.plugins {
+            if plugin.name.trim().is_empty() || plugin.manifest.trim().is_empty() {
+                return Err(ConfigError::InvalidPluginConfig);
+            }
+            if !plugin_names.insert(&plugin.name) {
+                return Err(ConfigError::DuplicatePluginName(plugin.name.clone()));
+            }
+        }
         Ok(())
     }
 }
@@ -83,7 +137,9 @@ fn validate_layout(
                 return Err(ConfigError::LayoutWidgetNotFound(id));
             }
         }
-        LayoutConfig::Columns { children } | LayoutConfig::Stack { children } => {
+        LayoutConfig::Columns { children }
+        | LayoutConfig::Stack { children }
+        | LayoutConfig::Split { children, .. } => {
             if children.is_empty() {
                 return Err(ConfigError::EmptyLayoutChildren);
             }
@@ -135,6 +191,14 @@ impl fmt::Display for ConfigFileError {
 
 impl std::error::Error for ConfigFileError {}
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct PluginConfig {
+    pub name: String,
+    pub manifest: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceConfig {
     pub name: String,
@@ -160,9 +224,20 @@ pub enum LayoutConfig {
     Stack {
         children: Vec<LayoutConfig>,
     },
+    Split {
+        direction: SplitDirection,
+        children: Vec<LayoutConfig>,
+    },
     Overlay {
         overlay: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitDirection {
+    Horizontal,
+    Vertical,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -253,6 +328,8 @@ pub struct WidgetInstanceConfig {
     pub format: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -268,6 +345,8 @@ pub enum ConfigError {
     LayoutOverlayNotFound(OverlayId),
     EmptyLayoutChildren,
     InvalidActiveTab(usize),
+    InvalidPluginConfig,
+    DuplicatePluginName(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -296,6 +375,12 @@ impl fmt::Display for ConfigError {
             Self::EmptyLayoutChildren => formatter.write_str("layout nodes must have children"),
             Self::InvalidActiveTab(index) => {
                 write!(formatter, "active tab index {index} is out of range")
+            }
+            Self::InvalidPluginConfig => {
+                formatter.write_str("plugin name and manifest path cannot be empty")
+            }
+            Self::DuplicatePluginName(name) => {
+                write!(formatter, "duplicate plugin name {name:?}")
             }
         }
     }
@@ -395,6 +480,35 @@ mod tests {
             Some(LayoutConfig::Stack { .. })
         ));
         assert_eq!(config.workspace.overlays[0].id, 9);
+    }
+
+    #[test]
+    fn validates_plugin_names_and_widget_settings() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[plugins]]
+            name = "example"
+            manifest = "example.toml"
+            [[workspace.widgets]]
+            id = 1
+            type = "external-text"
+            [workspace.widgets.settings]
+            theme = "dark"
+            "#,
+        )
+        .unwrap();
+        assert!(config.plugins[0].enabled);
+        assert_eq!(config.workspace.widgets[0].settings["theme"], "dark");
+    }
+
+    #[test]
+    fn migration_adds_missing_or_legacy_versions() {
+        let (_, missing) =
+            AppConfig::parse_with_migrations("[workspace]\nname = \"legacy\"\n").unwrap();
+        assert_eq!(missing, [ConfigMigration::AddedVersion]);
+        let (_, legacy) = AppConfig::parse_with_migrations("version = 0\n").unwrap();
+        assert_eq!(legacy, [ConfigMigration::LegacyVersion { from: 0, to: 1 }]);
     }
 
     #[test]

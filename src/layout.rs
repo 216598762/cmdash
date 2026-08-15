@@ -6,7 +6,7 @@ use std::{
 use ratatui::layout::Rect;
 
 use crate::{
-    config::LayoutConfig,
+    config::{LayoutConfig, SplitDirection},
     state::{OverlayId, WidgetId},
 };
 
@@ -19,6 +19,10 @@ pub enum LayoutNode {
         children: Vec<LayoutNode>,
     },
     Stack(Vec<LayoutNode>),
+    Split {
+        direction: SplitDirection,
+        children: Vec<LayoutNode>,
+    },
     Overlay(OverlayId),
 }
 
@@ -106,7 +110,9 @@ fn switch_tabs_in_node(node: &mut LayoutNode, forward: bool) -> bool {
             }
             true
         }
-        LayoutNode::Columns(children) | LayoutNode::Stack(children) => children
+        LayoutNode::Columns(children)
+        | LayoutNode::Stack(children)
+        | LayoutNode::Split { children, .. } => children
             .iter_mut()
             .any(|child| switch_tabs_in_node(child, forward)),
         LayoutNode::Tabs { children, .. } => children
@@ -166,6 +172,21 @@ fn convert_node(
                     .collect::<Result<_, _>>()?,
             ))
         }
+        LayoutConfig::Split {
+            direction,
+            children,
+        } => {
+            if children.is_empty() {
+                return Err(LayoutError::EmptyChildren);
+            }
+            Ok(LayoutNode::Split {
+                direction: *direction,
+                children: children
+                    .iter()
+                    .map(|child| convert_node(child, widgets, overlays))
+                    .collect::<Result<_, _>>()?,
+            })
+        }
         LayoutConfig::Overlay { overlay } => {
             let id = OverlayId::new(*overlay);
             if !overlays.contains(&id) {
@@ -183,7 +204,9 @@ fn collect_visible_widgets(node: &LayoutNode, ids: &mut Vec<WidgetId>) {
                 ids.push(*id);
             }
         }
-        LayoutNode::Columns(children) | LayoutNode::Stack(children) => {
+        LayoutNode::Columns(children)
+        | LayoutNode::Stack(children)
+        | LayoutNode::Split { children, .. } => {
             for child in children {
                 collect_visible_widgets(child, ids);
             }
@@ -202,7 +225,9 @@ fn collect_visible_overlays(node: &LayoutNode, ids: &mut Vec<OverlayId>) {
                 ids.push(*id);
             }
         }
-        LayoutNode::Columns(children) | LayoutNode::Stack(children) => {
+        LayoutNode::Columns(children)
+        | LayoutNode::Stack(children)
+        | LayoutNode::Split { children, .. } => {
             for child in children {
                 collect_visible_overlays(child, ids);
             }
@@ -220,7 +245,11 @@ fn place_widgets(node: &LayoutNode, area: Rect, placements: &mut BTreeMap<Widget
             placements.insert(*id, area);
         }
         LayoutNode::Columns(children) => {
-            for (child, child_area) in children.iter().zip(split_columns(area, children.len())) {
+            for (child, child_area) in
+                children
+                    .iter()
+                    .zip(split_area(area, children.len(), SplitDirection::Horizontal))
+            {
                 place_widgets(child, child_area, placements);
             }
         }
@@ -232,23 +261,41 @@ fn place_widgets(node: &LayoutNode, area: Rect, placements: &mut BTreeMap<Widget
                 place_widgets(child, area, placements);
             }
         }
+        LayoutNode::Split {
+            direction,
+            children,
+        } => {
+            for (child, child_area) in
+                children
+                    .iter()
+                    .zip(split_area(area, children.len(), *direction))
+            {
+                place_widgets(child, child_area, placements);
+            }
+        }
         LayoutNode::Overlay(_) => {}
     }
 }
 
-fn split_columns(area: Rect, count: usize) -> Vec<Rect> {
+fn split_area(area: Rect, count: usize, direction: SplitDirection) -> Vec<Rect> {
     if count == 0 {
         return Vec::new();
     }
     let count = count as u16;
-    let base_width = area.width / count;
-    let remainder = area.width % count;
-    let mut x = area.x;
+    let (total, mut offset) = match direction {
+        SplitDirection::Horizontal => (area.width, area.x),
+        SplitDirection::Vertical => (area.height, area.y),
+    };
+    let base = total / count;
+    let remainder = total % count;
     (0..count)
         .map(|index| {
-            let width = base_width + u16::from(index < remainder);
-            let child = Rect::new(x, area.y, width, area.height);
-            x = x.saturating_add(width);
+            let size = base + u16::from(index < remainder);
+            let child = match direction {
+                SplitDirection::Horizontal => Rect::new(offset, area.y, size, area.height),
+                SplitDirection::Vertical => Rect::new(area.x, offset, area.width, size),
+            };
+            offset = offset.saturating_add(size);
             child
         })
         .collect()
@@ -270,6 +317,31 @@ mod tests {
         assert_eq!(tree.visible_widget_ids(), widgets());
         assert_eq!(areas[&WidgetId::new(1)].width, 10);
         assert_eq!(areas[&WidgetId::new(3)].x, 20);
+    }
+
+    #[test]
+    fn split_layouts_divide_rows_and_columns() {
+        let horizontal = LayoutConfig::Split {
+            direction: SplitDirection::Horizontal,
+            children: vec![
+                LayoutConfig::Leaf { widget: 1 },
+                LayoutConfig::Leaf { widget: 2 },
+            ],
+        };
+        let tree = LayoutTree::from_config(Some(&horizontal), widgets(), []).unwrap();
+        let areas = tree.widget_areas(Rect::new(0, 0, 20, 10));
+        assert_eq!(areas[&WidgetId::new(1)], Rect::new(0, 0, 10, 10));
+
+        let vertical = LayoutConfig::Split {
+            direction: SplitDirection::Vertical,
+            children: vec![
+                LayoutConfig::Leaf { widget: 1 },
+                LayoutConfig::Leaf { widget: 2 },
+            ],
+        };
+        let tree = LayoutTree::from_config(Some(&vertical), widgets(), []).unwrap();
+        let areas = tree.widget_areas(Rect::new(0, 0, 20, 10));
+        assert_eq!(areas[&WidgetId::new(2)], Rect::new(0, 5, 20, 5));
     }
 
     #[test]

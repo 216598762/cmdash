@@ -10,10 +10,18 @@ use crate::{
 };
 
 pub const PLUGIN_ABI_VERSION: u32 = 1;
+pub const PLUGIN_API_VERSION: u32 = 1;
+pub const PLUGIN_MANIFEST_VERSION: u32 = 1;
 pub const PLUGIN_WIDGET_TYPE_MAX: usize = 32;
+
+fn default_manifest_version() -> u32 {
+    PLUGIN_MANIFEST_VERSION
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct PluginManifestV1 {
+    #[serde(default = "default_manifest_version")]
+    pub manifest_version: u32,
     pub name: String,
     pub version: String,
     pub abi_version: u32,
@@ -39,6 +47,12 @@ impl PluginManifestV1 {
     }
 
     pub fn validate(&self) -> Result<(), PluginManifestError> {
+        if self.manifest_version != PLUGIN_MANIFEST_VERSION {
+            return Err(PluginManifestError::ManifestVersionMismatch {
+                expected: PLUGIN_MANIFEST_VERSION,
+                actual: self.manifest_version,
+            });
+        }
         if self.name.trim().is_empty() || self.version.trim().is_empty() {
             return Err(PluginManifestError::MissingIdentity);
         }
@@ -70,6 +84,7 @@ impl PluginManifestV1 {
 pub enum PluginManifestError {
     Parse(String),
     MissingIdentity,
+    ManifestVersionMismatch { expected: u32, actual: u32 },
     AbiMismatch { expected: u32, actual: u32 },
     NoWidgets,
     InvalidWidgetType(String),
@@ -81,6 +96,12 @@ impl std::fmt::Display for PluginManifestError {
         match self {
             Self::Parse(message) => write!(formatter, "plugin manifest parse error: {message}"),
             Self::MissingIdentity => formatter.write_str("plugin manifest needs name and version"),
+            Self::ManifestVersionMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "plugin manifest version mismatch: expected {expected}, got {actual}"
+                )
+            }
             Self::AbiMismatch { expected, actual } => {
                 write!(
                     formatter,
@@ -386,6 +407,7 @@ mod tests {
             text: Some("loaded".to_owned()),
             format: None,
             command: None,
+            settings: std::collections::BTreeMap::new(),
         }
     }
 
@@ -433,6 +455,7 @@ mod tests {
     fn manifests_validate_abi_identity_and_capabilities() {
         let manifest = PluginManifestV1::parse(
             r#"
+            manifest_version = 1
             name = "example"
             version = "1.0"
             abi_version = 1
@@ -454,6 +477,28 @@ mod tests {
             PluginManifestV1::parse("name = \"missing\""),
             Err(PluginManifestError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn manifest_versions_are_rejected_before_code_loading() {
+        let error = PluginManifestV1::parse(
+            r#"
+            manifest_version = 2
+            name = "example"
+            version = "1.0"
+            abi_version = 1
+            [[widgets]]
+            type = "example-widget"
+            "#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            PluginManifestError::ManifestVersionMismatch {
+                expected: PLUGIN_MANIFEST_VERSION,
+                actual: 2,
+            }
+        );
     }
 
     #[test]
