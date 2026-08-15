@@ -2,13 +2,14 @@
 
 `cmdash` is a Linux terminal application that combines a configurable dashboard with terminal-multiplexer capabilities. It is being designed as a modular compositor: a user can assemble a workspace from terminal sessions, dashboards, and other widgets without requiring terminal sessions at all.
 
-The project is intentionally starting with architecture and behavior contracts before implementation. The most important rendering requirement is that every terminal session owns an independent terminal-emulation and graphics state. Kitty graphics, sixel content, cursor state, scrollback, and other visual state must remain isolated to the session/tab that produced them and be restored when that session becomes visible again.
+The project is intentionally starting with architecture and behavior contracts before implementation. Read the [configuration reference](docs/CONFIGURATION.md) for the TOML schema and discovery rules, and the [widget guide](docs/WIDGETS.md) for widget lifecycle, rendering, input, plugins, panes, and graphics behavior. The most important rendering requirement is that every terminal session owns an independent terminal-emulation and graphics state. Kitty graphics, sixel content, cursor state, scrollback, and other visual state must remain isolated to the session/tab that produced them and be restored when that session becomes visible again.
 
 ## Project documents
 
 - [Architecture](docs/ARCHITECTURE.md) — components, render pipeline, state ownership, and proposed Rust boundaries.
 - [Roadmap](docs/ROADMAP.md) — staged implementation plan and acceptance criteria.
 - [Configuration reference](docs/CONFIGURATION.md) — TOML discovery, widget/layout options, panes, migrations, and recovery.
+- [Widget guide](docs/WIDGETS.md) — widget types, lifecycle, scenes, input, graphics, plugins, panes, and extension guidance.
 - [External library candidates](docs/DEPENDENCIES.md) — categorized crate list, evaluation criteria, and selection risks.
 - [Default configuration](config/default.toml) — a checked-in widget-only starting point.
 
