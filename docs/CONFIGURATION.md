@@ -15,6 +15,49 @@ Configuration is selected in this order:
 
 An explicitly selected or discovered file is watched and can be safely reloaded
 with `Ctrl+R`. Invalid edits are rejected without replacing the active state.
+When cmdash starts from the embedded fallback because no file was found, there
+is no file to reload; `Ctrl+R` reports that it requires `--config <path>`.
+
+## First-run and daily workflow
+
+From a source checkout, the most direct workflow is:
+
+```bash
+mkdir -p ~/.config/cmdash
+cp config/default.toml ~/.config/cmdash/config.toml
+$EDITOR ~/.config/cmdash/config.toml
+cargo run -- --config ~/.config/cmdash/config.toml
+```
+
+The same configuration can be used with an installed or released binary:
+
+```bash
+cmdash --config ~/.config/cmdash/config.toml
+```
+
+Use an explicit path when experimenting with multiple workspaces. Use
+`CMDASH_CONFIG` when a shell profile or launcher should select a workspace
+without repeating the argument:
+
+```bash
+CMDASH_CONFIG="$HOME/.config/cmdash/config.toml" cmdash
+```
+
+A practical edit/reload loop is:
+
+1. Keep the active file in an editor.
+2. Make one small TOML change.
+3. Save it and wait for the file-backed watcher, or press `Ctrl+R` to request an
+   immediate reload.
+4. Check the diagnostic footer for migration warnings or rejection details.
+5. If validation fails, fix or restore the file; the last valid runtime remains
+   active.
+
+Runtime pane creation, closure, split ratios, focus, and tab state are retained
+through a safe reload when they remain valid. These runtime changes are held in
+memory; cmdash does not currently rewrite the source TOML automatically. Edit
+the layout and widget entries yourself when a pane arrangement must survive a
+full process restart.
 
 ## Top-level options
 
@@ -90,9 +133,14 @@ Pane controls operate on the focused terminal:
 - `Ctrl+PageUp` / `Ctrl+PageDown`: switch retained tabs.
 
 New panes inherit the focused terminal's command and widget settings. Pane
-creation assigns a fresh widget/session identity. Runtime pane trees, ratios,
-tab selection, and focus are retained across safe reloads when they remain
-valid against the edited configuration.
+creation assigns a fresh widget/session identity. The last visible pane cannot
+be closed. Runtime pane trees, ratios, tab selection, and focus are retained
+across safe reloads when they remain valid against the edited configuration;
+see [WIDGETS.md](WIDGETS.md) for the session and lifecycle implications.
+
+Pane changes are not persisted to disk automatically. To make a runtime layout
+permanent, copy its intended widget IDs and layout tree into the file before
+restarting cmdash.
 
 ## Overlays
 
@@ -126,6 +174,18 @@ access and use per-instance execution budgets.
 palette. `CMDASH_CRASH_DIR` enables bounded crash reproduction reports when the
 application exits with an error. Diagnostics are shown in the dashboard footer
 and are kept separate from PTY output.
+
+The command-line interface currently accepts only these configuration options:
+
+```text
+cmdash [--config <path> | -c <path>]
+cmdash --migrate-config --config <path>
+```
+
+`--migrate-config` validates the file and atomically adds or updates the schema
+version metadata. It prints each applied migration and does not start the
+interactive dashboard. Unsupported future versions are rejected rather than
+rewritten.
 
 Common recovery actions:
 

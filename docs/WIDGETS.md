@@ -65,6 +65,34 @@ A widget that is configured but not reachable from the layout is still created
 and validated, but it has no visible surface and does not contribute a scene.
 Every layout leaf must refer to an existing widget ID.
 
+## Using widgets day to day
+
+Most users only need two files:
+
+- edit `config/default.toml` or a copied user configuration to choose widget
+  instances and their layout;
+- use this page when a widget's runtime behavior, input, graphics, or lifecycle
+  matters.
+
+A practical cycle is:
+
+1. Start cmdash with `--config <path>` so `Ctrl+R` can reload the file.
+2. Focus widgets with `Tab` / `Shift+Tab`, or move between terminal panes with
+   `Alt+Arrow`.
+3. Use `?` and `Ctrl+P` to discover commands without memorizing the keymap.
+4. Edit the TOML file, save it, and reload with `Ctrl+R`.
+5. Keep the diagnostic footer visible while testing a new widget or layout.
+6. If a change is rejected, fix the file and reload again; the previous valid
+   runtime remains active.
+
+The runtime does not automatically save pane splits, widget IDs, or ratio
+changes back to TOML. Treat the file as the source of truth for the next
+process start, and copy desired runtime layout changes into it manually.
+
+For schema fields, discovery order, migration, and complete layout examples,
+continue to [CONFIGURATION.md](CONFIGURATION.md). For architecture and scene
+ownership, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Widget configuration
 
 Each widget instance uses the common shape below:
@@ -156,6 +184,21 @@ title = " host "
 The title defaults to ` system `. More detailed metrics are a future widget
 extension; this built-in should not be treated as a complete monitoring
 interface.
+
+### Choosing a widget type
+
+Use the smallest type that matches the job:
+
+| Need | Type | Starts a process? | Accepts input? |
+| --- | --- | ---: | ---: |
+| Static text, labels, or notes | `text` | no | no |
+| A UTC time display | `clock` | no | no |
+| Basic host identity information | `system` | no | no |
+| A shell or interactive terminal program | `terminal` | yes | yes |
+
+A dashboard can contain only passive widgets. Add `terminal` instances only for
+workflows that need a PTY; this keeps startup fast and makes failure isolation
+clear.
 
 ### `terminal`
 
@@ -371,6 +414,10 @@ bindings match:
 
 The palette and help overlay are application surfaces, not widget instances.
 
+When a key appears to do nothing, check which surface is focused and whether
+that widget accepts input. Application commands are handled before terminal
+input; ordinary unbound keys are passed to a focused input-capable terminal.
+
 ## Graphics
 
 ### Kitty graphics
@@ -502,6 +549,24 @@ state. Focus is restored only when its surface still exists and is visible.
 
 This gives every terminal pane independent PTY and graphics ownership while
 allowing the surrounding workspace arrangement to persist across reloads.
+
+## Troubleshooting a widget
+
+- **The widget is not visible:** confirm its `id` appears in a reachable
+  `leaf`, `columns`, `split`, or active `tabs` branch. A valid but unreachable
+  widget is still initialized without receiving a visible surface.
+- **A widget fails during startup:** check the diagnostic footer for its type and
+  initialization error. For terminals, verify the command exists and that the
+  layout gives the pane a non-zero area.
+- **A key is ignored:** focus the widget, then check whether it is interactive.
+  `text`, `clock`, and `system` intentionally do not handle input.
+- **A terminal copy does not reach the clipboard:** selection and OSC 52 depend
+  on the surrounding terminal emulator's clipboard policy.
+- **Images are missing:** Kitty and sixel are optional capability paths. Check
+  terminal support, feature flags, clipping, and graphics quota diagnostics.
+- **Reload loses a change:** configuration reload is validation-based and keeps
+  the last valid runtime. Check TOML syntax, duplicate IDs, layout references,
+  widget type names, and schema version.
 
 ## Failure isolation and diagnostics
 
