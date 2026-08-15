@@ -407,6 +407,10 @@ The core should be testable without a real terminal:
   suppression, recoverable protocol errors, and opt-in sixel support;
 - captured outer-terminal byte-stream fixtures for direct upload/reuse/delete,
   Unicode-placeholder cells, tmux passthrough escaping, and textual fallback;
+- a bounded headless Kitty stream model that semantically parses APC/CSI/SGR,
+  tmux unwrapping, chunk reassembly, resources, placements, placement-ID
+  replacement, z-order, deletion, placeholder references, malformed sequences,
+  and bounded input rejection;
 - acknowledgement-routing tests for upload success/failure, deferred deletion,
   delete acknowledgement, resource retirement, and bounded graphics metrics;
 - fuzz targets and retained seed corpora for TOML migration, plugin manifests, Kitty APC chunking, and sixel encoding;

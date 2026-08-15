@@ -1,8 +1,12 @@
+#[path = "support/headless_kitty.rs"]
+mod headless_kitty;
+
 use cmdash::{
     Backend, BackendCapabilities, CrosstermBackend, GraphicsCapabilityConfidence,
     GraphicsCapabilitySource, GraphicsSubmission, GraphicsSubmissionStatus, SessionGraphicsStore,
     SessionId,
 };
+use headless_kitty::HeadlessKittyTerminal;
 use ratatui::layout::Rect;
 
 fn capabilities(
@@ -53,6 +57,108 @@ fn assert_rendered(status: GraphicsSubmissionStatus, resources: usize, placement
 }
 
 #[test]
+fn headless_model_reassembles_chunked_kitty_uploads() {
+    let stream = b"\x1b[1;1H\x1b_Ga=T,f=24,i=21,c=1,r=1,m=1;AQ\x1b\\\x1b_Gm=0;ID\x1b\\";
+    let model = HeadlessKittyTerminal::replay(stream).unwrap();
+
+    assert_eq!(model.actions(), &["transmit"]);
+    assert_eq!(model.resource_count(), 1);
+    assert_eq!(model.placement_count(), 1);
+    assert_eq!(model.resource_payload(21), Some(&b"AQID"[..]));
+}
+
+#[test]
+fn headless_model_validates_z_order_and_placement_id_replacement() {
+    let stream = b"\x1b[1;1H\x1b_Ga=T,f=24,i=31,c=2,r=1,q=2;AQID\x1b\\\x1b[2;3H\x1b_Ga=p,i=31,p=7,c=1,r=1,z=5,q=2;\x1b\\\x1b[3;4H\x1b_Ga=p,i=31,p=8,c=1,r=1,z=10,q=2;\x1b\\\x1b[4;5H\x1b_Ga=p,i=31,p=7,c=3,r=2,z=-2,q=2;\x1b\\";
+    let model = HeadlessKittyTerminal::replay(stream).unwrap();
+
+    assert_eq!(model.placements().len(), 3);
+    let replacement = model
+        .placements()
+        .iter()
+        .find(|placement| placement.placement_id == Some(7))
+        .expect("placement id 7 should be present");
+    assert_eq!(replacement.x, 4);
+    assert_eq!(replacement.y, 3);
+    assert_eq!(replacement.width, 3);
+    assert_eq!(replacement.height, 2);
+    assert_eq!(replacement.z, -2);
+
+    let z_order = model.placements_in_z_order();
+    assert_eq!(
+        z_order
+            .iter()
+            .map(|placement| placement.z)
+            .collect::<Vec<_>>(),
+        vec![-2, 0, 10]
+    );
+    assert_eq!(model.actions(), &["transmit", "place", "place", "place"]);
+}
+
+#[test]
+fn headless_model_rejects_malformed_and_unbounded_streams() {
+    let unterminated_apc = b"\x1b_Ga=T,f=24,i=1;AQID";
+    assert!(
+        HeadlessKittyTerminal::replay(unterminated_apc)
+            .unwrap_err()
+            .contains("unterminated Kitty APC")
+    );
+
+    let unterminated_tmux = b"\x1bPtmux;\x1b\x1b_Ga=T,f=24,i=1;AQID\x1b\x1b\\";
+    assert!(
+        HeadlessKittyTerminal::replay(unterminated_tmux)
+            .unwrap_err()
+            .contains("unterminated tmux passthrough")
+    );
+
+    let invalid_action = b"\x1b_Ga=x,i=1;AQID\x1b\\";
+    assert!(
+        HeadlessKittyTerminal::replay(invalid_action)
+            .unwrap_err()
+            .contains("unsupported Kitty action")
+    );
+
+    let invalid_parameter = b"\x1b_Ga=T,f=24,i=not-a-number;AQID\x1b\\";
+    assert!(
+        HeadlessKittyTerminal::replay(invalid_parameter)
+            .unwrap_err()
+            .contains("invalid Kitty APC i")
+    );
+
+    let unknown_placement = b"\x1b_Ga=p,i=7;\x1b\\";
+    assert!(
+        HeadlessKittyTerminal::replay(unknown_placement)
+            .unwrap_err()
+            .contains("unknown image 7")
+    );
+
+    let mut unknown_placeholder =
+        b"\x1b_Ga=T,f=24,i=5,c=1,r=1,U=1;AQID\x1b\\\x1b[38;2;0;0;5m\x1b[1;1H".to_vec();
+    unknown_placeholder.extend_from_slice("\u{10eeee}\u{9999}\u{305}\u{305}".as_bytes());
+    assert!(
+        HeadlessKittyTerminal::replay(&unknown_placeholder)
+            .unwrap_err()
+            .contains("unknown Kitty placeholder combining mark")
+    );
+
+    let oversized_stream = vec![b'x'; 1024 * 1024 + 1];
+    assert!(
+        HeadlessKittyTerminal::replay(&oversized_stream)
+            .unwrap_err()
+            .contains("bounded input limit")
+    );
+
+    let mut oversized_payload = b"\x1b_Ga=T,f=24,i=6;".to_vec();
+    oversized_payload.extend(std::iter::repeat_n(b'A', 512 * 1024 + 1));
+    oversized_payload.extend_from_slice(b"\x1b\\");
+    assert!(
+        HeadlessKittyTerminal::replay(&oversized_payload)
+            .unwrap_err()
+            .contains("bounded input limit")
+    );
+}
+
+#[test]
 fn direct_adapter_matches_captured_upload_stream() {
     let submission = captured_submission(7, 2, 1);
     let mut backend = CrosstermBackend::new(Vec::new())
@@ -71,6 +177,11 @@ fn direct_adapter_matches_captured_upload_stream() {
         backend.writer(),
         b"\x1b[1;1H\x1b_Ga=T,f=24,i=7,c=2,r=1,C=1,q=2,m=0;AQID\x1b\\"
     );
+    let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
+    assert_eq!(model.actions(), &["transmit"]);
+    assert_eq!(model.resource_count(), 1);
+    assert_eq!(model.placement_count(), 1);
+    assert_eq!(model.resource_payload(7), Some(&b"AQID"[..]));
 }
 
 #[test]
@@ -102,6 +213,10 @@ fn direct_adapter_reuses_resources_and_captures_placement_only_replay() {
     );
     assert_eq!(backend.metrics().graphics_uploads, 1);
     assert_eq!(backend.metrics().graphics_reuses, 1);
+    let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
+    assert_eq!(model.actions(), &["transmit", "place"]);
+    assert_eq!(model.resource_count(), 1);
+    assert_eq!(model.placement_count(), 2);
 }
 
 #[test]
@@ -126,6 +241,10 @@ fn direct_adapter_matches_captured_delete_stream() {
     assert_rendered(status, 0, 0);
 
     assert_eq!(&backend.writer()[first_len..], b"\x1b_Ga=d,d=i,i=9;\x1b\\");
+    let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
+    assert_eq!(model.actions(), &["transmit", "delete"]);
+    assert_eq!(model.resource_count(), 0);
+    assert_eq!(model.placement_count(), 0);
 }
 
 #[test]
@@ -156,6 +275,11 @@ fn placeholder_adapter_matches_captured_upload_and_cell_stream() {
         '\u{305}',
     );
     assert_eq!(backend.writer(), expected.as_bytes());
+    let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
+    assert_eq!(model.actions(), &["transmit"]);
+    assert_eq!(model.resource_count(), 1);
+    assert_eq!(model.placement_count(), 0);
+    assert_eq!(model.placeholder_count(), 2);
 }
 
 #[test]
@@ -183,6 +307,10 @@ fn passthrough_adapter_matches_captured_escaped_stream() {
     expected.extend_from_slice(b"\x1b\\");
 
     assert_eq!(backend.writer(), expected.as_slice());
+    let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
+    assert_eq!(model.actions(), &["transmit"]);
+    assert_eq!(model.resource_count(), 1);
+    assert_eq!(model.placement_count(), 1);
 }
 
 #[test]
@@ -219,6 +347,9 @@ fn resource_gc_waits_for_upload_ack_then_delete_ack() {
     assert!(delete_ack.graphics_acknowledgements[0].success);
     assert_eq!(backend.metrics().graphics_acknowledgements, 2);
     assert_eq!(backend.metrics().graphics_gc, 1);
+    let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
+    assert_eq!(model.actions(), &["transmit", "delete"]);
+    assert_eq!(model.resource_count(), 0);
 }
 
 #[test]
@@ -257,4 +388,7 @@ fn text_fallback_matches_captured_degraded_stream() {
         .expect("fallback capture should write");
     assert!(matches!(status, GraphicsSubmissionStatus::Degraded { .. }));
     assert_eq!(backend.writer(), b"\x1b[1;1H[image:11]");
+    let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
+    assert_eq!(model.text(), "[image:11]");
+    assert_eq!(model.resource_count(), 0);
 }

@@ -664,6 +664,10 @@ Reference material:
 - [x] Add deterministic captured outer-terminal byte-stream fixtures for direct
   upload, placement-only resource reuse, deletion, Unicode placeholders,
   tmux-style passthrough escaping, and textual fallback.
+- [x] Add a bounded headless Kitty stream model that unwraps passthrough, parses
+  APC/CSI/SGR output, reassembles chunks, and semantically validates resources,
+  placements, placement-ID replacement, z-order, deletion, placeholder
+  references, malformed sequences, and bounded input rejection.
 - [ ] Add a headless or capture-based outer-terminal harness that verifies the
   emitted stream is accepted by Kitty; add Ghostty/WezTerm/Sixel/inline-image
   cases only where the advertised capability is verified.
