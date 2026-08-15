@@ -150,11 +150,10 @@ Widgets that draw an outline support these optional string settings:
   `none`. `border_style` is accepted as a compatibility alias.
 - `border_color` and semantic role names such as `foreground`, `background`,
   `focus`, and `muted`: `inherit`, `ansi:N`, or `#RRGGBB`.
-- Terminal cursor blinking uses `cursor_blink` and
-  `cursor_blink_interval_ms`; see the terminal widget section below.
+Motion and terminal cursor settings are documented in
+[ANIMATION.md](ANIMATION.md); they do not change the widget content geometry.
 
-Custom glyph sets, per-side visibility, and animated border/title styling remain
-future extensions in Phase 12.
+Custom glyph sets and per-side visibility remain future appearance extensions.
 
 The configured appearance controls the widget's content rectangle. Terminal PTY
 size, terminal graphics, selection, mouse routing, and resize handling all use
@@ -271,12 +270,9 @@ If `command` is omitted, the session uses the platform's configured shell
 fallback. The widget handles keyboard, mouse, paste, resize, selection copy,
 and shutdown. It is the only built-in widget that currently owns a PTY.
 
-The cursor is rendered by cmdash inside the terminal scene. When the terminal
-pane is focused and visible, it blinks at the configured interval; keyboard
-input, PTY output, cursor movement, and focus changes reset it to visible.
-Unfocused panes and hidden tabs do not blink. Set `cursor_blink = "false"` for a
-static cursor, or use `cursor_blink_interval_ms` to tune the interval. The
-scheduler is wakeable and does not use blinking to poll PTY output.
+The cursor is rendered by cmdash inside the terminal scene. Its optional
+presentation blink and motion settings are documented in
+[ANIMATION.md](ANIMATION.md); terminal emulator cursor modes remain authoritative.
 
 A terminal widget is not a global terminal pane. Splitting it creates another
 terminal widget and another session ID; the new pane inherits the source
@@ -428,10 +424,8 @@ Use `[appearance.colors]` for workspace-wide role overrides and widget
 precedence rules, border styles, and label policy are documented in
 [APPEARANCE.md](APPEARANCE.md).
 
-Animation is not implemented yet and remains an opt-in retained-scene feature
-planned for Phase 12. Planned options include transitions for focus, borders,
-labels, values, overlays, tabs, and panes, plus duration, easing, repetition,
-reduced-motion, and per-widget motion budgets.
+Optional retained-scene motion, transition triggers, and the coordinator-owned
+scheduler are documented in [ANIMATION.md](ANIMATION.md).
 
 This separation means widget code is independent of terminal cursor movement,
 style caching, changed-cell grouping, output metrics, and backend capability
@@ -613,7 +607,9 @@ The host-facing capability bits currently describe:
 - `RENDER_SCENE`: produce backend-neutral scene output;
 - `UPDATE`: receive update opportunities;
 - `INPUT`: receive input routed by the host;
-- `OVERLAYS`: request or contribute overlay behavior.
+- `OVERLAYS`: request or contribute overlay behavior;
+- `ANIMATION`: receive host-owned, bounded animation progress (see
+  [ANIMATION.md](ANIMATION.md)).
 
 A plugin may request only capabilities available from the selected host. The
 host must not expose stdout, raw terminal escape sequences, PTY handles,
@@ -778,6 +774,8 @@ contracts grow.
   layouts, panes, overlays, migrations, and recovery.
 - [Appearance guide](APPEARANCE.md) — semantic themes, inherited terminal
   palette colors, borders, labels, and per-widget overrides.
+- [Animation guide](ANIMATION.md) — retained motion, cursor presentation,
+  scheduling, accessibility, and lifecycle limits.
 - [Architecture](ARCHITECTURE.md) — state ownership, scenes, compositor, and
   backend boundaries.
 - [Dependencies](DEPENDENCIES.md) — selected crate roles and optional feature

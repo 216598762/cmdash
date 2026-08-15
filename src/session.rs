@@ -2,7 +2,7 @@ use std::{
     fmt,
     io::{self, Read, Write},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
@@ -10,7 +10,7 @@ use std::{
 };
 
 use alacritty_terminal::{
-    event::{Event, EventListener},
+    event::{Event, EventListener, WindowSize as EmulatorWindowSize},
     grid::Dimensions,
     term::{Config, Term, TermMode, cell::Flags},
     vte::ansi::{Color as AnsiColor, NamedColor, Processor},
@@ -34,11 +34,30 @@ use crate::{
 pub struct TerminalSize {
     pub columns: u16,
     pub rows: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
 }
 
 impl TerminalSize {
     pub const fn new(columns: u16, rows: u16) -> Self {
-        Self { columns, rows }
+        Self::with_pixels(columns, rows, 0, 0)
+    }
+
+    pub const fn with_pixels(columns: u16, rows: u16, pixel_width: u16, pixel_height: u16) -> Self {
+        Self {
+            columns,
+            rows,
+            pixel_width,
+            pixel_height,
+        }
+    }
+
+    pub fn cell_width(self) -> u16 {
+        self.pixel_width.checked_div(self.columns).unwrap_or(0)
+    }
+
+    pub fn cell_height(self) -> u16 {
+        self.pixel_height.checked_div(self.rows).unwrap_or(0)
     }
 
     fn validate(self) -> Result<Self, SessionError> {
@@ -103,6 +122,7 @@ pub enum UiEvent {
     Input(CrosstermEvent),
     PtyOutput,
     Tick,
+    AnimationFrame,
     CursorBlink(u64),
     InputError(String),
 }
@@ -146,16 +166,33 @@ struct SessionOutput {
 /// emulator's response before continuing.
 struct SessionEventListener {
     pty_writer: Sender<String>,
+    size: Arc<Mutex<TerminalSize>>,
+}
+
+impl SessionEventListener {
+    fn send_to_pty(&self, text: String) {
+        // The session drains this session-owned channel after feeding
+        // output to the emulator. A disconnected receiver only
+        // means the session is shutting down, so there is nothing useful to
+        // do with the response.
+        let _ = self.pty_writer.send(text);
+    }
 }
 
 impl EventListener for SessionEventListener {
     fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(text) = event {
-            // The session drains this session-owned channel after feeding
-            // output to the emulator. A disconnected receiver only
-            // means the session is shutting down, so there is nothing useful to
-            // do with the response.
-            let _ = self.pty_writer.send(text);
+        match event {
+            Event::PtyWrite(text) => self.send_to_pty(text),
+            Event::TextAreaSizeRequest(format) => {
+                let size = *self.size.lock().expect("terminal size mutex poisoned");
+                self.send_to_pty(format(EmulatorWindowSize {
+                    num_lines: size.rows,
+                    num_cols: size.columns,
+                    cell_width: size.cell_width(),
+                    cell_height: size.cell_height(),
+                }));
+            }
+            _ => {}
         }
     }
 }
@@ -175,6 +212,7 @@ pub struct TerminalSession {
     child: Box<dyn Child + Send + Sync>,
     output: SessionOutput,
     size: TerminalSize,
+    reported_size: Arc<Mutex<TerminalSize>>,
     closed: bool,
     failure: Option<String>,
     graphics: SessionGraphicsStore,
@@ -217,8 +255,8 @@ impl TerminalSession {
             .openpty(PtySize {
                 rows: size.rows,
                 cols: size.columns,
-                pixel_width: 0,
-                pixel_height: 0,
+                pixel_width: size.pixel_width,
+                pixel_height: size.pixel_height,
             })
             .map_err(|error| SessionError::Spawn(error.to_string()))?;
 
@@ -244,11 +282,13 @@ impl TerminalSession {
             receiver: spawn_reader(reader, wakeup),
         };
         let (response_sender, response_receiver) = mpsc::channel();
+        let reported_size = Arc::new(Mutex::new(size));
         let term = Term::new(
             Config::default(),
             &size,
             SessionEventListener {
                 pty_writer: response_sender,
+                size: Arc::clone(&reported_size),
             },
         );
 
@@ -261,6 +301,7 @@ impl TerminalSession {
             child,
             output,
             size,
+            reported_size,
             closed: false,
             failure: None,
             graphics: SessionGraphicsStore::new(session_id),
@@ -348,9 +389,9 @@ impl TerminalSession {
                     let plain = self.consume_output(&bytes)?;
                     if !plain.is_empty() {
                         self.processor.advance(&mut self.term, &plain);
-                        self.flush_emulator_responses()?;
                         changed = true;
                     }
+                    self.flush_emulator_responses()?;
                     changed = changed || !bytes.is_empty();
                 }
                 Err(error) => {
@@ -450,11 +491,15 @@ impl TerminalSession {
             .resize(PtySize {
                 rows: size.rows,
                 cols: size.columns,
-                pixel_width: 0,
-                pixel_height: 0,
+                pixel_width: size.pixel_width,
+                pixel_height: size.pixel_height,
             })
             .map_err(|error| SessionError::Resize(error.to_string()))?;
         self.term.resize(size);
+        *self
+            .reported_size
+            .lock()
+            .expect("terminal size mutex poisoned") = size;
         self.size = size;
         Ok(())
     }
@@ -859,6 +904,28 @@ mod tests {
     }
 
     #[test]
+    fn pixel_size_queries_are_formatted_from_current_session_geometry() {
+        let mut session =
+            TerminalSession::spawn(Some("sh"), TerminalSize::with_pixels(40, 8, 400, 160)).unwrap();
+        assert_eq!(
+            session.master.get_size().unwrap(),
+            PtySize {
+                rows: 8,
+                cols: 40,
+                pixel_width: 400,
+                pixel_height: 160,
+            }
+        );
+        session.processor.advance(&mut session.term, b"\x1b[14t");
+
+        assert_eq!(
+            session.emulator_responses.try_recv().unwrap(),
+            "\x1b[4;160;400t"
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
     fn terminal_session_parses_pty_output_into_the_emulator() {
         let mut session = TerminalSession::spawn_with_args(
             Some("sh"),
@@ -934,8 +1001,10 @@ mod tests {
     fn terminal_session_resizes_and_rejects_invalid_sizes() {
         let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(40, 8)).unwrap();
 
-        session.resize(TerminalSize::new(60, 12)).unwrap();
-        assert_eq!(session.size(), TerminalSize::new(60, 12));
+        session
+            .resize(TerminalSize::with_pixels(60, 12, 600, 240))
+            .unwrap();
+        assert_eq!(session.size(), TerminalSize::with_pixels(60, 12, 600, 240));
         assert_eq!(
             session.resize(TerminalSize::new(1, 0)),
             Err(SessionError::InvalidSize(TerminalSize::new(1, 0)))

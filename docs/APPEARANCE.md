@@ -192,98 +192,11 @@ WASM plugins will need an explicit future appearance capability before they can
 request dynamic theme changes. They must not emit raw color escape sequences or
 assume a specific terminal palette.
 
-## Cursor blinking and accessibility
+## Motion
 
-Focused visible terminal panes blink their scene cursor by default. Configure
-`cursor_blink = "false"` for a static cursor or set
-`cursor_blink_interval_ms` between `50` and `60000` milliseconds. Input, PTY
-output, cursor movement, and focus changes restore the cursor before the next
-blink. Hidden tabs and unfocused terminal panes remain static, and the scheduler
-wakes only while a pane is active. The cursor's emulator visibility mode still
-wins, so applications can hide it with terminal control sequences.
-
-Cursor settings are per terminal widget because each pane owns its own PTY and
-emulator. They belong in the widget's string-valued `settings` map rather than
-under `[appearance]`:
-
-### Default blinking
-
-The defaults are equivalent to:
-
-```toml
-[[workspace.widgets]]
-id = 10
-type = "terminal"
-command = "sh"
-
-[workspace.widgets.settings]
-cursor_blink = "true"
-cursor_blink_interval_ms = "500"
-```
-
-### Static cursor
-
-Disable blinking when a persistent cursor is preferred:
-
-```toml
-[[workspace.widgets]]
-id = 11
-type = "terminal"
-command = "sh"
-
-[workspace.widgets.settings]
-cursor_blink = "false"
-```
-
-### Custom blink interval
-
-Use a slower or faster interval within the supported 50–60000 millisecond
-range:
-
-```toml
-[[workspace.widgets]]
-id = 12
-type = "terminal"
-command = "sh"
-
-[workspace.widgets.settings]
-cursor_blink_interval_ms = "750"
-```
-
-Runtime-created panes inherit these terminal widget settings. Configuration
-reloads validate the values before replacing the active runtime, so an invalid
-interval leaves the previous terminal and cursor behavior unchanged.
-
-### Reduced-motion equivalent today
-
-A global reduced-motion setting is not implemented yet. To avoid cursor motion
-for a specific terminal pane today, use the static-cursor fallback:
-
-```toml
-[[workspace.widgets]]
-id = 13
-type = "terminal"
-command = "sh"
-
-[workspace.widgets.settings]
-# Current reduced-motion equivalent for this pane.
-cursor_blink = "false"
-```
-
-The planned Phase 12 global form is documented here for design reference only
-and is not accepted by the current configuration parser:
-
-```toml
-# Planned; not currently supported.
-[appearance.motion]
-reduced_motion = true
-```
-
-Animation is intentionally not part of Phase 11. The next roadmap phase covers
-opt-in transitions, reduced-motion preferences, timing budgets, and animated
-border/label changes. Phase 11 provides the static appearance foundation those
-features will consume.
-
+Motion, transition, and terminal cursor behavior are documented in
+[ANIMATION.md](ANIMATION.md). Static theme and geometry behavior in this guide
+remains valid regardless of whether motion is enabled.
 The terminal remains the authority for inherited reset and ANSI colors. A
 terminal that changes its palette while cmdash is running will affect native
 references on subsequent output, but explicit RGB overrides remain unchanged.

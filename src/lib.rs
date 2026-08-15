@@ -1,3 +1,4 @@
+pub mod animation;
 pub mod appearance;
 pub mod backend;
 pub mod command;
@@ -20,17 +21,23 @@ pub mod state;
 pub mod wasm_plugin;
 pub mod widget;
 
+pub use animation::{
+    AnimationDirection, AnimationFrame, AnimationKey, AnimationManager, AnimationSample,
+    AnimationSettings, AnimationSpec, Easing, FillMode,
+};
 pub use appearance::{AppearanceError, Theme};
-pub use backend::{Backend, BackendCapabilities, CrosstermBackend, OutputMetrics};
+pub use backend::{
+    Backend, BackendCapabilities, CrosstermBackend, OutputMetrics, TerminalWindowSize,
+};
 pub use command::{
     Command, CommandEffect, FocusCommand, FocusDirection, OverlayCommand, PaneCommand,
     SurfaceCommand, TabCommand,
 };
 pub use compositor::{CellSpan, Compositor, FrameDiff};
 pub use config::{
-    AppConfig, AppearanceConfig, CONFIG_SCHEMA, CURRENT_CONFIG_VERSION, ConfigError,
-    ConfigFileError, ConfigMigration, LabelPolicy, LayoutConfig, LoadedConfig, OverlayConfig,
-    PluginConfig, SplitDirection, WidgetInstanceConfig, WorkspaceConfig,
+    AnimationConfig, AppConfig, AppearanceConfig, CONFIG_SCHEMA, CURRENT_CONFIG_VERSION,
+    ConfigError, ConfigFileError, ConfigMigration, LabelPolicy, LayoutConfig, LoadedConfig,
+    OverlayConfig, PluginConfig, SplitDirection, WidgetInstanceConfig, WorkspaceConfig,
 };
 pub use crash::CrashReport;
 pub use graphics::{

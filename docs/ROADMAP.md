@@ -208,55 +208,233 @@ correctness, input handling, or terminal-session state. Animations must produce
 ordinary retained scenes, remain bounded by the coordinator, and degrade to a
 static frame on terminals or configurations that do not support them.
 
-- [ ] Define a retained animation model with timelines, keyframes, triggers,
+- [x] Define a retained animation model with timelines, keyframes, triggers,
   start/end values, cancellation, completion, and interruption semantics; keep
   animation state separate from PTY/emulator state.
-- [ ] Add a versioned animation configuration contract with per-widget and
+- [x] Add a versioned animation configuration contract with per-widget and
   per-theme options for enabled state, duration, delay, easing, repeat count,
   direction, fill mode, and trigger events.
-- [ ] Support a deliberate initial set of effects: widget enter/exit, focus
+- [x] Support a deliberate initial set of effects: widget enter/exit, focus
   changes, border and label transitions, color/attribute interpolation, value
   changes, progress updates, loading indicators, spinners, pulses, overlays,
   tab switches, and pane creation/closure.
-- [ ] Extend border and label options for animated visibility, style changes,
+- [x] Extend border and label options for animated visibility, style changes,
   title placement, label reveal/hide behavior, and transition-specific colors;
   define how `label = never` or a hidden border interacts with animation and
   content geometry.
-- [ ] Add a wakeable animation scheduler that requests frames only while an
+- [x] Add a wakeable animation scheduler that requests frames only while an
   animation is active, coalesces simultaneous updates, and preserves the
   existing event-driven PTY/input path without reintroducing fixed-rate output
   polling.
-- [ ] Add terminal cursor blinking for the focused, visible terminal pane: derive
+- [x] Add terminal cursor blinking for the focused, visible terminal pane: derive
   cursor visibility and shape from the session emulator, reset the blink phase
   on keyboard input, PTY output, focus changes, and cursor movement, and pause
   blinking for unfocused panes, hidden tabs, inactive sessions, and shutdown.
   Make the interval, enabled state, reduced-motion behavior, and static-cursor
   fallback configurable while ensuring the scheduler wakes only the active
   pane and never uses cursor blinking to drive PTY polling.
-- [ ] Define terminal-safe interpolation and fallback rules for ANSI palettes,
+- [x] Define terminal-safe interpolation and fallback rules for ANSI palettes,
   truecolor, bold/dim attributes, glyph changes, and unsupported effects;
   alpha/transparency must never leak malformed escape sequences or corrupt
   neighboring surfaces.
-- [ ] Add global and per-widget motion controls, including pause/resume, a
+- [x] Add global and per-widget motion controls, including pause/resume, a
   reduced-motion preference, an animation budget, maximum concurrent effects,
   and a static fallback for slow or overloaded terminals.
-- [ ] Expose animation capabilities to plugins through explicit manifest/API
+- [x] Expose animation capabilities to plugins through explicit manifest/API
   bits, bounded frame/keyframe counts, execution and memory quotas, and host
   ownership of scheduling; plugins must not spawn unbounded animation workers.
-- [ ] Define lifecycle behavior for hidden tabs, closed panes, failed widgets,
+- [x] Define lifecycle behavior for hidden tabs, closed panes, failed widgets,
   reloads, and shutdown so animations cannot retain sessions, graphics, or
   worker threads after their owner disappears.
-- [ ] Add deterministic clock injection, golden scene tests, timing-independent
+- [x] Add deterministic clock injection, golden scene tests, timing-independent
   transition tests, cancellation/restart coverage, performance benchmarks, and
   fuzz/config validation for malformed animation options.
-- [ ] Document animation presets and extended theme options with examples for
+- [x] Document animation presets and extended theme options with examples for
   dashboard status changes, terminal focus, overlays, pane transitions, and
   plugin widgets.
 
-**Exit criteria:** animations are opt-in, bounded, interruptible, and
+**Exit criteria (met):** animations are opt-in, bounded, interruptible, and
 accessibility-aware; active motion wakes the UI without timer-based PTY polling;
 all animated output remains clipped and session-isolated; and disabling motion
-produces a visually coherent static dashboard.
+produces a visually coherent static dashboard. See [ANIMATION.md](ANIMATION.md)
+for the implementation and user-facing contract.
+
+## Phase 13 — Compositor API endpoints, options, and documentation
+
+This phase adds a versioned, capability-aware local API for inspecting compositor
+state, requesting rendered snapshots, and submitting safe application commands
+without exposing raw terminal ownership or bypassing the UI coordinator.
+
+### Goals and boundaries
+
+- [ ] Define a stable machine-readable API for local automation, companion tools,
+  tests, and future dashboard clients.
+- [ ] Keep the API disabled by default and local-only unless explicitly enabled.
+- [ ] Route every mutation through the existing `AppState::dispatch(Command)` and
+  UI/coordinator path; API workers must never mutate `AppState`, widgets,
+  sessions, or `Compositor` directly.
+- [ ] Expose backend-neutral state and frame data rather than terminal escape
+  sequences, raw PTY streams, or backend handles.
+- [ ] Define bounded, versioned wire types before making internal Rust structs
+  part of a public contract.
+- [ ] Keep remote TCP access, arbitrary shell execution, raw PTY injection, and
+  public-network control out of the initial phase.
+
+### Endpoint contract
+
+Define logical versioned endpoints independently of the initial transport.
+
+Read-only endpoints should include:
+
+- `GET /v1/health` — process health, uptime, API version, and coordinator status.
+- `GET /v1/capabilities` — backend capabilities, optional features, and allowed
+  API operations.
+- `GET /v1/workspace` — workspace identity, active tab, focus target, and layout
+  metadata.
+- `GET /v1/surfaces` — surface/widget IDs, visibility, z-order, geometry, and
+  focus state.
+- `GET /v1/widgets` — widget kinds, health, and bounded status information.
+- `GET /v1/compositor/frame` — a consistent frame snapshot containing viewport,
+  generation, cells/styles, visible ownership, and bounded graphics metadata.
+- `GET /v1/compositor/diff` — a bounded diff from a requested frame generation,
+  or an explicit snapshot-required response when history is unavailable.
+- `GET /v1/metrics` — output and compositor metrics.
+- `GET /v1/diagnostics` — bounded application and widget diagnostics.
+
+Mutation endpoints should initially include:
+
+- `POST /v1/commands` — a versioned allowlist-backed subset of focus, tab, pane,
+  surface, overlay, redraw, and reload commands.
+- `POST /v1/reload` — request configuration reload through the existing
+  validation/replacement path.
+- `POST /v1/subscriptions` and `DELETE /v1/subscriptions/{id}` — manage bounded
+  frame, state, diagnostic, and lifecycle notifications.
+
+Use dedicated wire DTOs for these endpoints. Do not serialize internal
+`Compositor`, `Scene`, `FrameDiff`, or live session structs directly; this keeps
+private fields and implementation-specific enum layouts out of the public API.
+
+### Transport and coordinator bridge
+
+- [ ] Choose and document a transport, with a Unix-domain socket as the preferred
+  Linux-first implementation.
+- [ ] Define a bounded JSON request/response envelope, likely using `serde_json`,
+  with API version, request ID, typed result, and typed error fields.
+- [ ] Add a transport abstraction that can later support Windows named pipes or
+  an explicitly enabled loopback TCP adapter without changing endpoint semantics.
+- [ ] Add a bounded API request queue and response/event bridge owned by the UI
+  coordinator.
+- [ ] Generate API snapshots at a defined point in the frame loop so related
+  state and frame responses share a generation.
+- [ ] Add bounded frame history or an explicit snapshot-required fallback for
+  diff requests.
+- [ ] Ensure client disconnects, full queues, and API listener failures cannot
+  stall or terminate the dashboard.
+
+The intended ownership flow is:
+
+```text
+API listener
+    │
+    ▼
+bounded request queue
+    │
+    ▼
+UI/coordinator event loop
+    │
+    ├── AppState::dispatch(...)
+    ├── configuration reload
+    ├── compositor snapshot generation
+    └── response/event publication
+```
+
+### Configuration and CLI options
+
+Add an optional `[api]` configuration section while keeping the existing
+workspace schema compatible:
+
+```toml
+[api]
+enabled = false
+transport = "unix"
+socket = "~/.cache/cmdash/cmdash.sock"
+read_only = true
+max_clients = 4
+max_request_bytes = 65536
+max_response_bytes = 1048576
+event_queue_depth = 64
+```
+
+Plan and validate options for:
+
+- enabled/disabled state;
+- transport and socket or named-pipe path;
+- explicit loopback bind address for future TCP support;
+- read-only mode and allowed operation set;
+- authentication mode/reference;
+- maximum clients, request/response sizes, request timeout, and event queue
+  depth;
+- frame snapshot/history depth;
+- whether graphics metadata is exposed.
+
+Secrets must not be stored directly in TOML. Prefer protected token files,
+environment-provided secrets, or OS-level socket permissions. Add documented
+CLI overrides such as `--api`, `--api-disable`, `--api-read-only`, and
+`--api-socket <path>` only where one-shot automation needs them; CLI precedence
+must be explicit.
+
+### Security and capability policy
+
+- [ ] Keep the listener disabled by default and create local sockets with
+  restrictive permissions.
+- [ ] Validate socket paths and reject unsafe configurations where practical.
+- [ ] Make read-only operation the default and use explicit mutation allowlists.
+- [ ] Reject arbitrary shell execution, raw PTY input, raw terminal escape output,
+  clipboard contents, and unbounded graphics payloads by default.
+- [ ] Enforce request, response, client, queue, timeout, subscription, and frame
+  history limits.
+- [ ] Advertise supported and enabled operations through `/v1/capabilities`.
+- [ ] Require explicit binding and authentication before any future TCP support.
+
+### Documentation deliverables
+
+- [ ] Add `docs/API.md` with the API versioning policy, transport setup,
+  endpoint reference, request/response schemas, error envelopes, permissions,
+  limits, examples, subscriptions, and compatibility rules.
+- [ ] Update `docs/ARCHITECTURE.md` with the API-to-coordinator ownership
+  boundary and frame-generation model.
+- [ ] Update `docs/CONFIGURATION.md` with `[api]` options, CLI overrides,
+  security defaults, and recovery behavior.
+- [ ] Update `docs/DEPENDENCIES.md` with the selected serialization and transport
+  dependencies and their boundary rationale.
+- [ ] Update `README.md` with automation setup, local-socket troubleshooting,
+  and read-only/mutating deployment guidance.
+
+### Testing and validation
+
+- [ ] Add wire serialization round-trip tests, unknown-version tests, malformed
+  request tests, and invalid-command tests.
+- [ ] Test read-only mode, authorization failures, capability negotiation, and
+  unsupported endpoint behavior.
+- [ ] Test request/response limits, full queues, timeouts, disconnected clients,
+  and listener shutdown.
+- [ ] Prove API mutations execute only through the coordinator and existing
+  command/state validation.
+- [ ] Verify frame snapshots contain only visible surfaces and retain
+  session-qualified graphics ownership.
+- [ ] Test state/frame generation consistency and diff fallback behavior.
+- [ ] Test configuration reload, CLI precedence, socket permissions, and unsafe
+  path rejection.
+- [ ] Add fuzz coverage for API envelopes, command payloads, oversized messages,
+  and subscription requests.
+
+**Exit criteria:** the API is disabled by default and safely enabled through
+documented options; local clients can query health, capabilities, workspace state,
+surfaces, widgets, diagnostics, metrics, and compositor frames; safe focus/tab/
+pane/reload commands can be submitted; all mutations remain coordinator-owned;
+responses are versioned, bounded, and generation-consistent; API failures cannot
+crash or stall the dashboard; and endpoint schemas, security behavior, examples,
+and compatibility rules are documented and tested.
 
 ## Decision log starters
 

@@ -136,6 +136,8 @@ pub mod capabilities {
     pub const UPDATE: u64 = 1 << 1;
     pub const INPUT: u64 = 1 << 2;
     pub const OVERLAYS: u64 = 1 << 3;
+    /// Request access to host-owned bounded animation progress.
+    pub const ANIMATION: u64 = 1 << 4;
 }
 
 #[repr(C)]
@@ -152,7 +154,8 @@ impl PluginHostV1 {
             capability_bits: capabilities::RENDER_SCENE
                 | capabilities::UPDATE
                 | capabilities::INPUT
-                | capabilities::OVERLAYS,
+                | capabilities::OVERLAYS
+                | capabilities::ANIMATION,
         }
     }
 }

@@ -8,6 +8,10 @@ name = "default"
 [appearance]
 theme = "inherit"
 
+# Motion is opt-in; see docs/ANIMATION.md for timing and accessibility options.
+[animation]
+enabled = false
+
 [[workspace.widgets]]
 id = 1
 type = "text"

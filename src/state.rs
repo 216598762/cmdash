@@ -8,8 +8,9 @@ use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::{
+    animation::{AnimationFrame, AnimationKey, AnimationManager, AnimationSettings, AnimationSpec},
     appearance::Theme,
-    backend::BackendCapabilities,
+    backend::{BackendCapabilities, TerminalWindowSize},
     command::{
         Command, CommandEffect, FocusCommand, FocusDirection, OverlayCommand, PaneCommand,
         SurfaceCommand, TabCommand,
@@ -323,6 +324,8 @@ pub struct AppState {
     redraw_requested: bool,
     cursor_blink_visible: bool,
     cursor_blink_generation: u64,
+    animations: AnimationManager,
+    animation_now: SystemTime,
     pending_invalidations: Vec<Rect>,
     diagnostics: Vec<String>,
     pending_clipboard: Option<String>,
@@ -346,6 +349,8 @@ impl AppState {
             redraw_requested: true,
             cursor_blink_visible: true,
             cursor_blink_generation: 0,
+            animations: AnimationManager::new(crate::config::AnimationConfig::default()),
+            animation_now: SystemTime::now(),
             pending_invalidations: Vec::new(),
             diagnostics: Vec::new(),
             pending_clipboard: None,
@@ -353,6 +358,7 @@ impl AppState {
                 version: crate::config::CURRENT_CONFIG_VERSION,
                 workspace: crate::config::WorkspaceConfig::default(),
                 appearance: crate::config::AppearanceConfig::default(),
+                animation: crate::config::AnimationConfig::default(),
                 plugins: Vec::new(),
             },
             widget_registry: WidgetRegistry::builtins(),
@@ -409,6 +415,8 @@ impl AppState {
             redraw_requested: true,
             cursor_blink_visible: true,
             cursor_blink_generation: 0,
+            animations: AnimationManager::new(config.animation),
+            animation_now: SystemTime::now(),
             pending_invalidations: Vec::new(),
             diagnostics: Vec::new(),
             pending_clipboard: None,
@@ -543,6 +551,10 @@ impl AppState {
     }
 
     pub fn update_widgets(&mut self, now: SystemTime) -> WidgetUpdateReport {
+        self.animation_now = now;
+        if self.animations.advance(now) {
+            self.redraw_requested = true;
+        }
         let report = self.widget_runtime.update(now);
         if report.requests_redraw() || !report.failed().is_empty() {
             self.redraw_requested = true;
@@ -570,6 +582,81 @@ impl AppState {
 
     pub const fn cursor_blink_generation(&self) -> u64 {
         self.cursor_blink_generation
+    }
+
+    pub fn animation_schedule(&self) -> Option<Duration> {
+        self.animations.next_wakeup(self.animation_now)
+    }
+
+    pub fn advance_animations(&mut self, now: SystemTime) -> bool {
+        self.animation_now = now;
+        let changed = self.animations.advance(now);
+        if changed {
+            self.redraw_requested = true;
+        }
+        changed
+    }
+
+    pub fn animation_frame(&self) -> AnimationFrame {
+        AnimationFrame {
+            focus_progress: self.animations.sample(AnimationKey::Focus).progress,
+            transition_progress: self
+                .animations
+                .sample(AnimationKey::Tabs)
+                .progress
+                .min(self.animations.sample(AnimationKey::Panes).progress),
+        }
+    }
+
+    pub fn pause_animations(&mut self) {
+        self.animations.pause(self.animation_now);
+        self.redraw_requested = true;
+    }
+
+    pub fn resume_animations(&mut self) {
+        self.animations.resume(self.animation_now);
+        self.redraw_requested = true;
+    }
+
+    fn start_animation(&mut self, key: AnimationKey) {
+        let mut spec = AnimationSpec::from_config(self.animations.config());
+        if let Some(settings) = self.animation_settings_for(key) {
+            if !settings.enabled {
+                self.animations.cancel(key);
+                return;
+            }
+            spec = settings.apply(spec);
+        }
+        let _ = self.animations.start(key, spec, self.animation_now);
+        self.redraw_requested = true;
+    }
+
+    fn animation_settings_for(&self, key: AnimationKey) -> Option<AnimationSettings> {
+        let widget_id = match key {
+            AnimationKey::Widget(id) => WidgetId::new(id),
+            AnimationKey::Surface(id) => self
+                .workspace
+                .surfaces
+                .get(&SurfaceId::new(id))
+                .and_then(|surface| surface.widget())?,
+            AnimationKey::Focus => match self.focus.target()? {
+                FocusTarget::Surface(surface_id) => self
+                    .workspace
+                    .surfaces
+                    .get(&surface_id)
+                    .and_then(|surface| surface.widget())?,
+                FocusTarget::Overlay(_) => return None,
+            },
+            AnimationKey::Overlay(_) | AnimationKey::Tabs | AnimationKey::Panes => return None,
+        };
+        let settings = self
+            .config
+            .workspace
+            .widgets
+            .iter()
+            .find(|widget| widget.id == widget_id.get())
+            .map(|widget| &widget.settings)?;
+        AnimationSettings::from_settings(settings).ok()
     }
 
     /// Toggles the active terminal cursor and requests a frame.
@@ -730,6 +817,7 @@ impl AppState {
     pub fn resize_widget_surfaces(
         &mut self,
         areas: &BTreeMap<SurfaceId, Rect>,
+        window: TerminalWindowSize,
     ) -> Result<(), String> {
         let resize_requests: Vec<_> = areas
             .iter()
@@ -742,7 +830,22 @@ impl AppState {
                     && content.height > 0)
                     .then_some((
                         widget_id,
-                        crate::session::TerminalSize::new(content.width, content.height),
+                        crate::session::TerminalSize::with_pixels(
+                            content.width,
+                            content.height,
+                            pixel_extent(
+                                content.x,
+                                content.width,
+                                window.columns,
+                                window.pixel_width,
+                            ),
+                            pixel_extent(
+                                content.y,
+                                content.height,
+                                window.rows,
+                                window.pixel_height,
+                            ),
+                        ),
                     ))
             })
             .collect();
@@ -781,7 +884,12 @@ impl AppState {
             Some(FocusTarget::Overlay(_)) | None => None,
         };
         self.widget_runtime
-            .render_with_cursor(&areas, focused_widget, self.cursor_blink_visible)
+            .render_with_animation(
+                &areas,
+                focused_widget,
+                self.cursor_blink_visible,
+                self.animation_frame(),
+            )
             .into_iter()
             .filter_map(|(widget_id, scene)| {
                 surface_ids
@@ -947,6 +1055,7 @@ impl AppState {
                     .map(|surface| surface.area()),
             );
             self.persist_runtime_layout();
+            self.start_animation(AnimationKey::Tabs);
             self.reset_cursor_blink();
         }
     }
@@ -983,6 +1092,7 @@ impl AppState {
         }
         let new_surface = self.focused_surface_area();
         if old_surface != new_surface {
+            self.start_animation(AnimationKey::Focus);
             if let Some(area) = old_surface {
                 self.pending_invalidations.push(area);
             }
@@ -1122,6 +1232,7 @@ impl AppState {
         self.config.workspace.widgets.push(new_config);
         self.runtime_pane_ids.insert(new_id.get());
         self.persist_runtime_layout();
+        self.start_animation(AnimationKey::Panes);
         self.focus.set(FocusTarget::Surface(new_surface.id()));
         self.reset_cursor_blink();
         self.pending_invalidations.push(area);
@@ -1151,6 +1262,7 @@ impl AppState {
             .retain(|widget| widget.id != widget_id.get());
         self.runtime_pane_ids.remove(&widget_id.get());
         self.persist_runtime_layout();
+        self.start_animation(AnimationKey::Panes);
         self.focus.clear();
         self.reset_cursor_blink();
         self.pending_invalidations.push(area);
@@ -1272,6 +1384,19 @@ impl AppState {
         }
         Ok(())
     }
+}
+
+fn pixel_extent(start: u16, extent: u16, cells: u16, pixels: u16) -> u16 {
+    if cells == 0 || pixels == 0 {
+        return 0;
+    }
+    let start = u32::from(start).min(u32::from(cells));
+    let end = start
+        .saturating_add(u32::from(extent))
+        .min(u32::from(cells));
+    let first_pixel = start * u32::from(pixels) / u32::from(cells);
+    let last_pixel = end * u32::from(pixels) / u32::from(cells);
+    last_pixel.saturating_sub(first_pixel) as u16
 }
 
 fn intersect(first: Rect, second: Rect) -> Option<Rect> {
@@ -1735,6 +1860,43 @@ mod tests {
     }
 
     #[test]
+    fn enabled_motion_starts_on_focus_and_reaches_a_static_frame() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [animation]
+            enabled = true
+            duration_ms = 100
+            [[workspace.widgets]]
+            id = 1
+            type = "text"
+            text = "one"
+            [[workspace.widgets]]
+            id = 2
+            type = "text"
+            text = "two"
+            [workspace.layout]
+            type = "columns"
+            children = [
+              { type = "leaf", widget = 1 },
+              { type = "leaf", widget = 2 }
+            ]
+            "#,
+        )
+        .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(SurfaceId::new(1))))
+            .unwrap();
+        assert!(state.animation_frame().focus_progress < 1000);
+        assert!(state.animation_schedule().is_some());
+
+        state.advance_animations(SystemTime::now() + Duration::from_millis(200));
+        assert_eq!(state.animation_frame().focus_progress, 1000);
+    }
+
+    #[test]
     fn valid_config_reload_replaces_state_atomically() {
         let first = AppConfig::parse("version = 1\n[workspace]\nname = \"first\"\n").unwrap();
         let second = AppConfig::parse("version = 1\n[workspace]\nname = \"second\"\n").unwrap();
@@ -1826,6 +1988,14 @@ mod tests {
         assert_eq!(state.cursor_blink_schedule(), None);
         assert!(state.cursor_blink_visible());
         state.shutdown_widgets();
+    }
+
+    #[test]
+    fn pixel_extent_maps_cell_boundaries_to_outer_pixels() {
+        assert_eq!(pixel_extent(0, 40, 80, 800), 400);
+        assert_eq!(pixel_extent(1, 78, 80, 800), 780);
+        assert_eq!(pixel_extent(3, 4, 10, 103), 42);
+        assert_eq!(pixel_extent(0, 4, 10, 0), 0);
     }
 
     #[test]

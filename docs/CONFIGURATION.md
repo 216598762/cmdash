@@ -83,6 +83,8 @@ enabled = true
 - `workspace.name` labels the active workspace and defaults to `default`.
 - `appearance` selects inherited/fallback theme colors and workspace role
   overrides; see [APPEARANCE.md](APPEARANCE.md).
+- `animation` enables bounded retained motion when explicitly configured; see
+  [ANIMATION.md](ANIMATION.md) for its complete contract.
 - `plugins` contains named plugin manifest paths. Plugin loading remains
   capability-limited; WASM support is opt-in with `--features wasm-plugins`.
 
@@ -118,9 +120,6 @@ are `text`, `clock`, `system`, and `terminal`.
   `none`; `border_style` is an alias.
 - `settings.border_color` and semantic role names such as `foreground`,
   `background`, `focus`, and `muted` accept `inherit`, `ansi:N`, or `#RRGGBB`.
-- Terminal widgets support `settings.cursor_blink` (`true` or `false`, default
-  `true`) and `settings.cursor_blink_interval_ms` (50–60000 milliseconds,
-  default `500`).
 - `clock.format` accepts `HH:MM` or `HH:MM:SS`.
 - A terminal widget owns its PTY, emulator, selection, graphics resources, and
   shutdown lifecycle.
@@ -131,9 +130,9 @@ inheritance, border styles, label policies, override precedence, and examples.
 The default `theme = "inherit"` uses terminal-native reset and ANSI references,
 while `theme = "fallback"` selects deterministic RGB colors.
 
-Animation options are not supported yet. The next roadmap phase reserves a
-versioned animation configuration for opt-in transitions, easing, duration,
-repetition, reduced-motion preferences, and bounded per-widget motion budgets.
+Animation and terminal cursor options are documented in
+[ANIMATION.md](ANIMATION.md). The workspace-level `[animation]` section is
+optional and disabled by default; invalid motion values reject a reload.
 
 ## Layouts and panes
 

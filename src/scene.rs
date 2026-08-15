@@ -113,6 +113,20 @@ impl Scene {
         &self.image_layers
     }
 
+    /// Applies the bounded transition appearance used by the animation layer.
+    ///
+    /// Terminal scenes remain ordinary retained cells; animation never emits
+    /// terminal escape sequences or alters graphics ownership.
+    pub fn apply_motion(&mut self, progress: u16) {
+        if progress >= 1000 {
+            return;
+        }
+        let dim = progress < 500;
+        for cell in &mut self.cells {
+            cell.style.dim = dim;
+        }
+    }
+
     pub fn add_image_layer(&mut self, submission: GraphicsSubmission) {
         if let Some(submission) = submission.clipped_to(self.area) {
             self.image_layers.push(submission);

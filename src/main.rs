@@ -13,7 +13,7 @@ use std::{
 
 use cmdash::{
     AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend, SessionWakeup, Surface,
-    SurfaceCommand, SurfaceId, UiEvent, WidgetRegistry, WidgetRuntimeContext,
+    SurfaceCommand, SurfaceId, TerminalWindowSize, UiEvent, WidgetRegistry, WidgetRuntimeContext,
     dashboard::{
         render_static_dashboard_shell_with_theme,
         render_static_dashboard_surface_scenes_with_theme, static_dashboard_surface_areas,
@@ -23,7 +23,6 @@ use cmdash::{
     ui_event_channel,
 };
 use crossterm::event::{self, Event};
-use ratatui::layout::Rect;
 
 const MAX_EVENTS_PER_BATCH: usize = 32;
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -50,6 +49,9 @@ enum MaintenanceCommand {
         delay: Option<Duration>,
         generation: u64,
     },
+    ScheduleAnimation {
+        delay: Option<Duration>,
+    },
 }
 
 struct MaintenanceWaker {
@@ -62,6 +64,12 @@ impl MaintenanceWaker {
         let _ = self
             .command_sender
             .send(MaintenanceCommand::ScheduleCursorBlink { delay, generation });
+    }
+
+    fn schedule_animation(&self, delay: Option<Duration>) {
+        let _ = self
+            .command_sender
+            .send(MaintenanceCommand::ScheduleAnimation { delay });
     }
 
     fn shutdown(mut self) {
@@ -92,9 +100,11 @@ fn main() -> io::Result<()> {
     let explicit_config_path = config_path(&args)?;
     let (config_path, config) = load_config(explicit_config_path.as_deref())?;
     let config_path_for_report = config_path.clone();
+    let initial_window_size = backend.window_size()?;
     let (event_sender, event_receiver, pty_wakeup) = ui_event_channel();
     let registry = WidgetRegistry::builtins_with_context(
-        WidgetRuntimeContext::with_session_wakeup(pty_wakeup.clone()),
+        WidgetRuntimeContext::with_session_wakeup(pty_wakeup.clone())
+            .with_initial_terminal_size(initial_window_size.terminal_size()),
     );
     let mut state = AppState::from_config(backend.capabilities(), &registry, &config)
         .map_err(|error| io::Error::other(format!("application config rejected: {error}")))?;
@@ -157,6 +167,9 @@ where
             state.cursor_blink_schedule(),
             state.cursor_blink_generation(),
         );
+        context
+            .maintenance_waker
+            .schedule_animation(state.animation_schedule());
         if let Some(reloader) = context.reloader.as_deref_mut() {
             match reloader.poll_with_migrations() {
                 Ok(Some(loaded)) => {
@@ -181,8 +194,9 @@ where
         for invalidation in state.take_surface_invalidations() {
             compositor.invalidate(invalidation);
         }
-        let area = backend.size()?;
-        sync_dashboard_surfaces(state, area)?;
+        let window_size = backend.window_size()?;
+        let area = window_size.area();
+        sync_dashboard_surfaces(state, window_size)?;
         let widget_health =
             (!state.widget_runtime().is_empty()).then(|| state.widget_runtime().health_summary());
         let base = render_static_dashboard_shell_with_theme(
@@ -310,15 +324,23 @@ fn spawn_maintenance_waker(sender: Sender<UiEvent>) -> MaintenanceWaker {
     let handle = thread::spawn(move || {
         let mut maintenance_deadline = Instant::now() + MAINTENANCE_INTERVAL;
         let mut cursor_deadline: Option<(Instant, u64)> = None;
+        let mut animation_deadline: Option<Instant> = None;
         loop {
             let now = Instant::now();
-            let next_deadline = cursor_deadline.map_or(maintenance_deadline, |(cursor, _)| {
-                cursor.min(maintenance_deadline)
-            });
+            let next_deadline = cursor_deadline
+                .map(|(cursor, _)| cursor)
+                .into_iter()
+                .chain(animation_deadline)
+                .chain(std::iter::once(maintenance_deadline))
+                .min()
+                .expect("maintenance always has a deadline");
             match command_receiver.recv_timeout(next_deadline.saturating_duration_since(now)) {
                 Ok(MaintenanceCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Ok(MaintenanceCommand::ScheduleCursorBlink { delay, generation }) => {
                     cursor_deadline = delay.map(|delay| (Instant::now() + delay, generation));
+                }
+                Ok(MaintenanceCommand::ScheduleAnimation { delay }) => {
+                    animation_deadline = delay.map(|delay| Instant::now() + delay);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let now = Instant::now();
@@ -334,6 +356,12 @@ fn spawn_maintenance_waker(sender: Sender<UiEvent>) -> MaintenanceWaker {
                             break;
                         }
                         cursor_deadline = None;
+                    }
+                    if animation_deadline.is_some_and(|deadline| now >= deadline) {
+                        if sender.send(UiEvent::AnimationFrame).is_err() {
+                            break;
+                        }
+                        animation_deadline = None;
                     }
                 }
             }
@@ -385,6 +413,9 @@ fn collect_ui_event(
         UiEvent::Input(event) => events.push(event),
         UiEvent::PtyOutput => pty_wakeup.clear_pending(),
         UiEvent::Tick => {}
+        UiEvent::AnimationFrame => {
+            state.advance_animations(SystemTime::now());
+        }
         UiEvent::CursorBlink(generation) => {
             state.advance_cursor_blink(generation);
         }
@@ -468,7 +499,11 @@ fn dispatch_event(
     }
 }
 
-fn sync_dashboard_surfaces(state: &mut AppState, area: Rect) -> io::Result<()> {
+fn sync_dashboard_surfaces(
+    state: &mut AppState,
+    window_size: TerminalWindowSize,
+) -> io::Result<()> {
+    let area = window_size.area();
     let surface_areas: BTreeMap<_, _> = if state.widget_runtime().is_empty() {
         static_dashboard_surface_areas(area).into_iter().collect()
     } else {
@@ -550,7 +585,7 @@ fn sync_dashboard_surfaces(state: &mut AppState, area: Rect) -> io::Result<()> {
     }
 
     state
-        .resize_widget_surfaces(&surface_areas)
+        .resize_widget_surfaces(&surface_areas, window_size)
         .map_err(|error| io::Error::other(format!("widget resize rejected: {error}")))?;
     Ok(())
 }
@@ -560,6 +595,7 @@ mod tests {
     use super::*;
     use cmdash::{BackendCapabilities, FocusTarget, SurfaceId};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
 
     fn capabilities() -> BackendCapabilities {
         BackendCapabilities {

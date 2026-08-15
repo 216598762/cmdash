@@ -10,6 +10,7 @@ use ratatui::layout::Rect;
 #[cfg(feature = "sixel")]
 use crate::sixel::SixelSubmission;
 use crate::{
+    animation::{AnimationFrame, AnimationSettings},
     appearance::Theme,
     config::{AppConfig, LabelPolicy, WidgetInstanceConfig},
     graphics::GraphicsSubmission,
@@ -321,6 +322,16 @@ pub trait Widget: Send {
         self.render(area, focused)
     }
 
+    fn render_with_animation(
+        &self,
+        area: Rect,
+        focused: bool,
+        cursor_visible: bool,
+        _animation: AnimationFrame,
+    ) -> Scene {
+        self.render_with_cursor(area, focused, cursor_visible)
+    }
+
     fn cursor_blink_settings(&self) -> Option<CursorBlinkSettings> {
         None
     }
@@ -379,6 +390,7 @@ pub trait Widget: Send {
 #[derive(Clone, Default)]
 pub struct WidgetRuntimeContext {
     session_wakeup: Option<SessionWakeup>,
+    initial_terminal_size: Option<TerminalSize>,
     theme: Theme,
 }
 
@@ -390,8 +402,14 @@ impl WidgetRuntimeContext {
     pub fn with_session_wakeup(wakeup: SessionWakeup) -> Self {
         Self {
             session_wakeup: Some(wakeup),
+            initial_terminal_size: None,
             theme: Theme::default(),
         }
+    }
+
+    pub fn with_initial_terminal_size(mut self, size: TerminalSize) -> Self {
+        self.initial_terminal_size = Some(size);
+        self
     }
 
     pub fn with_theme(mut self, theme: Theme) -> Self {
@@ -401,6 +419,10 @@ impl WidgetRuntimeContext {
 
     pub fn session_wakeup(&self) -> Option<&SessionWakeup> {
         self.session_wakeup.as_ref()
+    }
+
+    pub const fn initial_terminal_size(&self) -> Option<TerminalSize> {
+        self.initial_terminal_size
     }
 
     pub const fn theme(&self) -> Theme {
@@ -510,6 +532,8 @@ impl WidgetRegistry {
     }
 
     fn instantiate(&self, config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>, WidgetError> {
+        AnimationSettings::from_settings(&config.settings)
+            .map_err(WidgetError::InvalidConfiguration)?;
         let factory = self
             .factories
             .get(&config.kind)
@@ -549,6 +573,8 @@ impl WidgetRuntime {
     ) -> Result<Self, WidgetError> {
         let mut instances = BTreeMap::new();
         for widget_config in &config.workspace.widgets {
+            AnimationSettings::from_settings(&widget_config.settings)
+                .map_err(WidgetError::InvalidConfiguration)?;
             let id = WidgetId::new(widget_config.id);
             if instances.contains_key(&id) {
                 return Err(WidgetError::DuplicateWidgetId(id));
@@ -789,14 +815,31 @@ impl WidgetRuntime {
         focused: Option<WidgetId>,
         cursor_visible: bool,
     ) -> BTreeMap<WidgetId, Scene> {
+        self.render_with_animation(areas, focused, cursor_visible, AnimationFrame::complete())
+    }
+
+    pub fn render_with_animation(
+        &self,
+        areas: &BTreeMap<WidgetId, Rect>,
+        focused: Option<WidgetId>,
+        cursor_visible: bool,
+        animation: AnimationFrame,
+    ) -> BTreeMap<WidgetId, Scene> {
         self.instances
             .iter()
             .filter_map(|(&id, entry)| {
                 let area = *areas.get(&id)?;
+                let is_focused = focused == Some(id);
                 let mut scene =
                     entry
                         .widget
-                        .render_with_cursor(area, focused == Some(id), cursor_visible);
+                        .render_with_animation(area, is_focused, cursor_visible, animation);
+                if is_focused && animation.focus_progress < 1000 {
+                    scene.apply_motion(animation.focus_progress);
+                }
+                if animation.transition_progress < 1000 {
+                    scene.apply_motion(animation.transition_progress);
+                }
                 for graphics in entry.widget.graphics(area) {
                     scene.add_image_layer(graphics);
                 }
@@ -1198,7 +1241,9 @@ fn terminal_widget_factory(
         crate::state::SessionId::new(config.id),
         config.command.as_deref(),
         &[],
-        TerminalSize::new(80, 24),
+        context
+            .initial_terminal_size()
+            .unwrap_or_else(|| TerminalSize::new(80, 24)),
         context.session_wakeup().cloned(),
     )
     .map_err(|error| WidgetError::InitializationFailed {

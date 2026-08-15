@@ -28,6 +28,49 @@ pub struct OutputMetrics {
     pub bytes_saved: u64,
 }
 
+/// The outer terminal's cell and pixel dimensions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalWindowSize {
+    pub columns: u16,
+    pub rows: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+}
+
+impl TerminalWindowSize {
+    pub const fn area(self) -> Rect {
+        Rect::new(0, 0, self.columns, self.rows)
+    }
+}
+
+impl From<crossterm::terminal::WindowSize> for TerminalWindowSize {
+    fn from(size: crossterm::terminal::WindowSize) -> Self {
+        Self {
+            columns: size.columns,
+            rows: size.rows,
+            pixel_width: size.width,
+            pixel_height: size.height,
+        }
+    }
+}
+
+impl From<TerminalWindowSize> for crate::session::TerminalSize {
+    fn from(size: TerminalWindowSize) -> Self {
+        Self::with_pixels(size.columns, size.rows, size.pixel_width, size.pixel_height)
+    }
+}
+
+impl TerminalWindowSize {
+    pub const fn terminal_size(self) -> crate::session::TerminalSize {
+        crate::session::TerminalSize::with_pixels(
+            self.columns,
+            self.rows,
+            self.pixel_width,
+            self.pixel_height,
+        )
+    }
+}
+
 struct ByteCountingWriter<W> {
     inner: W,
     bytes_written: u64,
@@ -93,6 +136,20 @@ pub trait Backend {
     fn capabilities(&self) -> BackendCapabilities;
     fn metrics(&self) -> OutputMetrics;
     fn size(&self) -> Result<Rect, Self::Error>;
+
+    /// Returns cell and pixel dimensions for the outer terminal.
+    ///
+    /// Backends that cannot report pixels retain the cell-only fallback.
+    fn window_size(&self) -> Result<TerminalWindowSize, Self::Error> {
+        let area = self.size()?;
+        Ok(TerminalWindowSize {
+            columns: area.width,
+            rows: area.height,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+    }
+
     fn enter(&mut self) -> Result<(), Self::Error>;
     fn leave(&mut self) -> Result<(), Self::Error>;
     fn submit(&mut self, scene: &Scene) -> Result<(), Self::Error>;
@@ -177,8 +234,11 @@ impl<W: Write> Backend for CrosstermBackend<W> {
     }
 
     fn size(&self) -> Result<Rect, Self::Error> {
-        let (width, height) = terminal::size()?;
-        Ok(Rect::new(0, 0, width, height))
+        Ok(self.window_size()?.area())
+    }
+
+    fn window_size(&self) -> Result<TerminalWindowSize, Self::Error> {
+        Ok(terminal::window_size()?.into())
     }
 
     fn enter(&mut self) -> Result<(), Self::Error> {
@@ -470,6 +530,19 @@ mod tests {
         Compositor, SessionGraphicsStore, SessionId,
         scene::{CellStyle, Color},
     };
+
+    #[test]
+    fn terminal_window_size_preserves_cell_and_pixel_metrics() {
+        let size = TerminalWindowSize {
+            columns: 80,
+            rows: 24,
+            pixel_width: 800,
+            pixel_height: 480,
+        };
+        assert_eq!(size.area(), Rect::new(0, 0, 80, 24));
+        assert_eq!(size.terminal_size().cell_width(), 10);
+        assert_eq!(size.terminal_size().cell_height(), 20);
+    }
 
     #[test]
     fn backend_capabilities_are_stable_for_a_constructed_backend() {

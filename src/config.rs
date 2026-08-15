@@ -6,7 +6,10 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::state::{OverlayId, WidgetId};
+use crate::{
+    animation::{AnimationDirection, Easing, FillMode},
+    state::{OverlayId, WidgetId},
+};
 
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
 pub const LEGACY_CONFIG_VERSION: u32 = 0;
@@ -19,6 +22,8 @@ pub struct AppConfig {
     pub workspace: WorkspaceConfig,
     #[serde(default)]
     pub appearance: AppearanceConfig,
+    #[serde(default)]
+    pub animation: AnimationConfig,
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
 }
@@ -38,6 +43,52 @@ impl Default for AppearanceConfig {
             colors: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub struct AnimationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub reduced_motion: bool,
+    #[serde(default = "default_animation_duration_ms")]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub delay_ms: u64,
+    #[serde(default)]
+    pub easing: Easing,
+    #[serde(default)]
+    pub repeat: u16,
+    #[serde(default)]
+    pub direction: AnimationDirection,
+    #[serde(default)]
+    pub fill: FillMode,
+    #[serde(default = "default_animation_max_concurrent")]
+    pub max_concurrent: usize,
+}
+
+impl Default for AnimationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reduced_motion: false,
+            duration_ms: default_animation_duration_ms(),
+            delay_ms: 0,
+            easing: Easing::Linear,
+            repeat: 0,
+            direction: AnimationDirection::Normal,
+            fill: FillMode::Forwards,
+            max_concurrent: default_animation_max_concurrent(),
+        }
+    }
+}
+
+fn default_animation_duration_ms() -> u64 {
+    180
+}
+
+fn default_animation_max_concurrent() -> usize {
+    16
 }
 
 fn default_appearance_theme() -> String {
@@ -84,6 +135,8 @@ impl AppConfig {
             #[serde(default)]
             appearance: AppearanceConfig,
             #[serde(default)]
+            animation: AnimationConfig,
+            #[serde(default)]
             plugins: Vec<PluginConfig>,
         }
 
@@ -107,6 +160,7 @@ impl AppConfig {
             version: CURRENT_CONFIG_VERSION,
             workspace: raw.workspace,
             appearance: raw.appearance,
+            animation: raw.animation,
             plugins: raw.plugins,
         };
         config.validate()?;
@@ -178,6 +232,21 @@ impl AppConfig {
         }
         crate::appearance::Theme::from_config(&self.appearance)
             .map_err(|error| ConfigError::InvalidAppearance(error.to_string()))?;
+        if self.animation.duration_ms == 0 || self.animation.duration_ms > 60_000 {
+            return Err(ConfigError::InvalidAnimation(
+                "animation duration_ms must be between 1 and 60000".to_owned(),
+            ));
+        }
+        if self.animation.delay_ms > 60_000 {
+            return Err(ConfigError::InvalidAnimation(
+                "animation delay_ms must be at most 60000".to_owned(),
+            ));
+        }
+        if self.animation.max_concurrent == 0 || self.animation.max_concurrent > 128 {
+            return Err(ConfigError::InvalidAnimation(
+                "animation max_concurrent must be between 1 and 128".to_owned(),
+            ));
+        }
 
         let mut ids = BTreeSet::new();
         for widget in &self.workspace.widgets {
@@ -460,6 +529,7 @@ pub enum ConfigError {
     InvalidActiveTab(usize),
     InvalidPluginConfig,
     InvalidAppearance(String),
+    InvalidAnimation(String),
     DuplicatePluginName(String),
 }
 
@@ -494,6 +564,7 @@ impl fmt::Display for ConfigError {
                 formatter.write_str("plugin name and manifest path cannot be empty")
             }
             Self::InvalidAppearance(message) => write!(formatter, "invalid appearance: {message}"),
+            Self::InvalidAnimation(message) => write!(formatter, "invalid animation: {message}"),
             Self::DuplicatePluginName(name) => {
                 write!(formatter, "duplicate plugin name {name:?}")
             }
@@ -549,6 +620,38 @@ mod tests {
 
         assert_eq!(config.appearance.theme, "fallback");
         assert_eq!(config.appearance.colors["muted"], "ansi:8");
+    }
+
+    #[test]
+    fn parses_bounded_animation_options_and_defaults_them_off() {
+        let defaults = AppConfig::parse("version = 1").unwrap();
+        assert!(!defaults.animation.enabled);
+
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [animation]
+            enabled = true
+            reduced_motion = true
+            duration_ms = 240
+            delay_ms = 20
+            easing = "easeinout"
+            repeat = 2
+            direction = "alternate"
+            fill = "forwards"
+            max_concurrent = 8
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.animation.duration_ms, 240);
+        assert_eq!(config.animation.max_concurrent, 8);
+        assert!(config.animation.reduced_motion);
+    }
+
+    #[test]
+    fn rejects_unbounded_animation_options() {
+        let error = AppConfig::parse("version = 1\n[animation]\nmax_concurrent = 129").unwrap_err();
+        assert!(matches!(error, ConfigError::InvalidAnimation(_)));
     }
 
     #[test]

@@ -68,8 +68,14 @@ Runs the main event loop and routes:
 
 - keyboard, mouse, resize, paste, selection/copy, and terminal capability events;
 - PTY output and child-process lifecycle events;
+- coordinator-owned maintenance deadlines for wakeable cursor and retained-scene animation;
 - timers, filesystem/watch events, and widget messages;
 - commands such as focus, split, close, reload, and switch tab.
+
+Animation state is owned by `AppState` and advanced only by the coordinator clock;
+widgets receive bounded frame progress while the compositor and backend retain
+normal scene/output ownership. See [ANIMATION.md](ANIMATION.md) for the motion
+contract and configuration.
 
 The coordinator updates application state and schedules a frame. It does not render partial output from event handlers.
 
@@ -158,9 +164,11 @@ A frame should follow these rules:
 5. Composite by z-order, applying focus decorations and overlays at the end.
 6. Compare with the previous frame where safe, clear invalidated regions, diff retained image layers, and submit the backend-specific output.
 7. Keep hidden sessions alive but do not include their scenes or graphics placements in the submitted frame.
-8. Submit only current visible image layers and delete stale session-qualified image IDs.
+8. Advance active retained animations only at coordinator wakeups; a static frame
+   remains valid when motion is disabled or unsupported.
+9. Submit only current visible image layers and delete stale session-qualified image IDs.
 
-The backend may optimize the final submission, but the logical frame must represent the complete visible dashboard. This prevents stale graphics or text from leaking across tab switches.
+The backend may optimize the final submission, but the logical frame must represent the complete visible dashboard. This prevents stale graphics or text from leaking across tab switches. Motion changes retained scene presentation only; it never gives widgets direct terminal output ownership. See [ANIMATION.md](ANIMATION.md) for scheduler, accessibility, and lifecycle details.
 
 ## 5. Terminal sessions and graphics isolation
 
