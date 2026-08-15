@@ -28,11 +28,43 @@ impl std::fmt::Display for SixelError {
 
 impl std::error::Error for SixelError {}
 
-/// Encodes an RGB image as a conservative two-color sixel stream.
-///
-/// The first implementation intentionally uses a monochrome threshold rather
-/// than introducing an image quantizer dependency. Callers can use it for
-/// small status images while richer palettes remain a future optimization.
+const PALETTE: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (128, 0, 0),
+    (0, 128, 0),
+    (128, 128, 0),
+    (0, 0, 128),
+    (128, 0, 128),
+    (0, 128, 128),
+    (192, 192, 192),
+    (64, 64, 64),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (0, 0, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+];
+
+fn palette_index(red: u8, green: u8, blue: u8) -> usize {
+    PALETTE
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, &(palette_red, palette_green, palette_blue))| {
+            let distance = |actual: u8, expected: u8| {
+                let difference = i32::from(actual) - i32::from(expected);
+                difference * difference
+            };
+            distance(red, palette_red)
+                + distance(green, palette_green)
+                + distance(blue, palette_blue)
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+/// Encodes an RGB image as a bounded 16-color sixel stream.
 pub fn encode_rgb(image: SixelImage<'_>) -> Result<Vec<u8>, SixelError> {
     if image.width == 0 || image.height == 0 {
         return Err(SixelError::EmptyImage);
@@ -42,31 +74,62 @@ pub fn encode_rgb(image: SixelImage<'_>) -> Result<Vec<u8>, SixelError> {
         return Err(SixelError::InvalidDimensions);
     }
 
-    let mut output = Vec::with_capacity(expected / 2 + 64);
-    output.extend_from_slice(b"\x1bPq#0;2;0;0;0#1;2;100;100;100");
-    for band_start in (0..image.height as usize).step_by(6) {
-        if band_start != 0 {
+    let mut output = Vec::with_capacity(expected + 128);
+    output.extend_from_slice(b"\x1bPq");
+    for (index, &(red, green, blue)) in PALETTE.iter().enumerate() {
+        output.extend_from_slice(
+            format!(
+                "#{index};2;{};{};{}",
+                u16::from(red) * 100 / 255,
+                u16::from(green) * 100 / 255,
+                u16::from(blue) * 100 / 255
+            )
+            .as_bytes(),
+        );
+    }
+
+    for (band_index, band_start) in (0..image.height as usize).step_by(6).enumerate() {
+        if band_index > 0 {
             output.push(b'-');
         }
-        output.extend_from_slice(b"#1");
-        for column in 0..image.width as usize {
-            let mut bits = 0u8;
-            for offset in 0..6 {
-                let row = band_start + offset;
-                if row >= image.height as usize {
-                    continue;
-                }
-                let pixel = (row * image.width as usize + column) * 3;
-                let luminance = u16::from(image.rgb[pixel]) * 30
-                    + u16::from(image.rgb[pixel + 1]) * 59
-                    + u16::from(image.rgb[pixel + 2]) * 11;
-                if luminance >= 12_750 {
-                    bits |= 1 << offset;
-                }
+        let mut first_color = true;
+        for color in 0..PALETTE.len() {
+            let has_pixels = (0..image.width as usize).any(|column| {
+                (0..6).any(|offset| {
+                    let row = band_start + offset;
+                    if row >= image.height as usize {
+                        return false;
+                    }
+                    let pixel = (row * image.width as usize + column) * 3;
+                    palette_index(image.rgb[pixel], image.rgb[pixel + 1], image.rgb[pixel + 2])
+                        == color
+                })
+            });
+            if !has_pixels {
+                continue;
             }
-            output.push(b'?'.saturating_add(bits));
+            if !first_color {
+                output.push(b'$');
+            }
+            first_color = false;
+            output.extend_from_slice(format!("#{color}").as_bytes());
+            for column in 0..image.width as usize {
+                let mut bits = 0u8;
+                for offset in 0..6 {
+                    let row = band_start + offset;
+                    if row >= image.height as usize {
+                        continue;
+                    }
+                    let pixel = (row * image.width as usize + column) * 3;
+                    if palette_index(image.rgb[pixel], image.rgb[pixel + 1], image.rgb[pixel + 2])
+                        == color
+                    {
+                        bits |= 1 << offset;
+                    }
+                }
+                output.push(b'?'.saturating_add(bits));
+            }
         }
-        output.push(b'$');
     }
     output.extend_from_slice(b"\x1b\\");
     Ok(output)
@@ -77,7 +140,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encodes_small_rgb_images_as_sixel() {
+    fn encodes_small_rgb_images_with_a_bounded_palette() {
         let image = SixelImage {
             width: 2,
             height: 1,
@@ -85,9 +148,9 @@ mod tests {
         };
         let encoded = encode_rgb(image).unwrap();
 
-        assert!(encoded.starts_with(b"\x1bPq"));
+        assert!(encoded.starts_with(b"\x1bPq#0;2;0;0;0"));
         assert!(encoded.ends_with(b"\x1b\\"));
-        assert!(encoded.contains(&b'@'));
+        assert!(encoded.windows(3).any(|window| window == b"#15"));
     }
 
     #[test]

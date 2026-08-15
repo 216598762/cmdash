@@ -10,7 +10,7 @@ This is an evaluation list and initial direction, not a dependency lockfile. The
 | Terminal emulator | `alacritty_terminal` | One emulator per session; Kitty APC sequences are intercepted by a cmdash-owned session adapter because graphics resources are not global emulator state. |
 | PTY and async runtime | `portable-pty` + `tokio` | Per-session I/O tasks communicate with the UI/coordinator through bounded messages. |
 | Layout primitives | `ratatui` + `unicode-width` | Use Ratatui layout/text primitives behind the backend-neutral scene boundary and track narrow/wide cell occupancy explicitly. |
-| Plugin boundary | Versioned native ABI | Active v1 host descriptor, manifest schema, widget settings map, and capability negotiation; dynamic loading remains a later isolation gate. |
+| Plugin boundary | Versioned manifest plus Wasmtime | Active v1 host descriptor/manifest, widget settings map, import-free Wasmtime host, and capability negotiation; enabled only with `wasm-plugins`. |
 | Workspace scope | One active workspace | Add saved/multiple workspace behavior only after the core runtime contracts are stable. |
 | Graphics fallback | Capability-aware Kitty/sixel adapters | Unsupported or over-limit graphics are omitted with in-app degraded diagnostics; Kitty layers are replayed only when supported and sixel is an opt-in feature. |
 
@@ -151,7 +151,7 @@ Low-level cross-platform dynamic-library loading. It can support a deliberately 
 
 ### `wasmtime`
 
-A WebAssembly runtime candidate for stronger isolation and a portable plugin format. It can be attractive for untrusted or third-party widgets, but adds runtime size, host-function design, serialization/copying concerns, and a separate rendering ABI.
+**Selected behind the `wasm-plugins` feature at v47.0.3.** The host uses Wasmtime's `Engine`, `Module`, `Store`, and `Linker` APIs with fuel accounting enabled. Modules must be import-free; no WASI, filesystem, terminal, or raw backend handles are exposed. The runtime remains opt-in because it materially increases build size and compilation time.
 
 ### `wasmer`
 
@@ -161,11 +161,9 @@ Another WebAssembly runtime alternative. Compare it with Wasmtime only if WASM p
 
 Worth evaluating if the plugin contract is designed around a language-neutral, versionable interface. This may be more future-proof than exposing Rust types, but the component model must represent widget lifecycle, input, messages, scene data, and resource ownership without excessive copying.
 
-### Initial plugin direction
+### Selected plugin direction
 
-Use a versioned native ABI for the first external-widget prototype. The host-facing contract must use C-compatible data, explicit ABI and capability versions, owned message/scene buffers, and documented lifecycle and failure behavior. `abi_stable` and a hand-defined C ABI remain implementation candidates, but neither may expose Rust's unstable ABI or raw terminal/backend handles.
-
-A WASM runtime remains a later option if stronger isolation or language neutrality becomes a product requirement; it is not part of the initial dependency set.
+Use the existing versioned manifest and C-compatible descriptor as the logical widget contract, and execute untrusted modules only through the opt-in Wasmtime host. The host currently accepts import-free modules and keeps host functions out until each capability has an explicit bounded ABI. The in-process fixture remains useful for exercising built-in registry behavior, but it is not the isolation path for untrusted plugins.
 
 ## Configuration, discovery, and live reload
 
@@ -185,7 +183,8 @@ Plugin discovery uses a validated manifest shape with ABI/API version, widget ty
 - [`tempfile`](https://crates.io/crates/tempfile) — isolated config, plugin, and PTY fixture directories.
 - [`criterion`](https://crates.io/crates/criterion) — benchmark frame composition, high-volume PTY output, and graphics-store operations.
 - `cargo-fuzz` — fuzz escape/protocol parsing, config migration, and plugin-manifest handling; this is a development tool rather than a runtime dependency.
-- The optional `sixel` feature currently uses a local, dependency-free encoder; add an image/quantization dependency only after profiling demonstrates the need.
+- The optional `sixel` feature currently uses a local, dependency-free 16-color quantizing encoder; add an image/quantization dependency only after profiling demonstrates the need.
+- Wasmtime is optional and should not be enabled for the default binary or fuzz harness unless a plugin-runtime test requires it.
 
 The most valuable first regression test remains: two tabs each use graphics image ID `1`, produce different images, switch A → B → A, and verify that the retained scenes and submitted placements remain isolated.
 
@@ -194,7 +193,7 @@ The most valuable first regression test remains: two tabs each use graphics imag
 1. Add and pin `crossterm`, `ratatui`, `portable-pty`, `tokio`, `serde`, `toml`, `tracing`, and `directories` as the package skeleton requires them.
 2. Integrate `alacritty_terminal` behind the per-session emulator boundary and verify the APIs needed for grid, alternate screen, cursor, scrollback, and resize behavior.
 3. Verify Kitty support and choose the smallest suitable cmdash-owned adapter using `little-kitty`, `kitty-graphics-protocol`, or a local implementation; the current Phase 5 slice uses a local adapter with session-qualified IDs and visible-placement replay.
-4. Prototype the versioned native plugin ABI with `abi_stable` or a hand-defined C ABI; evaluate Wasmtime only if isolation or language neutrality justifies it.
+4. Exercise the versioned manifest/descriptor through the opt-in Wasmtime host; add host functions only with explicit capability and quota tests.
 5. Add `notify`, `proptest`, `insta`, benchmarks, and other support crates as actual features require them.
 6. Run the checked-in fuzz targets before releases and attach the reproducible Linux archive plus checksum generated by the release workflow.
 

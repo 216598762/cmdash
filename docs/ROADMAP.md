@@ -8,7 +8,7 @@ This roadmap is intentionally staged so the rendering and session ownership cont
 - [x] Start with a single active workspace; defer multiple saved workspaces until the core runtime contracts are stable.
 - [x] Choose the initial Rust stack: `crossterm`, `alacritty_terminal`, `portable-pty`, `ratatui` primitives behind the scene boundary, and `tokio`.
 - [x] Require ANSI/VT text, cursor movement, Unicode cells, basic colors, alternate screen, keyboard input, and resize; degrade optional features and omit unsupported graphics without corrupting text/layout.
-- [x] Use a versioned native plugin ABI with C-compatible host data, capability negotiation, and no Rust trait objects across the shared-library boundary.
+- [x] Use a versioned plugin data contract with C-compatible host data, capability negotiation, and no Rust trait objects across an isolation boundary.
 - [x] Create the initial Cargo package with formatting and test commands.
 - [x] Add CI and linting workflows for formatting, checks, Clippy, and tests.
 - [x] Use TOML as the initial hand-authored configuration format.
@@ -44,7 +44,7 @@ This roadmap is intentionally staged so the rendering and session ownership cont
 - [x] Parse and validate version-1 TOML widget-instance configuration.
 - [x] Integrate widget registration and configuration-driven instances into the application shell, with the static dashboard retained as a fallback.
 - [x] Add a layout tree with leaf widgets, tab groups, and overlays; defer pane splits until the tab model is validated.
-- [x] Define the versioned plugin host contract and exercise it with a minimal external-widget fixture; dynamic-library loading remains deferred.
+- [x] Define the versioned plugin host contract and exercise it with a minimal external-widget fixture; untrusted execution is now isolated through the opt-in Wasmtime host.
 - [x] Add non-terminal widgets including text, a UTC clock, and system information, exercising the same host-facing contract.
 - [x] Start the application shell from a widget-only TOML configuration without enabling terminal sessions.
 - [x] Load user-provided widget-only TOML configuration through `--config` / `-c`, with the embedded config as the no-argument fallback.
@@ -105,7 +105,10 @@ The next milestone is Phase 3: add one isolated terminal session as an optional 
 - [x] Add configuration-driven horizontal and vertical pane splitting after tabs and session restoration are stable.
 - [x] Add bounded parser stress coverage for escape/protocol input.
 - [x] Enforce graphics resource quotas and surface widget/session shutdown failures as diagnostics.
-- [x] Add fuzzing targets, upgrade/migration handling, and reproducible Linux release packaging.
+- [x] Add fuzzing targets and scheduled CI smoke runs, upgrade/migration rewrites with warnings, crash reproduction artifacts, and reproducible multi-target release packaging.
+- [x] Select Wasmtime as the isolated plugin runtime with an import-free, capability-limited host foundation.
+- [x] Add interactive pane focus, adjustable split ratios, and focused-pane lifecycle commands.
+- [x] Improve the opt-in sixel path with bounded 16-color quantization.
 
 **Exit criteria (met for the current contract):** documented extension points, repeatable builds/tests, and controlled behavior under malformed input and resource pressure.
 
@@ -119,10 +122,10 @@ The next milestone is Phase 3: add one isolated terminal session as an optional 
 | Terminal capabilities | ANSI/VT text and core interaction required; graphics and enhanced input optional | Ensures unsupported terminal features degrade deliberately rather than corrupting output |
 | Terminal session ownership | One emulator and graphics store for each terminal tab/session | Prevents state and image-ID cross-contamination |
 | Rendering | Retained, backend-neutral scene composed into complete frames | Makes widgets modular and tab restoration deterministic |
-| Widget extensibility | Versioned native plugin ABI with C-compatible host data | Makes external widgets a first-class design constraint without exposing Rust's unstable ABI |
+| Widget extensibility | Versioned manifest plus opt-in Wasmtime host | Keeps untrusted widget execution isolated and avoids exposing Rust's unstable ABI or terminal handles |
 | Graphics | Kitty first, optional dependency-free sixel adapter, capability-aware fallback | Matches the initial requirement while keeping restoration faithful and making sixel opt-in |
 | Async model | Coordinator/UI owner plus per-session I/O tasks | Keeps frame submission serialized while PTYs remain responsive |
 | Configuration | TOML for the initial user-facing format | Readable for hand-authored layouts and widget settings |
-| Initial multiplexer UX | Retained tabs plus configuration-driven horizontal/vertical panes | Validates session isolation and restoration before adding interactive pane mutation |
+| Initial multiplexer UX | Retained tabs plus interactive horizontal/vertical panes | Validates session isolation and restoration while keeping pane mutation command-driven |
 
 Update this table as product decisions are made; do not let provisional choices silently become public API guarantees.

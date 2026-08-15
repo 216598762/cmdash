@@ -22,9 +22,26 @@ pub struct AppConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoadedConfig {
+    pub config: AppConfig,
+    pub migrations: Vec<ConfigMigration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfigMigration {
     AddedVersion,
     LegacyVersion { from: u32, to: u32 },
+}
+
+impl ConfigMigration {
+    pub fn warning(&self) -> String {
+        match self {
+            Self::AddedVersion => "configuration had no version; assumed version 1".to_owned(),
+            Self::LegacyVersion { from, to } => {
+                format!("configuration version {from} migrated to version {to}")
+            }
+        }
+    }
 }
 
 impl AppConfig {
@@ -71,12 +88,36 @@ impl AppConfig {
     }
 
     pub fn load_file(path: impl AsRef<Path>) -> Result<Self, ConfigFileError> {
+        Self::load_file_with_migrations(path).map(|loaded| loaded.config)
+    }
+
+    pub fn load_file_with_migrations(
+        path: impl AsRef<Path>,
+    ) -> Result<LoadedConfig, ConfigFileError> {
         let path = path.as_ref();
         let source = fs::read_to_string(path).map_err(|error| ConfigFileError::Read {
             path: path.to_path_buf(),
             message: error.to_string(),
         })?;
-        Self::parse(&source).map_err(ConfigFileError::Invalid)
+        let (config, migrations) =
+            Self::parse_with_migrations(&source).map_err(ConfigFileError::Invalid)?;
+        Ok(LoadedConfig { config, migrations })
+    }
+
+    pub fn migrate_source(source: &str) -> Result<(String, Vec<ConfigMigration>), ConfigError> {
+        let (_, migrations) = Self::parse_with_migrations(source)?;
+        if migrations.is_empty() {
+            return Ok((source.to_owned(), migrations));
+        }
+        let mut value: toml::Value =
+            toml::from_str(source).map_err(|error| ConfigError::Parse(error.to_string()))?;
+        if let Some(table) = value.as_table_mut() {
+            table.insert(
+                "version".to_owned(),
+                toml::Value::Integer(i64::from(CURRENT_CONFIG_VERSION)),
+            );
+        }
+        Ok((value.to_string(), migrations))
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -226,6 +267,8 @@ pub enum LayoutConfig {
     },
     Split {
         direction: SplitDirection,
+        #[serde(default)]
+        ratios: Vec<u16>,
         children: Vec<LayoutConfig>,
     },
     Overlay {
@@ -504,11 +547,13 @@ mod tests {
 
     #[test]
     fn migration_adds_missing_or_legacy_versions() {
-        let (_, missing) =
-            AppConfig::parse_with_migrations("[workspace]\nname = \"legacy\"\n").unwrap();
+        let (rewritten, missing) =
+            AppConfig::migrate_source("[workspace]\nname = \"legacy\"\n").unwrap();
         assert_eq!(missing, [ConfigMigration::AddedVersion]);
+        assert!(rewritten.contains("version = 1"));
         let (_, legacy) = AppConfig::parse_with_migrations("version = 0\n").unwrap();
         assert_eq!(legacy, [ConfigMigration::LegacyVersion { from: 0, to: 1 }]);
+        assert!(missing[0].warning().contains("assumed"));
     }
 
     #[test]

@@ -395,6 +395,13 @@ impl WidgetRuntime {
         }
     }
 
+    pub fn shutdown_widget(&mut self, id: WidgetId) -> Result<(), String> {
+        let Some(mut entry) = self.instances.remove(&id) else {
+            return Err(format!("widget {} is not registered", id.get()));
+        };
+        entry.widget.shutdown()
+    }
+
     pub fn shutdown(&mut self) -> Vec<String> {
         let mut failures = Vec::new();
         for entry in self.instances.values_mut() {

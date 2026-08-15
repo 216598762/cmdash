@@ -1,14 +1,17 @@
 # Release packaging
 
-Tagged builds are packaged by `.github/workflows/release.yml` as:
+Tagged builds are packaged by `.github/workflows/release.yml` for:
 
-- `cmdash-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
-- a matching `.sha256` checksum file
+- `x86_64-unknown-linux-gnu`
+- `aarch64-apple-darwin`
+- `x86_64-pc-windows-msvc`
 
-The archive contains the release binary, license, project documentation, and no runtime-generated state. Validate a downloaded archive with:
+Each target produces a `cmdash-vX.Y.Z-TARGET.tar.gz` archive and matching `.sha256` checksum. Archives contain the release binary, license, and project documentation, but no runtime-generated state.
+
+Validate a downloaded archive with:
 
 ```bash
-sha256sum --check cmdash-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum --check cmdash-vX.Y.Z-TARGET.tar.gz.sha256
 ```
 
-The current package targets Linux x86_64. Additional targets should be added only after backend, PTY, and graphics capability tests run on those platforms.
+The default release is built without optional protocol/runtime features. Build variants such as `--features sixel` or `--features wasm-plugins` should be published separately only after their target-specific capability and size checks pass.

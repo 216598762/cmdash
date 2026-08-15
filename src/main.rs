@@ -71,6 +71,7 @@ fn main() -> io::Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
     let config_path = config_path(&args)?;
     let config = load_config(config_path.as_deref())?;
+    let config_path_for_report = config_path.clone();
     let registry = WidgetRegistry::builtins();
     let mut state = AppState::from_config(backend.capabilities(), &registry, &config)
         .map_err(|error| io::Error::other(format!("application config rejected: {error}")))?;
@@ -91,7 +92,15 @@ fn main() -> io::Result<()> {
     state.shutdown_widgets();
     let leave_result = backend.leave();
 
-    run_result.and(leave_result)
+    let result = run_result.and(leave_result);
+    if let Err(error) = &result
+        && let Some(directory) = env::var_os("CMDASH_CRASH_DIR")
+    {
+        let _ = cmdash::CrashReport::from_error(error.to_string())
+            .with_context(format!("config={:?}", config_path_for_report))
+            .write_to(directory);
+    }
+    result
 }
 
 fn run<B>(
@@ -106,9 +115,15 @@ where
 {
     loop {
         if let Some(reloader) = reloader.as_deref_mut() {
-            match reloader.poll() {
-                Ok(Some(config)) => {
-                    if let Err(error) = state.reload_config(registry, &config) {
+            match reloader.poll_with_migrations() {
+                Ok(Some(loaded)) => {
+                    for migration in &loaded.migrations {
+                        state.record_diagnostic(format!(
+                            "config migration: {}",
+                            migration.warning()
+                        ));
+                    }
+                    if let Err(error) = state.reload_config(registry, &loaded.config) {
                         state.record_diagnostic(format!("config reload rejected: {error}"));
                     }
                 }
@@ -238,9 +253,15 @@ fn dispatch_event(
             }
             Some(Command::ReloadConfig) => {
                 if let Some(reloader) = reloader {
-                    match reloader.reload() {
-                        Ok(config) => {
-                            if let Err(error) = state.reload_config(registry, &config) {
+                    match reloader.reload_with_migrations() {
+                        Ok(loaded) => {
+                            for migration in &loaded.migrations {
+                                state.record_diagnostic(format!(
+                                    "config migration: {}",
+                                    migration.warning()
+                                ));
+                            }
+                            if let Err(error) = state.reload_config(registry, &loaded.config) {
                                 state.record_diagnostic(format!("config reload rejected: {error}"));
                             }
                         }

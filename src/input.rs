@@ -1,8 +1,32 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::command::{Command, FocusCommand, TabCommand};
+use crate::command::{Command, FocusCommand, FocusDirection, PaneCommand, TabCommand};
 
 pub fn command_for_key(key: KeyEvent) -> Option<Command> {
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return match key.code {
+            KeyCode::Left => Some(Command::Focus(FocusCommand::Direction(
+                FocusDirection::Left,
+            ))),
+            KeyCode::Right => Some(Command::Focus(FocusCommand::Direction(
+                FocusDirection::Right,
+            ))),
+            KeyCode::Up => Some(Command::Focus(FocusCommand::Direction(FocusDirection::Up))),
+            KeyCode::Down => Some(Command::Focus(FocusCommand::Direction(
+                FocusDirection::Down,
+            ))),
+            _ => None,
+        };
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        match key.code {
+            KeyCode::Left => return Some(Command::Pane(PaneCommand::Shrink)),
+            KeyCode::Right => return Some(Command::Pane(PaneCommand::Grow)),
+            KeyCode::Char('w') => return Some(Command::Pane(PaneCommand::Close)),
+            _ => {}
+        }
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::PageDown => Some(Command::Tab(TabCommand::Next)),
@@ -73,6 +97,37 @@ mod tests {
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
             Some(Command::ReloadConfig)
+        );
+    }
+
+    #[test]
+    fn pane_and_directional_focus_keys_are_available() {
+        assert_eq!(
+            command_for_key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            Some(Command::Pane(PaneCommand::Grow))
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            Some(Command::Pane(PaneCommand::Shrink))
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Some(Command::Pane(PaneCommand::Close))
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)),
+            Some(Command::Focus(FocusCommand::Direction(
+                FocusDirection::Down
+            )))
         );
     }
 

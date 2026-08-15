@@ -21,6 +21,7 @@ pub enum LayoutNode {
     Stack(Vec<LayoutNode>),
     Split {
         direction: SplitDirection,
+        ratios: Vec<u16>,
         children: Vec<LayoutNode>,
     },
     Overlay(OverlayId),
@@ -29,6 +30,7 @@ pub enum LayoutNode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LayoutTree {
     root: LayoutNode,
+    hidden_widgets: BTreeSet<WidgetId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,7 +72,10 @@ impl LayoutTree {
             Some(config) => convert_node(config, &widgets, &overlays)?,
             None => LayoutNode::Columns(widgets.into_iter().map(LayoutNode::Leaf).collect()),
         };
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            hidden_widgets: BTreeSet::new(),
+        })
     }
 
     pub fn root(&self) -> &LayoutNode {
@@ -79,7 +84,7 @@ impl LayoutTree {
 
     pub fn visible_widget_ids(&self) -> Vec<WidgetId> {
         let mut ids = Vec::new();
-        collect_visible_widgets(&self.root, &mut ids);
+        collect_visible_widgets(&self.root, &self.hidden_widgets, &mut ids);
         ids
     }
 
@@ -91,12 +96,24 @@ impl LayoutTree {
 
     pub fn widget_areas(&self, area: Rect) -> BTreeMap<WidgetId, Rect> {
         let mut placements = BTreeMap::new();
-        place_widgets(&self.root, area, &mut placements);
+        place_widgets(&self.root, &self.hidden_widgets, area, &mut placements);
         placements
     }
 
     pub fn switch_tabs(&mut self, forward: bool) -> bool {
         switch_tabs_in_node(&mut self.root, forward)
+    }
+
+    pub fn adjust_split_for_widget(&mut self, widget: WidgetId, delta: i16) -> bool {
+        adjust_split(&mut self.root, widget, delta)
+    }
+
+    pub fn hide_widget(&mut self, widget: WidgetId) -> bool {
+        self.hidden_widgets.insert(widget)
+    }
+
+    pub fn is_hidden(&self, widget: WidgetId) -> bool {
+        self.hidden_widgets.contains(&widget)
     }
 }
 
@@ -174,6 +191,7 @@ fn convert_node(
         }
         LayoutConfig::Split {
             direction,
+            ratios,
             children,
         } => {
             if children.is_empty() {
@@ -181,6 +199,7 @@ fn convert_node(
             }
             Ok(LayoutNode::Split {
                 direction: *direction,
+                ratios: ratios.clone(),
                 children: children
                     .iter()
                     .map(|child| convert_node(child, widgets, overlays))
@@ -197,10 +216,14 @@ fn convert_node(
     }
 }
 
-fn collect_visible_widgets(node: &LayoutNode, ids: &mut Vec<WidgetId>) {
+fn collect_visible_widgets(
+    node: &LayoutNode,
+    hidden_widgets: &BTreeSet<WidgetId>,
+    ids: &mut Vec<WidgetId>,
+) {
     match node {
         LayoutNode::Leaf(id) => {
-            if !ids.contains(id) {
+            if !hidden_widgets.contains(id) && !ids.contains(id) {
                 ids.push(*id);
             }
         }
@@ -208,11 +231,11 @@ fn collect_visible_widgets(node: &LayoutNode, ids: &mut Vec<WidgetId>) {
         | LayoutNode::Stack(children)
         | LayoutNode::Split { children, .. } => {
             for child in children {
-                collect_visible_widgets(child, ids);
+                collect_visible_widgets(child, hidden_widgets, ids);
             }
         }
         LayoutNode::Tabs { active, children } => {
-            collect_visible_widgets(&children[*active], ids);
+            collect_visible_widgets(&children[*active], hidden_widgets, ids);
         }
         LayoutNode::Overlay(_) => {}
     }
@@ -239,45 +262,123 @@ fn collect_visible_overlays(node: &LayoutNode, ids: &mut Vec<OverlayId>) {
     }
 }
 
-fn place_widgets(node: &LayoutNode, area: Rect, placements: &mut BTreeMap<WidgetId, Rect>) {
+fn place_widgets(
+    node: &LayoutNode,
+    hidden_widgets: &BTreeSet<WidgetId>,
+    area: Rect,
+    placements: &mut BTreeMap<WidgetId, Rect>,
+) {
     match node {
         LayoutNode::Leaf(id) => {
-            placements.insert(*id, area);
+            if !hidden_widgets.contains(id) {
+                placements.insert(*id, area);
+            }
         }
         LayoutNode::Columns(children) => {
-            for (child, child_area) in
-                children
-                    .iter()
-                    .zip(split_area(area, children.len(), SplitDirection::Horizontal))
-            {
-                place_widgets(child, child_area, placements);
+            for (child, child_area) in children.iter().zip(split_area(
+                area,
+                children.len(),
+                SplitDirection::Horizontal,
+                &[],
+            )) {
+                place_widgets(child, hidden_widgets, child_area, placements);
             }
         }
         LayoutNode::Tabs { active, children } => {
-            place_widgets(&children[*active], area, placements);
+            place_widgets(&children[*active], hidden_widgets, area, placements);
         }
         LayoutNode::Stack(children) => {
             for child in children {
-                place_widgets(child, area, placements);
+                place_widgets(child, hidden_widgets, area, placements);
             }
         }
         LayoutNode::Split {
             direction,
+            ratios,
             children,
         } => {
             for (child, child_area) in
                 children
                     .iter()
-                    .zip(split_area(area, children.len(), *direction))
+                    .zip(split_area(area, children.len(), *direction, ratios))
             {
-                place_widgets(child, child_area, placements);
+                place_widgets(child, hidden_widgets, child_area, placements);
             }
         }
         LayoutNode::Overlay(_) => {}
     }
 }
 
-fn split_area(area: Rect, count: usize, direction: SplitDirection) -> Vec<Rect> {
+fn adjust_split(node: &mut LayoutNode, widget: WidgetId, delta: i16) -> bool {
+    match node {
+        LayoutNode::Split {
+            children, ratios, ..
+        } => {
+            let Some(index) = children
+                .iter()
+                .position(|child| contains_widget(child, widget))
+            else {
+                return children
+                    .iter_mut()
+                    .any(|child| adjust_split(child, widget, delta));
+            };
+            if children.len() < 2 || delta == 0 {
+                return false;
+            }
+            if ratios.len() != children.len() || ratios.iter().all(|ratio| *ratio == 0) {
+                *ratios = vec![100 / children.len() as u16; children.len()];
+                let assigned = ratios.iter().sum::<u16>();
+                if let Some(last) = ratios.last_mut() {
+                    *last += 100 - assigned;
+                }
+            }
+            let neighbor = if delta.is_positive() {
+                (index + 1 < children.len()).then_some(index + 1)
+            } else {
+                (index > 0).then_some(index - 1)
+            };
+            let Some(neighbor) = neighbor else {
+                return false;
+            };
+            let amount = delta.unsigned_abs().min(ratios[neighbor].saturating_sub(1));
+            if amount == 0 {
+                return false;
+            }
+            if delta.is_positive() {
+                ratios[index] = ratios[index].saturating_add(amount);
+                ratios[neighbor] = ratios[neighbor].saturating_sub(amount);
+            } else {
+                ratios[index] = ratios[index].saturating_sub(amount);
+                ratios[neighbor] = ratios[neighbor].saturating_add(amount);
+            }
+            true
+        }
+        LayoutNode::Columns(children) | LayoutNode::Stack(children) => children
+            .iter_mut()
+            .any(|child| adjust_split(child, widget, delta)),
+        LayoutNode::Tabs { children, .. } => children
+            .iter_mut()
+            .any(|child| adjust_split(child, widget, delta)),
+        LayoutNode::Leaf(_) | LayoutNode::Overlay(_) => false,
+    }
+}
+
+fn contains_widget(node: &LayoutNode, widget: WidgetId) -> bool {
+    match node {
+        LayoutNode::Leaf(id) => *id == widget,
+        LayoutNode::Columns(children)
+        | LayoutNode::Stack(children)
+        | LayoutNode::Split { children, .. } => {
+            children.iter().any(|child| contains_widget(child, widget))
+        }
+        LayoutNode::Tabs { children, .. } => {
+            children.iter().any(|child| contains_widget(child, widget))
+        }
+        LayoutNode::Overlay(_) => false,
+    }
+}
+
+fn split_area(area: Rect, count: usize, direction: SplitDirection, ratios: &[u16]) -> Vec<Rect> {
     if count == 0 {
         return Vec::new();
     }
@@ -286,11 +387,21 @@ fn split_area(area: Rect, count: usize, direction: SplitDirection) -> Vec<Rect> 
         SplitDirection::Horizontal => (area.width, area.x),
         SplitDirection::Vertical => (area.height, area.y),
     };
-    let base = total / count;
-    let remainder = total % count;
+    let weights = if ratios.len() == count as usize && ratios.iter().any(|ratio| *ratio > 0) {
+        ratios.to_vec()
+    } else {
+        vec![1; count as usize]
+    };
+    let total_weight: u32 = weights.iter().map(|weight| u32::from(*weight)).sum();
+    let mut assigned = 0u16;
     (0..count)
         .map(|index| {
-            let size = base + u16::from(index < remainder);
+            let size = if index + 1 == count {
+                total.saturating_sub(assigned)
+            } else {
+                ((u32::from(total) * u32::from(weights[index as usize])) / total_weight) as u16
+            };
+            assigned = assigned.saturating_add(size);
             let child = match direction {
                 SplitDirection::Horizontal => Rect::new(offset, area.y, size, area.height),
                 SplitDirection::Vertical => Rect::new(area.x, offset, area.width, size),
@@ -323,6 +434,7 @@ mod tests {
     fn split_layouts_divide_rows_and_columns() {
         let horizontal = LayoutConfig::Split {
             direction: SplitDirection::Horizontal,
+            ratios: Vec::new(),
             children: vec![
                 LayoutConfig::Leaf { widget: 1 },
                 LayoutConfig::Leaf { widget: 2 },
@@ -334,6 +446,7 @@ mod tests {
 
         let vertical = LayoutConfig::Split {
             direction: SplitDirection::Vertical,
+            ratios: Vec::new(),
             children: vec![
                 LayoutConfig::Leaf { widget: 1 },
                 LayoutConfig::Leaf { widget: 2 },
@@ -404,6 +517,7 @@ mod tests {
                 &BTreeSet::from([OverlayId::new(9)]),
             )
             .unwrap(),
+            hidden_widgets: BTreeSet::new(),
         };
 
         assert_eq!(tree.visible_widget_ids(), [WidgetId::new(1)]);

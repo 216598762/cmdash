@@ -12,6 +12,7 @@ pub enum Command {
     TogglePalette,
     Focus(FocusCommand),
     Tab(TabCommand),
+    Pane(PaneCommand),
     Surface(SurfaceCommand),
     Overlay(OverlayCommand),
 }
@@ -28,7 +29,23 @@ pub enum FocusCommand {
     Overlay(OverlayId),
     Next,
     Previous,
+    Direction(FocusDirection),
     Clear,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FocusDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaneCommand {
+    Grow,
+    Shrink,
+    Close,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

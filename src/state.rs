@@ -5,7 +5,10 @@ use ratatui::layout::Rect;
 
 use crate::{
     backend::BackendCapabilities,
-    command::{Command, CommandEffect, FocusCommand, OverlayCommand, SurfaceCommand, TabCommand},
+    command::{
+        Command, CommandEffect, FocusCommand, FocusDirection, OverlayCommand, PaneCommand,
+        SurfaceCommand, TabCommand,
+    },
     config::{AppConfig, ConfigError},
     graphics::GraphicsSubmission,
     layout::{LayoutError, LayoutTree},
@@ -281,6 +284,8 @@ pub enum CommandError {
     OverlayNotVisible(OverlayId),
     InvalidSurfaceArea(SurfaceId),
     InvalidOverlayArea(OverlayId),
+    PaneNotFound(WidgetId),
+    NoSplitForPane(WidgetId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -706,7 +711,7 @@ impl AppState {
                     OverlayId::new(u64::MAX - 1),
                     Rect::new(3, 3, 58, 9),
                     " command palette ",
-                    "q / Esc       quit\nTab           next focus\nCtrl+PageUp   previous tab\nCtrl+PageDown next tab\nCtrl+R        reload TOML configuration",
+                    "q / Esc       quit\nTab           next focus\nAlt+Arrow     directional pane focus\nCtrl+Shift+←/→ resize pane ratio\nCtrl+Shift+W  close focused pane\nCtrl+PageUp   previous tab\nCtrl+PageDown next tab\nCtrl+R        reload TOML configuration",
                 );
                 CommandEffect::Redraw
             }
@@ -716,6 +721,10 @@ impl AppState {
             }
             Command::Tab(command) => {
                 self.apply_tab(command);
+                CommandEffect::Redraw
+            }
+            Command::Pane(command) => {
+                self.apply_pane(command)?;
                 CommandEffect::Redraw
             }
             Command::Surface(command) => {
@@ -831,6 +840,7 @@ impl AppState {
             }
             FocusCommand::Next => self.navigate_focus(true),
             FocusCommand::Previous => self.navigate_focus(false),
+            FocusCommand::Direction(direction) => self.navigate_direction(direction),
             FocusCommand::Clear => self.focus.clear(),
         }
         let new_surface = self.focused_surface_area();
@@ -854,6 +864,89 @@ impl AppState {
                 .map(|surface| surface.area()),
             Some(FocusTarget::Overlay(_)) | None => None,
         }
+    }
+
+    fn navigate_direction(&mut self, direction: FocusDirection) {
+        let Some(FocusTarget::Surface(current_id)) = self.focus.target() else {
+            self.navigate_focus(true);
+            return;
+        };
+        let Some(current) = self.workspace.surfaces.get(&current_id).copied() else {
+            return;
+        };
+        let center = |area: Rect| {
+            (
+                i32::from(area.x) + i32::from(area.width) / 2,
+                i32::from(area.y) + i32::from(area.height) / 2,
+            )
+        };
+        let current_center = center(current.area());
+        let candidate = self
+            .workspace
+            .surfaces
+            .values()
+            .filter(|surface| surface.visible() && surface.id() != current_id)
+            .filter_map(|surface| {
+                let target = center(surface.area());
+                let valid = match direction {
+                    FocusDirection::Left => target.0 < current_center.0,
+                    FocusDirection::Right => target.0 > current_center.0,
+                    FocusDirection::Up => target.1 < current_center.1,
+                    FocusDirection::Down => target.1 > current_center.1,
+                };
+                valid.then_some((
+                    (target.0 - current_center.0).abs() + (target.1 - current_center.1).abs(),
+                    surface.id(),
+                ))
+            })
+            .min_by_key(|candidate| candidate.0)
+            .map(|candidate| candidate.1);
+        if let Some(id) = candidate {
+            let _ = self.apply_focus(FocusCommand::Surface(id));
+        }
+    }
+
+    fn apply_pane(&mut self, command: PaneCommand) -> Result<(), CommandError> {
+        let Some(FocusTarget::Surface(surface_id)) = self.focus.target() else {
+            return Err(CommandError::PaneNotFound(WidgetId::new(0)));
+        };
+        let Some(widget_id) = self
+            .workspace
+            .surfaces
+            .get(&surface_id)
+            .and_then(|surface| surface.widget())
+        else {
+            return Err(CommandError::PaneNotFound(WidgetId::new(0)));
+        };
+        match command {
+            PaneCommand::Grow | PaneCommand::Shrink => {
+                let delta = if matches!(command, PaneCommand::Grow) {
+                    10
+                } else {
+                    -10
+                };
+                if !self.layout.adjust_split_for_widget(widget_id, delta) {
+                    return Err(CommandError::NoSplitForPane(widget_id));
+                }
+                self.redraw_requested = true;
+            }
+            PaneCommand::Close => {
+                if !self.layout.hide_widget(widget_id) {
+                    return Err(CommandError::PaneNotFound(widget_id));
+                }
+                if let Err(error) = self.widget_runtime.shutdown_widget(widget_id) {
+                    self.record_diagnostic(format!("pane shutdown failed: {error}"));
+                }
+                if let Some(surface) = self.workspace.surfaces.get_mut(&surface_id) {
+                    *surface = surface.with_visible(false);
+                }
+                self.focus.clear();
+                self.pending_invalidations
+                    .push(self.workspace.surfaces[&surface_id].area());
+                self.redraw_requested = true;
+            }
+        }
+        Ok(())
     }
 
     fn navigate_focus(&mut self, forward: bool) {
@@ -1314,5 +1407,64 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.focus().target(), None);
+    }
+
+    #[test]
+    fn directional_focus_and_pane_ratio_commands_work() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "text"
+            [[workspace.widgets]]
+            id = 2
+            type = "text"
+            [workspace.layout]
+            type = "split"
+            direction = "horizontal"
+            children = [
+              { type = "leaf", widget = 1 },
+              { type = "leaf", widget = 2 }
+            ]
+            "#,
+        )
+        .unwrap();
+        let mut state =
+            AppState::from_config(capabilities(), &WidgetRegistry::builtins(), &config).unwrap();
+        state
+            .dispatch(Command::Surface(SurfaceCommand::SetArea {
+                id: SurfaceId::new(1),
+                area: Rect::new(0, 0, 10, 4),
+            }))
+            .unwrap();
+        state
+            .dispatch(Command::Surface(SurfaceCommand::SetArea {
+                id: SurfaceId::new(2),
+                area: Rect::new(10, 0, 10, 4),
+            }))
+            .unwrap();
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(SurfaceId::new(1))))
+            .unwrap();
+        state
+            .dispatch(Command::Focus(FocusCommand::Direction(
+                FocusDirection::Right,
+            )))
+            .unwrap();
+        assert_eq!(
+            state.focus().target(),
+            Some(FocusTarget::Surface(SurfaceId::new(2)))
+        );
+        state
+            .dispatch(Command::Focus(FocusCommand::Direction(
+                FocusDirection::Left,
+            )))
+            .unwrap();
+        state.dispatch(Command::Pane(PaneCommand::Grow)).unwrap();
+        assert_eq!(
+            state.layout().widget_areas(Rect::new(0, 0, 100, 4))[&WidgetId::new(2)].width,
+            40
+        );
     }
 }

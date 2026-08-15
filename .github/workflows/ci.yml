@@ -3,6 +3,9 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 6"
 
 permissions:
   contents: read
@@ -35,6 +38,35 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
+
+  fuzz-smoke:
+    name: Fuzz parser and migration smoke tests
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run bounded fuzz smoke tests
+        run: |
+          cargo fuzz run config_parse -- -runs=250
+          cargo fuzz run plugin_manifest -- -runs=250
+          cargo fuzz run kitty_stream -- -runs=250
+
+      - name: Upload fuzz artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmdash-fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
 
   msrv:
     name: Check Rust MSRV

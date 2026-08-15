@@ -14,6 +14,14 @@ pub const PLUGIN_API_VERSION: u32 = 1;
 pub const PLUGIN_MANIFEST_VERSION: u32 = 1;
 pub const PLUGIN_WIDGET_TYPE_MAX: usize = 32;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginRuntime {
+    #[default]
+    InProcess,
+    Wasm,
+}
+
 fn default_manifest_version() -> u32 {
     PLUGIN_MANIFEST_VERSION
 }
@@ -25,6 +33,8 @@ pub struct PluginManifestV1 {
     pub name: String,
     pub version: String,
     pub abi_version: u32,
+    #[serde(default)]
+    pub runtime: PluginRuntime,
     #[serde(default)]
     pub capabilities: u64,
     pub widgets: Vec<PluginWidgetManifest>,

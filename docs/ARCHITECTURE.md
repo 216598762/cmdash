@@ -16,7 +16,7 @@ The first implementation will use these boundaries:
 - **Terminal backend:** `crossterm` owns raw mode, input collection, resize events, and basic terminal controls. The cmdash scene/compositor remains independent of Crossterm's frame lifecycle.
 - **Terminal emulator:** use one `alacritty_terminal` instance per session. Kitty APC sequences are intercepted by a cmdash-owned adapter and `SessionGraphicsStore`; retained image layers flow through `Scene` and `Compositor`.
 - **Workspace scope:** start with one active workspace. The state model should leave room for saved workspaces later without making them part of the first runtime contract.
-- **Plugin ABI:** use a versioned native ABI with C-compatible host-facing data and explicit capability/version negotiation. Plugin manifests are validated before code loading, and the host must not pass Rust trait objects across the dynamic-library boundary.
+- **Plugin boundary:** use a versioned manifest and C-compatible data contract, with untrusted plugin execution isolated behind an opt-in Wasmtime host. Plugin manifests are validated before code loading, and the host must not pass Rust trait objects, terminal handles, WASI, or filesystem access across the boundary.
 - **Initial terminal capabilities:** require ANSI/VT text, cursor movement, Unicode cell output, basic colors, alternate-screen support, keyboard input, and resize handling. Treat truecolor, mouse, bracketed paste, keyboard enhancement, and Kitty graphics as optional capabilities.
 - **Fallback behavior:** downgrade optional color/input features when unavailable and omit unsupported or over-limit graphics with an in-app degraded diagnostic. Capability mismatches must never emit malformed output or corrupt text/layout.
 
@@ -106,7 +106,7 @@ Widgets should have a small lifecycle-oriented interface, conceptually similar t
 - produce a backend-neutral `Scene`;
 - optionally request timers, redraws, or external capabilities.
 
-Dynamic plugins are an early product requirement, so this boundary must be designed before widget implementations spread across the codebase. The host will expose the versioned, capability-based native contract described above rather than passing Rust trait objects directly across a shared-library boundary. The plugin manager must document plugin lifecycle, permissions, threading, and failure isolation, and reject unsupported ABI versions before loading widget code.
+Dynamic plugins are an early product requirement, so this boundary must be designed before widget implementations spread across the codebase. The host exposes the versioned, capability-based contract through an opt-in Wasmtime runtime rather than passing Rust trait objects directly across a shared-library boundary. The initial host rejects all module imports, does not link WASI, configures fuel accounting, and bounds module size; future host functions must be added explicitly to the manifest capability set. The plugin manager must document plugin lifecycle, permissions, threading, and failure isolation, and reject unsupported ABI/API versions before loading widget code.
 
 The plugin API should avoid exposing `stdout`, raw terminal escape sequences, or a concrete terminal backend. A plugin communicates through messages and backend-neutral scene data. Built-in widgets should use the same host-facing contract wherever practical so they exercise the plugin boundary continuously.
 
@@ -243,7 +243,7 @@ Image layers are diffed as part of `FrameDiff`; stale physical image IDs are exp
 
 The scene should carry clipping and ownership metadata. Every image placement should include its owning `SessionId` or a derived resource namespace so the compositor can reject cross-session references during development.
 
-The first backend can target a single local terminal, but the interface should keep these concerns separate. The first interaction model prioritizes retained terminal tabs. Configuration-driven horizontal and vertical pane splits are now supported after validating the tab/session and scene contracts; interactive pane mutation remains a later command-layer extension:
+The first backend can target a single local terminal, but the interface should keep these concerns separate. The first interaction model prioritizes retained terminal tabs. Configuration-driven horizontal and vertical pane splits are supported, and the command layer now provides directional pane focus, ratio adjustment, and focused-pane shutdown while preserving retained session ownership:
 
 - terminal input/output and raw mode;
 - layout and cell rendering;
@@ -261,7 +261,7 @@ Candidate crates are cataloged in [External library candidates](DEPENDENCIES.md)
 | Escape parsing | Parser APIs exposed by `alacritty_terminal`, with `vte` only if a narrow adapter is required |
 | Terminal emulation | `alacritty_terminal`, one instance per session |
 | Kitty/image output | Cmdash-owned session adapter and retained `Scene` image layers; optional dependency-free sixel encoder for dashboard RGB images |
-| Dynamic plugins | Versioned native ABI; evaluate `abi_stable` versus a hand-defined C ABI during the prototype |
+| Dynamic plugins | Versioned manifest plus opt-in Wasmtime host with no imports | Isolates plugin faults and keeps terminal/filesystem capabilities explicit |
 | Errors/logging | `thiserror`, `anyhow`, `tracing`, `tracing-subscriber` |
 | Config/serialization | `serde` + `toml` |
 
@@ -288,7 +288,7 @@ Dynamic plugins are an early requirement, with compile-time feature flags still 
 - a workspace config chooses which widget types and instances are present;
 - plugin loading, health, permissions, and shutdown are managed by a host-side plugin manager.
 
-The plugin manager must validate manifests, reject unsupported ABI/API versions and capabilities, isolate failures to the affected widget where possible, and ensure a plugin cannot write directly to the terminal backend. Native dynamic loading should not rely on Rust's unstable ABI; use the stabilized C-compatible v1 descriptor/manifest boundary or an explicitly chosen portable runtime. The current configuration contract is `cmdash.workspace` v1, with named plugin manifests and a string-valued widget settings map; legacy/missing config versions are reported through explicit migration records.
+The plugin manager must validate manifests, reject unsupported ABI/API versions and capabilities, isolate failures to the affected widget where possible, and ensure a plugin cannot write directly to the terminal backend. The current runtime choice is Wasmtime behind the `wasm-plugins` feature; the default build remains free of that runtime. The configuration contract is `cmdash.workspace` v1, with named plugin manifests and a string-valued widget settings map; legacy/missing config versions can be rewritten and are reported through explicit migration warnings. Runtime failures can be written as bounded reproduction artifacts when `CMDASH_CRASH_DIR` is configured.
 
 ## 9. Testing strategy
 

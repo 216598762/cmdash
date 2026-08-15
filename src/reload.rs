@@ -1,6 +1,6 @@
 use std::{fmt, fs, path::PathBuf, time::SystemTime};
 
-use crate::config::{AppConfig, ConfigFileError};
+use crate::config::{AppConfig, ConfigFileError, LoadedConfig};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReloadError {
@@ -45,21 +45,32 @@ impl ConfigReloader {
     }
 
     pub fn poll(&mut self) -> Result<Option<AppConfig>, ReloadError> {
+        self.poll_with_migrations()
+            .map(|loaded| loaded.map(|loaded| loaded.config))
+    }
+
+    pub fn poll_with_migrations(&mut self) -> Result<Option<LoadedConfig>, ReloadError> {
         let modified = modified(&self.path)?;
         if self.last_modified.is_some_and(|last| modified <= last) {
             return Ok(None);
         }
         self.last_modified = Some(modified);
-        self.load().map(Some).map_err(ReloadError::Config)
+        self.load_with_migrations()
+            .map(Some)
+            .map_err(ReloadError::Config)
     }
 
     pub fn reload(&mut self) -> Result<AppConfig, ReloadError> {
-        self.last_modified = Some(modified(&self.path)?);
-        self.load().map_err(ReloadError::Config)
+        self.reload_with_migrations().map(|loaded| loaded.config)
     }
 
-    fn load(&self) -> Result<AppConfig, ConfigFileError> {
-        AppConfig::load_file(&self.path)
+    pub fn reload_with_migrations(&mut self) -> Result<LoadedConfig, ReloadError> {
+        self.last_modified = Some(modified(&self.path)?);
+        self.load_with_migrations().map_err(ReloadError::Config)
+    }
+
+    fn load_with_migrations(&self) -> Result<LoadedConfig, ConfigFileError> {
+        AppConfig::load_file_with_migrations(&self.path)
     }
 }
 
