@@ -268,8 +268,8 @@ transitions for the next geometry tranche.
 Graphics submission is an explicit outer-rendering contract rather than a
 successful no-op: the backend reports `Rendered`, `Degraded`, `Suppressed`, or
 `Failed` with a placement count and bounded reason. The selected
-`disabled`/`direct`/`unicode_placeholder` mode is included in backend capability
-metadata and API snapshots. Placeholder geometry is validated before emission,
+`disabled`/`direct`/`unicode_placeholder`/`passthrough`/`text_fallback` mode is
+included in backend capability metadata and API snapshots. Placeholder geometry is validated before emission,
 so an invalid placement cannot leave a partial escape stream behind. Child-side
 malformed graphics commands are isolated to the session: cmdash records a
 bounded diagnostic and returns a Kitty error acknowledgement when an image or
@@ -282,10 +282,15 @@ A bounded `GraphicsProtocolBroker` keeps child-PTY responses in a separate queue
 from outer-terminal probe traffic. `GraphicsCapabilityProbe` emits a Kitty/DA1/
 pixel-size probe, correlates only the outer Kitty acknowledgement, and reports
 confirmed, rejected, or timed-out capability state; callers must provide the raw
-outer input and must not feed child PTY bytes into it. Capability metadata records
-whether support was inferred from the environment, explicitly overridden, or
-actively probed, together with confidence. Automatic outer-input demultiplexing,
-scroll-region semantics, and scene occlusion remain follow-up work.
+outer input and must not feed child PTY bytes into it. Capability metadata records whether support was inferred from the environment,
+explicitly overridden, or actively probed, together with confidence. The
+`GraphicsInputDemultiplexer` now separates Kitty/CSI probe replies from ordinary
+keyboard bytes across read boundaries. Direct replay reuses uploaded resources
+by generation, passthrough wraps and ESC-doubles Kitty APCs for tmux-style hosts,
+and text fallback emits a bounded degraded marker. Primary/alternate screen
+anchors, opaque scene occlusion, and cleanup generations are retained; detailed
+scroll-region semantics and automatic ownership of the process-wide crossterm
+reader remain follow-up integration work.
 
 This is why a global image map or a single terminal emulator shared by tabs is explicitly out of scope.
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::{self, Write},
     time::{Duration, Instant},
 };
@@ -17,7 +18,9 @@ use ratatui::layout::Rect;
 
 use crate::{
     compositor::{CellSpan, FrameDiff},
-    graphics::{GraphicsProtocolBroker, GraphicsSubmission},
+    graphics::{
+        GraphicsInputDemultiplexer, GraphicsProtocolBroker, GraphicsSubmission, OuterInputEvent,
+    },
     scene::{Cell, CellStyle, CellWidth, Color, Scene},
 };
 
@@ -29,6 +32,10 @@ pub struct OutputMetrics {
     pub optimized_diff_bytes: u64,
     pub naive_diff_bytes: u64,
     pub bytes_saved: u64,
+    pub graphics_uploads: u64,
+    pub graphics_reuses: u64,
+    pub graphics_bytes: u64,
+    pub graphics_suppressed: u64,
 }
 
 /// The outer terminal's cell and pixel dimensions.
@@ -105,6 +112,8 @@ pub enum KittyGraphicsMode {
     Disabled,
     Direct,
     UnicodePlaceholder,
+    Passthrough,
+    TextFallback,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,6 +185,12 @@ pub enum GraphicsProbeState {
     Confirmed,
     Rejected,
     TimedOut,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OuterInputBatch {
+    pub terminal_bytes: Vec<u8>,
+    pub graphics_report: Option<GraphicsCapabilityReport>,
 }
 
 /// Active outer-terminal Kitty probe and response correlator.
@@ -341,13 +356,19 @@ pub struct BackendCapabilities {
     pub kitty_unicode_placeholders: bool,
     pub graphics_source: GraphicsCapabilitySource,
     pub graphics_confidence: GraphicsCapabilityConfidence,
+    pub kitty_passthrough: bool,
+    pub kitty_text_fallback: bool,
     pub sixel: bool,
 }
 
 impl BackendCapabilities {
     pub const fn kitty_graphics_mode(self) -> KittyGraphicsMode {
-        if !self.kitty_graphics {
+        if self.kitty_text_fallback {
+            KittyGraphicsMode::TextFallback
+        } else if !self.kitty_graphics {
             KittyGraphicsMode::Disabled
+        } else if self.kitty_passthrough {
+            KittyGraphicsMode::Passthrough
         } else if self.kitty_unicode_placeholders {
             KittyGraphicsMode::UnicodePlaceholder
         } else {
@@ -396,8 +417,8 @@ impl BackendCapabilities {
                 std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some(),
             ),
         };
-        let kitty_graphics =
-            detected_kitty_graphics && !matches!(graphics_mode.as_str(), "off" | "disabled");
+        let kitty_graphics = (detected_kitty_graphics || graphics_mode == "passthrough")
+            && !matches!(graphics_mode.as_str(), "off" | "disabled");
         let placeholder_capable = kitty_placeholder_from_hints(
             &terminal_hint,
             &program_hint,
@@ -411,6 +432,8 @@ impl BackendCapabilities {
                 _ => placeholder_capable,
             };
 
+        let kitty_passthrough = graphics_mode == "passthrough";
+        let kitty_text_fallback = matches!(graphics_mode.as_str(), "text" | "fallback");
         let graphics_source = if explicit_graphics.is_some()
             || matches!(graphics_mode.as_str(), "off" | "disabled")
         {
@@ -434,6 +457,8 @@ impl BackendCapabilities {
             kitty_unicode_placeholders,
             graphics_source,
             graphics_confidence,
+            kitty_passthrough,
+            kitty_text_fallback,
             sixel: cfg!(feature = "sixel")
                 && (terminal_hint.contains("sixel")
                     || std::env::var("CMDASH_SIXEL").is_ok_and(|value| value == "1")),
@@ -574,13 +599,19 @@ pub struct CrosstermBackend<W: Write> {
     writer: ByteCountingWriter<W>,
     capabilities: BackendCapabilities,
     graphics_probe: GraphicsCapabilityProbe,
+    graphics_input: GraphicsInputDemultiplexer,
     graphics_broker: GraphicsProtocolBroker,
+    uploaded_generations: BTreeMap<u32, u64>,
     entered: bool,
     frames_submitted: u64,
     frames_skipped: u64,
     optimized_diff_bytes: u64,
     naive_diff_bytes: u64,
     bytes_saved: u64,
+    graphics_uploads: u64,
+    graphics_reuses: u64,
+    graphics_bytes: u64,
+    graphics_suppressed: u64,
 }
 
 impl<W: Write> CrosstermBackend<W> {
@@ -589,13 +620,19 @@ impl<W: Write> CrosstermBackend<W> {
             writer: ByteCountingWriter::new(writer),
             capabilities: BackendCapabilities::detect(),
             graphics_probe: GraphicsCapabilityProbe::default(),
+            graphics_input: GraphicsInputDemultiplexer::default(),
             graphics_broker: GraphicsProtocolBroker::default(),
+            uploaded_generations: BTreeMap::new(),
             entered: false,
             frames_submitted: 0,
             frames_skipped: 0,
             optimized_diff_bytes: 0,
             naive_diff_bytes: 0,
             bytes_saved: 0,
+            graphics_uploads: 0,
+            graphics_reuses: 0,
+            graphics_bytes: 0,
+            graphics_suppressed: 0,
         }
     }
 
@@ -616,6 +653,10 @@ impl<W: Write> CrosstermBackend<W> {
             optimized_diff_bytes: self.optimized_diff_bytes,
             naive_diff_bytes: self.naive_diff_bytes,
             bytes_saved: self.bytes_saved,
+            graphics_uploads: self.graphics_uploads,
+            graphics_reuses: self.graphics_reuses,
+            graphics_bytes: self.graphics_bytes,
+            graphics_suppressed: self.graphics_suppressed,
         }
     }
 
@@ -640,6 +681,23 @@ impl<W: Write> CrosstermBackend<W> {
         Ok(true)
     }
 
+    pub fn feed_outer_input(&mut self, bytes: &[u8]) -> OuterInputBatch {
+        let mut terminal_bytes = Vec::new();
+        let mut graphics_report = None;
+        for event in self.graphics_input.feed(bytes) {
+            match event {
+                OuterInputEvent::TerminalInput(bytes) => terminal_bytes.extend(bytes),
+                OuterInputEvent::GraphicsResponse(bytes) => {
+                    graphics_report = self.feed_graphics_probe(&bytes).or(graphics_report);
+                }
+            }
+        }
+        OuterInputBatch {
+            terminal_bytes,
+            graphics_report,
+        }
+    }
+
     pub fn feed_graphics_probe(&mut self, bytes: &[u8]) -> Option<GraphicsCapabilityReport> {
         let report = self.graphics_probe.feed(bytes)?;
         self.capabilities.kitty_graphics = report.kitty_graphics;
@@ -662,6 +720,25 @@ impl<W: Write> CrosstermBackend<W> {
         for response in self.graphics_broker.drain_outer() {
             self.writer.write_all(response.bytes())?;
         }
+        self.writer.flush()
+    }
+
+    fn clear_uploaded_graphics(&mut self) -> io::Result<()> {
+        for image_id in self
+            .uploaded_generations
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            if self.capabilities.kitty_graphics_mode() == KittyGraphicsMode::Passthrough {
+                write_passthrough_command(&mut self.writer, |buffer| {
+                    write!(buffer, "\x1b_Ga=d,d=i,i={};\x1b\\", image_id)
+                })?;
+            } else {
+                write!(self.writer, "\x1b_Ga=d,d=i,i={};\x1b\\", image_id)?;
+            }
+        }
+        self.uploaded_generations.clear();
         self.writer.flush()
     }
 }
@@ -710,6 +787,7 @@ impl<W: Write> Backend for CrosstermBackend<W> {
             return Ok(());
         }
 
+        self.clear_uploaded_graphics()?;
         let terminal_result = execute!(
             self.writer,
             Show,
@@ -758,6 +836,18 @@ impl<W: Write> Backend for CrosstermBackend<W> {
         visible: &[GraphicsSubmission],
         removed: &[GraphicsSubmission],
     ) -> Result<GraphicsSubmissionStatus, Self::Error> {
+        if self.capabilities.kitty_graphics_mode() == KittyGraphicsMode::TextFallback {
+            for submission in visible {
+                write_text_fallback(&mut self.writer, submission)?;
+            }
+            self.writer.flush()?;
+            self.graphics_suppressed += visible.len() as u64;
+            return Ok(GraphicsSubmissionStatus::Degraded {
+                placements: visible.len(),
+                reason: "Kitty graphics unavailable; emitted bounded textual image markers"
+                    .to_owned(),
+            });
+        }
         if !self.capabilities.kitty_graphics {
             return if visible.is_empty() {
                 Ok(GraphicsSubmissionStatus::Rendered {
@@ -765,6 +855,7 @@ impl<W: Write> Backend for CrosstermBackend<W> {
                     placements: 0,
                 })
             } else {
+                self.graphics_suppressed += visible.len() as u64;
                 Ok(GraphicsSubmissionStatus::Suppressed {
                     placements: visible.len(),
                     reason: "outer terminal graphics capability is unavailable".to_owned(),
@@ -778,47 +869,74 @@ impl<W: Write> Backend for CrosstermBackend<W> {
                     reason,
                 });
             }
+            let mut uploaded = 0;
             for submission in changed {
-                write_placeholder_upload(&mut self.writer, submission)?;
+                let physical_id = submission.terminal_image_id();
+                if self.uploaded_generations.get(&physical_id) != Some(&submission.generation()) {
+                    write_placeholder_upload(&mut self.writer, submission)?;
+                    self.uploaded_generations
+                        .insert(physical_id, submission.generation());
+                    self.graphics_uploads += 1;
+                    self.graphics_bytes += submission.encoded_payload().len() as u64;
+                    uploaded += 1;
+                }
             }
             for submission in visible {
                 write_placeholder_cells(&mut self.writer, submission)?;
             }
             self.writer.flush()?;
             return Ok(GraphicsSubmissionStatus::Rendered {
-                resources: changed.len(),
+                resources: uploaded,
                 placements: visible.len(),
             });
         }
         for submission in removed {
-            write!(
-                self.writer,
-                "\x1b_Ga=d,d=i,i={};\x1b\\",
-                submission.terminal_image_id()
-            )?;
+            let physical_id = submission.terminal_image_id();
+            if self.capabilities.kitty_graphics_mode() == KittyGraphicsMode::Passthrough {
+                write_passthrough_command(&mut self.writer, |buffer| {
+                    write!(buffer, "\x1b_Ga=d,d=i,i={};\x1b\\", physical_id)
+                })?;
+            } else {
+                write!(self.writer, "\x1b_Ga=d,d=i,i={};\x1b\\", physical_id)?;
+            }
+            self.uploaded_generations.remove(&physical_id);
         }
+        let mut uploaded = 0;
         for submission in changed {
             let physical_id = submission.terminal_image_id();
             let placement = submission.placement();
             queue!(self.writer, MoveTo(placement.x(), placement.y()))?;
-            write!(
-                self.writer,
-                "\x1b_Ga=T,f={},i={},c={},r={},C=1,q=2,m=0",
-                submission.format(),
-                physical_id,
-                placement.width(),
-                placement.height()
-            )?;
-            if placement.z_index() != 0 {
-                write!(self.writer, ",z={}", placement.z_index())?;
+            let reused =
+                self.uploaded_generations.get(&physical_id) == Some(&submission.generation());
+            if reused {
+                if self.capabilities.kitty_graphics_mode() == KittyGraphicsMode::Passthrough {
+                    write_passthrough_command(&mut self.writer, |buffer| {
+                        write_direct_placement(buffer, submission)
+                    })?;
+                } else {
+                    write_direct_placement(&mut self.writer, submission)?;
+                }
+            } else {
+                if self.capabilities.kitty_graphics_mode() == KittyGraphicsMode::Passthrough {
+                    write_passthrough_command(&mut self.writer, |buffer| {
+                        write_direct_upload(buffer, submission)
+                    })?;
+                } else {
+                    write_direct_upload(&mut self.writer, submission)?;
+                }
+                self.uploaded_generations
+                    .insert(physical_id, submission.generation());
+                self.graphics_uploads += 1;
+                self.graphics_bytes += submission.encoded_payload().len() as u64;
+                uploaded += 1;
             }
-            self.writer.write_all(b";")?;
-            self.writer.write_all(submission.encoded_payload())?;
-            self.writer.write_all(b"\x1b\\")?;
+            if reused {
+                self.graphics_reuses += 1;
+            }
         }
         self.writer.flush()?;
         Ok(GraphicsSubmissionStatus::Rendered {
-            resources: changed.len(),
+            resources: uploaded,
             placements: visible.len(),
         })
     }
@@ -988,6 +1106,72 @@ fn write_style<W: Write>(writer: &mut W, style: CellStyle) -> io::Result<()> {
         queue!(writer, SetAttribute(Attribute::Dim))?;
     }
     Ok(())
+}
+
+fn write_direct_placement<W: Write>(
+    writer: &mut W,
+    submission: &GraphicsSubmission,
+) -> io::Result<()> {
+    let physical_id = submission.terminal_image_id();
+    let placement = submission.placement();
+    write!(
+        writer,
+        "\x1b_Ga=p,i={},c={},r={},C=1,q=2",
+        physical_id,
+        placement.width(),
+        placement.height()
+    )?;
+    if placement.z_index() != 0 {
+        write!(writer, ",z={}", placement.z_index())?;
+    }
+    writer.write_all(b";\x1b\\")
+}
+
+fn write_passthrough_command<W: Write>(
+    writer: &mut W,
+    command: impl FnOnce(&mut Vec<u8>) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut command_bytes = Vec::new();
+    command(&mut command_bytes)?;
+    writer.write_all(b"\x1bPtmux;")?;
+    for byte in command_bytes {
+        if byte == 0x1b {
+            writer.write_all(b"\x1b")?;
+        }
+        writer.write_all(&[byte])?;
+    }
+    writer.write_all(b"\x1b\\")
+}
+
+fn write_text_fallback<W: Write>(
+    writer: &mut W,
+    submission: &GraphicsSubmission,
+) -> io::Result<()> {
+    let placement = submission.placement();
+    queue!(writer, MoveTo(placement.x(), placement.y()))?;
+    write!(writer, "[image:{}]", submission.resource().image())
+}
+
+fn write_direct_upload<W: Write>(
+    writer: &mut W,
+    submission: &GraphicsSubmission,
+) -> io::Result<()> {
+    let physical_id = submission.terminal_image_id();
+    let placement = submission.placement();
+    write!(
+        writer,
+        "\x1b_Ga=T,f={},i={},c={},r={},C=1,q=2,m=0",
+        submission.format(),
+        physical_id,
+        placement.width(),
+        placement.height()
+    )?;
+    if placement.z_index() != 0 {
+        write!(writer, ",z={}", placement.z_index())?;
+    }
+    writer.write_all(b";")?;
+    writer.write_all(submission.encoded_payload())?;
+    writer.write_all(b"\x1b\\")
 }
 
 fn write_placeholder_upload<W: Write>(
@@ -1224,6 +1408,26 @@ mod tests {
     }
 
     #[test]
+    fn outer_input_batch_routes_probe_bytes_without_eating_keyboard_input() {
+        let mut backend = CrosstermBackend::new(Vec::<u8>::new());
+        backend.begin_graphics_probe().unwrap();
+        let batch = backend.feed_outer_input(b"x\x1b[?1;2c\x1b[4;160;400t\x1b_Gi=0;OK\x1b\\y");
+        assert_eq!(batch.terminal_bytes, b"xy");
+        assert_eq!(
+            batch
+                .graphics_report
+                .as_ref()
+                .and_then(|report| report.pixel_size),
+            Some((160, 400))
+        );
+        assert!(
+            batch
+                .graphics_report
+                .is_some_and(|report| report.kitty_graphics)
+        );
+    }
+
+    #[test]
     fn graphics_probe_times_out_without_claiming_outer_support() {
         let now = Instant::now();
         let mut probe = GraphicsCapabilityProbe::new(Duration::from_millis(1), 256);
@@ -1249,6 +1453,8 @@ mod tests {
             kitty_unicode_placeholders: false,
             graphics_source: GraphicsCapabilitySource::Unavailable,
             graphics_confidence: GraphicsCapabilityConfidence::Rejected,
+            kitty_passthrough: false,
+            kitty_text_fallback: false,
             sixel: false,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
@@ -1269,6 +1475,8 @@ mod tests {
             kitty_unicode_placeholders: false,
             graphics_source: GraphicsCapabilitySource::Unavailable,
             graphics_confidence: GraphicsCapabilityConfidence::Rejected,
+            kitty_passthrough: false,
+            kitty_text_fallback: false,
             sixel: false,
         };
         assert_eq!(disabled.kitty_graphics_mode(), KittyGraphicsMode::Disabled);
@@ -1287,6 +1495,23 @@ mod tests {
         assert_eq!(
             placeholder.kitty_graphics_mode(),
             KittyGraphicsMode::UnicodePlaceholder
+        );
+        let passthrough = BackendCapabilities {
+            kitty_passthrough: true,
+            ..direct
+        };
+        assert_eq!(
+            passthrough.kitty_graphics_mode(),
+            KittyGraphicsMode::Passthrough
+        );
+        let fallback = BackendCapabilities {
+            kitty_graphics: false,
+            kitty_text_fallback: true,
+            ..disabled
+        };
+        assert_eq!(
+            fallback.kitty_graphics_mode(),
+            KittyGraphicsMode::TextFallback
         );
     }
 
@@ -1400,6 +1625,8 @@ mod tests {
             kitty_unicode_placeholders: false,
             graphics_source: GraphicsCapabilitySource::Unavailable,
             graphics_confidence: GraphicsCapabilityConfidence::Rejected,
+            kitty_passthrough: false,
+            kitty_text_fallback: false,
             sixel: false,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
@@ -1409,8 +1636,40 @@ mod tests {
         assert!(output.windows(4).any(|window| window == b"a=T,"));
         assert!(output.windows(7).any(|window| window == b"c=2,r=1"));
         assert!(output.windows(3).any(|window| window == b"C=1"));
-        assert!(!output.windows(4).any(|window| window == b"a=p,"));
+        assert!(output.windows(4).any(|window| window == b"a=p,"));
         assert!(output.windows(3).any(|window| window == b"AQI"));
+    }
+
+    #[test]
+    fn unchanged_resources_are_repositioned_without_reuploading() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(17));
+        store
+            .apply_kitty_command(b"a=T,f=24,i=17,c=2,r=1", b"AQID")
+            .unwrap();
+        let graphics = store.visible_submissions(Rect::new(0, 0, 8, 4));
+        let capabilities = BackendCapabilities {
+            truecolor: true,
+            mouse: true,
+            bracketed_paste: true,
+            kitty_graphics: true,
+            kitty_unicode_placeholders: false,
+            graphics_source: GraphicsCapabilitySource::EnvironmentHint,
+            graphics_confidence: GraphicsCapabilityConfidence::Inferred,
+            kitty_passthrough: false,
+            kitty_text_fallback: false,
+            sixel: false,
+        };
+        let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
+        backend.submit_graphics(&graphics, &graphics, &[]).unwrap();
+        let before = backend.writer().len();
+        backend.submit_graphics(&graphics, &graphics, &[]).unwrap();
+        let second = &backend.writer()[before..];
+        assert!(second.windows(4).any(|window| window == b"a=p,"));
+        assert!(!second.windows(4).any(|window| window == b"a=T,"));
+        let metrics = backend.metrics();
+        assert_eq!(metrics.graphics_uploads, 1);
+        assert_eq!(metrics.graphics_reuses, 1);
+        assert_eq!(metrics.graphics_bytes, 4);
     }
 
     #[test]
@@ -1428,6 +1687,8 @@ mod tests {
             kitty_unicode_placeholders: true,
             graphics_source: GraphicsCapabilitySource::EnvironmentHint,
             graphics_confidence: GraphicsCapabilityConfidence::Inferred,
+            kitty_passthrough: false,
+            kitty_text_fallback: false,
             sixel: false,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
@@ -1446,6 +1707,63 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_wraps_and_escapes_direct_kitty_commands() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(18));
+        store
+            .apply_kitty_command(b"a=T,f=24,i=18,c=1,r=1", b"AQID")
+            .unwrap();
+        let graphics = store.visible_submissions(Rect::new(0, 0, 4, 2));
+        let capabilities = BackendCapabilities {
+            truecolor: true,
+            mouse: true,
+            bracketed_paste: true,
+            kitty_graphics: true,
+            kitty_unicode_placeholders: false,
+            graphics_source: GraphicsCapabilitySource::ExplicitOverride,
+            graphics_confidence: GraphicsCapabilityConfidence::Inferred,
+            kitty_passthrough: true,
+            kitty_text_fallback: false,
+            sixel: false,
+        };
+        let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
+        backend.submit_graphics(&graphics, &graphics, &[]).unwrap();
+        let output = backend.writer();
+        assert!(output.windows(7).any(|window| window == b"\x1bPtmux;"));
+        assert!(output.windows(4).any(|window| window == b"\x1b\x1b_G"));
+        assert!(output.windows(4).any(|window| window == b"AQID"));
+    }
+
+    #[test]
+    fn text_fallback_is_reported_as_degraded_and_emits_a_bounded_marker() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(19));
+        store
+            .apply_kitty_command(b"a=T,f=24,i=19,c=1,r=1", b"AQID")
+            .unwrap();
+        let graphics = store.visible_submissions(Rect::new(0, 0, 4, 2));
+        let capabilities = BackendCapabilities {
+            truecolor: true,
+            mouse: true,
+            bracketed_paste: true,
+            kitty_graphics: false,
+            kitty_unicode_placeholders: false,
+            graphics_source: GraphicsCapabilitySource::ExplicitOverride,
+            graphics_confidence: GraphicsCapabilityConfidence::Rejected,
+            kitty_passthrough: false,
+            kitty_text_fallback: true,
+            sixel: false,
+        };
+        let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
+        let status = backend.submit_graphics(&graphics, &graphics, &[]).unwrap();
+        assert!(matches!(status, GraphicsSubmissionStatus::Degraded { .. }));
+        assert!(
+            backend
+                .writer()
+                .windows(9)
+                .any(|window| window == b"[image:19")
+        );
+    }
+
+    #[test]
     fn placeholder_geometry_failures_are_reported_without_partial_output() {
         let mut store = SessionGraphicsStore::new(SessionId::new(14));
         store
@@ -1460,6 +1778,8 @@ mod tests {
             kitty_unicode_placeholders: true,
             graphics_source: GraphicsCapabilitySource::EnvironmentHint,
             graphics_confidence: GraphicsCapabilityConfidence::Inferred,
+            kitty_passthrough: false,
+            kitty_text_fallback: false,
             sixel: false,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
@@ -1492,6 +1812,8 @@ mod tests {
             kitty_unicode_placeholders: true,
             graphics_source: GraphicsCapabilitySource::EnvironmentHint,
             graphics_confidence: GraphicsCapabilityConfidence::Inferred,
+            kitty_passthrough: false,
+            kitty_text_fallback: false,
             sixel: false,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);

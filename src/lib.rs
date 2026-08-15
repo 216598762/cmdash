@@ -34,8 +34,8 @@ pub use appearance::{AppearanceError, Theme};
 pub use backend::{
     Backend, BackendCapabilities, CrosstermBackend, GraphicsCapabilityConfidence,
     GraphicsCapabilityProbe, GraphicsCapabilityReport, GraphicsCapabilitySource,
-    GraphicsProbeState, GraphicsSubmissionStatus, KittyGraphicsMode, OutputMetrics,
-    TerminalWindowSize,
+    GraphicsProbeState, GraphicsSubmissionStatus, KittyGraphicsMode, OuterInputBatch,
+    OutputMetrics, TerminalWindowSize,
 };
 pub use command::{
     Command, CommandEffect, FocusCommand, FocusDirection, OverlayCommand, PaneCommand,
@@ -49,9 +49,10 @@ pub use config::{
 };
 pub use crash::CrashReport;
 pub use graphics::{
-    GraphicsDiagnostic, GraphicsError, GraphicsGridAnchor, GraphicsLimits, GraphicsPlacement,
-    GraphicsProtocolBroker, GraphicsResourceId, GraphicsResponse, GraphicsResponseDestination,
-    GraphicsSubmission, SessionGraphicsStore, kitty_error_response,
+    GraphicsDiagnostic, GraphicsError, GraphicsGridAnchor, GraphicsInputDemultiplexer,
+    GraphicsLimits, GraphicsPlacement, GraphicsProtocolBroker, GraphicsResourceId,
+    GraphicsResponse, GraphicsResponseDestination, GraphicsScreen, GraphicsSubmission,
+    OuterInputEvent, SessionGraphicsStore, kitty_error_response,
 };
 pub use input::command_for_key;
 pub use layout::{LayoutError, LayoutNode, LayoutTree};

@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, io,
+    env,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -106,6 +107,8 @@ fn main() -> io::Result<()> {
         .map_err(|error| io::Error::other(format!("application config rejected: {error}")))?;
     let config_path_for_report = config_path.clone();
     let initial_window_size = backend.window_size()?;
+    backend.enter()?;
+    probe_outer_terminal(&mut backend)?;
     let (event_sender, event_receiver, pty_wakeup) = ui_event_channel();
     let mut api_server = ApiServer::start(&config.api, event_sender.clone())?;
     let registry = WidgetRegistry::builtins_with_context(
@@ -120,7 +123,6 @@ fn main() -> io::Result<()> {
         .map(ConfigReloader::new)
         .transpose()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    backend.enter()?;
     let input_reader = spawn_input_reader(event_sender.clone());
     let maintenance_waker = spawn_maintenance_waker(event_sender);
 
@@ -284,6 +286,59 @@ where
         }
     }
 
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+}
+
+fn probe_outer_terminal(backend: &mut CrosstermBackend<io::Stdout>) -> io::Result<()> {
+    let requested = env::var("CMDASH_KITTY_GRAPHICS_PROBE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    let kitty_root = env::var_os("KITTY_WINDOW_ID").is_some();
+    if !requested && !kitty_root {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if !backend.begin_graphics_probe()? {
+            return Ok(());
+        }
+        let mut tty = std::fs::OpenOptions::new().read(true).open("/dev/tty")?;
+        let mut poll_fd = PollFd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(&tty),
+            events: 1,
+            revents: 0,
+        };
+        let ready = unsafe { poll(&mut poll_fd, 1, 300) };
+        if ready > 0 {
+            let mut bytes = [0_u8; 4096];
+            let length = tty.read(&mut bytes)?;
+            let _ = backend.feed_outer_input(&bytes[..length]);
+        } else if ready == 0 {
+            let _ = backend.poll_graphics_probe_timeout();
+        }
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = backend;
+    }
     Ok(())
 }
 
@@ -690,6 +745,8 @@ mod tests {
             kitty_unicode_placeholders: false,
             graphics_source: cmdash::GraphicsCapabilitySource::Unavailable,
             graphics_confidence: cmdash::GraphicsCapabilityConfidence::Rejected,
+            kitty_passthrough: false,
+            kitty_text_fallback: false,
             sixel: false,
         }
     }

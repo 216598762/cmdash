@@ -316,6 +316,8 @@ mod tests {
             kitty_unicode_placeholders: false,
             graphics_source: crate::backend::GraphicsCapabilitySource::Unavailable,
             graphics_confidence: crate::backend::GraphicsCapabilityConfidence::Rejected,
+            kitty_passthrough: false,
+            kitty_text_fallback: false,
             sixel: false,
         }
     }

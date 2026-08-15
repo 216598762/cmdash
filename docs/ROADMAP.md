@@ -568,8 +568,11 @@ Reference material:
 - [x] Add a bounded response broker with separate destinations for child PTY
   responses and outer-terminal responses. Never write an outer response into a
   child session or vice versa.
-- [ ] Wire the broker to the interactive outer-input demultiplexer so probe replies
-  are consumed without competing with keyboard/event decoding.
+- [x] Add a bounded outer-input demultiplexer that preserves keyboard/CSI input,
+  handles split probe responses, and routes only graphics replies to the probe.
+- [ ] Replace the current crossterm-reader integration point with a process-wide
+  raw-input owner so the demultiplexer is fed automatically without competing
+  for stdin.
 - [ ] Define unsupported-transfer behavior so `t=f`/`t=s` negotiation reliably
   falls back to direct stream mode without claiming that an image was displayed.
 - [ ] Add malformed-sequence recovery and cancellation so one bad graphics command
@@ -583,10 +586,11 @@ Reference material:
 - [x] Store logical emulator-grid anchors, captured scrollback depth, cursor
   position, pixel dimensions, cell dimensions, z-index, and owning session rather
   than only absolute `u16` screen coordinates.
-- [ ] Track scroll-region movement, primary-screen history edge cases,
-  alternate-screen changes, cursor movement, resize, and pane transforms fully so
-  every image follows the terminal content that created it; the current slice
-  resolves primary-screen movement from scrollback depth.
+- [x] Track primary/alternate screen ownership, scrollback-relative movement,
+  resize clipping, and replay resource generations; placements no longer leak
+  between alternate and primary screens.
+- [ ] Track DECSTBM scroll-region movement and cursor movement fully so every
+  image follows content inside a non-default scroll region.
 - [ ] Preserve natural image geometry when pixel-size ioctl data is unavailable;
   use CSI 14t/16t or a documented fallback rather than shrinking an image to a
   misleading `1x1` placement.
@@ -616,9 +620,10 @@ Reference material:
 - [ ] Implement a Unicode-placeholder adapter for pane-safe rendering: quiet
   resource upload, virtual placement creation, canonical ID encoding, placeholder
   cell emission, stale-cell clearing, and redraw recovery.
-- [ ] Implement optional tmux-style passthrough for applications that emit DCS
-  wrappers, including ESC doubling/undoubling, allow/deny policy, bounded unwrap,
-  and outer-response routing.
+- [x] Implement the bounded tmux-style passthrough serializer with ESC
+  doubling/undoubling-compatible wrapping and outer-response routing boundaries.
+- [x] Add a bounded textual fallback with an explicit `Degraded` outcome when
+  Kitty graphics are unavailable.
 - [ ] Add protocol adapters for other supported outer paths only after capability
   and ownership semantics are defined; do not label WezTerm/iTerm2/Sixel support
   as Kitty support without a conformance result.
@@ -629,12 +634,15 @@ Reference material:
 
 - [ ] Define upload/replay behavior for pane creation, movement, resize, tab
   switching, hidden sessions, overlays, reload, close, and application shutdown.
-- [ ] Add outer-resource garbage collection, replay generations, bounded retries,
-  cancellation, and cleanup after child or backend failure.
+- [x] Add replay generations, unchanged-resource reuse, store cancellation on
+  session shutdown/delete-all, and outer-resource cleanup when the backend leaves.
+- [ ] Add bounded retries and acknowledgement-driven outer-resource garbage
+  collection.
 - [ ] Keep file/shared-memory transfers opt-in and sandboxed; never read arbitrary
   paths or shared-memory names merely because an inner application requested them.
-- [ ] Add metrics for parsed commands, accepted uploads, rendered placements,
-  suppressed images, fallback count, bytes, latency, and outer acknowledgements.
+- [x] Add output metrics for graphics uploads, resource reuse, payload bytes, and
+  suppressed/degraded placements.
+- [ ] Add parsed-command latency and outer-acknowledgement metrics.
 - [ ] Bound placeholder output and avoid re-uploading unchanged resources on every
   frame; preserve UI responsiveness during large images and rapid pane switches.
 

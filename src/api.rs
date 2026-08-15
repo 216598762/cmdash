@@ -401,6 +401,7 @@ impl From<Color> for ColorDto {
 pub struct GraphicsDto {
     pub session_id: u64,
     pub image_id: u32,
+    pub generation: u64,
     pub format: u8,
     pub area: RectDto,
     pub z_index: i16,
@@ -412,6 +413,7 @@ impl From<&crate::graphics::GraphicsSubmission> for GraphicsDto {
         Self {
             session_id: graphics.resource().session().get(),
             image_id: graphics.resource().image(),
+            generation: graphics.generation(),
             format: graphics.format(),
             area: RectDto::from(placement.area()),
             z_index: placement.z_index(),
@@ -444,6 +446,8 @@ impl From<BackendCapabilities> for BackendCapabilitiesDto {
                 crate::backend::KittyGraphicsMode::Disabled => "disabled",
                 crate::backend::KittyGraphicsMode::Direct => "direct",
                 crate::backend::KittyGraphicsMode::UnicodePlaceholder => "unicode_placeholder",
+                crate::backend::KittyGraphicsMode::Passthrough => "passthrough",
+                crate::backend::KittyGraphicsMode::TextFallback => "text_fallback",
             },
             graphics_source: match capabilities.graphics_source {
                 crate::backend::GraphicsCapabilitySource::EnvironmentHint => "environment_hint",
@@ -469,6 +473,10 @@ pub struct MetricsDto {
     pub optimized_diff_bytes: u64,
     pub naive_diff_bytes: u64,
     pub bytes_saved: u64,
+    pub graphics_uploads: u64,
+    pub graphics_reuses: u64,
+    pub graphics_bytes: u64,
+    pub graphics_suppressed: u64,
 }
 
 impl From<OutputMetrics> for MetricsDto {
@@ -480,6 +488,10 @@ impl From<OutputMetrics> for MetricsDto {
             optimized_diff_bytes: metrics.optimized_diff_bytes,
             naive_diff_bytes: metrics.naive_diff_bytes,
             bytes_saved: metrics.bytes_saved,
+            graphics_uploads: metrics.graphics_uploads,
+            graphics_reuses: metrics.graphics_reuses,
+            graphics_bytes: metrics.graphics_bytes,
+            graphics_suppressed: metrics.graphics_suppressed,
         }
     }
 }
@@ -1109,6 +1121,8 @@ mod tests {
                 kitty_unicode_placeholders: false,
                 graphics_source: crate::backend::GraphicsCapabilitySource::Unavailable,
                 graphics_confidence: crate::backend::GraphicsCapabilityConfidence::Rejected,
+                kitty_passthrough: false,
+                kitty_text_fallback: false,
                 sixel: false,
             },
             &WidgetRegistry::builtins(),

@@ -26,7 +26,8 @@ use ratatui::layout::Rect;
 use crate::{
     appearance::Theme,
     graphics::{
-        GraphicsProtocolBroker, GraphicsSubmission, SessionGraphicsStore, kitty_error_response,
+        GraphicsProtocolBroker, GraphicsScreen, GraphicsSubmission, SessionGraphicsStore,
+        kitty_error_response,
     },
     scene::{CellStyle, Color, Scene},
     state::SessionId,
@@ -343,8 +344,15 @@ impl TerminalSession {
     }
 
     pub fn graphics(&self, surface: Rect) -> Vec<GraphicsSubmission> {
-        self.graphics
-            .visible_submissions_at(surface, self.scrollback_lines())
+        self.graphics.visible_submissions_with_state(
+            surface,
+            self.scrollback_lines(),
+            if self.alternate_screen() {
+                GraphicsScreen::Alternate
+            } else {
+                GraphicsScreen::Primary
+            },
+        )
     }
 
     pub fn graphics_diagnostics(&self) -> &[crate::graphics::GraphicsDiagnostic] {
@@ -442,12 +450,17 @@ impl TerminalSession {
                     }
                 }
                 KittyStreamEvent::Command(parameters, payload) => {
-                    let response = match self.graphics.apply_kitty_command_with_grid_context(
+                    let response = match self.graphics.apply_kitty_command_with_grid_state(
                         &parameters,
                         &payload,
                         self.cursor_position(),
                         (self.size.cell_width(), self.size.cell_height()),
                         self.scrollback_lines(),
+                        if self.alternate_screen() {
+                            GraphicsScreen::Alternate
+                        } else {
+                            GraphicsScreen::Primary
+                        },
                     ) {
                         Ok(response) => response,
                         Err(error) => {
@@ -640,6 +653,8 @@ impl TerminalSession {
         }
         let kill_result = self.child.kill();
         let wait_result = self.child.wait();
+        self.graphics.clear();
+        self.graphics_input.clear();
         self.closed = true;
         if let Err(error) = kill_result {
             return Err(SessionError::Io(error.to_string()));

@@ -27,6 +27,13 @@ impl GraphicsResourceId {
     }
 }
 
+/// The emulator screen that owns a graphics placement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphicsScreen {
+    Primary,
+    Alternate,
+}
+
 /// The emulator-grid location that owns a graphics placement.
 ///
 /// `scrollback` is captured from the child emulator when the placement is
@@ -37,6 +44,7 @@ pub struct GraphicsGridAnchor {
     column: u16,
     row: u16,
     scrollback: usize,
+    screen: GraphicsScreen,
 }
 
 impl GraphicsGridAnchor {
@@ -45,6 +53,7 @@ impl GraphicsGridAnchor {
             column,
             row,
             scrollback,
+            screen: GraphicsScreen::Primary,
         }
     }
 
@@ -58,6 +67,15 @@ impl GraphicsGridAnchor {
 
     pub const fn scrollback(self) -> usize {
         self.scrollback
+    }
+
+    pub const fn screen(self) -> GraphicsScreen {
+        self.screen
+    }
+
+    pub const fn with_screen(mut self, screen: GraphicsScreen) -> Self {
+        self.screen = screen;
+        self
     }
 
     pub fn resolve_row(self, current_scrollback: usize) -> i32 {
@@ -119,6 +137,7 @@ impl GraphicsPlacement {
 pub struct GraphicsSubmission {
     resource: GraphicsResourceId,
     format: u8,
+    generation: u64,
     encoded_payload: Vec<u8>,
     placement: GraphicsPlacement,
 }
@@ -215,6 +234,113 @@ impl GraphicsProtocolBroker {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OuterInputEvent {
+    GraphicsResponse(Vec<u8>),
+    TerminalInput(Vec<u8>),
+}
+
+/// Splits raw outer-terminal input into probe responses and bytes that belong
+/// to the normal keyboard/event decoder. It retains incomplete escape prefixes
+/// across reads and never treats an ordinary CSI keyboard sequence as a probe
+/// response.
+#[derive(Clone, Debug)]
+pub struct GraphicsInputDemultiplexer {
+    pending: Vec<u8>,
+    max_pending: usize,
+}
+
+impl Default for GraphicsInputDemultiplexer {
+    fn default() -> Self {
+        Self::new(16 * 1024)
+    }
+}
+
+impl GraphicsInputDemultiplexer {
+    pub fn new(max_pending: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            max_pending: max_pending.max(64),
+        }
+    }
+
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<OuterInputEvent> {
+        self.pending.extend_from_slice(bytes);
+        if self.pending.len() > self.max_pending {
+            let overflow = self.pending.len() - self.max_pending;
+            self.pending.drain(..overflow);
+        }
+        let mut events = Vec::new();
+        let mut index = 0;
+        while index < self.pending.len() {
+            let csi = self.pending[index..]
+                .windows(2)
+                .position(|window| window == b"\x1b[");
+            let apc = self.pending[index..]
+                .windows(3)
+                .position(|window| window == b"\x1b_G");
+            let Some(offset) = (match (csi, apc) {
+                (Some(csi), Some(apc)) => Some(csi.min(apc)),
+                (Some(offset), None) | (None, Some(offset)) => Some(offset),
+                (None, None) => None,
+            }) else {
+                let keep = usize::from(self.pending.last() == Some(&0x1b));
+                let end = self.pending.len().saturating_sub(keep);
+                if end > index {
+                    events.push(OuterInputEvent::TerminalInput(
+                        self.pending[index..end].to_vec(),
+                    ));
+                }
+                self.pending = self.pending[end..].to_vec();
+                return events;
+            };
+            let start = index + offset;
+            if start > index {
+                events.push(OuterInputEvent::TerminalInput(
+                    self.pending[index..start].to_vec(),
+                ));
+            }
+            if self.pending[start..].starts_with(b"\x1b_G") {
+                let Some(end) = find_bytes(&self.pending[start + 3..], b"\x1b\\") else {
+                    self.pending = self.pending[start..].to_vec();
+                    return events;
+                };
+                let end = start + 3 + end + 2;
+                events.push(OuterInputEvent::GraphicsResponse(
+                    self.pending[start..end].to_vec(),
+                ));
+                index = end;
+                continue;
+            }
+            let Some(final_offset) = self.pending[start + 2..]
+                .iter()
+                .position(|byte| (0x40..=0x7e).contains(byte))
+            else {
+                self.pending = self.pending[start..].to_vec();
+                return events;
+            };
+            let end = start + 2 + final_offset + 1;
+            let sequence = &self.pending[start..end];
+            if sequence.ends_with(b"c") && sequence.starts_with(b"\x1b[?")
+                || sequence.ends_with(b"t") && sequence.starts_with(b"\x1b[4;")
+            {
+                events.push(OuterInputEvent::GraphicsResponse(sequence.to_vec()));
+            } else {
+                events.push(OuterInputEvent::TerminalInput(sequence.to_vec()));
+            }
+            index = end;
+        }
+        self.pending.clear();
+        events
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 impl GraphicsSubmission {
     pub const fn resource(&self) -> GraphicsResourceId {
         self.resource
@@ -222,6 +348,10 @@ impl GraphicsSubmission {
 
     pub const fn format(&self) -> u8 {
         self.format
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn encoded_payload(&self) -> &[u8] {
@@ -241,6 +371,7 @@ impl GraphicsSubmission {
         Some(Self {
             resource: self.resource,
             format: self.format,
+            generation: self.generation,
             encoded_payload: self.encoded_payload.clone(),
             placement: GraphicsPlacement {
                 x: area.x,
@@ -323,6 +454,7 @@ impl std::error::Error for GraphicsError {}
 #[derive(Clone, Debug)]
 struct GraphicsResource {
     format: u8,
+    generation: u64,
     pixel_width: u32,
     pixel_height: u32,
     decoded_payload: Vec<u8>,
@@ -345,6 +477,7 @@ pub struct SessionGraphicsStore {
     pending_upload: Option<PendingUpload>,
     next_internal_image_id: u32,
     next_placement_key: u64,
+    next_resource_generation: u64,
     outer_kitty_graphics: bool,
     diagnostics: Vec<GraphicsDiagnostic>,
 }
@@ -364,6 +497,7 @@ impl SessionGraphicsStore {
             pending_upload: None,
             next_internal_image_id: 1,
             next_placement_key: 1,
+            next_resource_generation: 1,
             outer_kitty_graphics: true,
             diagnostics: Vec::new(),
         }
@@ -397,6 +531,13 @@ impl SessionGraphicsStore {
 
     pub fn clear_diagnostics(&mut self) {
         self.diagnostics.clear();
+    }
+
+    pub fn clear(&mut self) {
+        self.resources.clear();
+        self.placements.clear();
+        self.pending_upload = None;
+        self.decoded_bytes = 0;
     }
 
     pub fn record_diagnostic(&mut self, image: Option<u32>, message: impl Into<String>) {
@@ -454,6 +595,25 @@ impl SessionGraphicsStore {
         cursor: (u16, u16),
         cell_size: (u16, u16),
         scrollback: usize,
+    ) -> Result<Option<Vec<u8>>, GraphicsError> {
+        self.apply_kitty_command_with_grid_state(
+            parameters,
+            encoded_payload,
+            cursor,
+            cell_size,
+            scrollback,
+            GraphicsScreen::Primary,
+        )
+    }
+
+    pub fn apply_kitty_command_with_grid_state(
+        &mut self,
+        parameters: &[u8],
+        encoded_payload: &[u8],
+        cursor: (u16, u16),
+        cell_size: (u16, u16),
+        scrollback: usize,
+        screen: GraphicsScreen,
     ) -> Result<Option<Vec<u8>>, GraphicsError> {
         let values = parse_parameters(parameters)?;
         let action = values
@@ -516,12 +676,13 @@ impl SessionGraphicsStore {
             }
             pending.parameters.insert("m".to_owned(), "0".to_owned());
             let parameters = serialize_parameters(&pending.parameters);
-            return self.apply_kitty_command_with_grid_context(
+            return self.apply_kitty_command_with_grid_state(
                 &parameters,
                 &pending.encoded_payload,
                 cursor,
                 cell_size,
                 scrollback,
+                screen,
             );
         }
 
@@ -629,13 +790,18 @@ impl SessionGraphicsStore {
                     );
                     return Ok(None);
                 }
-                let pixel_width = parameter_u32(&values, "s", 0)?;
-                let pixel_height = parameter_u32(&values, "v", 0)?;
+                let natural = natural_dimensions(&decoded_payload, format);
+                let pixel_width = parameter_u32(&values, "s", natural.map_or(0, |size| size.0))?;
+                let pixel_height = parameter_u32(&values, "v", natural.map_or(0, |size| size.1))?;
+                let generation = self.next_resource_generation;
+                self.next_resource_generation =
+                    self.next_resource_generation.wrapping_add(1).max(1);
                 self.decoded_bytes = projected_bytes;
                 self.resources.insert(
                     image,
                     GraphicsResource {
                         format,
+                        generation,
                         pixel_width,
                         pixel_height,
                         decoded_payload,
@@ -651,6 +817,7 @@ impl SessionGraphicsStore {
                     cursor,
                     cell_size,
                     scrollback,
+                    screen,
                     (pixel_width, pixel_height),
                 )?;
                 if quiet != 2 && requested_image != 0 {
@@ -663,17 +830,15 @@ impl SessionGraphicsStore {
                     .get(&image)
                     .ok_or(GraphicsError::ImageNotFound(image))?;
                 let dimensions = (resource.pixel_width, resource.pixel_height);
-                self.insert_placement(image, &values, cursor, cell_size, scrollback, dimensions)?;
+                self.insert_placement(
+                    image, &values, cursor, cell_size, scrollback, screen, dimensions,
+                )?;
                 if quiet != 2 {
                     response = Some(kitty_response(image, placement_id(&values), "OK"));
                 }
             }
             Some(b'd') | Some(b'D') => match values.get("d").map(String::as_str) {
-                Some("a") => {
-                    self.resources.clear();
-                    self.placements.clear();
-                    self.decoded_bytes = 0;
-                }
+                Some("a") => self.clear(),
                 Some("p") => {
                     self.placements.clear();
                 }
@@ -722,6 +887,7 @@ impl SessionGraphicsStore {
         cursor: (u16, u16),
         cell_size: (u16, u16),
         scrollback: usize,
+        screen: GraphicsScreen,
         pixel_size: (u32, u32),
     ) -> Result<(), GraphicsError> {
         let requested_placement_id = placement_id(values);
@@ -750,7 +916,7 @@ impl SessionGraphicsStore {
             width: placement_dimension(values, "c", pixel_size.0, cell_size.0)?,
             height: placement_dimension(values, "r", pixel_size.1, cell_size.1)?,
             z_index: parameter_i16(values, "z", 0)?,
-            anchor: GraphicsGridAnchor::new(cursor.0, cursor.1, scrollback),
+            anchor: GraphicsGridAnchor::new(cursor.0, cursor.1, scrollback).with_screen(screen),
         };
         self.placements.insert(key, placement);
         Ok(())
@@ -777,10 +943,22 @@ impl SessionGraphicsStore {
         surface: Rect,
         current_scrollback: usize,
     ) -> Vec<GraphicsSubmission> {
+        self.visible_submissions_with_state(surface, current_scrollback, GraphicsScreen::Primary)
+    }
+
+    pub fn visible_submissions_with_state(
+        &self,
+        surface: Rect,
+        current_scrollback: usize,
+        current_screen: GraphicsScreen,
+    ) -> Vec<GraphicsSubmission> {
         let mut submissions = self
             .placements
             .values()
             .filter_map(|placement| {
+                if placement.anchor.screen() != current_screen {
+                    return None;
+                }
                 let resource = self.resources.get(&placement.resource.image())?;
                 let resolved_y = placement.anchor.resolve_row(current_scrollback);
                 let placement_area = (
@@ -793,6 +971,7 @@ impl SessionGraphicsStore {
                 Some(GraphicsSubmission {
                     resource: placement.resource,
                     format: resource.format,
+                    generation: resource.generation,
                     encoded_payload: resource.encoded_payload.clone(),
                     placement: GraphicsPlacement {
                         x: clipped_area.x,
@@ -921,6 +1100,20 @@ pub fn terminal_image_id(resource: GraphicsResourceId) -> u32 {
     session.wrapping_mul(0x0010_0001) ^ resource.image()
 }
 
+fn natural_dimensions(payload: &[u8], format: u8) -> Option<(u32, u32)> {
+    match format {
+        100 if payload.len() >= 10 && payload.starts_with(b"GIF") => Some((
+            u32::from(u16::from_le_bytes([payload[6], payload[7]])),
+            u32::from(u16::from_le_bytes([payload[8], payload[9]])),
+        )),
+        24 | 32 if payload.len() >= 24 && payload.starts_with(b"\x89PNG\r\n\x1a\n") => Some((
+            u32::from_be_bytes(payload[16..20].try_into().ok()?),
+            u32::from_be_bytes(payload[20..24].try_into().ok()?),
+        )),
+        _ => None,
+    }
+}
+
 fn decode_base64(payload: &[u8]) -> Option<Vec<u8>> {
     let mut output = Vec::new();
     let mut accumulator = 0u32;
@@ -1030,6 +1223,32 @@ mod tests {
     }
 
     #[test]
+    fn alternate_screen_placements_do_not_leak_into_primary_screen() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(20));
+        store
+            .apply_kitty_command_with_grid_state(
+                b"a=T,f=24,i=20,c=1,r=1,q=2",
+                b"AQID",
+                (1, 1),
+                (10, 20),
+                0,
+                GraphicsScreen::Alternate,
+            )
+            .unwrap();
+        assert!(
+            store
+                .visible_submissions_with_state(Rect::new(0, 0, 4, 4), 0, GraphicsScreen::Primary)
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .visible_submissions_with_state(Rect::new(0, 0, 4, 4), 0, GraphicsScreen::Alternate)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn grid_anchors_follow_content_as_scrollback_grows() {
         let mut store = SessionGraphicsStore::new(SessionId::new(16));
         store
@@ -1047,6 +1266,29 @@ mod tests {
         assert_eq!(initial[0].placement().area(), Rect::new(1, 4, 2, 2));
         assert_eq!(scrolled[0].placement().area(), Rect::new(1, 2, 2, 2));
         assert_eq!(scrolled[0].placement().anchor().scrollback(), 3);
+    }
+
+    #[test]
+    fn outer_input_demultiplexer_preserves_keyboard_sequences_and_splits_probe_replies() {
+        let mut demux = GraphicsInputDemultiplexer::new(256);
+        let events = demux.feed(b"key\x1b_Gi=0;OK\x1b\\\x1b[A");
+        assert_eq!(
+            events,
+            vec![
+                OuterInputEvent::TerminalInput(b"key".to_vec()),
+                OuterInputEvent::GraphicsResponse(b"\x1b_Gi=0;OK\x1b\\".to_vec()),
+                OuterInputEvent::TerminalInput(b"\x1b[A".to_vec()),
+            ]
+        );
+
+        let mut split = GraphicsInputDemultiplexer::new(256);
+        assert!(split.feed(b"\x1b_Gi=0;OK\x1b").is_empty());
+        assert_eq!(
+            split.feed(b"\\").first(),
+            Some(&OuterInputEvent::GraphicsResponse(
+                b"\x1b_Gi=0;OK\x1b\\".to_vec()
+            ))
+        );
     }
 
     #[test]
@@ -1086,6 +1328,50 @@ mod tests {
             .unwrap();
         assert!(String::from_utf8_lossy(&unsupported).contains("ENOTSUP"));
         assert_eq!(store.resource_count(), 0);
+    }
+
+    #[test]
+    fn natural_gif_dimensions_are_used_when_cell_geometry_is_missing() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(21));
+        let gif = b"GIF89a\x03\x00\x02\x00";
+        store
+            .apply_kitty_command_with_context(
+                b"a=T,f=100,i=21,q=2",
+                &encode_base64_for_test(gif),
+                (0, 0),
+                (2, 2),
+            )
+            .unwrap();
+        assert_eq!(
+            store.visible_submissions(Rect::new(0, 0, 8, 8))[0]
+                .placement()
+                .area(),
+            Rect::new(0, 0, 2, 1)
+        );
+    }
+
+    fn encode_base64_for_test(bytes: &[u8]) -> Vec<u8> {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut output = Vec::new();
+        for chunk in bytes.chunks(3) {
+            let value = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            output.push(TABLE[((value >> 18) & 63) as usize]);
+            output.push(TABLE[((value >> 12) & 63) as usize]);
+            output.push(if chunk.len() > 1 {
+                TABLE[((value >> 6) & 63) as usize]
+            } else {
+                b'='
+            });
+            output.push(if chunk.len() > 2 {
+                TABLE[(value & 63) as usize]
+            } else {
+                b'='
+            });
+        }
+        output
     }
 
     #[test]
@@ -1193,6 +1479,23 @@ mod tests {
         assert_eq!(store.resource_count(), 0);
         assert_eq!(store.placement_count(), 0);
         assert_eq!(store.decoded_bytes(1), None);
+    }
+
+    #[test]
+    fn clearing_a_store_cancels_pending_uploads_and_reclaims_resources() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(22));
+        store
+            .apply_kitty_command(b"a=T,f=24,i=22,m=1", b"AQID")
+            .unwrap();
+        assert_eq!(store.resource_count(), 0);
+        store
+            .apply_kitty_command(b"a=d,d=a", b"")
+            .expect("delete-all should clear pending state");
+        store
+            .apply_kitty_command(b"a=T,f=24,i=22,q=2", b"BAUG")
+            .unwrap();
+        assert_eq!(store.resource_count(), 1);
+        assert_eq!(store.placement_count(), 1);
     }
 
     #[test]

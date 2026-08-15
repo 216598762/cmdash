@@ -202,6 +202,7 @@ impl Scene {
                 self.clear_cell_occupancy(x, y);
             }
         }
+        self.occlude_images(clip);
         for image in &source.image_layers {
             if let Some(image) = image
                 .clipped_to(clip)
@@ -238,6 +239,63 @@ impl Scene {
                 }
             }
         }
+    }
+
+    /// Removes image fragments covered by an opaque composed surface or
+    /// overlay. Image layers are split around the occluder so visible portions
+    /// remain renderable and no backend escape sequence is emitted underneath
+    /// a higher z-order surface.
+    pub fn occlude_images(&mut self, occluder: Rect) {
+        let mut visible = Vec::new();
+        for image in std::mem::take(&mut self.image_layers) {
+            let image_area = image.placement().area();
+            let Some(intersection) = intersect(image_area, occluder) else {
+                visible.push(image);
+                continue;
+            };
+            let candidates = [
+                Rect::new(
+                    image_area.x,
+                    image_area.y,
+                    image_area.width,
+                    intersection.y.saturating_sub(image_area.y),
+                ),
+                Rect::new(
+                    image_area.x,
+                    intersection.y.saturating_add(intersection.height),
+                    image_area.width,
+                    image_area
+                        .y
+                        .saturating_add(image_area.height)
+                        .saturating_sub(intersection.y.saturating_add(intersection.height)),
+                ),
+                Rect::new(
+                    image_area.x,
+                    intersection.y,
+                    intersection.x.saturating_sub(image_area.x),
+                    intersection.height,
+                ),
+                Rect::new(
+                    intersection.x.saturating_add(intersection.width),
+                    intersection.y,
+                    image_area
+                        .x
+                        .saturating_add(image_area.width)
+                        .saturating_sub(intersection.x.saturating_add(intersection.width)),
+                    intersection.height,
+                ),
+            ];
+            for candidate in candidates {
+                if candidate.width > 0
+                    && candidate.height > 0
+                    && let Some(fragment) = image.clipped_to(candidate)
+                {
+                    visible.push(fragment);
+                }
+            }
+        }
+        visible.sort_by_key(|layer| layer.placement().z_index());
+        self.image_layers = visible;
     }
 
     pub fn border(&mut self, rect: Rect, title: &str, style: CellStyle) {
@@ -348,6 +406,20 @@ impl Scene {
     }
 }
 
+fn intersect(first: Rect, second: Rect) -> Option<Rect> {
+    let left = first.x.max(second.x);
+    let top = first.y.max(second.y);
+    let right = first
+        .x
+        .saturating_add(first.width)
+        .min(second.x.saturating_add(second.width));
+    let bottom = first
+        .y
+        .saturating_add(first.height)
+        .min(second.y.saturating_add(second.height));
+    (left < right && top < bottom).then(|| Rect::new(left, top, right - left, bottom - top))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +488,29 @@ mod tests {
         assert_eq!(
             destination.image_layers()[0].placement().area(),
             Rect::new(3, 1, 2, 1)
+        );
+    }
+
+    #[test]
+    fn opaque_blits_occlude_only_the_covered_image_region() {
+        let mut store = crate::SessionGraphicsStore::new(crate::SessionId::new(2));
+        store.apply_kitty_command(b"a=T,f=24,i=2", b"AQID").unwrap();
+        store
+            .apply_kitty_command_with_context(b"a=p,i=2,c=6,r=2", b"", (0, 1), (10, 20))
+            .unwrap();
+        let image = store.visible_submissions(Rect::new(0, 0, 8, 4))[1].clone();
+        let mut destination = Scene::new(Rect::new(0, 0, 8, 4));
+        destination.add_image_layer(image);
+        let overlay = Scene::new(Rect::new(2, 1, 2, 2));
+        destination.blit(&overlay, overlay.area());
+
+        assert_eq!(destination.image_layers().len(), 2);
+        assert!(
+            destination.image_layers().iter().all(|layer| intersect(
+                layer.placement().area(),
+                Rect::new(2, 1, 2, 2)
+            )
+            .is_none())
         );
     }
 
