@@ -150,6 +150,8 @@ Widgets that draw an outline support these optional string settings:
   `none`. `border_style` is accepted as a compatibility alias.
 - `border_color` and semantic role names such as `foreground`, `background`,
   `focus`, and `muted`: `inherit`, `ansi:N`, or `#RRGGBB`.
+- Terminal cursor blinking uses `cursor_blink` and
+  `cursor_blink_interval_ms`; see the terminal widget section below.
 
 Custom glyph sets, per-side visibility, and animated border/title styling remain
 future extensions in Phase 12.
@@ -268,6 +270,13 @@ command = "sh"
 If `command` is omitted, the session uses the platform's configured shell
 fallback. The widget handles keyboard, mouse, paste, resize, selection copy,
 and shutdown. It is the only built-in widget that currently owns a PTY.
+
+The cursor is rendered by cmdash inside the terminal scene. When the terminal
+pane is focused and visible, it blinks at the configured interval; keyboard
+input, PTY output, cursor movement, and focus changes reset it to visible.
+Unfocused panes and hidden tabs do not blink. Set `cursor_blink = "false"` for a
+static cursor, or use `cursor_blink_interval_ms` to tune the interval. The
+scheduler is wakeable and does not use blinking to poll PTY output.
 
 A terminal widget is not a global terminal pane. Splitting it creates another
 terminal widget and another session ID; the new pane inherits the source

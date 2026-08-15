@@ -118,6 +118,9 @@ are `text`, `clock`, `system`, and `terminal`.
   `none`; `border_style` is an alias.
 - `settings.border_color` and semantic role names such as `foreground`,
   `background`, `focus`, and `muted` accept `inherit`, `ansi:N`, or `#RRGGBB`.
+- Terminal widgets support `settings.cursor_blink` (`true` or `false`, default
+  `true`) and `settings.cursor_blink_interval_ms` (50–60000 milliseconds,
+  default `500`).
 - `clock.format` accepts `HH:MM` or `HH:MM:SS`.
 - A terminal widget owns its PTY, emulator, selection, graphics resources, and
   shutdown lifecycle.

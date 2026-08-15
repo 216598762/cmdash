@@ -8,7 +8,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use cmdash::{
@@ -44,14 +44,28 @@ impl InputReader {
     }
 }
 
+enum MaintenanceCommand {
+    Stop,
+    ScheduleCursorBlink {
+        delay: Option<Duration>,
+        generation: u64,
+    },
+}
+
 struct MaintenanceWaker {
-    stop_sender: Sender<()>,
+    command_sender: Sender<MaintenanceCommand>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl MaintenanceWaker {
+    fn schedule_cursor_blink(&self, delay: Option<Duration>, generation: u64) {
+        let _ = self
+            .command_sender
+            .send(MaintenanceCommand::ScheduleCursorBlink { delay, generation });
+    }
+
     fn shutdown(mut self) {
-        let _ = self.stop_sender.send(());
+        let _ = self.command_sender.send(MaintenanceCommand::Stop);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -97,10 +111,13 @@ fn main() -> io::Result<()> {
         &mut backend,
         &mut state,
         &mut compositor,
-        &event_receiver,
-        &pty_wakeup,
-        &registry,
-        reloader.as_mut(),
+        RunContext {
+            event_receiver: &event_receiver,
+            pty_wakeup: &pty_wakeup,
+            registry: &registry,
+            reloader: reloader.as_mut(),
+            maintenance_waker: &maintenance_waker,
+        },
     );
     input_reader.shutdown();
     maintenance_waker.shutdown();
@@ -118,20 +135,29 @@ fn main() -> io::Result<()> {
     result
 }
 
+struct RunContext<'a> {
+    event_receiver: &'a Receiver<UiEvent>,
+    pty_wakeup: &'a SessionWakeup,
+    registry: &'a WidgetRegistry,
+    reloader: Option<&'a mut ConfigReloader>,
+    maintenance_waker: &'a MaintenanceWaker,
+}
+
 fn run<B>(
     backend: &mut B,
     state: &mut AppState,
     compositor: &mut Compositor,
-    event_receiver: &Receiver<UiEvent>,
-    pty_wakeup: &SessionWakeup,
-    registry: &WidgetRegistry,
-    mut reloader: Option<&mut ConfigReloader>,
+    mut context: RunContext<'_>,
 ) -> io::Result<()>
 where
     B: Backend<Error = io::Error>,
 {
     loop {
-        if let Some(reloader) = reloader.as_deref_mut() {
+        context.maintenance_waker.schedule_cursor_blink(
+            state.cursor_blink_schedule(),
+            state.cursor_blink_generation(),
+        );
+        if let Some(reloader) = context.reloader.as_deref_mut() {
             match reloader.poll_with_migrations() {
                 Ok(Some(loaded)) => {
                     for migration in &loaded.migrations {
@@ -140,7 +166,7 @@ where
                             migration.warning()
                         ));
                     }
-                    if let Err(error) = state.reload_config(registry, &loaded.config) {
+                    if let Err(error) = state.reload_config(context.registry, &loaded.config) {
                         state.record_diagnostic(format!("config reload rejected: {error}"));
                     }
                 }
@@ -180,10 +206,10 @@ where
 
         if dispatch_available_events(
             state,
-            event_receiver,
-            pty_wakeup,
-            registry,
-            reloader.as_deref_mut(),
+            context.event_receiver,
+            context.pty_wakeup,
+            context.registry,
+            context.reloader.as_deref_mut(),
         )? {
             break;
         }
@@ -280,21 +306,41 @@ fn spawn_input_reader(sender: Sender<UiEvent>) -> InputReader {
 }
 
 fn spawn_maintenance_waker(sender: Sender<UiEvent>) -> MaintenanceWaker {
-    let (stop_sender, stop_receiver) = mpsc::channel();
+    let (command_sender, command_receiver) = mpsc::channel();
     let handle = thread::spawn(move || {
+        let mut maintenance_deadline = Instant::now() + MAINTENANCE_INTERVAL;
+        let mut cursor_deadline: Option<(Instant, u64)> = None;
         loop {
-            match stop_receiver.recv_timeout(MAINTENANCE_INTERVAL) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            let now = Instant::now();
+            let next_deadline = cursor_deadline.map_or(maintenance_deadline, |(cursor, _)| {
+                cursor.min(maintenance_deadline)
+            });
+            match command_receiver.recv_timeout(next_deadline.saturating_duration_since(now)) {
+                Ok(MaintenanceCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Ok(MaintenanceCommand::ScheduleCursorBlink { delay, generation }) => {
+                    cursor_deadline = delay.map(|delay| (Instant::now() + delay, generation));
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if sender.send(UiEvent::Tick).is_err() {
-                        break;
+                    let now = Instant::now();
+                    if now >= maintenance_deadline {
+                        if sender.send(UiEvent::Tick).is_err() {
+                            break;
+                        }
+                        maintenance_deadline = now + MAINTENANCE_INTERVAL;
+                    }
+                    if cursor_deadline.is_some_and(|(deadline, _)| now >= deadline) {
+                        let (_, generation) = cursor_deadline.expect("cursor deadline was checked");
+                        if sender.send(UiEvent::CursorBlink(generation)).is_err() {
+                            break;
+                        }
+                        cursor_deadline = None;
                     }
                 }
             }
         }
     });
     MaintenanceWaker {
-        stop_sender,
+        command_sender,
         handle: Some(handle),
     }
 }
@@ -308,6 +354,7 @@ fn dispatch_available_events(
 ) -> io::Result<bool> {
     let mut events = Vec::with_capacity(MAX_EVENTS_PER_BATCH);
     collect_ui_event(
+        state,
         event_receiver
             .recv()
             .map_err(|_| io::Error::other("input and PTY event channel disconnected"))?,
@@ -317,7 +364,7 @@ fn dispatch_available_events(
 
     while events.len() < MAX_EVENTS_PER_BATCH {
         match event_receiver.try_recv() {
-            Ok(event) => collect_ui_event(event, &mut events, pty_wakeup)?,
+            Ok(event) => collect_ui_event(state, event, &mut events, pty_wakeup)?,
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
                 return Err(io::Error::other("input and PTY event channel disconnected"));
@@ -329,6 +376,7 @@ fn dispatch_available_events(
 }
 
 fn collect_ui_event(
+    state: &mut AppState,
     event: UiEvent,
     events: &mut Vec<Event>,
     pty_wakeup: &SessionWakeup,
@@ -337,6 +385,9 @@ fn collect_ui_event(
         UiEvent::Input(event) => events.push(event),
         UiEvent::PtyOutput => pty_wakeup.clear_pending(),
         UiEvent::Tick => {}
+        UiEvent::CursorBlink(generation) => {
+            state.advance_cursor_blink(generation);
+        }
         UiEvent::InputError(message) => return Err(io::Error::other(message)),
     }
     Ok(())

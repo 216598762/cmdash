@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt, time::SystemTime};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    time::{Duration, SystemTime},
+};
 
 use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -317,6 +321,8 @@ pub struct AppState {
     layout: LayoutTree,
     quit_requested: bool,
     redraw_requested: bool,
+    cursor_blink_visible: bool,
+    cursor_blink_generation: u64,
     pending_invalidations: Vec<Rect>,
     diagnostics: Vec<String>,
     pending_clipboard: Option<String>,
@@ -338,6 +344,8 @@ impl AppState {
             layout: LayoutTree::from_config(None, [], []).expect("empty layout is valid"),
             quit_requested: false,
             redraw_requested: true,
+            cursor_blink_visible: true,
+            cursor_blink_generation: 0,
             pending_invalidations: Vec::new(),
             diagnostics: Vec::new(),
             pending_clipboard: None,
@@ -399,6 +407,8 @@ impl AppState {
             layout,
             quit_requested: false,
             redraw_requested: true,
+            cursor_blink_visible: true,
+            cursor_blink_generation: 0,
             pending_invalidations: Vec::new(),
             diagnostics: Vec::new(),
             pending_clipboard: None,
@@ -537,7 +547,67 @@ impl AppState {
         if report.requests_redraw() || !report.failed().is_empty() {
             self.redraw_requested = true;
         }
+        let active_terminal = self.active_terminal_widget();
+        if active_terminal.is_some_and(|id| report.changed().contains(&id)) {
+            self.reset_cursor_blink();
+        }
         report
+    }
+
+    /// Returns the delay until the focused visible terminal should blink again.
+    ///
+    /// `None` means there is no active blinking terminal and the scheduler can
+    /// remain idle for cursor purposes.
+    pub fn cursor_blink_schedule(&self) -> Option<Duration> {
+        let widget_id = self.active_terminal_widget()?;
+        let settings = self.widget_runtime.cursor_blink_settings(widget_id)?;
+        settings.enabled().then_some(settings.interval())
+    }
+
+    pub const fn cursor_blink_visible(&self) -> bool {
+        self.cursor_blink_visible
+    }
+
+    pub const fn cursor_blink_generation(&self) -> u64 {
+        self.cursor_blink_generation
+    }
+
+    /// Toggles the active terminal cursor and requests a frame.
+    pub fn advance_cursor_blink(&mut self, generation: u64) -> bool {
+        if generation != self.cursor_blink_generation {
+            return false;
+        }
+        if self.cursor_blink_schedule().is_none() {
+            if !self.cursor_blink_visible {
+                self.cursor_blink_visible = true;
+                self.redraw_requested = true;
+                return true;
+            }
+            return false;
+        }
+        self.cursor_blink_visible = !self.cursor_blink_visible;
+        self.redraw_requested = true;
+        true
+    }
+
+    fn reset_cursor_blink(&mut self) {
+        self.cursor_blink_generation = self.cursor_blink_generation.wrapping_add(1);
+        if !self.cursor_blink_visible {
+            self.cursor_blink_visible = true;
+            self.redraw_requested = true;
+        }
+    }
+
+    fn active_terminal_widget(&self) -> Option<WidgetId> {
+        let FocusTarget::Surface(surface_id) = self.focus.target()? else {
+            return None;
+        };
+        let surface = self.workspace.surfaces.get(&surface_id)?;
+        if !surface.visible() {
+            return None;
+        }
+        let widget_id = surface.widget()?;
+        (self.widget_runtime.widget_kind(widget_id) == Some("terminal")).then_some(widget_id)
     }
 
     pub fn handle_focused_key(&mut self, key: KeyEvent) -> Result<bool, String> {
@@ -556,6 +626,7 @@ impl AppState {
             return Ok(false);
         }
         let update = self.widget_runtime.handle_key(widget_id, key)?;
+        self.reset_cursor_blink();
         if update == crate::widget::WidgetUpdate::Redraw {
             self.redraw_requested = true;
         }
@@ -578,6 +649,7 @@ impl AppState {
             return Ok(false);
         }
         self.widget_runtime.handle_paste(widget_id, text)?;
+        self.reset_cursor_blink();
         Ok(true)
     }
 
@@ -651,6 +723,7 @@ impl AppState {
         }
         self.widget_runtime
             .handle_mouse(widget_id, mouse, (input_area.x, input_area.y))?;
+        self.reset_cursor_blink();
         Ok(true)
     }
 
@@ -708,7 +781,7 @@ impl AppState {
             Some(FocusTarget::Overlay(_)) | None => None,
         };
         self.widget_runtime
-            .render(&areas, focused_widget)
+            .render_with_cursor(&areas, focused_widget, self.cursor_blink_visible)
             .into_iter()
             .filter_map(|(widget_id, scene)| {
                 surface_ids
@@ -874,6 +947,7 @@ impl AppState {
                     .map(|surface| surface.area()),
             );
             self.persist_runtime_layout();
+            self.reset_cursor_blink();
         }
     }
 
@@ -916,6 +990,7 @@ impl AppState {
                 self.pending_invalidations.push(area);
             }
         }
+        self.reset_cursor_blink();
         Ok(())
     }
 
@@ -1048,6 +1123,7 @@ impl AppState {
         self.runtime_pane_ids.insert(new_id.get());
         self.persist_runtime_layout();
         self.focus.set(FocusTarget::Surface(new_surface.id()));
+        self.reset_cursor_blink();
         self.pending_invalidations.push(area);
         self.redraw_requested = true;
         Ok(())
@@ -1076,6 +1152,7 @@ impl AppState {
         self.runtime_pane_ids.remove(&widget_id.get());
         self.persist_runtime_layout();
         self.focus.clear();
+        self.reset_cursor_blink();
         self.pending_invalidations.push(area);
         self.redraw_requested = true;
         Ok(())
@@ -1155,6 +1232,7 @@ impl AppState {
                 *surface = surface.with_visible(visible);
                 if !visible && self.focus.is_focused(FocusTarget::Surface(id)) {
                     self.focus.clear();
+                    self.reset_cursor_blink();
                 }
             }
         }
@@ -1517,6 +1595,146 @@ mod tests {
     }
 
     #[test]
+    fn cursor_blinking_is_limited_to_the_focused_visible_terminal() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "terminal"
+            command = "sh"
+            [workspace.widgets.settings]
+            cursor_blink_interval_ms = "120"
+            "#,
+        )
+        .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        let surface = SurfaceId::new(1);
+        state
+            .dispatch(Command::Surface(SurfaceCommand::SetArea {
+                id: surface,
+                area: Rect::new(0, 0, 20, 8),
+            }))
+            .unwrap();
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(surface)))
+            .unwrap();
+
+        assert_eq!(
+            state.cursor_blink_schedule(),
+            Some(Duration::from_millis(120))
+        );
+        assert!(state.cursor_blink_visible());
+        assert!(state.advance_cursor_blink(state.cursor_blink_generation()));
+        assert!(!state.cursor_blink_visible());
+        state
+            .handle_focused_key(KeyEvent::new(
+                crossterm::event::KeyCode::Char('x'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .unwrap();
+        assert!(state.cursor_blink_visible());
+
+        state.dispatch(Command::Focus(FocusCommand::Clear)).unwrap();
+        assert_eq!(state.cursor_blink_schedule(), None);
+        state.shutdown_widgets();
+    }
+
+    #[test]
+    fn cursor_visibility_resets_when_focus_moves_between_terminal_panes() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "terminal"
+            command = "sh"
+            [[workspace.widgets]]
+            id = 2
+            type = "terminal"
+            command = "sh"
+            "#,
+        )
+        .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        let first = SurfaceId::new(1);
+        let second = SurfaceId::new(2);
+
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(first)))
+            .unwrap();
+        let first_generation = state.cursor_blink_generation();
+        assert!(state.cursor_blink_schedule().is_some());
+        assert!(state.advance_cursor_blink(first_generation));
+        assert!(!state.cursor_blink_visible());
+
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(second)))
+            .unwrap();
+        assert!(state.cursor_blink_visible());
+        assert!(state.cursor_blink_generation() != first_generation);
+        assert!(!state.advance_cursor_blink(first_generation));
+        assert!(state.cursor_blink_visible());
+
+        state.dispatch(Command::Focus(FocusCommand::Clear)).unwrap();
+        assert_eq!(state.cursor_blink_schedule(), None);
+        assert!(state.cursor_blink_visible());
+        state.shutdown_widgets();
+    }
+
+    #[test]
+    fn cursor_visibility_pauses_for_hidden_terminal_tabs() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "terminal"
+            command = "sh"
+            [[workspace.widgets]]
+            id = 2
+            type = "terminal"
+            command = "sh"
+            [workspace.layout]
+            type = "tabs"
+            active = 0
+            children = [
+              { type = "leaf", widget = 1 },
+              { type = "leaf", widget = 2 }
+            ]
+            "#,
+        )
+        .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        let first = SurfaceId::new(1);
+        let second = SurfaceId::new(2);
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(first)))
+            .unwrap();
+        let stale_generation = state.cursor_blink_generation();
+        assert!(state.advance_cursor_blink(stale_generation));
+        assert!(!state.cursor_blink_visible());
+
+        state.dispatch(Command::Tab(TabCommand::Next)).unwrap();
+        assert!(!state.workspace().surfaces()[&first].visible());
+        assert!(state.workspace().surfaces()[&second].visible());
+        assert_eq!(state.focus().target(), None);
+        assert_eq!(state.cursor_blink_schedule(), None);
+        assert!(state.cursor_blink_visible());
+        assert!(!state.advance_cursor_blink(stale_generation));
+
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(second)))
+            .unwrap();
+        assert!(state.cursor_blink_schedule().is_some());
+        assert!(state.cursor_blink_visible());
+        state.shutdown_widgets();
+    }
+
+    #[test]
     fn valid_config_reload_replaces_state_atomically() {
         let first = AppConfig::parse("version = 1\n[workspace]\nname = \"first\"\n").unwrap();
         let second = AppConfig::parse("version = 1\n[workspace]\nname = \"second\"\n").unwrap();
@@ -1567,6 +1785,10 @@ mod tests {
         state
             .dispatch(Command::Focus(FocusCommand::Surface(original)))
             .unwrap();
+        let original_generation = state.cursor_blink_generation();
+        assert!(state.cursor_blink_schedule().is_some());
+        assert!(state.advance_cursor_blink(original_generation));
+        assert!(!state.cursor_blink_visible());
 
         state
             .dispatch(Command::Pane(PaneCommand::Split(
@@ -1581,6 +1803,10 @@ mod tests {
         assert_ne!(created_surface, original);
         assert_eq!(state.layout().visible_widget_ids().len(), 2);
         assert_eq!(state.widget_runtime().widget_ids().count(), 2);
+        assert!(state.cursor_blink_schedule().is_some());
+        assert!(state.cursor_blink_visible());
+        assert!(!state.advance_cursor_blink(original_generation));
+        assert!(state.cursor_blink_visible());
 
         state.reload_config(&registry, &config).unwrap();
         assert!(state.workspace().surfaces().contains_key(&created_surface));
@@ -1589,11 +1815,16 @@ mod tests {
             state.focus().target(),
             Some(FocusTarget::Surface(created_surface))
         );
+        assert!(state.cursor_blink_schedule().is_some());
+        assert!(state.cursor_blink_visible());
 
         state.dispatch(Command::Pane(PaneCommand::Close)).unwrap();
         assert_eq!(state.layout().visible_widget_ids(), [WidgetId::new(10)]);
         assert_eq!(state.widget_runtime().widget_ids().count(), 1);
         assert!(!state.workspace().surfaces().contains_key(&created_surface));
+        assert_eq!(state.focus().target(), None);
+        assert_eq!(state.cursor_blink_schedule(), None);
+        assert!(state.cursor_blink_visible());
         state.shutdown_widgets();
     }
 

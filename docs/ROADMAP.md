@@ -226,6 +226,13 @@ static frame on terminals or configurations that do not support them.
   animation is active, coalesces simultaneous updates, and preserves the
   existing event-driven PTY/input path without reintroducing fixed-rate output
   polling.
+- [ ] Add terminal cursor blinking for the focused, visible terminal pane: derive
+  cursor visibility and shape from the session emulator, reset the blink phase
+  on keyboard input, PTY output, focus changes, and cursor movement, and pause
+  blinking for unfocused panes, hidden tabs, inactive sessions, and shutdown.
+  Make the interval, enabled state, reduced-motion behavior, and static-cursor
+  fallback configurable while ensuring the scheduler wakes only the active
+  pane and never uses cursor blinking to drive PTY polling.
 - [ ] Define terminal-safe interpolation and fallback rules for ANSI palettes,
   truecolor, bold/dim attributes, glyph changes, and unsupported effects;
   alpha/transparency must never leak malformed escape sequences or corrupt
@@ -269,6 +276,7 @@ produces a visually coherent static dashboard.
 | Default widget palette | Use terminal-native reset/ANSI references, with a deterministic RGB fallback | Makes cmdash blend into the user's terminal without blocking on optional palette-query protocols |
 | Widget chrome | Explicit border-style and label policies, including a first-class no-label mode | Keeps layout/content geometry independent from decorative labels and allows themes to control borders consistently |
 | Animation model | Optional retained transitions scheduled by the UI coordinator with bounded budgets | Adds motion without compromising PTY responsiveness, deterministic rendering, or plugin isolation |
+| Active terminal cursor | Blink only the focused visible terminal pane through the wakeable scheduler, with reduced-motion and static-cursor fallbacks | Provides familiar terminal behavior without waking hidden sessions or reintroducing timer-based PTY polling |
 | Initial multiplexer UX | Retained tabs plus interactive horizontal/vertical panes | Validates session isolation and restoration while keeping pane mutation command-driven |
 
 Update this table as product decisions are made; do not let provisional choices silently become public API guarantees.

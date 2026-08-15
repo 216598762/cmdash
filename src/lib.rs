@@ -60,7 +60,7 @@ pub use state::{
 #[cfg(feature = "wasm-plugins")]
 pub use wasm_plugin::{WasmLimits, WasmPluginError, WasmPluginHost, WasmPluginInstance};
 pub use widget::{
-    Widget, WidgetAppearance, WidgetBorderStyle, WidgetError, WidgetFactory, WidgetHealth,
-    WidgetRegistry, WidgetRuntime, WidgetRuntimeContext, WidgetStatus, WidgetUpdate,
+    CursorBlinkSettings, Widget, WidgetAppearance, WidgetBorderStyle, WidgetError, WidgetFactory,
+    WidgetHealth, WidgetRegistry, WidgetRuntime, WidgetRuntimeContext, WidgetStatus, WidgetUpdate,
     WidgetUpdateReport, widget_content_area,
 };

@@ -103,6 +103,7 @@ pub enum UiEvent {
     Input(CrosstermEvent),
     PtyOutput,
     Tick,
+    CursorBlink(u64),
     InputError(String),
 }
 
@@ -463,6 +464,16 @@ impl TerminalSession {
     }
 
     pub fn render_with_theme(&self, area: Rect, focused: bool, theme: Theme) -> Scene {
+        self.render_with_theme_and_cursor(area, focused, theme, true)
+    }
+
+    pub fn render_with_theme_and_cursor(
+        &self,
+        area: Rect,
+        focused: bool,
+        theme: Theme,
+        cursor_visible: bool,
+    ) -> Scene {
         let mut scene = Scene::new(area);
         let default_style = CellStyle::new(theme.foreground(), theme.background());
         scene.fill(area, default_style);
@@ -489,7 +500,7 @@ impl TerminalSession {
             }
             scene.set(x, y, cell.c, style);
         }
-        if focused {
+        if focused && cursor_visible && self.term.mode().contains(TermMode::SHOW_CURSOR) {
             let cursor = self.term.grid().cursor.point;
             let x = area.x.saturating_add(cursor.column.0 as u16);
             let y = area.y.saturating_add(cursor.line.0 as u16);
@@ -788,6 +799,36 @@ mod tests {
         wakeup.clear_pending();
         wakeup.notify();
         assert!(matches!(receiver.try_recv(), Ok(UiEvent::PtyOutput)));
+    }
+
+    #[test]
+    fn cursor_visibility_can_be_toggled_without_changing_terminal_state() {
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &["-c", "sleep 5"],
+            TerminalSize::new(20, 4),
+        )
+        .unwrap();
+        session.processor.advance(&mut session.term, b"\x1b[?25h");
+
+        let visible = session.render_with_theme_and_cursor(
+            Rect::new(0, 0, 20, 4),
+            true,
+            Theme::fallback(),
+            true,
+        );
+        let hidden = session.render_with_theme_and_cursor(
+            Rect::new(0, 0, 20, 4),
+            true,
+            Theme::fallback(),
+            false,
+        );
+        assert_ne!(
+            visible.cell_at(0, 0).unwrap().style,
+            hidden.cell_at(0, 0).unwrap().style
+        );
+        assert_eq!(session.cursor_position(), (0, 0));
+        session.shutdown().unwrap();
     }
 
     #[test]

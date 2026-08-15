@@ -141,6 +141,66 @@ impl WidgetAppearance {
     }
 }
 
+/// Cursor blinking behavior for an interactive terminal widget.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CursorBlinkSettings {
+    enabled: bool,
+    interval: Duration,
+}
+
+impl Default for CursorBlinkSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval: Duration::from_millis(500),
+        }
+    }
+}
+
+impl CursorBlinkSettings {
+    pub fn from_settings(settings: &BTreeMap<String, String>) -> Result<Self, WidgetError> {
+        let enabled = settings
+            .get("cursor_blink")
+            .map(|value| {
+                value.parse::<bool>().map_err(|_| {
+                    WidgetError::InvalidConfiguration(format!(
+                        "terminal cursor_blink must be true or false, got {value:?}"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(true);
+        let interval_ms = settings
+            .get("cursor_blink_interval_ms")
+            .map(|value| {
+                value.parse::<u64>().map_err(|_| {
+                    WidgetError::InvalidConfiguration(format!(
+                        "terminal cursor_blink_interval_ms must be an integer, got {value:?}"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(500);
+        if !(50..=60_000).contains(&interval_ms) {
+            return Err(WidgetError::InvalidConfiguration(format!(
+                "terminal cursor_blink_interval_ms must be between 50 and 60000, got {interval_ms}"
+            )));
+        }
+        Ok(Self {
+            enabled,
+            interval: Duration::from_millis(interval_ms),
+        })
+    }
+
+    pub const fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    pub const fn interval(self) -> Duration {
+        self.interval
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BorderGlyphs {
     horizontal: char,
@@ -256,6 +316,14 @@ pub trait Widget: Send {
     }
 
     fn render(&self, area: Rect, focused: bool) -> Scene;
+
+    fn render_with_cursor(&self, area: Rect, focused: bool, _cursor_visible: bool) -> Scene {
+        self.render(area, focused)
+    }
+
+    fn cursor_blink_settings(&self) -> Option<CursorBlinkSettings> {
+        None
+    }
 
     fn content_area(&self, area: Rect) -> Rect {
         widget_content_area(area)
@@ -712,11 +780,23 @@ impl WidgetRuntime {
         areas: &BTreeMap<WidgetId, Rect>,
         focused: Option<WidgetId>,
     ) -> BTreeMap<WidgetId, Scene> {
+        self.render_with_cursor(areas, focused, true)
+    }
+
+    pub fn render_with_cursor(
+        &self,
+        areas: &BTreeMap<WidgetId, Rect>,
+        focused: Option<WidgetId>,
+        cursor_visible: bool,
+    ) -> BTreeMap<WidgetId, Scene> {
         self.instances
             .iter()
             .filter_map(|(&id, entry)| {
                 let area = *areas.get(&id)?;
-                let mut scene = entry.widget.render(area, focused == Some(id));
+                let mut scene =
+                    entry
+                        .widget
+                        .render_with_cursor(area, focused == Some(id), cursor_visible);
                 for graphics in entry.widget.graphics(area) {
                     scene.add_image_layer(graphics);
                 }
@@ -727,6 +807,12 @@ impl WidgetRuntime {
                 Some((id, scene))
             })
             .collect()
+    }
+
+    pub fn cursor_blink_settings(&self, id: WidgetId) -> Option<CursorBlinkSettings> {
+        self.instances
+            .get(&id)
+            .and_then(|entry| entry.widget.cursor_blink_settings())
     }
 }
 
@@ -948,6 +1034,7 @@ struct TerminalWidget {
     session: TerminalSession,
     appearance: WidgetAppearance,
     theme: Theme,
+    cursor_blink: CursorBlinkSettings,
 }
 
 /// Returns the content rectangle inside a one-cell widget outline.
@@ -1003,6 +1090,10 @@ impl Widget for TerminalWidget {
     }
 
     fn render(&self, area: Rect, focused: bool) -> Scene {
+        self.render_with_cursor(area, focused, true)
+    }
+
+    fn render_with_cursor(&self, area: Rect, focused: bool, cursor_visible: bool) -> Scene {
         let color = if focused {
             self.theme.focus()
         } else {
@@ -1017,11 +1108,18 @@ impl Widget for TerminalWidget {
             if self.label { &self.title } else { "" },
             CellStyle::new(color, background),
         );
-        let content =
-            self.session
-                .render_with_theme(self.appearance.content_area(area), focused, self.theme);
+        let content = self.session.render_with_theme_and_cursor(
+            self.appearance.content_area(area),
+            focused,
+            self.theme,
+            cursor_visible,
+        );
         scene.blit(&content, area);
         scene
+    }
+
+    fn cursor_blink_settings(&self) -> Option<CursorBlinkSettings> {
+        (!self.session.is_closed()).then_some(self.cursor_blink)
     }
 
     fn graphics(&self, area: Rect) -> Vec<GraphicsSubmission> {
@@ -1091,6 +1189,7 @@ fn terminal_widget_factory(
     context: &WidgetRuntimeContext,
 ) -> Result<Box<dyn Widget>, WidgetError> {
     let appearance = WidgetAppearance::from_settings(&config.settings)?;
+    let cursor_blink = CursorBlinkSettings::from_settings(&config.settings)?;
     let theme = context
         .theme()
         .with_settings(&config.settings)
@@ -1115,6 +1214,7 @@ fn terminal_widget_factory(
         session,
         appearance,
         theme,
+        cursor_blink,
     }))
 }
 
@@ -1196,6 +1296,20 @@ mod tests {
         _context: &WidgetRuntimeContext,
     ) -> Result<Box<dyn Widget>, WidgetError> {
         Ok(Box::new(FailingWidget))
+    }
+
+    #[test]
+    fn cursor_blink_settings_parse_and_validate() {
+        let settings = BTreeMap::from([
+            ("cursor_blink".to_owned(), "false".to_owned()),
+            ("cursor_blink_interval_ms".to_owned(), "750".to_owned()),
+        ]);
+        let parsed = CursorBlinkSettings::from_settings(&settings).unwrap();
+        assert!(!parsed.enabled());
+        assert_eq!(parsed.interval(), Duration::from_millis(750));
+
+        let invalid = BTreeMap::from([("cursor_blink_interval_ms".to_owned(), "0".to_owned())]);
+        assert!(CursorBlinkSettings::from_settings(&invalid).is_err());
     }
 
     #[test]
@@ -1402,6 +1516,7 @@ mod tests {
             .unwrap(),
             appearance: WidgetAppearance::default(),
             theme: Theme::fallback(),
+            cursor_blink: CursorBlinkSettings::default(),
         };
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
