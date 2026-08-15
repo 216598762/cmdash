@@ -11,7 +11,16 @@ struct Resource {
     format: u8,
     width: u16,
     height: u16,
+    z: i16,
     payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeadlessPlaceholder {
+    pub image_id: u32,
+    pub x: u16,
+    pub y: u16,
+    pub z: i16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,24 +52,56 @@ pub struct HeadlessKittyTerminal {
     placements: Vec<HeadlessPlacement>,
     pending_upload: Option<PendingUpload>,
     actions: Vec<&'static str>,
-    placeholder_cells: Vec<u32>,
+    placeholder_cells: Vec<HeadlessPlaceholder>,
     text: String,
     cursor: (u16, u16),
     foreground: Option<(u8, u8, u8)>,
+    viewport: Option<(u16, u16)>,
+    acknowledgements: Vec<Vec<u8>>,
+    pending_input: Vec<u8>,
 }
 
 impl HeadlessKittyTerminal {
     pub fn replay(bytes: &[u8]) -> Result<Self, String> {
-        let mut terminal = Self::default();
+        Self::replay_with_viewport(bytes, None)
+    }
+
+    pub fn with_viewport(viewport: Option<(u16, u16)>) -> Self {
+        Self {
+            viewport,
+            ..Self::default()
+        }
+    }
+
+    pub fn replay_with_viewport(
+        bytes: &[u8],
+        viewport: Option<(u16, u16)>,
+    ) -> Result<Self, String> {
+        let mut terminal = Self::with_viewport(viewport);
         terminal.feed(bytes)?;
+        terminal.finish()?;
         Ok(terminal)
     }
 
+    /// Feeds one bounded raw-input chunk. Framing may span any number of
+    /// chunks; callers must invoke [`Self::finish`] when the stream ends.
     pub fn feed(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if bytes.len() > MAX_STREAM_BYTES {
+        if self.pending_input.len().saturating_add(bytes.len()) > MAX_STREAM_BYTES {
             return Err("headless Kitty stream exceeds the bounded input limit".to_owned());
         }
-        self.feed_inner(bytes)
+        self.pending_input.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Parses all buffered input and rejects an incomplete terminal sequence or
+    /// an unfinished Kitty upload.
+    pub fn finish(&mut self) -> Result<(), String> {
+        let bytes = std::mem::take(&mut self.pending_input);
+        self.feed_inner(&bytes)?;
+        if self.pending_upload.is_some() {
+            return Err("unterminated chunked Kitty upload".to_owned());
+        }
+        Ok(())
     }
 
     pub fn resource_count(&self) -> usize {
@@ -73,6 +114,37 @@ impl HeadlessKittyTerminal {
 
     pub fn placeholder_count(&self) -> usize {
         self.placeholder_cells.len()
+    }
+
+    pub fn placeholder_cells(&self) -> &[HeadlessPlaceholder] {
+        &self.placeholder_cells
+    }
+
+    /// Returns the topmost placeholder at each visible cell.
+    ///
+    /// The raw placeholder list retains every parsed cell for diagnostics. The
+    /// visible view applies terminal viewport clipping first, then resolves
+    /// overlapping cells by z-index, matching the semantic result that an
+    /// outer terminal can display.
+    pub fn visible_placeholder_cells(&self) -> Vec<HeadlessPlaceholder> {
+        let mut visible = BTreeMap::new();
+        for cell in &self.placeholder_cells {
+            if self
+                .viewport
+                .is_some_and(|(columns, rows)| cell.x >= columns || cell.y >= rows)
+            {
+                continue;
+            }
+            visible
+                .entry((cell.x, cell.y))
+                .and_modify(|current: &mut HeadlessPlaceholder| {
+                    if cell.z >= current.z {
+                        *current = cell.clone();
+                    }
+                })
+                .or_insert_with(|| cell.clone());
+        }
+        visible.into_values().collect()
     }
 
     pub fn placements(&self) -> &[HeadlessPlacement] {
@@ -97,6 +169,11 @@ impl HeadlessKittyTerminal {
         self.resources
             .get(&image_id)
             .map(|resource| resource.payload.as_slice())
+    }
+
+    /// Responses the headless terminal would send after accepting commands.
+    pub fn acknowledgements(&self) -> &[Vec<u8>] {
+        &self.acknowledgements
     }
 
     fn feed_inner(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -218,10 +295,17 @@ impl HeadlessKittyTerminal {
             | (u32::from(red) << 16)
             | (u32::from(green) << 8)
             | u32::from(blue);
-        if !self.resources.contains_key(&image_id) {
-            return Err(format!("placeholder references unknown image {image_id}"));
-        }
-        self.placeholder_cells.push(image_id);
+        let z = self
+            .resources
+            .get(&image_id)
+            .map(|resource| resource.z)
+            .ok_or_else(|| format!("placeholder references unknown image {image_id}"))?;
+        self.placeholder_cells.push(HeadlessPlaceholder {
+            image_id,
+            x: self.cursor.0,
+            y: self.cursor.1,
+            z,
+        });
         self.cursor.0 = self.cursor.0.saturating_add(1);
         Ok(offset)
     }
@@ -287,6 +371,7 @@ impl HeadlessKittyTerminal {
                         format,
                         width,
                         height,
+                        z: parameter_i16(&parameters, "z", 0)?,
                         payload: payload.to_vec(),
                     },
                 );
@@ -313,6 +398,7 @@ impl HeadlessKittyTerminal {
                     self.placements
                         .retain(|placement| placement.image_id != image_id);
                     self.actions.push("delete");
+                    self.acknowledgements.push(kitty_acknowledgement(image_id));
                 }
                 Some("p") | Some("P") => {
                     self.placements.clear();
@@ -479,6 +565,10 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn kitty_acknowledgement(image_id: u32) -> Vec<u8> {
+    format!("\x1b_Gi={image_id};OK\x1b\\").into_bytes()
 }
 
 fn unescape_tmux(bytes: &[u8]) -> Result<Vec<u8>, String> {

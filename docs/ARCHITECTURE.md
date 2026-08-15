@@ -282,21 +282,26 @@ session-qualified, while the backend derives a separate outer-terminal image ID.
 A bounded `GraphicsProtocolBroker` keeps child-PTY responses in a separate queue
 from outer-terminal probe traffic. `GraphicsCapabilityProbe` emits a Kitty/DA1/
 pixel-size probe, correlates only the outer Kitty acknowledgement, and reports
-confirmed, rejected, or timed-out capability state; callers must provide the raw
-outer input and must not feed child PTY bytes into it. Capability metadata records whether support was inferred from the environment,
-explicitly overridden, or actively probed, together with confidence. The
-`GraphicsInputDemultiplexer` now separates Kitty/CSI probe replies from ordinary
-keyboard bytes across read boundaries. Direct replay reuses uploaded resources
-by generation, passthrough wraps and ESC-doubles Kitty APCs for tmux-style hosts,
-and text fallback emits a bounded degraded marker. Primary/alternate screen
-anchors, DECSTBM region tracking, opaque scene occlusion, and cleanup generations
-are retained. Outer resources now keep generation/acknowledgement state: removed
-resources wait for the upload acknowledgement before deletion and are retired
-only after the delete acknowledgement. A session-owned VT observer mirrors the emulator's private margins
-and scroll displacement so partial-region linefeeds, explicit scrolls, reverse
-index, origin mode, and resize resets move matching graphics anchors without
-confusing them with primary-screen scrollback. Automatic ownership of the
-process-wide crossterm reader remains follow-up integration work.
+confirmed, rejected, or timed-out capability state. The session now delegates
+APC framing to `GraphicsProtocolAdapter`, which incrementally handles 7-bit APC,
+C1 APC, C1 ST, tmux passthrough unwrapping, malformed-sequence recovery, and
+input/payload bounds before the retained store interprets parameters. Capability
+metadata records whether support was inferred from the environment, explicitly
+overridden, or actively probed, together with confidence. On Linux, one raw
+`/dev/tty` input owner feeds the outer demultiplexer before decoding keyboard
+input, so graphics acknowledgements cannot be consumed by a competing crossterm
+reader. Direct replay reuses uploaded resources by generation, passthrough wraps
+and ESC-doubles Kitty APCs for tmux-style hosts, and text fallback emits a
+bounded degraded marker. Primary/alternate screen anchors, DECSTBM region
+tracking, opaque scene occlusion, and cleanup generations are retained. Outer
+resources now keep generation/acknowledgement state: removed resources wait for
+the upload acknowledgement before deletion and are retired only after the delete
+acknowledgement. Image and placeholder regions are first-class retained scene
+layers; the compositor clips, orders, diffs, and occludes both before any
+terminal-specific adapter emits bytes. A session-owned VT observer mirrors the
+emulator's private margins and scroll displacement so partial-region linefeeds,
+explicit scrolls, reverse index, origin mode, and resize resets move matching
+graphics anchors without confusing them with primary-screen scrollback.
 
 This is why a global image map or a single terminal emulator shared by tabs is explicitly out of scope.
 
@@ -337,10 +342,10 @@ Crossterm color commands, preserving the serialized frame boundary.
 Use three representations:
 
 1. **Widget/session model:** mutable state and protocol semantics.
-2. **Scene:** immutable frame-local primitives such as cells, spans, borders, rectangles, image placements, and overlays.
+2. **Scene:** immutable frame-local primitives such as cells, spans, borders, rectangles, image placements, placeholder regions, and overlays.
 3. **Backend submission:** terminal-specific cursor movement, color encoding, clear operations, and graphics escape sequences.
 
-Image layers are diffed as part of `FrameDiff`; stale physical image IDs are explicitly deleted before visible current layers are replayed. A frame diff carries changed, currently visible, and removed image submissions so placeholder backends can clear old cell regions before text output and restore current placeholders afterward.
+Image and placeholder layers are diffed as part of `FrameDiff`; stale physical image IDs are explicitly deleted before visible current layers are replayed. A frame diff carries changed, currently visible, and removed image submissions plus independently clipped placeholder regions, so a placeholder adapter can clear old cell regions before text output and restore only the composed, non-occluded result afterward.
 
 The scene should carry clipping and ownership metadata. Every image placement should include its owning `SessionId` or a derived resource namespace so the compositor can reject cross-session references during development.
 
@@ -409,8 +414,9 @@ The core should be testable without a real terminal:
   Unicode-placeholder cells, tmux passthrough escaping, and textual fallback;
 - a bounded headless Kitty stream model that semantically parses APC/CSI/SGR,
   tmux unwrapping, chunk reassembly, resources, placements, placement-ID
-  replacement, z-order, deletion, placeholder references, malformed sequences,
-  and bounded input rejection;
+  replacement, z-order, placeholder references, viewport clipping, z-index
+  occlusion, randomized chunk boundaries, malformed sequences, bounded input
+  rejection, and delete-acknowledgement acceptance;
 - acknowledgement-routing tests for upload success/failure, deferred deletion,
   delete acknowledgement, resource retirement, and bounded graphics metrics;
 - fuzz targets and retained seed corpora for TOML migration, plugin manifests, Kitty APC chunking, and sixel encoding;

@@ -541,9 +541,9 @@ Reference material:
 - [x] Add a typed capability result with graphics mode, capability source,
   confidence, and placeholder support metadata; terminal-name hints are now
   explicitly distinguishable from active confirmation.
-- [ ] Define the complete stable mode set: `disabled`, `direct`,
-  `unicode_placeholder`, `passthrough`, and `fallback`. The current runtime
-  implements the first three and documents the remaining adapter boundary.
+- [x] Define the complete stable mode set: `disabled`, `direct`,
+  `unicode_placeholder`, `passthrough`, and `fallback`. The typed runtime and
+  capability metadata expose all five modes.
 - [x] Add a bounded active outer-terminal probe containing Kitty graphics, DA1,
   and pixel-size queries, with response correlation and timeout/rejection
   outcomes. Automatic outer-input demultiplexing is still required to wire this
@@ -556,7 +556,7 @@ Reference material:
 
 ### Workstream 2 — Protocol adapter and response broker
 
-- [ ] Introduce a `GraphicsProtocolAdapter` that parses Kitty APC, C1 APC where
+- [x] Introduce a `GraphicsProtocolAdapter` that parses Kitty APC, C1 APC where
   applicable, and tmux-style DCS passthrough wrappers without mixing parsing with
   resource storage or backend output.
 - [ ] Support protocol fields needed for conformance: compression, source crops,
@@ -570,13 +570,14 @@ Reference material:
   child session or vice versa.
 - [x] Add a bounded outer-input demultiplexer that preserves keyboard/CSI input,
   handles split probe responses, and routes only graphics replies to the probe.
-- [ ] Replace the current crossterm-reader integration point with a process-wide
+- [x] Replace the current crossterm-reader integration point with a process-wide
   raw-input owner so the demultiplexer is fed automatically without competing
   for stdin.
 - [ ] Define unsupported-transfer behavior so `t=f`/`t=s` negotiation reliably
   falls back to direct stream mode without claiming that an image was displayed.
 - [ ] Add malformed-sequence recovery and cancellation so one bad graphics command
-  cannot fail an otherwise healthy terminal widget.
+  cannot fail an otherwise healthy terminal widget. Framing recovery is complete;
+  cancellation remains pending.
 
 ### Workstream 3 — Logical graphics state and geometry
 
@@ -601,18 +602,18 @@ Reference material:
 
 ### Workstream 4 — Scene and compositor integration
 
-- [ ] Make image/placeholder primitives first-class scene data with ownership,
+- [x] Make image/placeholder primitives first-class scene data with ownership,
   clipping, occlusion, and z-order semantics; backend emission must not bypass
   overlay and surface composition.
-- [ ] Represent placeholder graphemes/combining marks as a backend-neutral
+- [x] Represent placeholder graphemes/combining marks as a backend-neutral
   primitive or validated cell cluster rather than writing invisible text directly
   after the frame.
-- [ ] Diff old/current visible graphics, placeholder regions, and resource uploads
+- [x] Diff old/current visible graphics, placeholder regions, and resource uploads
   independently. Clear stale placeholders before text restoration and reapply only
   the visible, non-occluded result.
-- [ ] Define ordering for overlays, negative/positive image z-index, cell
+- [x] Define ordering for overlays, negative/positive image z-index, cell
   backgrounds, text, and multiple overlapping images.
-- [ ] Ensure zero-area, clipped, hidden, tab-switched, and pane-moved surfaces
+- [x] Ensure zero-area, clipped, hidden, tab-switched, and pane-moved surfaces
   cannot emit graphics outside their assigned scene.
 
 ### Workstream 5 — Outer-terminal adapters
@@ -667,7 +668,9 @@ Reference material:
 - [x] Add a bounded headless Kitty stream model that unwraps passthrough, parses
   APC/CSI/SGR output, reassembles chunks, and semantically validates resources,
   placements, placement-ID replacement, z-order, deletion, placeholder
-  references, malformed sequences, and bounded input rejection.
+  references, viewport clipping, z-index occlusion, randomized chunk
+  boundaries, malformed sequences, bounded input rejection, and delete-
+  acknowledgement acceptance.
 - [ ] Add a headless or capture-based outer-terminal harness that verifies the
   emitted stream is accepted by Kitty; add Ghostty/WezTerm/Sixel/inline-image
   cases only where the advertised capability is verified.
@@ -818,7 +821,7 @@ or plugin boundaries.
 | Terminal session ownership | One emulator and graphics store for each terminal tab/session | Prevents state and image-ID cross-contamination |
 | Rendering | Retained, backend-neutral scene composed into complete frames | Makes widgets modular and tab restoration deterministic |
 | Widget extensibility | Versioned manifest plus opt-in Wasmtime host | Keeps untrusted widget execution isolated and avoids exposing Rust's unstable ABI or terminal handles |
-| Graphics | Session-owned Kitty adapter with direct replay, Unicode-placeholder mode, typed active probing, a child/outer response broker, and scroll-aware grid anchors | Keeps child protocol handling isolated, makes outer capability evidence explicit, and lets placements follow primary-screen content; scroll-region and automatic outer-input routing remain follow-up work |
+| Graphics | Session-owned Kitty adapter with a bounded protocol framer, direct replay, Unicode-placeholder mode, typed active probing, a child/outer response broker, a process-wide raw-input owner, and scroll-aware grid anchors | Keeps child protocol handling isolated, makes outer capability evidence explicit, lets placements follow primary-screen content, and prevents outer acknowledgements from competing with keyboard input |
 | Async model | Coordinator/UI owner plus per-session I/O tasks | Keeps frame submission serialized while PTYs remain responsive |
 | Configuration | TOML with checked-in `config/default.toml` and `docs/CONFIGURATION.md` | Makes the embedded fallback discoverable while keeping schema evolution explicit |
 | Default configuration discovery | Explicit CLI path, user config, example/default file, embedded fallback | Preserves safe startup while giving users an editable starting point |

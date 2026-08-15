@@ -217,6 +217,52 @@ impl GraphicsPlacement {
     }
 }
 
+/// A backend-neutral placeholder region derived from a logical graphics
+/// placement. The compositor carries this separately from the image resource;
+/// an adapter may later encode it as Kitty combining-mark cells or another
+/// terminal-specific representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphicsPlaceholderLayer {
+    resource: GraphicsResourceId,
+    area: Rect,
+    z_index: i16,
+}
+
+impl GraphicsPlaceholderLayer {
+    pub const fn new(resource: GraphicsResourceId, area: Rect, z_index: i16) -> Self {
+        Self {
+            resource,
+            area,
+            z_index,
+        }
+    }
+
+    pub const fn resource(&self) -> GraphicsResourceId {
+        self.resource
+    }
+
+    pub const fn area(&self) -> Rect {
+        self.area
+    }
+
+    pub const fn z_index(&self) -> i16 {
+        self.z_index
+    }
+
+    pub fn from_submission(submission: &GraphicsSubmission) -> Self {
+        Self::new(
+            submission.resource(),
+            submission.placement().area(),
+            submission.placement().z_index(),
+        )
+    }
+
+    pub fn clipped_to(&self, clip: Rect) -> Option<Self> {
+        let area = intersect(self.area, clip)?;
+        Some(Self { area, ..*self })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphicsSubmission {
     resource: GraphicsResourceId,
@@ -322,6 +368,261 @@ impl GraphicsProtocolBroker {
 pub enum OuterInputEvent {
     GraphicsResponse(Vec<u8>),
     TerminalInput(Vec<u8>),
+}
+
+/// A Kitty command after terminal framing has been removed.
+///
+/// This is deliberately independent of `SessionGraphicsStore`: the adapter
+/// owns byte-stream framing and bounded input, while the store owns Kitty
+/// resource semantics and retained state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphicsProtocolCommand {
+    parameters: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+impl GraphicsProtocolCommand {
+    pub fn new(parameters: Vec<u8>, payload: Vec<u8>) -> Self {
+        Self {
+            parameters,
+            payload,
+        }
+    }
+
+    pub fn parameters(&self) -> &[u8] {
+        &self.parameters
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GraphicsProtocolEvent {
+    Plain(Vec<u8>),
+    Command(GraphicsProtocolCommand),
+    Malformed { bytes: Vec<u8>, reason: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GraphicsProtocolError {
+    InputTooLarge,
+    PayloadTooLarge,
+    UnterminatedSequence,
+}
+
+/// Bounded, incremental Kitty framing for child and passthrough streams.
+///
+/// Supported framing includes 7-bit APC (`ESC _ G`), C1 APC (`0x9f`), C1 ST
+/// (`0x9c`), and tmux's `DCS tmux;` wrapper with doubled ESC bytes. It does not
+/// interpret Kitty parameters or store image data; callers can therefore test
+/// protocol framing independently from a terminal emulator and resource store.
+#[derive(Clone, Debug)]
+pub struct GraphicsProtocolAdapter {
+    pending: Vec<u8>,
+    max_input_bytes: usize,
+    max_payload_bytes: usize,
+}
+
+impl Default for GraphicsProtocolAdapter {
+    fn default() -> Self {
+        Self::new(4 * 1024 * 1024, 2 * 1024 * 1024)
+    }
+}
+
+impl GraphicsProtocolAdapter {
+    pub fn new(max_input_bytes: usize, max_payload_bytes: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            max_input_bytes: max_input_bytes.max(64),
+            max_payload_bytes: max_payload_bytes.max(1),
+        }
+    }
+
+    pub fn pending_bytes(&self) -> &[u8] {
+        &self.pending
+    }
+
+    pub fn feed(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Vec<GraphicsProtocolEvent>, GraphicsProtocolError> {
+        if self.pending.len().saturating_add(bytes.len()) > self.max_input_bytes {
+            self.pending.clear();
+            return Err(GraphicsProtocolError::InputTooLarge);
+        }
+        self.pending.extend_from_slice(bytes);
+        let (events, consumed) =
+            match parse_protocol_buffer(&self.pending, self.max_payload_bytes, false) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    self.pending.clear();
+                    return Err(error);
+                }
+            };
+        if consumed > 0 {
+            self.pending.drain(..consumed);
+        }
+        Ok(events)
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<GraphicsProtocolEvent>, GraphicsProtocolError> {
+        let events = self.feed(&[])?;
+        if self.pending.is_empty() {
+            Ok(events)
+        } else {
+            Err(GraphicsProtocolError::UnterminatedSequence)
+        }
+    }
+}
+
+fn parse_protocol_buffer(
+    buffer: &[u8],
+    max_payload_bytes: usize,
+    _nested: bool,
+) -> Result<(Vec<GraphicsProtocolEvent>, usize), GraphicsProtocolError> {
+    const APC: &[u8] = b"\x1b_G";
+    const TMUX: &[u8] = b"\x1bPtmux;";
+    let mut events = Vec::new();
+    let mut index = 0;
+
+    while index < buffer.len() {
+        let next = [
+            find_sequence(&buffer[index..], APC),
+            buffer[index..].iter().position(|byte| *byte == 0x9f),
+            find_sequence(&buffer[index..], TMUX),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let Some(offset) = next else {
+            let keep = partial_protocol_prefix_len(&buffer[index..]);
+            let plain_end = buffer.len().saturating_sub(keep);
+            if plain_end > index {
+                events.push(GraphicsProtocolEvent::Plain(
+                    buffer[index..plain_end].to_vec(),
+                ));
+            }
+            return Ok((events, plain_end));
+        };
+        let start = index + offset;
+        if start > index {
+            events.push(GraphicsProtocolEvent::Plain(buffer[index..start].to_vec()));
+        }
+
+        if buffer[start..].starts_with(TMUX) {
+            let body_start = start + TMUX.len();
+            let Some((body_end, terminator_len)) = find_tmux_terminator(&buffer[body_start..])
+            else {
+                return Ok((events, start));
+            };
+            let mut inner = Vec::with_capacity(body_end);
+            let mut cursor = 0;
+            while cursor < body_end {
+                if buffer[body_start + cursor..].starts_with(b"\x1b\x1b") {
+                    inner.push(0x1b);
+                    cursor += 2;
+                } else {
+                    inner.push(buffer[body_start + cursor]);
+                    cursor += 1;
+                }
+            }
+            let (inner_events, inner_consumed) =
+                parse_protocol_buffer(&inner, max_payload_bytes, true)?;
+            if inner_consumed != inner.len() {
+                events.push(GraphicsProtocolEvent::Malformed {
+                    bytes: inner,
+                    reason: "tmux passthrough contained an incomplete Kitty command".to_owned(),
+                });
+            } else {
+                events.extend(inner_events);
+            }
+            index = body_start + body_end + terminator_len;
+            continue;
+        }
+
+        let (body_start, c1) = if buffer[start..].starts_with(b"\x9f") {
+            (start + 1, true)
+        } else {
+            (start + APC.len(), false)
+        };
+        let terminator = if c1 {
+            find_c1_terminator(&buffer[body_start..]).map(|end| (end, 1))
+        } else {
+            find_sequence(&buffer[body_start..], b"\x1b\\").map(|end| (end, 2))
+        };
+        let Some((body_end, terminator_len)) = terminator else {
+            return Ok((events, start));
+        };
+        let body = &buffer[body_start..body_start + body_end];
+        if body.len() > max_payload_bytes {
+            return Err(GraphicsProtocolError::PayloadTooLarge);
+        }
+        let Some(separator) = body.iter().position(|byte| *byte == b';') else {
+            events.push(GraphicsProtocolEvent::Malformed {
+                bytes: buffer[start..body_start + body_end + terminator_len].to_vec(),
+                reason: "Kitty APC has no parameter/payload separator".to_owned(),
+            });
+            index = body_start + body_end + terminator_len;
+            continue;
+        };
+        let payload = &body[separator + 1..];
+        if payload.len() > max_payload_bytes {
+            return Err(GraphicsProtocolError::PayloadTooLarge);
+        }
+        events.push(GraphicsProtocolEvent::Command(
+            GraphicsProtocolCommand::new(body[..separator].to_vec(), payload.to_vec()),
+        ));
+        index = body_start + body_end + terminator_len;
+    }
+
+    Ok((events, index))
+}
+
+fn find_sequence(buffer: &[u8], sequence: &[u8]) -> Option<usize> {
+    buffer
+        .windows(sequence.len())
+        .position(|window| window == sequence)
+}
+
+fn find_c1_terminator(buffer: &[u8]) -> Option<usize> {
+    buffer.iter().position(|byte| *byte == 0x9c)
+}
+
+fn find_tmux_terminator(buffer: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index < buffer.len() {
+        if buffer[index] == 0x1b {
+            if buffer.get(index + 1) == Some(&0x1b) {
+                index += 2;
+            } else if buffer.get(index + 1) == Some(&b'\\') {
+                return Some((index, 2));
+            } else {
+                index += 1;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+fn partial_protocol_prefix_len(buffer: &[u8]) -> usize {
+    [
+        b"\x1b_G".as_slice(),
+        b"\x1bPtmux;".as_slice(),
+        b"\x9f".as_slice(),
+    ]
+    .into_iter()
+    .map(|prefix| {
+        (1..prefix.len().min(buffer.len() + 1))
+            .rev()
+            .find(|length| buffer.ends_with(&prefix[..*length]))
+            .unwrap_or(0)
+    })
+    .max()
+    .unwrap_or(0)
 }
 
 /// Splits raw outer-terminal input into probe responses and bytes that belong
@@ -1187,8 +1488,14 @@ fn placement_dimension(
             .map(|value| value.max(1))
             .map_err(|_| GraphicsError::InvalidParameter(value.clone()));
     }
-    if pixels == 0 || cell_pixels == 0 {
+    if pixels == 0 {
         return Ok(1);
+    }
+    // Pixel-size ioctls are unavailable on a number of terminals. Preserve
+    // known natural geometry instead of collapsing the placement to 1x1; the
+    // backend can later refine this estimate when a cell size is available.
+    if cell_pixels == 0 {
+        return Ok(pixels.min(u32::from(u16::MAX)) as u16);
     }
     Ok(pixels
         .div_ceil(u32::from(cell_pixels))
@@ -1320,6 +1627,79 @@ fn intersect_signed(first: (i32, i32, u16, u16), second: Rect) -> Option<Rect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_adapter_handles_split_apc_and_c1_apc() {
+        let mut adapter = GraphicsProtocolAdapter::new(1024, 128);
+        assert!(adapter.feed(b"text\x1b_Ga=T,f=24,i=1;AQ").unwrap().len() >= 1);
+        let events = adapter.feed(b"ID\x1b\\\x9fa=p,i=1;\x9c").unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GraphicsProtocolEvent::Command(command) if command.parameters() == b"a=T,f=24,i=1"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GraphicsProtocolEvent::Command(command) if command.parameters() == b"a=p,i=1"
+        )));
+        assert!(adapter.pending_bytes().is_empty());
+    }
+
+    #[test]
+    fn protocol_adapter_unwraps_tmux_and_reports_incomplete_finish() {
+        let command = b"\x1b_Ga=T,f=24,i=2;AQID\x1b\\";
+        let mut stream = b"\x1bPtmux;".to_vec();
+        for byte in command {
+            if *byte == 0x1b {
+                stream.push(0x1b);
+            }
+            stream.push(*byte);
+        }
+        stream.extend_from_slice(b"\x1b\\");
+
+        let mut adapter = GraphicsProtocolAdapter::new(1024, 128);
+        let events = adapter.feed(&stream).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GraphicsProtocolEvent::Command(command) if command.parameters() == b"a=T,f=24,i=2"
+        )));
+
+        let mut incomplete = GraphicsProtocolAdapter::new(1024, 128);
+        incomplete.feed(b"\x1b_Ga=T;AQID").unwrap();
+        assert_eq!(
+            incomplete.finish(),
+            Err(GraphicsProtocolError::UnterminatedSequence)
+        );
+    }
+
+    #[test]
+    fn protocol_adapter_rejects_bounded_payloads_without_storage_side_effects() {
+        let mut adapter = GraphicsProtocolAdapter::new(64, 4);
+        assert_eq!(
+            adapter.feed(b"\x1b_Ga=T;AQIDBAUG\x1b\\"),
+            Err(GraphicsProtocolError::PayloadTooLarge)
+        );
+        assert!(adapter.pending_bytes().is_empty());
+    }
+
+    #[test]
+    fn natural_geometry_survives_missing_cell_size() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(22));
+        let gif = b"GIF89a\x03\x00\x02\x00";
+        store
+            .apply_kitty_command_with_context(
+                b"a=T,f=100,i=22,q=2",
+                &encode_base64_for_test(gif),
+                (0, 0),
+                (0, 0),
+            )
+            .unwrap();
+        assert_eq!(
+            store.visible_submissions(Rect::new(0, 0, 8, 8))[0]
+                .placement()
+                .area(),
+            Rect::new(0, 0, 3, 2)
+        );
+    }
 
     #[test]
     fn resources_and_placements_are_namespaced_by_session() {

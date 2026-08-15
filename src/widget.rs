@@ -13,7 +13,7 @@ use crate::{
     animation::{AnimationFrame, AnimationSettings},
     appearance::Theme,
     config::{AppConfig, LabelPolicy, WidgetInstanceConfig},
-    graphics::GraphicsSubmission,
+    graphics::{GraphicsPlaceholderLayer, GraphicsSubmission},
     plugin::PluginRegistry,
     scene::{CellStyle, Color, Scene},
     session::{SessionWakeup, TerminalSession, TerminalSize},
@@ -852,6 +852,9 @@ impl WidgetRuntime {
                     scene.apply_motion(animation.transition_progress);
                 }
                 for graphics in entry.widget.graphics(area) {
+                    scene.add_placeholder_layer(GraphicsPlaceholderLayer::from_submission(
+                        &graphics,
+                    ));
                     scene.add_image_layer(graphics);
                 }
                 #[cfg(feature = "sixel")]

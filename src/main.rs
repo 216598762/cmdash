@@ -14,8 +14,8 @@ use std::{
 
 use cmdash::{
     ApiServer, AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend,
-    GraphicsSubmissionStatus, SessionWakeup, Surface, SurfaceCommand, SurfaceId,
-    TerminalWindowSize, UiEvent, WidgetRegistry, WidgetRuntimeContext,
+    GraphicsInputDemultiplexer, GraphicsSubmissionStatus, OuterInputEvent, SessionWakeup, Surface,
+    SurfaceCommand, SurfaceId, TerminalWindowSize, UiEvent, WidgetRegistry, WidgetRuntimeContext,
     dashboard::{
         render_static_dashboard_shell_with_theme,
         render_static_dashboard_surface_scenes_with_theme, static_dashboard_surface_areas,
@@ -24,9 +24,12 @@ use cmdash::{
     reload::ConfigReloader,
     ui_event_channel,
 };
-use crossterm::event::{self, Event};
+#[cfg(not(target_os = "linux"))]
+use crossterm::event;
+use crossterm::event::Event;
 
 const MAX_EVENTS_PER_BATCH: usize = 32;
+#[cfg(not(target_os = "linux"))]
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
@@ -229,10 +232,12 @@ where
         let scene = compositor.compose(area, state, &base, &surface_scenes);
         let diff = compositor.diff(&scene);
         backend.submit_diff(&diff)?;
-        let graphics_status = backend.submit_graphics(
+        let graphics_status = backend.submit_graphics_frame(
             diff.graphics(),
             diff.visible_graphics(),
             diff.removed_graphics(),
+            diff.visible_placeholders(),
+            diff.removed_placeholders(),
         )?;
         if !graphics_status.is_successful()
             && graphics_status.placements() > 0
@@ -276,6 +281,7 @@ where
         }
 
         if dispatch_available_events(
+            backend,
             state,
             context.event_receiver,
             context.pty_wakeup,
@@ -425,6 +431,7 @@ fn apply_api_cli_overrides(config: &mut AppConfig, args: &[String]) -> io::Resul
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn spawn_input_reader(sender: Sender<UiEvent>) -> InputReader {
     let cancellation = Arc::new(AtomicBool::new(false));
     let thread_cancellation = Arc::clone(&cancellation);
@@ -455,6 +462,208 @@ fn spawn_input_reader(sender: Sender<UiEvent>) -> InputReader {
         cancellation,
         handle: Some(handle),
     }
+}
+
+/// Linux input owner that reads `/dev/tty` once, demultiplexes outer graphics
+/// replies, and only then decodes terminal input. This avoids crossterm and a
+/// graphics probe competing for the same process-wide input stream.
+#[cfg(target_os = "linux")]
+fn spawn_input_reader(sender: Sender<UiEvent>) -> InputReader {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let thread_cancellation = Arc::clone(&cancellation);
+    let handle = thread::spawn(move || {
+        let mut tty = match std::fs::OpenOptions::new().read(true).open("/dev/tty") {
+            Ok(tty) => tty,
+            Err(error) => {
+                let _ = sender.send(UiEvent::InputError(format!(
+                    "could not open /dev/tty: {error}"
+                )));
+                return;
+            }
+        };
+        let mut demultiplexer = GraphicsInputDemultiplexer::default();
+        let mut bytes = [0_u8; 4096];
+        while !thread_cancellation.load(Ordering::Acquire) {
+            let mut poll_fd = PollFd {
+                fd: std::os::fd::AsRawFd::as_raw_fd(&tty),
+                events: 1,
+                revents: 0,
+            };
+            let ready = unsafe { poll(&mut poll_fd, 1, 100) };
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                let _ = sender.send(UiEvent::InputError(io::Error::last_os_error().to_string()));
+                break;
+            }
+            if ready == 0 {
+                continue;
+            }
+            let length = match tty.read(&mut bytes) {
+                Ok(length) => length,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    let _ = sender.send(UiEvent::InputError(error.to_string()));
+                    break;
+                }
+            };
+            if length == 0 {
+                break;
+            }
+            for event in demultiplexer.feed(&bytes[..length]) {
+                match event {
+                    OuterInputEvent::GraphicsResponse(bytes) => {
+                        if sender.send(UiEvent::OuterInput(bytes)).is_err() {
+                            return;
+                        }
+                    }
+                    OuterInputEvent::TerminalInput(bytes) => {
+                        for event in decode_terminal_input(&bytes) {
+                            if sender.send(UiEvent::Input(event)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    InputReader {
+        cancellation,
+        handle: Some(handle),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn decode_terminal_input(bytes: &[u8]) -> Vec<Event> {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut events = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b {
+            if bytes.get(index + 1) == Some(&b'[')
+                && let Some(final_offset) = bytes[index + 2..]
+                    .iter()
+                    .position(|byte| (0x40..=0x7e).contains(byte))
+            {
+                let final_index = index + 2 + final_offset;
+                let sequence = &bytes[index + 2..=final_index];
+                if let Some(mouse) = decode_sgr_mouse(sequence) {
+                    events.push(mouse);
+                    index = final_index + 1;
+                    continue;
+                }
+                let code = match sequence.last().copied() {
+                    Some(b'A') => Some(KeyCode::Up),
+                    Some(b'B') => Some(KeyCode::Down),
+                    Some(b'C') => Some(KeyCode::Right),
+                    Some(b'D') => Some(KeyCode::Left),
+                    Some(b'H') => Some(KeyCode::Home),
+                    Some(b'F') => Some(KeyCode::End),
+                    Some(b'Z') => Some(KeyCode::BackTab),
+                    Some(b'~') if sequence.starts_with(b"1;") => Some(KeyCode::Home),
+                    Some(b'~') if sequence.starts_with(b"4;") => Some(KeyCode::End),
+                    Some(b'~') => Some(KeyCode::Delete),
+                    _ => None,
+                };
+                if let Some(code) = code {
+                    events.push(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+                }
+                index = final_index + 1;
+                continue;
+            }
+            events.push(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+            index += 1;
+            continue;
+        }
+        let byte = bytes[index];
+        if byte == b'\r' || byte == b'\n' {
+            events.push(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )));
+            index += 1;
+            continue;
+        }
+        if byte == b'\t' {
+            events.push(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+            index += 1;
+            continue;
+        }
+        if byte < 0x20 {
+            let character = (byte.saturating_sub(1) + b'a') as char;
+            events.push(Event::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::CONTROL,
+            )));
+            index += 1;
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes[index..]);
+        let Some(character) = text.chars().next() else {
+            break;
+        };
+        events.push(Event::Key(KeyEvent::new(
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+        )));
+        index += character.len_utf8();
+    }
+    events
+}
+
+#[cfg(target_os = "linux")]
+fn decode_sgr_mouse(sequence: &[u8]) -> Option<Event> {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    if !sequence.starts_with(b"<") || !matches!(sequence.last(), Some(b'M' | b'm')) {
+        return None;
+    }
+    let body = std::str::from_utf8(&sequence[1..sequence.len().saturating_sub(1)]).ok()?;
+    let mut values = body.split(';');
+    let button = values.next()?.parse::<u16>().ok()?;
+    let column = values.next()?.parse::<u16>().ok()?.saturating_sub(1);
+    let row = values.next()?.parse::<u16>().ok()?.saturating_sub(1);
+    let modifiers = KeyModifiers::from_bits_truncate(
+        (u8::from(button & 4 != 0) * KeyModifiers::SHIFT.bits())
+            | (u8::from(button & 8 != 0) * KeyModifiers::ALT.bits())
+            | (u8::from(button & 16 != 0) * KeyModifiers::CONTROL.bits()),
+    );
+    let base = button & 3;
+    let kind = if button & 64 != 0 {
+        match base {
+            0 => MouseEventKind::ScrollUp,
+            1 => MouseEventKind::ScrollDown,
+            2 => MouseEventKind::ScrollLeft,
+            _ => MouseEventKind::ScrollRight,
+        }
+    } else if button & 32 != 0 {
+        MouseEventKind::Drag(match base {
+            1 => MouseButton::Middle,
+            2 => MouseButton::Right,
+            _ => MouseButton::Left,
+        })
+    } else if sequence.ends_with(b"m") {
+        MouseEventKind::Up(match base {
+            1 => MouseButton::Middle,
+            2 => MouseButton::Right,
+            _ => MouseButton::Left,
+        })
+    } else {
+        MouseEventKind::Down(match base {
+            1 => MouseButton::Middle,
+            2 => MouseButton::Right,
+            _ => MouseButton::Left,
+        })
+    };
+    Some(Event::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers,
+    }))
 }
 
 fn spawn_maintenance_waker(sender: Sender<UiEvent>) -> MaintenanceWaker {
@@ -511,7 +720,8 @@ fn spawn_maintenance_waker(sender: Sender<UiEvent>) -> MaintenanceWaker {
     }
 }
 
-fn dispatch_available_events(
+fn dispatch_available_events<B: Backend<Error = io::Error>>(
+    backend: &mut B,
     state: &mut AppState,
     event_receiver: &Receiver<UiEvent>,
     pty_wakeup: &SessionWakeup,
@@ -520,6 +730,7 @@ fn dispatch_available_events(
 ) -> io::Result<bool> {
     let mut events = Vec::with_capacity(MAX_EVENTS_PER_BATCH);
     collect_ui_event(
+        backend,
         state,
         event_receiver
             .recv()
@@ -530,7 +741,7 @@ fn dispatch_available_events(
 
     while events.len() < MAX_EVENTS_PER_BATCH {
         match event_receiver.try_recv() {
-            Ok(event) => collect_ui_event(state, event, &mut events, pty_wakeup)?,
+            Ok(event) => collect_ui_event(backend, state, event, &mut events, pty_wakeup)?,
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
                 return Err(io::Error::other("input and PTY event channel disconnected"));
@@ -541,7 +752,8 @@ fn dispatch_available_events(
     dispatch_event_batch(state, registry, reloader, events)
 }
 
-fn collect_ui_event(
+fn collect_ui_event<B: Backend<Error = io::Error>>(
+    backend: &mut B,
     state: &mut AppState,
     event: UiEvent,
     events: &mut Vec<Event>,
@@ -549,6 +761,12 @@ fn collect_ui_event(
 ) -> io::Result<()> {
     match event {
         UiEvent::Input(event) => events.push(event),
+        UiEvent::OuterInput(bytes) => {
+            let batch = backend.feed_outer_input(&bytes);
+            if let Some(error) = batch.graphics_error {
+                state.record_diagnostic(format!("outer graphics input rejected: {error}"));
+            }
+        }
         UiEvent::PtyOutput => pty_wakeup.clear_pending(),
         UiEvent::Tick => {}
         UiEvent::ApiWakeup => {}
@@ -753,6 +971,23 @@ mod tests {
 
     fn tab_event() -> Event {
         Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_input_decoder_keeps_graphics_out_of_keyboard_events() {
+        let mut demux = GraphicsInputDemultiplexer::default();
+        let events = demux.feed(b"q\x1b_Gi=7;OK\x1b\\\x1b[A");
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], OuterInputEvent::TerminalInput(_)));
+        assert!(matches!(events[1], OuterInputEvent::GraphicsResponse(_)));
+        assert!(matches!(events[2], OuterInputEvent::TerminalInput(_)));
+
+        let decoded = decode_terminal_input(b"q\x1b[A\r");
+        assert_eq!(decoded.len(), 3);
+        assert!(matches!(decoded[0], Event::Key(_)));
+        assert!(matches!(decoded[1], Event::Key(_)));
+        assert!(matches!(decoded[2], Event::Key(_)));
     }
 
     #[test]

@@ -56,6 +56,59 @@ fn assert_rendered(status: GraphicsSubmissionStatus, resources: usize, placement
     );
 }
 
+fn replay_in_chunks(
+    bytes: &[u8],
+    seed: u64,
+    viewport: Option<(u16, u16)>,
+) -> Result<HeadlessKittyTerminal, String> {
+    let mut terminal = HeadlessKittyTerminal::with_viewport(viewport);
+    let mut state = seed;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let chunk_length = 1 + (state as usize % 23);
+        let end = offset.saturating_add(chunk_length).min(bytes.len());
+        terminal.feed(&bytes[offset..end])?;
+        offset = end;
+    }
+    terminal.finish()?;
+    Ok(terminal)
+}
+
+fn assert_random_chunk_boundaries_preserve_semantics(
+    bytes: &[u8],
+    viewport: Option<(u16, u16)>,
+    image_ids: &[u32],
+) {
+    let expected = HeadlessKittyTerminal::replay_with_viewport(bytes, viewport).unwrap();
+    for seed in [1, 7, 0xC0FFEE, u64::MAX - 1, 0x5EED_1234] {
+        let actual = replay_in_chunks(bytes, seed, viewport)
+            .unwrap_or_else(|error| panic!("chunked replay failed for seed {seed}: {error}"));
+        assert_eq!(actual.actions(), expected.actions(), "seed {seed}");
+        assert_eq!(actual.text(), expected.text(), "seed {seed}");
+        assert_eq!(actual.placements(), expected.placements(), "seed {seed}");
+        assert_eq!(
+            actual.placeholder_cells(),
+            expected.placeholder_cells(),
+            "seed {seed}"
+        );
+        assert_eq!(
+            actual.resource_count(),
+            expected.resource_count(),
+            "seed {seed}"
+        );
+        for image_id in image_ids {
+            assert_eq!(
+                actual.resource_payload(*image_id),
+                expected.resource_payload(*image_id),
+                "seed {seed}, image {image_id}"
+            );
+        }
+    }
+}
+
 #[test]
 fn headless_model_reassembles_chunked_kitty_uploads() {
     let stream = b"\x1b[1;1H\x1b_Ga=T,f=24,i=21,c=1,r=1,m=1;AQ\x1b\\\x1b_Gm=0;ID\x1b\\";
@@ -65,6 +118,29 @@ fn headless_model_reassembles_chunked_kitty_uploads() {
     assert_eq!(model.resource_count(), 1);
     assert_eq!(model.placement_count(), 1);
     assert_eq!(model.resource_payload(21), Some(&b"AQID"[..]));
+}
+
+#[test]
+fn randomized_chunk_boundaries_preserve_headless_kitty_semantics() {
+    let chunked = b"\x1b[1;1H\x1b_Ga=T,f=24,i=21,c=1,r=1,m=1;AQ\x1b\\\x1b_Gm=0;ID\x1b\\text";
+    assert_random_chunk_boundaries_preserve_semantics(chunked, None, &[21]);
+
+    let command = b"\x1b_Ga=T,f=24,i=22,c=1,r=1,q=2,m=0;BAUG\x1b\\";
+    let mut passthrough = b"\x1b[2;2H\x1bPtmux;".to_vec();
+    for byte in command {
+        if *byte == 0x1b {
+            passthrough.push(0x1b);
+        }
+        passthrough.push(*byte);
+    }
+    passthrough.extend_from_slice(b"\x1b\\");
+    assert_random_chunk_boundaries_preserve_semantics(&passthrough, None, &[22]);
+
+    let placeholder = "\u{10eeee}\u{305}\u{305}\u{305}";
+    let mut placeholder_stream =
+        b"\x1b_Ga=T,f=24,i=41,c=1,r=1,U=1,z=-2;AQID\x1b\\\x1b[38;2;0;0;41m\x1b[1;1H".to_vec();
+    placeholder_stream.extend_from_slice(placeholder.as_bytes());
+    assert_random_chunk_boundaries_preserve_semantics(&placeholder_stream, Some((1, 1)), &[41]);
 }
 
 #[test]
@@ -93,6 +169,36 @@ fn headless_model_validates_z_order_and_placement_id_replacement() {
         vec![-2, 0, 10]
     );
     assert_eq!(model.actions(), &["transmit", "place", "place", "place"]);
+}
+
+#[test]
+fn headless_model_validates_placeholder_clipping_and_z_index_occlusion() {
+    let placeholder = "\u{10eeee}\u{305}\u{305}\u{305}";
+    let mut stream = b"\x1b_Ga=T,f=24,i=41,c=2,r=1,U=1,z=-3;AQID\x1b\\".to_vec();
+    stream.extend_from_slice(b"\x1b_Ga=T,f=24,i=42,c=2,r=1,U=1,z=7;BAUG\x1b\\");
+    stream.extend_from_slice(b"\x1b[38;2;0;0;41m\x1b[1;1H");
+    stream.extend_from_slice(placeholder.as_bytes());
+    stream.extend_from_slice(b"\x1b[38;2;0;0;42m\x1b[1;1H");
+    stream.extend_from_slice(placeholder.as_bytes());
+    stream.extend_from_slice(b"\x1b[38;2;0;0;41m\x1b[1;3H");
+    stream.extend_from_slice(placeholder.as_bytes());
+
+    let model = HeadlessKittyTerminal::replay_with_viewport(&stream, Some((2, 1))).unwrap();
+
+    assert_eq!(model.placeholder_count(), 3);
+    assert_eq!(
+        model
+            .placeholder_cells()
+            .iter()
+            .map(|cell| (cell.image_id, cell.x, cell.y))
+            .collect::<Vec<_>>(),
+        vec![(41, 0, 0), (42, 0, 0), (41, 2, 0)]
+    );
+    let visible = model.visible_placeholder_cells();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].image_id, 42);
+    assert_eq!(visible[0].z, 7);
+    assert_eq!((visible[0].x, visible[0].y), (0, 0));
 }
 
 #[test]
@@ -311,6 +417,50 @@ fn passthrough_adapter_matches_captured_escaped_stream() {
     assert_eq!(model.actions(), &["transmit"]);
     assert_eq!(model.resource_count(), 1);
     assert_eq!(model.placement_count(), 1);
+}
+
+#[test]
+fn headless_terminal_accepts_delete_and_returns_a_kitty_acknowledgement() {
+    let submission = captured_submission(14, 1, 1);
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+    backend
+        .submit_graphics(
+            std::slice::from_ref(&submission),
+            std::slice::from_ref(&submission),
+            &[],
+        )
+        .unwrap();
+
+    let mut terminal = HeadlessKittyTerminal::with_viewport(None);
+    terminal.feed(backend.writer()).unwrap();
+    terminal.finish().unwrap();
+    assert_eq!(terminal.resource_count(), 1);
+    assert!(terminal.acknowledgements().is_empty());
+
+    let upload_ack = backend.feed_outer_input(b"\x1b_Gi=14;OK\x1b\\");
+    assert_eq!(upload_ack.graphics_acknowledgements.len(), 1);
+    let delete_start = backend.writer().len();
+    backend
+        .submit_graphics(&[], &[], std::slice::from_ref(&submission))
+        .expect("acknowledged resource removal should emit delete");
+    let delete_stream = backend.writer()[delete_start..].to_vec();
+    assert_eq!(delete_stream, b"\x1b_Ga=d,d=i,i=14;\x1b\\");
+
+    terminal.feed(&delete_stream).unwrap();
+    terminal.finish().unwrap();
+    assert_eq!(terminal.resource_count(), 0);
+    assert_eq!(terminal.placement_count(), 0);
+    assert_eq!(terminal.actions(), &["transmit", "delete"]);
+    assert_eq!(
+        terminal.acknowledgements(),
+        &[b"\x1b_Gi=14;OK\x1b\\".to_vec()]
+    );
+
+    let delete_ack = backend.feed_outer_input(&terminal.acknowledgements()[0]);
+    assert_eq!(delete_ack.graphics_acknowledgements.len(), 1);
+    assert!(delete_ack.graphics_acknowledgements[0].success);
+    assert_eq!(backend.metrics().graphics_gc, 1);
 }
 
 #[test]

@@ -27,8 +27,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::{
     appearance::Theme,
     graphics::{
-        GraphicsProtocolBroker, GraphicsScreen, GraphicsScrollRegion, GraphicsSubmission,
-        SessionGraphicsStore, kitty_error_response,
+        GraphicsProtocolAdapter, GraphicsProtocolBroker, GraphicsProtocolEvent, GraphicsScreen,
+        GraphicsScrollRegion, GraphicsSubmission, SessionGraphicsStore, kitty_error_response,
     },
     scene::{CellStyle, Color, Scene},
     state::SessionId,
@@ -124,6 +124,9 @@ impl std::error::Error for SessionError {}
 #[derive(Debug)]
 pub enum UiEvent {
     Input(CrosstermEvent),
+    /// Bytes classified by the process-wide raw-input owner as outer-terminal
+    /// graphics responses, before crossterm's event decoder sees them.
+    OuterInput(Vec<u8>),
     PtyOutput,
     Tick,
     AnimationFrame,
@@ -551,7 +554,7 @@ pub struct TerminalSession {
     failure: Option<String>,
     graphics: SessionGraphicsStore,
     graphics_broker: GraphicsProtocolBroker,
-    graphics_input: Vec<u8>,
+    graphics_protocol: GraphicsProtocolAdapter,
     selection: Option<Selection>,
 }
 
@@ -643,7 +646,7 @@ impl TerminalSession {
             failure: None,
             graphics: SessionGraphicsStore::new(session_id),
             graphics_broker: GraphicsProtocolBroker::default(),
-            graphics_input: Vec::new(),
+            graphics_protocol: GraphicsProtocolAdapter::default(),
             selection: None,
         })
     }
@@ -755,13 +758,20 @@ impl TerminalSession {
     }
 
     fn consume_output(&mut self, bytes: &[u8]) -> Result<bool, SessionError> {
-        self.graphics_input.extend_from_slice(bytes);
-        let (events, remainder) = extract_kitty_events(&self.graphics_input);
-        self.graphics_input = remainder;
+        let events = match self.graphics_protocol.feed(bytes) {
+            Ok(events) => events,
+            Err(error) => {
+                self.graphics.record_diagnostic(
+                    None,
+                    format!("Kitty graphics protocol stream rejected: {error:?}"),
+                );
+                return Ok(false);
+            }
+        };
         let mut changed = false;
         for event in events {
             match event {
-                KittyStreamEvent::Plain(plain) => {
+                GraphicsProtocolEvent::Plain(plain) => {
                     if !plain.is_empty() {
                         self.processor.advance(&mut self.term, &plain);
                         self.scroll_processor
@@ -770,7 +780,9 @@ impl TerminalSession {
                         changed = true;
                     }
                 }
-                KittyStreamEvent::Command(parameters, payload) => {
+                GraphicsProtocolEvent::Command(command) => {
+                    let parameters = command.parameters();
+                    let payload = command.payload();
                     let response = match self.graphics.apply_kitty_command_with_scroll_region(
                         &parameters,
                         &payload,
@@ -802,6 +814,16 @@ impl TerminalSession {
                             "child graphics response queue is full; response was dropped",
                         );
                     }
+                    changed = true;
+                }
+                GraphicsProtocolEvent::Malformed { bytes, reason } => {
+                    self.graphics.record_diagnostic(
+                        None,
+                        format!(
+                            "malformed Kitty graphics sequence ({} bytes): {reason}",
+                            bytes.len()
+                        ),
+                    );
                     changed = true;
                 }
             }
@@ -974,7 +996,7 @@ impl TerminalSession {
         let kill_result = self.child.kill();
         let wait_result = self.child.wait();
         self.graphics.clear();
-        self.graphics_input.clear();
+        let _ = self.graphics_protocol.finish();
         self.closed = true;
         if let Err(error) = kill_result {
             return Err(SessionError::Io(error.to_string()));
@@ -1028,61 +1050,23 @@ fn extract_kitty_commands(buffer: &[u8]) -> KittyExtraction {
 }
 
 fn extract_kitty_events(buffer: &[u8]) -> (Vec<KittyStreamEvent>, Vec<u8>) {
-    const PREFIX: &[u8] = b"\x1b_G";
-    const TERMINATOR: &[u8] = b"\x1b\\";
-    let mut events = Vec::new();
-    let mut index = 0;
-    while index < buffer.len() {
-        let Some(prefix_offset) = buffer[index..]
-            .windows(PREFIX.len())
-            .position(|window| window == PREFIX)
-        else {
-            let suffix_len = partial_prefix_suffix_len(&buffer[index..], PREFIX);
-            let plain_end = buffer.len().saturating_sub(suffix_len);
-            if plain_end > index {
-                events.push(KittyStreamEvent::Plain(buffer[index..plain_end].to_vec()));
-            }
-            return (events, buffer[plain_end..].to_vec());
-        };
-        let prefix = index + prefix_offset;
-        if prefix > index {
-            events.push(KittyStreamEvent::Plain(buffer[index..prefix].to_vec()));
-        }
-        let command_start = prefix + PREFIX.len();
-        let Some(terminator_offset) = find_bytes(&buffer[command_start..], TERMINATOR) else {
-            return (events, buffer[prefix..].to_vec());
-        };
-        let end = command_start + terminator_offset;
-        let Some(separator) = buffer[command_start..end]
-            .iter()
-            .position(|byte| *byte == b';')
-        else {
-            events.push(KittyStreamEvent::Plain(
-                buffer[prefix..end + TERMINATOR.len()].to_vec(),
-            ));
-            index = end + TERMINATOR.len();
-            continue;
-        };
-        events.push(KittyStreamEvent::Command(
-            buffer[command_start..command_start + separator].to_vec(),
-            buffer[command_start + separator + 1..end].to_vec(),
-        ));
-        index = end + TERMINATOR.len();
-    }
-    (events, Vec::new())
-}
-
-fn partial_prefix_suffix_len(buffer: &[u8], prefix: &[u8]) -> usize {
-    (1..prefix.len().min(buffer.len() + 1))
-        .rev()
-        .find(|length| buffer.ends_with(&prefix[..*length]))
-        .unwrap_or(0)
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    let mut adapter = GraphicsProtocolAdapter::new(4 * 1024 * 1024, 2 * 1024 * 1024);
+    let events = match adapter.feed(buffer) {
+        Ok(events) => events,
+        Err(_) => return (Vec::new(), buffer.to_vec()),
+    };
+    let mapped = events
+        .into_iter()
+        .filter_map(|event| match event {
+            GraphicsProtocolEvent::Plain(bytes) => Some(KittyStreamEvent::Plain(bytes)),
+            GraphicsProtocolEvent::Command(command) => Some(KittyStreamEvent::Command(
+                command.parameters().to_vec(),
+                command.payload().to_vec(),
+            )),
+            GraphicsProtocolEvent::Malformed { bytes, .. } => Some(KittyStreamEvent::Plain(bytes)),
+        })
+        .collect();
+    (mapped, adapter.pending_bytes().to_vec())
 }
 
 fn default_command() -> CommandBuilder {

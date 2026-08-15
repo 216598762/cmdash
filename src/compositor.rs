@@ -45,6 +45,9 @@ pub struct FrameDiff {
     graphics: Vec<crate::graphics::GraphicsSubmission>,
     visible_graphics: Vec<crate::graphics::GraphicsSubmission>,
     removed_graphics: Vec<crate::graphics::GraphicsSubmission>,
+    placeholders: Vec<crate::graphics::GraphicsPlaceholderLayer>,
+    visible_placeholders: Vec<crate::graphics::GraphicsPlaceholderLayer>,
+    removed_placeholders: Vec<crate::graphics::GraphicsPlaceholderLayer>,
     #[cfg(feature = "sixel")]
     sixel: Vec<crate::sixel::SixelSubmission>,
 }
@@ -82,22 +85,39 @@ impl FrameDiff {
         &self.removed_graphics
     }
 
+    pub fn placeholders(&self) -> &[crate::graphics::GraphicsPlaceholderLayer] {
+        &self.placeholders
+    }
+
+    pub fn visible_placeholders(&self) -> &[crate::graphics::GraphicsPlaceholderLayer] {
+        &self.visible_placeholders
+    }
+
+    pub fn removed_placeholders(&self) -> &[crate::graphics::GraphicsPlaceholderLayer] {
+        &self.removed_placeholders
+    }
+
     #[cfg(feature = "sixel")]
     pub fn sixel(&self) -> &[crate::sixel::SixelSubmission] {
         &self.sixel
     }
 
     pub fn is_empty(&self) -> bool {
-        self.changes.is_empty() && self.graphics.is_empty() && self.removed_graphics.is_empty() && {
-            #[cfg(feature = "sixel")]
-            {
-                self.sixel.is_empty()
+        self.changes.is_empty()
+            && self.graphics.is_empty()
+            && self.removed_graphics.is_empty()
+            && self.placeholders.is_empty()
+            && self.removed_placeholders.is_empty()
+            && {
+                #[cfg(feature = "sixel")]
+                {
+                    self.sixel.is_empty()
+                }
+                #[cfg(not(feature = "sixel"))]
+                {
+                    true
+                }
             }
-            #[cfg(not(feature = "sixel"))]
-            {
-                true
-            }
-        }
     }
 }
 
@@ -181,7 +201,10 @@ impl Compositor {
             .collect();
         let previous = self.previous.as_ref();
         let graphics_changed = full_redraw
-            || previous.is_none_or(|previous| previous.image_layers() != current.image_layers());
+            || previous.is_none_or(|previous| {
+                previous.image_layers() != current.image_layers()
+                    || previous.placeholder_layers() != current.placeholder_layers()
+            });
         #[cfg(feature = "sixel")]
         let sixel_changed = full_redraw
             || previous.is_none_or(|previous| previous.sixel_layers() != current.sixel_layers());
@@ -211,6 +234,13 @@ impl Compositor {
             })
             .cloned()
             .collect();
+        let current_placeholders = current.placeholder_layers();
+        let removed_placeholders = previous
+            .into_iter()
+            .flat_map(|previous| previous.placeholder_layers())
+            .filter(|placeholder| !current_placeholders.contains(placeholder))
+            .copied()
+            .collect::<Vec<_>>();
         let mut changes = Vec::new();
 
         for (index, cell) in current.cells().iter().enumerate() {
@@ -242,6 +272,13 @@ impl Compositor {
             graphics,
             visible_graphics: current.image_layers().to_vec(),
             removed_graphics,
+            placeholders: if graphics_changed {
+                current.placeholder_layers().to_vec()
+            } else {
+                Vec::new()
+            },
+            visible_placeholders: current.placeholder_layers().to_vec(),
+            removed_placeholders,
             #[cfg(feature = "sixel")]
             sixel,
         }
@@ -488,6 +525,27 @@ mod tests {
         assert_eq!(diff.invalidated_regions(), &[Rect::new(1, 0, 2, 1)]);
         assert_eq!(diff.changes().len(), 2);
         assert!(diff.changes().iter().all(|change| change.y == 0));
+    }
+
+    #[test]
+    fn placeholder_layers_are_owned_by_frame_diffs_and_removed_with_the_scene() {
+        let resource = crate::GraphicsResourceId::new(crate::SessionId::new(4), 7);
+        let mut first_scene = Scene::new(Rect::new(0, 0, 4, 2));
+        first_scene.add_placeholder_layer(crate::GraphicsPlaceholderLayer::new(
+            resource,
+            Rect::new(1, 0, 2, 1),
+            3,
+        ));
+        let mut compositor = Compositor::new();
+        let first = compositor.diff(&first_scene);
+        assert_eq!(first.placeholders().len(), 1);
+        assert_eq!(first.visible_placeholders().len(), 1);
+        assert!(first.removed_placeholders().is_empty());
+
+        let second_scene = Scene::new(first_scene.area());
+        let second = compositor.diff(&second_scene);
+        assert!(second.placeholders().is_empty());
+        assert_eq!(second.removed_placeholders(), first.visible_placeholders());
     }
 
     #[test]

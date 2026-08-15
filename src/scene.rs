@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
 
-use crate::graphics::GraphicsSubmission;
+use crate::graphics::{GraphicsPlaceholderLayer, GraphicsSubmission};
 #[cfg(feature = "sixel")]
 use crate::sixel::SixelSubmission;
 
@@ -84,6 +84,7 @@ pub struct Scene {
     area: Rect,
     cells: Vec<Cell>,
     image_layers: Vec<GraphicsSubmission>,
+    placeholder_layers: Vec<GraphicsPlaceholderLayer>,
     #[cfg(feature = "sixel")]
     sixel_layers: Vec<SixelSubmission>,
 }
@@ -96,6 +97,7 @@ impl Scene {
             area,
             cells: vec![Cell::blank(style); cell_count],
             image_layers: Vec::new(),
+            placeholder_layers: Vec::new(),
             #[cfg(feature = "sixel")]
             sixel_layers: Vec::new(),
         }
@@ -111,6 +113,10 @@ impl Scene {
 
     pub fn image_layers(&self) -> &[GraphicsSubmission] {
         &self.image_layers
+    }
+
+    pub fn placeholder_layers(&self) -> &[GraphicsPlaceholderLayer] {
+        &self.placeholder_layers
     }
 
     /// Applies the bounded transition appearance used by the animation layer.
@@ -132,6 +138,13 @@ impl Scene {
             self.image_layers.push(submission);
             self.image_layers
                 .sort_by_key(|layer| layer.placement().z_index());
+        }
+    }
+
+    pub fn add_placeholder_layer(&mut self, layer: GraphicsPlaceholderLayer) {
+        if let Some(layer) = layer.clipped_to(self.area) {
+            self.placeholder_layers.push(layer);
+            self.placeholder_layers.sort_by_key(|layer| layer.z_index());
         }
     }
 
@@ -203,6 +216,7 @@ impl Scene {
             }
         }
         self.occlude_images(clip);
+        self.occlude_placeholder_layers(clip);
         for image in &source.image_layers {
             if let Some(image) = image
                 .clipped_to(clip)
@@ -213,6 +227,15 @@ impl Scene {
         }
         self.image_layers
             .sort_by_key(|layer| layer.placement().z_index());
+        for placeholder in &source.placeholder_layers {
+            if let Some(placeholder) = placeholder
+                .clipped_to(clip)
+                .and_then(|placeholder| placeholder.clipped_to(self.area))
+            {
+                self.placeholder_layers.push(placeholder);
+            }
+        }
+        self.placeholder_layers.sort_by_key(|layer| layer.z_index());
         #[cfg(feature = "sixel")]
         for image in &source.sixel_layers {
             if let Some(image) = image
@@ -296,6 +319,60 @@ impl Scene {
         }
         visible.sort_by_key(|layer| layer.placement().z_index());
         self.image_layers = visible;
+    }
+
+    /// Applies the same opaque-surface occlusion policy to backend-neutral
+    /// placeholder regions. Keeping this in `Scene` prevents adapters from
+    /// reintroducing cells underneath overlays after composition.
+    pub fn occlude_placeholder_layers(&mut self, occluder: Rect) {
+        let mut visible = Vec::new();
+        for layer in std::mem::take(&mut self.placeholder_layers) {
+            let area = layer.area();
+            let Some(intersection) = intersect(area, occluder) else {
+                visible.push(layer);
+                continue;
+            };
+            let candidates = [
+                Rect::new(
+                    area.x,
+                    area.y,
+                    area.width,
+                    intersection.y.saturating_sub(area.y),
+                ),
+                Rect::new(
+                    area.x,
+                    intersection.y.saturating_add(intersection.height),
+                    area.width,
+                    area.y
+                        .saturating_add(area.height)
+                        .saturating_sub(intersection.y.saturating_add(intersection.height)),
+                ),
+                Rect::new(
+                    area.x,
+                    intersection.y,
+                    intersection.x.saturating_sub(area.x),
+                    intersection.height,
+                ),
+                Rect::new(
+                    intersection.x.saturating_add(intersection.width),
+                    intersection.y,
+                    area.x
+                        .saturating_add(area.width)
+                        .saturating_sub(intersection.x.saturating_add(intersection.width)),
+                    intersection.height,
+                ),
+            ];
+            for candidate in candidates {
+                if candidate.width > 0
+                    && candidate.height > 0
+                    && let Some(fragment) = layer.clipped_to(candidate)
+                {
+                    visible.push(fragment);
+                }
+            }
+        }
+        visible.sort_by_key(|layer| layer.z_index());
+        self.placeholder_layers = visible;
     }
 
     pub fn border(&mut self, rect: Rect, title: &str, style: CellStyle) {
@@ -470,6 +547,29 @@ mod tests {
         assert_eq!(destination.cell_at(1, 0).unwrap().symbol, 'b');
         assert_eq!(destination.cell_at(2, 0).unwrap().symbol, 'c');
         assert_eq!(destination.cell_at(3, 0).unwrap().symbol, ' ');
+    }
+
+    #[test]
+    fn placeholder_layers_are_clipped_and_occluded_with_images() {
+        let resource = crate::GraphicsResourceId::new(crate::SessionId::new(9), 3);
+        let mut scene = Scene::new(Rect::new(0, 0, 6, 3));
+        scene.add_placeholder_layer(GraphicsPlaceholderLayer::new(
+            resource,
+            Rect::new(1, 1, 4, 1),
+            -2,
+        ));
+        assert_eq!(scene.placeholder_layers().len(), 1);
+        assert_eq!(scene.placeholder_layers()[0].area(), Rect::new(1, 1, 4, 1));
+
+        let occluder = Scene::new(Rect::new(2, 1, 2, 1));
+        scene.blit(&occluder, occluder.area());
+        assert_eq!(scene.placeholder_layers().len(), 2);
+        assert!(
+            scene
+                .placeholder_layers()
+                .iter()
+                .all(|layer| intersect(layer.area(), occluder.area()).is_none())
+        );
     }
 
     #[test]

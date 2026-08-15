@@ -19,7 +19,8 @@ use ratatui::layout::Rect;
 use crate::{
     compositor::{CellSpan, FrameDiff},
     graphics::{
-        GraphicsInputDemultiplexer, GraphicsProtocolBroker, GraphicsSubmission, OuterInputEvent,
+        GraphicsInputDemultiplexer, GraphicsPlaceholderLayer, GraphicsProtocolBroker,
+        GraphicsSubmission, OuterInputEvent,
     },
     scene::{Cell, CellStyle, CellWidth, Color, Scene},
 };
@@ -584,6 +585,17 @@ pub trait Backend {
     fn submit(&mut self, scene: &Scene) -> Result<(), Self::Error>;
     fn submit_diff(&mut self, diff: &FrameDiff) -> Result<(), Self::Error>;
 
+    /// Accepts bytes read by the process-wide raw-input owner. Backends that
+    /// do not broker outer-terminal graphics simply return an empty batch.
+    fn feed_outer_input(&mut self, _bytes: &[u8]) -> OuterInputBatch {
+        OuterInputBatch {
+            terminal_bytes: Vec::new(),
+            graphics_report: None,
+            graphics_acknowledgements: Vec::new(),
+            graphics_error: None,
+        }
+    }
+
     fn submit_graphics(
         &mut self,
         _changed: &[GraphicsSubmission],
@@ -601,6 +613,20 @@ pub trait Backend {
                 reason: "backend does not provide a graphics submission adapter".to_owned(),
             })
         }
+    }
+
+    /// Submits a composed graphics frame, including backend-neutral placeholder
+    /// regions. Existing adapters can use image submissions while newer
+    /// adapters consume the independently composed placeholder list.
+    fn submit_graphics_frame(
+        &mut self,
+        changed: &[GraphicsSubmission],
+        visible: &[GraphicsSubmission],
+        removed: &[GraphicsSubmission],
+        _visible_placeholders: &[GraphicsPlaceholderLayer],
+        _removed_placeholders: &[GraphicsPlaceholderLayer],
+    ) -> Result<GraphicsSubmissionStatus, Self::Error> {
+        self.submit_graphics(changed, visible, removed)
     }
 
     #[cfg(feature = "sixel")]
@@ -924,6 +950,34 @@ impl<W: Write> Backend for CrosstermBackend<W> {
         Ok(())
     }
 
+    fn submit_graphics_frame(
+        &mut self,
+        changed: &[GraphicsSubmission],
+        visible: &[GraphicsSubmission],
+        removed: &[GraphicsSubmission],
+        visible_placeholders: &[GraphicsPlaceholderLayer],
+        removed_placeholders: &[GraphicsPlaceholderLayer],
+    ) -> Result<GraphicsSubmissionStatus, Self::Error> {
+        if self.capabilities.kitty_unicode_placeholders {
+            let placeholder_visible = submissions_for_placeholders(visible, visible_placeholders);
+            let placeholder_removed = submissions_for_placeholders(removed, removed_placeholders);
+            return self.submit_graphics(
+                changed,
+                if placeholder_visible.is_empty() {
+                    visible
+                } else {
+                    &placeholder_visible
+                },
+                if placeholder_removed.is_empty() {
+                    removed
+                } else {
+                    &placeholder_removed
+                },
+            );
+        }
+        self.submit_graphics(changed, visible, removed)
+    }
+
     fn submit_graphics(
         &mut self,
         changed: &[GraphicsSubmission],
@@ -1070,11 +1124,21 @@ impl<W: Write> Backend for CrosstermBackend<W> {
         self.writer.flush()
     }
 
+    fn feed_outer_input(&mut self, bytes: &[u8]) -> OuterInputBatch {
+        CrosstermBackend::feed_outer_input(self, bytes)
+    }
+
     fn submit_diff(&mut self, diff: &FrameDiff) -> Result<(), Self::Error> {
         if self.capabilities.kitty_unicode_placeholders {
-            for submission in diff.removed_graphics() {
+            let removed =
+                submissions_for_placeholders(diff.removed_graphics(), diff.removed_placeholders());
+            for submission in if removed.is_empty() {
+                diff.removed_graphics().to_vec()
+            } else {
+                removed
+            } {
                 self.request_graphics_delete(submission.terminal_image_id())?;
-                clear_placeholder_cells(&mut self.writer, submission)?;
+                clear_placeholder_cells(&mut self.writer, &submission)?;
             }
         }
         if diff.is_empty() {
@@ -1244,6 +1308,21 @@ fn write_style<W: Write>(writer: &mut W, style: CellStyle) -> io::Result<()> {
         queue!(writer, SetAttribute(Attribute::Dim))?;
     }
     Ok(())
+}
+
+fn submissions_for_placeholders(
+    submissions: &[GraphicsSubmission],
+    placeholders: &[GraphicsPlaceholderLayer],
+) -> Vec<GraphicsSubmission> {
+    placeholders
+        .iter()
+        .filter_map(|placeholder| {
+            submissions
+                .iter()
+                .find(|submission| submission.resource() == placeholder.resource())
+                .and_then(|submission| submission.clipped_to(placeholder.area()))
+        })
+        .collect()
 }
 
 fn write_direct_placement<W: Write>(
