@@ -406,9 +406,9 @@ mod tests {
         let mut store = crate::SessionGraphicsStore::new(crate::SessionId::new(1));
         store.apply_kitty_command(b"a=T,f=24,i=1", b"AQID").unwrap();
         store
-            .apply_kitty_command(b"a=p,i=1,x=2,y=1,c=5,r=2", b"")
+            .apply_kitty_command_with_context(b"a=p,i=1,c=5,r=2", b"", (2, 1), (10, 20))
             .unwrap();
-        source.add_image_layer(store.visible_submissions(source.area())[0].clone());
+        source.add_image_layer(store.visible_submissions(source.area())[1].clone());
         let mut destination = Scene::new(Rect::new(0, 0, 8, 4));
         destination.blit(&source, Rect::new(3, 1, 2, 1));
 

@@ -298,6 +298,9 @@ mod tests {
             mouse: true,
             bracketed_paste: true,
             kitty_graphics: false,
+            kitty_unicode_placeholders: false,
+            graphics_source: crate::backend::GraphicsCapabilitySource::Unavailable,
+            graphics_confidence: crate::backend::GraphicsCapabilityConfidence::Rejected,
             sixel: false,
         });
         state

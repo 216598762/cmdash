@@ -83,8 +83,28 @@ The next milestone is Phase 3: add one isolated terminal session as an optional 
 - [x] Implement tab-switch invalidation and graphics restore/replay behavior.
 - [x] Add captured-sequence parser coverage and the A/B image-ID collision test.
 - [x] Retain decoded graphics in memory for the lifetime of each live session with bounded resources and degraded health diagnostics.
+- [x] Answer Kitty `a=q` capability queries and route protocol acknowledgements back
+  through the child PTY rather than the outer terminal writer.
+- [x] Support direct-transfer negotiation, quiet acknowledgements, chunked APC
+  uploads, and `a=T` transmit-and-display placement semantics.
+- [x] Add installed-`kitten` PTY fixtures covering detection, negotiation, chunked
+  uploads, retained resources, and cursor-relative placement without requiring a
+  running Kitty window.
+- [x] Preserve changed, visible, and removed graphics submissions in frame diffs
+  so backend adapters can restore current layers and clear stale placements.
+- [x] Add a hybrid outer-terminal graphics policy: direct replay for compatible
+  terminals and Kitty Unicode-placeholder replay for pane-safe composition.
+- [x] Add capability hints and explicit `CMDASH_KITTY_GRAPHICS`/
+  `CMDASH_KITTY_GRAPHICS_MODE` overrides, including controlled graphics disablement.
+- [x] Keep placeholder uploads quiet, encode Kitty image IDs with the canonical
+  combining-mark table, preserve z-index, and prevent replay from moving the
+  parent cursor.
 
-**Exit criteria (met):** a Kitty image rendered in one tab is hidden, preserved, and restored independently when the user changes tabs.
+**Exit criteria (met for retained foundation):** a Kitty image is parsed, retained,
+  session-isolated, diffed, and emitted through the available direct or
+  Unicode-placeholder backend path without stale frame-layer state. Full outer
+  terminal rendering and scroll/occlusion conformance remain tracked in the
+  graphics compatibility program below.
 
 ## Phase 6 — Usable dashboard product
 
@@ -436,6 +456,337 @@ responses are versioned, bounded, and generation-consistent; API failures cannot
 crash or stall the dashboard; and endpoint schemas, security behavior, examples,
 and compatibility rules are documented and tested in [API.md](API.md).
 
+## Graphics compatibility program — protocol-faithful multiplexer architecture
+
+**Status:** foundation complete; the larger architecture remains in progress.
+
+The initial retained graphics implementation proved that cmdash can parse Kitty
+APCs, answer `kitten icat` negotiation, retain image data, and submit a backend
+command. It did not prove that the outer terminal rendered the image. A child-side
+`ESC_G...OK` response only confirms that cmdash answered the inner PTY; it says
+nothing about outer-terminal capability, pane coordinate translation, clipping,
+scroll anchoring, z-order, or placeholder lifetime. A backend that silently drops
+unsupported graphics also makes this failure look like a successful no-op.
+
+### Findings from comparable implementations
+
+- Kitty's own `icat` documentation warns that graphics may not work inside a
+  multiplexer, explains that `icat` communicates directly with the TTY, and
+  recommends Unicode placeholders or explicit passthrough when integrating with
+  a complex host.
+- tmux's passthrough model wraps application output in a DCS sequence and requires
+  an explicit `allow-passthrough` policy. tmux primarily forwards the protocol;
+  it does not become the image renderer or infer arbitrary pane placement.
+- Kitty's Unicode-placeholder model separates resource upload from visible cell
+  placement. The outer terminal owns the image while ordinary cell composition
+  determines where placeholders move.
+- Ghostty advertises Kitty graphics and supports the Unicode-placeholder path used
+  to make graphics work through multiplexers. Current ecosystem compatibility
+  matrices report WezTerm and iTerm2 primarily through inline-image protocols and
+  Zellij primarily through Sixel, so capability names must not be treated as a
+  universal protocol guarantee.
+
+Reference material:
+[Kitty `icat` documentation](https://sw.kovidgoyal.net/kitty/kittens/icat/),
+[Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/),
+[tmux passthrough option](https://man7.org/linux/man-pages/man1/tmux.1.html),
+[Ghostty features](https://ghostty.org/docs/features), and
+[Yazi's terminal/multiplexer compatibility matrix](https://yazi-rs.github.io/docs/image-preview/).
+
+### Completed foundation
+
+- [x] Keep Kitty parsing and child-PTY responses inside the session boundary.
+- [x] Answer `a=q` and DA1 negotiation in the correct PTY direction.
+- [x] Support bounded direct-transfer and chunked APC upload handling.
+- [x] Retain session-qualified resources and image payloads through `Scene`,
+  `Compositor`, and visible-frame submission.
+- [x] Carry changed, currently visible, and removed image submissions through
+  `FrameDiff`.
+- [x] Add direct replay and Unicode-placeholder backend paths with capability
+  hints, explicit mode overrides, quiet uploads, z-index, and cursor-static output.
+- [x] Add no-Kitty and installed-`kitten` PTY fixtures plus backend/compositor
+  regression tests.
+- [x] Add typed direct/placeholder/disabled mode selection and expose the
+  selected mode through backend capability metadata.
+- [x] Distinguish rendered, degraded, suppressed, and failed graphics outcomes;
+  record bounded diagnostics instead of treating an outer no-op as success.
+- [x] Support multiple placements and placement-ID replacement in the retained
+  session graphics store.
+- [x] Recover from malformed or unsupported child graphics commands by retaining
+  a diagnostic and returning a bounded Kitty error acknowledgement when IDs are
+  available.
+
+### Architecture goals and invariants
+
+- [x] A graphics command must end in one explicit state: rendered, intentionally
+  suppressed with a reason, degraded to a fallback, or failed with a bounded
+  diagnostic. `Ok(())` must never mean an image was silently discarded.
+- [ ] Child-terminal protocol state, logical graphics state, composed scene state,
+  and outer-terminal serialization must be separate interfaces.
+- [x] Image resources, placements, virtual placeholders, and backend image IDs
+  have distinct identities and lifetimes in the retained store/backend boundary;
+  virtual-placeholder ownership and lifecycle integration remain future work.
+- [ ] Pane-local coordinates must never be confused with outer-terminal absolute
+  coordinates; all projections must carry the owning surface and clip rectangle.
+- [ ] Hidden tabs, overlays, pane movement, resize, scrollback, alternate-screen
+  transitions, reload, close, and shutdown must have defined graphics behavior.
+- [x] Unsupported outer-terminal protocols are visible through capability state
+  and diagnostics, not inferred from an apparently successful child query.
+- [x] Protocol handling remains bounded: payloads, chunk accumulation, resource
+  counts, placements, placeholder cells, and diagnostic history have explicit
+  limits; retry policy remains future work.
+
+### Workstream 1 — Capability and mode contract
+
+- [x] Add a typed capability result with graphics mode, capability source,
+  confidence, and placeholder support metadata; terminal-name hints are now
+  explicitly distinguishable from active confirmation.
+- [ ] Define the complete stable mode set: `disabled`, `direct`,
+  `unicode_placeholder`, `passthrough`, and `fallback`. The current runtime
+  implements the first three and documents the remaining adapter boundary.
+- [x] Add a bounded active outer-terminal probe containing Kitty graphics, DA1,
+  and pixel-size queries, with response correlation and timeout/rejection
+  outcomes. Automatic outer-input demultiplexing is still required to wire this
+  into every interactive input path.
+- [x] Make `CMDASH_KITTY_GRAPHICS` and
+  `CMDASH_KITTY_GRAPHICS_MODE=placeholder|direct|passthrough|off` overrides
+  explicit and precedence-ordered.
+- [x] Expose selected mode, capability source, and confidence through backend/API
+  capability metadata; last outer diagnostic publication remains follow-up work.
+
+### Workstream 2 — Protocol adapter and response broker
+
+- [ ] Introduce a `GraphicsProtocolAdapter` that parses Kitty APC, C1 APC where
+  applicable, and tmux-style DCS passthrough wrappers without mixing parsing with
+  resource storage or backend output.
+- [ ] Support protocol fields needed for conformance: compression, source crops,
+  pixel dimensions, natural PNG dimensions, placement IDs, `C` cursor policy,
+  z-index, delete selectors, frame/animation actions, and all bounded transfer
+  modes.
+- [ ] Preserve exact child-output ordering across text, graphics, DA1, pixel-size,
+  and graphics acknowledgements.
+- [x] Add a bounded response broker with separate destinations for child PTY
+  responses and outer-terminal responses. Never write an outer response into a
+  child session or vice versa.
+- [ ] Wire the broker to the interactive outer-input demultiplexer so probe replies
+  are consumed without competing with keyboard/event decoding.
+- [ ] Define unsupported-transfer behavior so `t=f`/`t=s` negotiation reliably
+  falls back to direct stream mode without claiming that an image was displayed.
+- [ ] Add malformed-sequence recovery and cancellation so one bad graphics command
+  cannot fail an otherwise healthy terminal widget.
+
+### Workstream 3 — Logical graphics state and geometry
+
+- [x] Replace the one-placement-per-image map with separate resource and placement
+  registries supporting multiple placements, placement IDs, replacement, delete,
+  and resource lifetime rules from the Kitty protocol.
+- [x] Store logical emulator-grid anchors, captured scrollback depth, cursor
+  position, pixel dimensions, cell dimensions, z-index, and owning session rather
+  than only absolute `u16` screen coordinates.
+- [ ] Track scroll-region movement, primary-screen history edge cases,
+  alternate-screen changes, cursor movement, resize, and pane transforms fully so
+  every image follows the terminal content that created it; the current slice
+  resolves primary-screen movement from scrollback depth.
+- [ ] Preserve natural image geometry when pixel-size ioctl data is unavailable;
+  use CSI 14t/16t or a documented fallback rather than shrinking an image to a
+  misleading `1x1` placement.
+- [ ] Separate session image IDs from outer-terminal IDs and maintain a replay
+  generation/acknowledgement state for each outer resource.
+
+### Workstream 4 — Scene and compositor integration
+
+- [ ] Make image/placeholder primitives first-class scene data with ownership,
+  clipping, occlusion, and z-order semantics; backend emission must not bypass
+  overlay and surface composition.
+- [ ] Represent placeholder graphemes/combining marks as a backend-neutral
+  primitive or validated cell cluster rather than writing invisible text directly
+  after the frame.
+- [ ] Diff old/current visible graphics, placeholder regions, and resource uploads
+  independently. Clear stale placeholders before text restoration and reapply only
+  the visible, non-occluded result.
+- [ ] Define ordering for overlays, negative/positive image z-index, cell
+  backgrounds, text, and multiple overlapping images.
+- [ ] Ensure zero-area, clipped, hidden, tab-switched, and pane-moved surfaces
+  cannot emit graphics outside their assigned scene.
+
+### Workstream 5 — Outer-terminal adapters
+
+- [ ] Implement a direct Kitty adapter for a compatible root or explicitly opted-in
+  outer terminal, including resource reuse, delete, placement, and acknowledgements.
+- [ ] Implement a Unicode-placeholder adapter for pane-safe rendering: quiet
+  resource upload, virtual placement creation, canonical ID encoding, placeholder
+  cell emission, stale-cell clearing, and redraw recovery.
+- [ ] Implement optional tmux-style passthrough for applications that emit DCS
+  wrappers, including ESC doubling/undoubling, allow/deny policy, bounded unwrap,
+  and outer-response routing.
+- [ ] Add protocol adapters for other supported outer paths only after capability
+  and ownership semantics are defined; do not label WezTerm/iTerm2/Sixel support
+  as Kitty support without a conformance result.
+- [ ] Provide deliberate fallbacks such as a textual/placeholder diagnostic or
+  configured Sixel/inline-image path, with no silent success.
+
+### Workstream 6 — Lifecycle, performance, and security
+
+- [ ] Define upload/replay behavior for pane creation, movement, resize, tab
+  switching, hidden sessions, overlays, reload, close, and application shutdown.
+- [ ] Add outer-resource garbage collection, replay generations, bounded retries,
+  cancellation, and cleanup after child or backend failure.
+- [ ] Keep file/shared-memory transfers opt-in and sandboxed; never read arbitrary
+  paths or shared-memory names merely because an inner application requested them.
+- [ ] Add metrics for parsed commands, accepted uploads, rendered placements,
+  suppressed images, fallback count, bytes, latency, and outer acknowledgements.
+- [ ] Bound placeholder output and avoid re-uploading unchanged resources on every
+  frame; preserve UI responsiveness during large images and rapid pane switches.
+
+### Workstream 7 — Conformance and regression matrix
+
+- [ ] Add protocol golden tests for every supported action/field, chunk boundary,
+  compression mode, transfer negotiation, response ordering, delete operation,
+  source crop, placement ID, z-index, and cursor policy.
+- [ ] Add deterministic scene/compositor tests for panes, overlays, clipping,
+  scrolling, resize, tabs, hidden sessions, multiple placements, and resource
+  collisions.
+- [ ] Add PTY fixtures using installed `kitten icat` for detection, image upload,
+  `--place`, `--unicode-placeholder`, passthrough, animation, and failure paths.
+- [ ] Add a headless or capture-based outer-terminal harness that verifies the
+  emitted stream is accepted by Kitty; add Ghostty/WezTerm/Sixel/inline-image
+  cases only where the advertised capability is verified.
+- [ ] Assert both sides of every test: child receives the expected response and
+  outer adapter reports/render-states the expected resource and placement.
+- [ ] Add failure tests proving unsupported capability, timeout, malformed payload,
+  quota rejection, and outer write failure become visible diagnostics rather than
+  empty successful frames.
+- [ ] Add performance tests for large/chunked images, rapid pane switching,
+  placeholder redraws, and bounded memory/resource cleanup.
+
+**Exit criteria:** graphics support is protocol-faithful and capability-explicit;
+`kitten icat` either produces a verified outer-terminal image or a visible,
+explainable fallback; pane-local images remain correct through scroll, resize,
+movement, overlays, tabs, and lifecycle changes; unsupported modes never report
+silent success; and every advertised outer-terminal mode has capture-based or
+interactive conformance coverage.
+
+## Phase 14 — Built-in widget catalog and widget authoring guide
+
+This phase expands the default dashboard widget catalog and makes widget creation
+approachable without weakening the scene, lifecycle, configuration, or plugin
+boundaries.
+
+### Goals and boundaries
+
+- [ ] Establish a coherent catalog of useful built-in dashboard widgets.
+- [ ] Keep built-ins optional, composable, capability-aware, and usable without
+  terminal sessions.
+- [ ] Reuse common rendering, appearance, layout, and bounded-data helpers
+  instead of duplicating widget-specific behavior.
+- [ ] Define stable widget type names, defaults, settings, failure behavior, and
+  compatibility expectations.
+- [ ] Provide a complete guide for creating, testing, registering, and
+  distributing custom widgets.
+- [ ] Keep custom widgets behind the existing `Widget`/factory/context boundary.
+- [ ] Ensure widget authors never need direct access to terminal output, PTYs,
+  compositor internals, or global mutable state.
+
+### Built-in widget catalog
+
+Start with dependency-light widgets that exercise the existing contracts:
+
+- [ ] Add a `status` widget for semantic success, warning, error, and neutral
+  states.
+- [ ] Add a `key_value` widget for bounded labeled values and diagnostics.
+- [ ] Add a `gauge` widget for bounded progress or utilization displays with a
+  textual fallback.
+- [ ] Add a clipped `list` widget for bounded static or scrollable rows.
+- [ ] Add a bounded recent-message `log` widget with severity styling.
+- [ ] Add a `sparkline` widget for compact historical values with a scene-safe
+  glyph and textual fallback.
+- [ ] Add a `separator` or `spacer` widget for intentional layout grouping
+  without requiring a fake text widget.
+- [ ] Extend `system` only where the data source and refresh behavior are
+  portable and well-defined.
+
+Each widget must define stable TOML type and field names, defaults, minimum useful
+geometry, update/redraw behavior, theme-role usage, focus/input behavior, bounded
+data policy, degraded/failed health states, and lifecycle behavior.
+
+Host metrics, network data, process inspection, filesystem watching, and arbitrary
+command execution must not be added implicitly. Each requires a separate provider
+and explicit security/dependency decisions.
+
+### Shared widget infrastructure
+
+- [ ] Add reusable helpers for bounded text and row rendering, status/severity
+  styling, clipping, minimum-size handling, and deterministic test data.
+- [ ] Define how data-backed widgets request wakeups or periodic updates, ensuring
+  hidden or inactive widgets do not create unnecessary work.
+- [ ] Keep data providers separate from rendering so providers can be tested
+  without an interactive terminal.
+- [ ] Preserve the existing semantic theme, animation, graphics, and scene
+  contracts for all new widgets.
+
+### Widget authoring documentation
+
+- [ ] Create `docs/CREATING_WIDGETS.md` as the focused development guide, while
+  keeping `docs/WIDGETS.md` primarily as the user-facing catalog and runtime
+  reference.
+- [ ] Document how to choose between a built-in, in-process custom widget, and
+  plugin widget.
+- [ ] Document the `Widget` lifecycle, factory contract, runtime context, and
+  `WidgetInstanceConfig`/`settings` behavior.
+- [ ] Explain scene rendering, clipping, geometry, Unicode widths, borders,
+  labels, theme roles, focus, input, resize, graphics, and animation.
+- [ ] Document `Unchanged` versus `Redraw`, health reporting, diagnostics,
+  failure isolation, background work, wakeups, cancellation, and shutdown.
+- [ ] Provide a complete minimal custom-widget example and a data-backed example.
+- [ ] Document factory registration, configuration examples, testing strategy,
+  plugin/WASM restrictions, and troubleshooting for invisible or invalid widgets.
+
+### Documentation updates
+
+- [ ] Expand `docs/WIDGETS.md` with the built-in catalog and link to the authoring
+  guide, moving implementation tutorials into `CREATING_WIDGETS.md`.
+- [ ] Update `docs/CONFIGURATION.md` with every new built-in type, setting,
+  default, and settings namespace.
+- [ ] Update `docs/ARCHITECTURE.md` with shared widget helpers, provider/render
+  separation, scheduling, and lifecycle ownership.
+- [ ] Update `README.md` with links to the widget catalog and authoring guide.
+- [ ] Update `docs/DEPENDENCIES.md` if a new metrics or data-provider dependency
+  is selected, including its capability and portability rationale.
+
+### Testing and validation
+
+- [ ] Add configuration tests for every built-in type, default, invalid setting,
+  and minimum-size case.
+- [ ] Add rendering/golden tests for normal, focused, empty, clipped, narrow, and
+  zero-area surfaces, proving no widget draws outside its assigned scene.
+- [ ] Add deterministic update tests, redraw-coalescing tests, and hidden-widget
+  scheduling tests.
+- [ ] Add health and failure-isolation tests for malformed or unavailable data.
+- [ ] Add reload, removal, pane-closure, and shutdown lifecycle tests.
+- [ ] Add theme, border, label, animation, reduced-motion, and optional-feature
+  compatibility tests.
+- [ ] Add an example custom-widget test that follows `CREATING_WIDGETS.md`.
+- [ ] Add plugin capability and configuration tests wherever the authoring guide
+  references the plugin path.
+- [ ] Validate documentation links and configuration examples in CI where
+  practical.
+
+**Exit criteria:** cmdash ships with a documented, stable set of useful built-in
+widgets; every widget has bounded rendering, update, health, and lifecycle
+behavior; a new author can create and test a custom widget by following
+`docs/CREATING_WIDGETS.md`; user-facing widget documentation is separated from
+implementation guidance; and no widget bypasses the scene, coordinator, theme,
+or plugin boundaries.
+
+### Non-goals
+
+- A third-party widget marketplace.
+- Arbitrary shell-command execution as a built-in widget.
+- Unbounded network or filesystem polling.
+- Completing the full WASM host-function ABI.
+- Promising cross-platform system metrics before provider behavior is defined.
+- Moving application commands or layout containers into ordinary dashboard widgets.
+
 ## Decision log starters
 
 | Topic | Provisional direction | Why it matters |
@@ -447,7 +798,7 @@ and compatibility rules are documented and tested in [API.md](API.md).
 | Terminal session ownership | One emulator and graphics store for each terminal tab/session | Prevents state and image-ID cross-contamination |
 | Rendering | Retained, backend-neutral scene composed into complete frames | Makes widgets modular and tab restoration deterministic |
 | Widget extensibility | Versioned manifest plus opt-in Wasmtime host | Keeps untrusted widget execution isolated and avoids exposing Rust's unstable ABI or terminal handles |
-| Graphics | Kitty first, optional dependency-free sixel adapter, capability-aware fallback | Matches the initial requirement while keeping restoration faithful and making sixel opt-in |
+| Graphics | Session-owned Kitty adapter with direct replay, Unicode-placeholder mode, typed active probing, a child/outer response broker, and scroll-aware grid anchors | Keeps child protocol handling isolated, makes outer capability evidence explicit, and lets placements follow primary-screen content; scroll-region and automatic outer-input routing remain follow-up work |
 | Async model | Coordinator/UI owner plus per-session I/O tasks | Keeps frame submission serialized while PTYs remain responsive |
 | Configuration | TOML with checked-in `config/default.toml` and `docs/CONFIGURATION.md` | Makes the embedded fallback discoverable while keeping schema evolution explicit |
 | Default configuration discovery | Explicit CLI path, user config, example/default file, embedded fallback | Preserves safe startup while giving users an editable starting point |

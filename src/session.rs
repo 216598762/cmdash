@@ -25,7 +25,9 @@ use ratatui::layout::Rect;
 
 use crate::{
     appearance::Theme,
-    graphics::{GraphicsError, GraphicsSubmission, SessionGraphicsStore},
+    graphics::{
+        GraphicsProtocolBroker, GraphicsSubmission, SessionGraphicsStore, kitty_error_response,
+    },
     scene::{CellStyle, Color, Scene},
     state::SessionId,
 };
@@ -183,7 +185,7 @@ impl SessionEventListener {
 impl EventListener for SessionEventListener {
     fn send_event(&self, event: Event) {
         match event {
-            Event::PtyWrite(text) => self.send_to_pty(text),
+            Event::PtyWrite(text) => self.send_to_pty(normalize_emulator_response(text)),
             Event::TextAreaSizeRequest(format) => {
                 let size = *self.size.lock().expect("terminal size mutex poisoned");
                 self.send_to_pty(format(EmulatorWindowSize {
@@ -195,6 +197,17 @@ impl EventListener for SessionEventListener {
             }
             _ => {}
         }
+    }
+}
+
+fn normalize_emulator_response(text: String) -> String {
+    // alacritty_terminal's default DA1 response is the short `CSI ? 6 c`.
+    // kitty's icat detector requires a parameterized DA1 response, so expose
+    // the equivalent standard `CSI ? 1 ; 2 c` identity to PTY applications.
+    if text == "\x1b[?6c" {
+        "\x1b[?1;2c".to_owned()
+    } else {
+        text
     }
 }
 
@@ -217,6 +230,7 @@ pub struct TerminalSession {
     closed: bool,
     failure: Option<String>,
     graphics: SessionGraphicsStore,
+    graphics_broker: GraphicsProtocolBroker,
     graphics_input: Vec<u8>,
     selection: Option<Selection>,
 }
@@ -306,6 +320,7 @@ impl TerminalSession {
             closed: false,
             failure: None,
             graphics: SessionGraphicsStore::new(session_id),
+            graphics_broker: GraphicsProtocolBroker::default(),
             graphics_input: Vec::new(),
             selection: None,
         })
@@ -328,11 +343,16 @@ impl TerminalSession {
     }
 
     pub fn graphics(&self, surface: Rect) -> Vec<GraphicsSubmission> {
-        self.graphics.visible_submissions(surface)
+        self.graphics
+            .visible_submissions_at(surface, self.scrollback_lines())
     }
 
     pub fn graphics_diagnostics(&self) -> &[crate::graphics::GraphicsDiagnostic] {
         self.graphics.diagnostics()
+    }
+
+    pub fn set_kitty_graphics_support(&mut self, supported: bool) {
+        self.graphics.set_outer_kitty_graphics(supported);
     }
 
     pub fn begin_selection(&mut self, position: (u16, u16)) {
@@ -387,13 +407,7 @@ impl TerminalSession {
         while let Ok(result) = self.output.receiver.try_recv() {
             match result {
                 Ok(bytes) => {
-                    let plain = self.consume_output(&bytes)?;
-                    if !plain.is_empty() {
-                        self.processor.advance(&mut self.term, &plain);
-                        changed = true;
-                    }
-                    self.flush_emulator_responses()?;
-                    changed = changed || !bytes.is_empty();
+                    changed = self.consume_output(&bytes)? || changed || !bytes.is_empty();
                 }
                 Err(error) => {
                     let message = error.to_string();
@@ -413,16 +427,55 @@ impl TerminalSession {
         Ok(changed)
     }
 
-    fn consume_output(&mut self, bytes: &[u8]) -> Result<Vec<u8>, SessionError> {
+    fn consume_output(&mut self, bytes: &[u8]) -> Result<bool, SessionError> {
         self.graphics_input.extend_from_slice(bytes);
-        let (plain, commands, remainder) = extract_kitty_commands(&self.graphics_input);
+        let (events, remainder) = extract_kitty_events(&self.graphics_input);
         self.graphics_input = remainder;
-        for (parameters, payload) in commands {
-            self.graphics
-                .apply_kitty_command(&parameters, &payload)
-                .map_err(|error: GraphicsError| SessionError::Graphics(error.to_string()))?;
+        let mut changed = false;
+        for event in events {
+            match event {
+                KittyStreamEvent::Plain(plain) => {
+                    if !plain.is_empty() {
+                        self.processor.advance(&mut self.term, &plain);
+                        self.flush_emulator_responses()?;
+                        changed = true;
+                    }
+                }
+                KittyStreamEvent::Command(parameters, payload) => {
+                    let response = match self.graphics.apply_kitty_command_with_grid_context(
+                        &parameters,
+                        &payload,
+                        self.cursor_position(),
+                        (self.size.cell_width(), self.size.cell_height()),
+                        self.scrollback_lines(),
+                    ) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            let image = parameters
+                                .split(|byte| *byte == b',')
+                                .find_map(|parameter| parameter.strip_prefix(b"i="))
+                                .and_then(|value| std::str::from_utf8(value).ok())
+                                .and_then(|value| value.parse::<u32>().ok());
+                            self.graphics.record_diagnostic(image, error.to_string());
+                            image
+                                .filter(|image| *image != 0)
+                                .map(|_| kitty_error_response(&parameters, &error))
+                        }
+                    };
+                    if let Some(response) = response
+                        && !self.graphics_broker.queue_child(response)
+                    {
+                        self.graphics.record_diagnostic(
+                            None,
+                            "child graphics response queue is full; response was dropped",
+                        );
+                    }
+                    changed = true;
+                }
+            }
         }
-        Ok(plain)
+        self.flush_emulator_responses()?;
+        Ok(changed)
     }
 
     fn flush_emulator_responses(&mut self) -> Result<(), SessionError> {
@@ -430,13 +483,19 @@ impl TerminalSession {
         while let Ok(text) = self.emulator_responses.try_recv() {
             response.extend_from_slice(text.as_bytes());
         }
-        if response.is_empty() {
-            return Ok(());
+        if !response.is_empty() && !self.graphics_broker.queue_child(response) {
+            self.graphics.record_diagnostic(
+                None,
+                "child emulator response queue is full; response was dropped",
+            );
         }
-        self.writer
-            .write_all(&response)
-            .and_then(|_| self.writer.flush())
-            .map_err(|error| SessionError::Io(error.to_string()))
+        for queued in self.graphics_broker.drain_child() {
+            self.writer
+                .write_all(queued.bytes())
+                .and_then(|_| self.writer.flush())
+                .map_err(|error| SessionError::Io(error.to_string()))?;
+        }
+        Ok(())
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
@@ -606,6 +665,11 @@ fn allocate_session_id() -> SessionId {
 type KittyCommand = (Vec<u8>, Vec<u8>);
 type KittyExtraction = (Vec<u8>, Vec<KittyCommand>, Vec<u8>);
 
+enum KittyStreamEvent {
+    Plain(Vec<u8>),
+    Command(Vec<u8>, Vec<u8>),
+}
+
 /// Returns `(plain_bytes, kitty_commands, pending_bytes)` for parser stress tooling.
 ///
 /// The parser itself remains session-owned; this bounded summary lets fuzz
@@ -616,36 +680,68 @@ pub fn kitty_stream_stats(buffer: &[u8]) -> (usize, usize, usize) {
 }
 
 fn extract_kitty_commands(buffer: &[u8]) -> KittyExtraction {
-    const PREFIX: &[u8] = b"\x1b_G";
-    const TERMINATOR: &[u8] = b"\x1b\\";
+    let (events, remainder) = extract_kitty_events(buffer);
     let mut plain = Vec::new();
     let mut commands = Vec::new();
+    for event in events {
+        match event {
+            KittyStreamEvent::Plain(bytes) => plain.extend(bytes),
+            KittyStreamEvent::Command(parameters, payload) => commands.push((parameters, payload)),
+        }
+    }
+    (plain, commands, remainder)
+}
+
+fn extract_kitty_events(buffer: &[u8]) -> (Vec<KittyStreamEvent>, Vec<u8>) {
+    const PREFIX: &[u8] = b"\x1b_G";
+    const TERMINATOR: &[u8] = b"\x1b\\";
+    let mut events = Vec::new();
     let mut index = 0;
     while index < buffer.len() {
-        if !buffer[index..].starts_with(PREFIX) {
-            plain.push(buffer[index]);
-            index += 1;
-            continue;
+        let Some(prefix_offset) = buffer[index..]
+            .windows(PREFIX.len())
+            .position(|window| window == PREFIX)
+        else {
+            let suffix_len = partial_prefix_suffix_len(&buffer[index..], PREFIX);
+            let plain_end = buffer.len().saturating_sub(suffix_len);
+            if plain_end > index {
+                events.push(KittyStreamEvent::Plain(buffer[index..plain_end].to_vec()));
+            }
+            return (events, buffer[plain_end..].to_vec());
+        };
+        let prefix = index + prefix_offset;
+        if prefix > index {
+            events.push(KittyStreamEvent::Plain(buffer[index..prefix].to_vec()));
         }
-        let command_start = index + PREFIX.len();
+        let command_start = prefix + PREFIX.len();
         let Some(terminator_offset) = find_bytes(&buffer[command_start..], TERMINATOR) else {
-            break;
+            return (events, buffer[prefix..].to_vec());
         };
         let end = command_start + terminator_offset;
         let Some(separator) = buffer[command_start..end]
             .iter()
             .position(|byte| *byte == b';')
         else {
-            plain.extend_from_slice(&buffer[index..end + TERMINATOR.len()]);
+            events.push(KittyStreamEvent::Plain(
+                buffer[prefix..end + TERMINATOR.len()].to_vec(),
+            ));
             index = end + TERMINATOR.len();
             continue;
         };
-        let parameters = buffer[command_start..command_start + separator].to_vec();
-        let payload = buffer[command_start + separator + 1..end].to_vec();
-        commands.push((parameters, payload));
+        events.push(KittyStreamEvent::Command(
+            buffer[command_start..command_start + separator].to_vec(),
+            buffer[command_start + separator + 1..end].to_vec(),
+        ));
         index = end + TERMINATOR.len();
     }
-    (plain, commands, buffer[index..].to_vec())
+    (events, Vec::new())
+}
+
+fn partial_prefix_suffix_len(buffer: &[u8], prefix: &[u8]) -> usize {
+    (1..prefix.len().min(buffer.len() + 1))
+        .rev()
+        .find(|length| buffer.ends_with(&prefix[..*length]))
+        .unwrap_or(0)
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -883,7 +979,7 @@ mod tests {
             Some("sh"),
             &[
                 "-c",
-                "stty -icanon min 1 time 0; printf '\\033[c'; response=$(dd bs=1 count=5 2>/dev/null); if [ \"$response\" = \"$(printf '\\033[?6c')\" ]; then printf 'primary-ok'; fi; sleep 5",
+                "stty -icanon min 1 time 0; printf '\\033[c'; response=$(dd bs=1 count=7 2>/dev/null); if [ \"$response\" = \"$(printf '\\033[?1;2c')\" ]; then printf 'primary-ok'; fi; sleep 5",
             ],
             TerminalSize::new(40, 8),
         )
@@ -901,6 +997,33 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(primary_ok, "child did not receive the DA1 response");
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn kitty_graphics_queries_are_answered_before_terminal_queries() {
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &[
+                "-c",
+                "stty -icanon min 1 time 0; printf '\\033_Ga=q,i=7,t=d,s=1,v=1,f=24;MTIz\\033\\\\\\033[c'; response=$(dd bs=1 count=11 2>/dev/null); da=$(dd bs=1 count=7 2>/dev/null); if [ \"$response\" = \"$(printf '\\033_Gi=7;OK\\033\\\\')\" ] && [ \"$da\" = \"$(printf '\\033[?1;2c')\" ]; then printf 'kitty-query-ok'; fi; sleep 5",
+            ],
+            TerminalSize::new(40, 8),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut query_ok = false;
+        while Instant::now() < deadline {
+            session.poll_output().unwrap();
+            let scene = session.render(Rect::new(0, 0, 40, 8), false);
+            let rendered: String = scene.cells().iter().map(|cell| cell.symbol).collect();
+            if rendered.contains("kitty-query-ok") {
+                query_ok = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(query_ok, "child did not receive Kitty and DA responses");
         session.shutdown().unwrap();
     }
 

@@ -12,9 +12,9 @@ use std::{
 };
 
 use cmdash::{
-    ApiServer, AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend, SessionWakeup,
-    Surface, SurfaceCommand, SurfaceId, TerminalWindowSize, UiEvent, WidgetRegistry,
-    WidgetRuntimeContext,
+    ApiServer, AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend,
+    GraphicsSubmissionStatus, SessionWakeup, Surface, SurfaceCommand, SurfaceId,
+    TerminalWindowSize, UiEvent, WidgetRegistry, WidgetRuntimeContext,
     dashboard::{
         render_static_dashboard_shell_with_theme,
         render_static_dashboard_surface_scenes_with_theme, static_dashboard_surface_areas,
@@ -110,7 +110,8 @@ fn main() -> io::Result<()> {
     let mut api_server = ApiServer::start(&config.api, event_sender.clone())?;
     let registry = WidgetRegistry::builtins_with_context(
         WidgetRuntimeContext::with_session_wakeup(pty_wakeup.clone())
-            .with_initial_terminal_size(initial_window_size.terminal_size()),
+            .with_initial_terminal_size(initial_window_size.terminal_size())
+            .with_kitty_graphics(backend.capabilities().kitty_graphics),
     );
     let mut state = AppState::from_config(backend.capabilities(), &registry, &config)
         .map_err(|error| io::Error::other(format!("application config rejected: {error}")))?;
@@ -226,7 +227,27 @@ where
         let scene = compositor.compose(area, state, &base, &surface_scenes);
         let diff = compositor.diff(&scene);
         backend.submit_diff(&diff)?;
-        backend.submit_graphics(diff.graphics(), diff.removed_graphics())?;
+        let graphics_status = backend.submit_graphics(
+            diff.graphics(),
+            diff.visible_graphics(),
+            diff.removed_graphics(),
+        )?;
+        if !graphics_status.is_successful()
+            && graphics_status.placements() > 0
+            && (!diff.graphics().is_empty() || !diff.removed_graphics().is_empty())
+        {
+            let outcome = match &graphics_status {
+                GraphicsSubmissionStatus::Suppressed { .. } => "suppressed",
+                GraphicsSubmissionStatus::Failed { .. } => "failed",
+                GraphicsSubmissionStatus::Degraded { .. } => "degraded",
+                GraphicsSubmissionStatus::Rendered { .. } => "rendered",
+            };
+            state.record_diagnostic(format!(
+                "graphics {outcome} for {} placement(s): {}",
+                graphics_status.placements(),
+                graphics_status.reason().unwrap_or("no additional details")
+            ));
+        }
         #[cfg(feature = "sixel")]
         backend.submit_sixel(diff.sixel())?;
         frame_generation = frame_generation.wrapping_add(1);
@@ -666,6 +687,9 @@ mod tests {
             mouse: true,
             bracketed_paste: true,
             kitty_graphics: false,
+            kitty_unicode_placeholders: false,
+            graphics_source: cmdash::GraphicsCapabilitySource::Unavailable,
+            graphics_confidence: cmdash::GraphicsCapabilityConfidence::Rejected,
             sixel: false,
         }
     }

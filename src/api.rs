@@ -425,6 +425,10 @@ pub struct BackendCapabilitiesDto {
     pub mouse: bool,
     pub bracketed_paste: bool,
     pub kitty_graphics: bool,
+    pub kitty_unicode_placeholders: bool,
+    pub kitty_graphics_mode: &'static str,
+    pub graphics_source: &'static str,
+    pub graphics_confidence: &'static str,
     pub sixel: bool,
 }
 
@@ -435,6 +439,23 @@ impl From<BackendCapabilities> for BackendCapabilitiesDto {
             mouse: capabilities.mouse,
             bracketed_paste: capabilities.bracketed_paste,
             kitty_graphics: capabilities.kitty_graphics,
+            kitty_unicode_placeholders: capabilities.kitty_unicode_placeholders,
+            kitty_graphics_mode: match capabilities.kitty_graphics_mode() {
+                crate::backend::KittyGraphicsMode::Disabled => "disabled",
+                crate::backend::KittyGraphicsMode::Direct => "direct",
+                crate::backend::KittyGraphicsMode::UnicodePlaceholder => "unicode_placeholder",
+            },
+            graphics_source: match capabilities.graphics_source {
+                crate::backend::GraphicsCapabilitySource::EnvironmentHint => "environment_hint",
+                crate::backend::GraphicsCapabilitySource::ExplicitOverride => "explicit_override",
+                crate::backend::GraphicsCapabilitySource::ActiveProbe => "active_probe",
+                crate::backend::GraphicsCapabilitySource::Unavailable => "unavailable",
+            },
+            graphics_confidence: match capabilities.graphics_confidence {
+                crate::backend::GraphicsCapabilityConfidence::Inferred => "inferred",
+                crate::backend::GraphicsCapabilityConfidence::Confirmed => "confirmed",
+                crate::backend::GraphicsCapabilityConfidence::Rejected => "rejected",
+            },
             sixel: capabilities.sixel,
         }
     }
@@ -1085,6 +1106,9 @@ mod tests {
                 mouse: true,
                 bracketed_paste: true,
                 kitty_graphics: false,
+                kitty_unicode_placeholders: false,
+                graphics_source: crate::backend::GraphicsCapabilitySource::Unavailable,
+                graphics_confidence: crate::backend::GraphicsCapabilityConfidence::Rejected,
                 sixel: false,
             },
             &WidgetRegistry::builtins(),

@@ -190,7 +190,11 @@ A frame should follow these rules:
 7. Keep hidden sessions alive but do not include their scenes or graphics placements in the submitted frame.
 8. Advance active retained animations only at coordinator wakeups; a static frame
    remains valid when motion is disabled or unsupported.
-9. Submit only current visible image layers and delete stale session-qualified image IDs.
+9. For placeholder graphics, clear removed layers before the text diff, upload changed
+   resources, and re-emit current visible placeholder cells after composition;
+   direct replay may submit only changed resource/placement layers.
+10. Submit only current visible image layers and delete stale session-qualified
+    image IDs.
 
 The backend may optimize the final submission, but the logical frame must represent the complete visible dashboard. This prevents stale graphics or text from leaking across tab switches. Motion changes retained scene presentation only; it never gives widgets direct terminal output ownership. See [ANIMATION.md](ANIMATION.md) for scheduler, accessibility, and lifecycle details.
 
@@ -244,9 +248,44 @@ When a user switches away from a tab:
 When the user returns:
 
 - the retained emulator state and placements are rendered into a fresh scene for the current surface size;
-- the backend receives the visible frame and replayable Kitty upload/placement commands only for that session's visible resources;
+- the backend receives the visible frame and replayable Kitty resource commands only for that session's visible resources;
 - session-qualified terminal image IDs prevent identical source IDs in different tabs from colliding;
+- if the outer terminal supports Unicode placeholders, the backend creates a quiet virtual Kitty placement and emits placeholder cells after the normal text frame, so pane composition controls the visible location;
+- direct `a=T` placement replay remains available when placeholder mode is unavailable or explicitly selected for a compatible outer terminal;
 - if the terminal backend cannot safely retain/reuse an image, the session can replay/re-upload from its store without changing logical state.
+
+Placeholder replay clears stale virtual placements before the next text diff and
+re-emits current visible placeholders after each frame. This keeps image output
+from being silently lost when a pane is moved, resized, hidden, or redrawn. The
+mode can be selected with `CMDASH_KITTY_GRAPHICS_MODE=placeholder` (the default
+when placeholder support is detected), `direct`, or `off`; `CMDASH_KITTY_GRAPHICS=1`
+and `0` remain explicit capability overrides. Placements now retain a logical
+emulator-grid anchor and the scrollback depth at creation, then resolve against
+current history before surface clipping. This preserves ordinary primary-screen
+scroll movement while leaving scroll-region semantics and alternate-screen
+transitions for the next geometry tranche.
+
+Graphics submission is an explicit outer-rendering contract rather than a
+successful no-op: the backend reports `Rendered`, `Degraded`, `Suppressed`, or
+`Failed` with a placement count and bounded reason. The selected
+`disabled`/`direct`/`unicode_placeholder` mode is included in backend capability
+metadata and API snapshots. Placeholder geometry is validated before emission,
+so an invalid placement cannot leave a partial escape stream behind. Child-side
+malformed graphics commands are isolated to the session: cmdash records a
+bounded diagnostic and returns a Kitty error acknowledgement when an image or
+placement ID is available instead of terminating the terminal widget.
+
+The retained session store supports multiple placements per image and replaces
+only the matching `(image_id, placement_id)` pair. Resource IDs remain
+session-qualified, while the backend derives a separate outer-terminal image ID.
+A bounded `GraphicsProtocolBroker` keeps child-PTY responses in a separate queue
+from outer-terminal probe traffic. `GraphicsCapabilityProbe` emits a Kitty/DA1/
+pixel-size probe, correlates only the outer Kitty acknowledgement, and reports
+confirmed, rejected, or timed-out capability state; callers must provide the raw
+outer input and must not feed child PTY bytes into it. Capability metadata records
+whether support was inferred from the environment, explicitly overridden, or
+actively probed, together with confidence. Automatic outer-input demultiplexing,
+scroll-region semantics, and scene occlusion remain follow-up work.
 
 This is why a global image map or a single terminal emulator shared by tabs is explicitly out of scope.
 
@@ -290,7 +329,7 @@ Use three representations:
 2. **Scene:** immutable frame-local primitives such as cells, spans, borders, rectangles, image placements, and overlays.
 3. **Backend submission:** terminal-specific cursor movement, color encoding, clear operations, and graphics escape sequences.
 
-Image layers are diffed as part of `FrameDiff`; stale physical image IDs are explicitly deleted before visible current layers are replayed.
+Image layers are diffed as part of `FrameDiff`; stale physical image IDs are explicitly deleted before visible current layers are replayed. A frame diff carries changed, currently visible, and removed image submissions so placeholder backends can clear old cell regions before text output and restore current placeholders afterward.
 
 The scene should carry clipping and ownership metadata. Every image placement should include its owning `SessionId` or a derived resource namespace so the compositor can reject cross-session references during development.
 
@@ -352,7 +391,9 @@ The core should be testable without a real terminal:
 - parser conformance tests for text, alternate screen, resize, and graphics sequences;
 - frame golden tests for cell output and invalidation;
 - PTY integration tests for shell startup, input, output, resize, and clean shutdown;
-- capability tests for terminals with and without Kitty or opt-in sixel support;
+- capability and outcome tests for terminals with and without Kitty, direct versus
+  Unicode-placeholder mode, active probe acknowledgement/timeout, explicit
+  suppression, recoverable protocol errors, and opt-in sixel support;
 - fuzz targets and retained seed corpora for TOML migration, plugin manifests, Kitty APC chunking, and sixel encoding;
 - pane lifecycle tests for independent PTYs, nested layout persistence, and safe reload;
 - release archive, checksum, feature-variant, and startup checks on tagged builds;

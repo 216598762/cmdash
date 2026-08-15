@@ -391,6 +391,7 @@ pub trait Widget: Send {
 pub struct WidgetRuntimeContext {
     session_wakeup: Option<SessionWakeup>,
     initial_terminal_size: Option<TerminalSize>,
+    kitty_graphics: bool,
     theme: Theme,
 }
 
@@ -403,12 +404,18 @@ impl WidgetRuntimeContext {
         Self {
             session_wakeup: Some(wakeup),
             initial_terminal_size: None,
+            kitty_graphics: false,
             theme: Theme::default(),
         }
     }
 
     pub fn with_initial_terminal_size(mut self, size: TerminalSize) -> Self {
         self.initial_terminal_size = Some(size);
+        self
+    }
+
+    pub fn with_kitty_graphics(mut self, supported: bool) -> Self {
+        self.kitty_graphics = supported;
         self
     }
 
@@ -423,6 +430,10 @@ impl WidgetRuntimeContext {
 
     pub const fn initial_terminal_size(&self) -> Option<TerminalSize> {
         self.initial_terminal_size
+    }
+
+    pub const fn kitty_graphics(&self) -> bool {
+        self.kitty_graphics
     }
 
     pub const fn theme(&self) -> Theme {
@@ -1237,7 +1248,7 @@ fn terminal_widget_factory(
         .theme()
         .with_settings(&config.settings)
         .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?;
-    let session = TerminalSession::spawn_with_session_id_and_wakeup(
+    let mut session = TerminalSession::spawn_with_session_id_and_wakeup(
         crate::state::SessionId::new(config.id),
         config.command.as_deref(),
         &[],
@@ -1250,6 +1261,7 @@ fn terminal_widget_factory(
         kind: "terminal".to_owned(),
         reason: error.to_string(),
     })?;
+    session.set_kitty_graphics_support(context.kitty_graphics());
     Ok(Box::new(TerminalWidget {
         title: config
             .title

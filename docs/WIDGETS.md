@@ -678,6 +678,9 @@ allowing the surrounding workspace arrangement to persist across reloads.
   on the surrounding terminal emulator's clipboard policy.
 - **Images are missing:** Kitty and sixel are optional capability paths. Check
   terminal support, feature flags, clipping, and graphics quota diagnostics.
+  For pane-safe Kitty rendering, use the default Unicode-placeholder mode or
+  set `CMDASH_KITTY_GRAPHICS_MODE=placeholder`; use `direct` only when the
+  outer terminal is known to support root-terminal placement semantics.
 - **Reload loses a change:** configuration reload is validation-based and keeps
   the last valid runtime. Check TOML syntax, duplicate IDs, layout references,
   widget type names, and schema version.

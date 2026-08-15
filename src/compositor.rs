@@ -43,7 +43,8 @@ pub struct FrameDiff {
     changes: Vec<CellChange>,
     spans: Vec<CellSpan>,
     graphics: Vec<crate::graphics::GraphicsSubmission>,
-    removed_graphics: Vec<u32>,
+    visible_graphics: Vec<crate::graphics::GraphicsSubmission>,
+    removed_graphics: Vec<crate::graphics::GraphicsSubmission>,
     #[cfg(feature = "sixel")]
     sixel: Vec<crate::sixel::SixelSubmission>,
 }
@@ -73,7 +74,11 @@ impl FrameDiff {
         &self.graphics
     }
 
-    pub fn removed_graphics(&self) -> &[u32] {
+    pub fn visible_graphics(&self) -> &[crate::graphics::GraphicsSubmission] {
+        &self.visible_graphics
+    }
+
+    pub fn removed_graphics(&self) -> &[crate::graphics::GraphicsSubmission] {
         &self.removed_graphics
     }
 
@@ -204,7 +209,7 @@ impl Compositor {
                     .get(&image.terminal_image_id())
                     .is_none_or(|current| *current != *image)
             })
-            .map(|image| image.terminal_image_id())
+            .cloned()
             .collect();
         let mut changes = Vec::new();
 
@@ -235,6 +240,7 @@ impl Compositor {
             changes,
             spans,
             graphics,
+            visible_graphics: current.image_layers().to_vec(),
             removed_graphics,
             #[cfg(feature = "sixel")]
             sixel,
@@ -307,6 +313,9 @@ mod tests {
             mouse: true,
             bracketed_paste: true,
             kitty_graphics: false,
+            kitty_unicode_placeholders: false,
+            graphics_source: crate::backend::GraphicsCapabilitySource::Unavailable,
+            graphics_confidence: crate::backend::GraphicsCapabilityConfidence::Rejected,
             sixel: false,
         }
     }
@@ -494,9 +503,10 @@ mod tests {
         let second = compositor.diff(&second_scene);
         assert!(!second.is_empty());
         assert_eq!(second.graphics().len(), 0);
+        assert_eq!(second.removed_graphics().len(), 1);
         assert_eq!(
-            second.removed_graphics(),
-            &[first.graphics()[0].terminal_image_id()]
+            second.removed_graphics()[0].terminal_image_id(),
+            first.graphics()[0].terminal_image_id()
         );
     }
 

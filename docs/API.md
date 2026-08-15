@@ -94,7 +94,7 @@ All endpoints use the `/v1` prefix.
 | Endpoint | Result |
 | --- | --- |
 | `GET /v1/health` | Process status, API version, and current frame generation. |
-| `GET /v1/capabilities` | Transport, read-only state, graphics exposure, and allowed operations. |
+| `GET /v1/capabilities` | Transport, read-only state, graphics exposure, capability mode/source/confidence, and allowed operations. |
 | `GET /v1/workspace` | Workspace ID/name and current focus target. |
 | `GET /v1/surfaces` | Surface/widget IDs, visibility, z-order, geometry, and focus. |
 | `GET /v1/widgets` | Widget IDs, kinds, and bounded health summaries. |
@@ -237,6 +237,10 @@ require explicit binding, authentication, and a security review; it must not
 inherit the Unix-socket trust model automatically.
 
 ## Testing contract
+
+Graphics capability snapshots distinguish environment hints, explicit overrides,
+and active-probe confirmation/rejection. A probe response is never serialized as
+child PTY output.
 
 The API implementation tests request validation, JSON command allowlisting,
 read-only authorization, state validation, snapshot generation, diff fallback,
