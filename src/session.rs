@@ -1,21 +1,30 @@
 use std::{
     fmt,
     io::{self, Read, Write},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
 };
 
 use alacritty_terminal::{
-    event::VoidListener,
+    event::{Event, EventListener},
     grid::Dimensions,
     term::{Config, Term, TermMode, cell::Flags},
     vte::ansi::{Color as AnsiColor, NamedColor, Processor},
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+use crossterm::event::{
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::layout::Rect;
 
 use crate::{
+    appearance::Theme,
     graphics::{GraphicsError, GraphicsSubmission, SessionGraphicsStore},
     scene::{CellStyle, Color, Scene},
     state::SessionId,
@@ -89,8 +98,65 @@ impl fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
+#[derive(Debug)]
+pub enum UiEvent {
+    Input(CrosstermEvent),
+    PtyOutput,
+    Tick,
+    InputError(String),
+}
+
+/// A coalescing wakeup shared by terminal PTY readers and the UI coordinator.
+#[derive(Clone)]
+pub struct SessionWakeup {
+    sender: Sender<UiEvent>,
+    pending: Arc<AtomicBool>,
+}
+
+impl SessionWakeup {
+    fn notify(&self) {
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            let _ = self.sender.send(UiEvent::PtyOutput);
+        }
+    }
+
+    pub fn clear_pending(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+}
+
+pub fn ui_event_channel() -> (Sender<UiEvent>, Receiver<UiEvent>, SessionWakeup) {
+    let (sender, receiver) = mpsc::channel();
+    let wakeup = SessionWakeup {
+        sender: sender.clone(),
+        pending: Arc::new(AtomicBool::new(false)),
+    };
+    (sender, receiver, wakeup)
+}
+
 struct SessionOutput {
     receiver: Receiver<io::Result<Vec<u8>>>,
+}
+
+/// Receives terminal-emulator requests that must be sent back to the child PTY.
+///
+/// Shells use these requests for capability negotiation. In particular, fish
+/// sends a Primary Device Attribute query during startup and waits for the
+/// emulator's response before continuing.
+struct SessionEventListener {
+    pty_writer: Sender<String>,
+}
+
+impl EventListener for SessionEventListener {
+    fn send_event(&self, event: Event) {
+        if let Event::PtyWrite(text) = event {
+            // The session drains this session-owned channel after feeding
+            // output to the emulator. A disconnected receiver only
+            // means the session is shutting down, so there is nothing useful to
+            // do with the response.
+            let _ = self.pty_writer.send(text);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,8 +166,9 @@ struct Selection {
 }
 
 pub struct TerminalSession {
-    term: Term<VoidListener>,
+    term: Term<SessionEventListener>,
     processor: Processor,
+    emulator_responses: Receiver<String>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -133,6 +200,16 @@ impl TerminalSession {
         args: &[&str],
         size: TerminalSize,
     ) -> Result<Self, SessionError> {
+        Self::spawn_with_session_id_and_wakeup(session_id, command, args, size, None)
+    }
+
+    pub fn spawn_with_session_id_and_wakeup(
+        session_id: SessionId,
+        command: Option<&str>,
+        args: &[&str],
+        size: TerminalSize,
+        wakeup: Option<SessionWakeup>,
+    ) -> Result<Self, SessionError> {
         let size = size.validate()?;
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -163,13 +240,21 @@ impl TerminalSession {
             .take_writer()
             .map_err(|error| SessionError::Io(error.to_string()))?;
         let output = SessionOutput {
-            receiver: spawn_reader(reader),
+            receiver: spawn_reader(reader, wakeup),
         };
-        let term = Term::new(Config::default(), &size, VoidListener);
+        let (response_sender, response_receiver) = mpsc::channel();
+        let term = Term::new(
+            Config::default(),
+            &size,
+            SessionEventListener {
+                pty_writer: response_sender,
+            },
+        );
 
         Ok(Self {
             term,
             processor: Processor::new(),
+            emulator_responses: response_receiver,
             master: pair.master,
             writer,
             child,
@@ -262,6 +347,7 @@ impl TerminalSession {
                     let plain = self.consume_output(&bytes)?;
                     if !plain.is_empty() {
                         self.processor.advance(&mut self.term, &plain);
+                        self.flush_emulator_responses()?;
                         changed = true;
                     }
                     changed = changed || !bytes.is_empty();
@@ -294,6 +380,20 @@ impl TerminalSession {
                 .map_err(|error: GraphicsError| SessionError::Graphics(error.to_string()))?;
         }
         Ok(plain)
+    }
+
+    fn flush_emulator_responses(&mut self) -> Result<(), SessionError> {
+        let mut response = Vec::new();
+        while let Ok(text) = self.emulator_responses.try_recv() {
+            response.extend_from_slice(text.as_bytes());
+        }
+        if response.is_empty() {
+            return Ok(());
+        }
+        self.writer
+            .write_all(&response)
+            .and_then(|_| self.writer.flush())
+            .map_err(|error| SessionError::Io(error.to_string()))
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
@@ -359,8 +459,12 @@ impl TerminalSession {
     }
 
     pub fn render(&self, area: Rect, focused: bool) -> Scene {
+        self.render_with_theme(area, focused, Theme::fallback())
+    }
+
+    pub fn render_with_theme(&self, area: Rect, focused: bool, theme: Theme) -> Scene {
         let mut scene = Scene::new(area);
-        let default_style = CellStyle::new(Color::rgb(220, 224, 230), Color::rgb(18, 22, 30));
+        let default_style = CellStyle::new(theme.foreground(), theme.background());
         scene.fill(area, default_style);
         for indexed in self.term.grid().display_iter() {
             let point = indexed.point;
@@ -374,8 +478,8 @@ impl TerminalSession {
                 continue;
             }
             let mut style = CellStyle::new(
-                color_to_scene(cell.fg, Color::rgb(220, 224, 230)),
-                color_to_scene(cell.bg, Color::rgb(18, 22, 30)),
+                color_to_scene(cell.fg, theme.foreground()),
+                color_to_scene(cell.bg, theme.background()),
             );
             if cell.flags.contains(Flags::BOLD) {
                 style = style.bold();
@@ -501,21 +605,35 @@ fn default_command() -> CommandBuilder {
     }
 }
 
-fn spawn_reader(mut reader: Box<dyn Read + Send>) -> Receiver<io::Result<Vec<u8>>> {
+fn spawn_reader(
+    mut reader: Box<dyn Read + Send>,
+    wakeup: Option<SessionWakeup>,
+) -> Receiver<io::Result<Vec<u8>>> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         loop {
             let mut buffer = vec![0; 4096];
             match reader.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => {
+                    if let Some(wakeup) = &wakeup {
+                        wakeup.notify();
+                    }
+                    break;
+                }
                 Ok(length) => {
                     buffer.truncate(length);
                     if sender.send(Ok(buffer)).is_err() {
                         break;
                     }
+                    if let Some(wakeup) = &wakeup {
+                        wakeup.notify();
+                    }
                 }
                 Err(error) => {
                     let _ = sender.send(Err(error));
+                    if let Some(wakeup) = &wakeup {
+                        wakeup.notify();
+                    }
                     break;
                 }
             }
@@ -598,49 +716,31 @@ fn color_to_scene(color: AnsiColor, fallback: Color) -> Color {
 }
 
 fn named_color(color: NamedColor) -> Option<Color> {
-    let color = match color {
-        NamedColor::Black => (0, 0, 0),
-        NamedColor::Red => (205, 49, 49),
-        NamedColor::Green => (13, 188, 121),
-        NamedColor::Yellow => (229, 229, 16),
-        NamedColor::Blue => (36, 114, 200),
-        NamedColor::Magenta => (188, 63, 188),
-        NamedColor::Cyan => (17, 168, 205),
-        NamedColor::White => (229, 229, 229),
-        NamedColor::BrightBlack => (102, 102, 102),
-        NamedColor::BrightRed => (241, 76, 76),
-        NamedColor::BrightGreen => (35, 209, 139),
-        NamedColor::BrightYellow => (245, 245, 67),
-        NamedColor::BrightBlue => (59, 142, 234),
-        NamedColor::BrightMagenta => (214, 112, 214),
-        NamedColor::BrightCyan => (41, 184, 219),
-        NamedColor::BrightWhite => (255, 255, 255),
+    let index = match color {
+        NamedColor::Black => 0,
+        NamedColor::Red => 1,
+        NamedColor::Green => 2,
+        NamedColor::Yellow => 3,
+        NamedColor::Blue => 4,
+        NamedColor::Magenta => 5,
+        NamedColor::Cyan => 6,
+        NamedColor::White => 7,
+        NamedColor::BrightBlack => 8,
+        NamedColor::BrightRed => 9,
+        NamedColor::BrightGreen => 10,
+        NamedColor::BrightYellow => 11,
+        NamedColor::BrightBlue => 12,
+        NamedColor::BrightMagenta => 13,
+        NamedColor::BrightCyan => 14,
+        NamedColor::BrightWhite => 15,
         _ => return None,
     };
-    Some(Color::rgb(color.0, color.1, color.2))
+    Some(Color::ansi(index))
 }
 
 fn indexed_color(index: u8) -> Color {
-    const BASIC: [Color; 16] = [
-        Color::rgb(0, 0, 0),
-        Color::rgb(205, 49, 49),
-        Color::rgb(13, 188, 121),
-        Color::rgb(229, 229, 16),
-        Color::rgb(36, 114, 200),
-        Color::rgb(188, 63, 188),
-        Color::rgb(17, 168, 205),
-        Color::rgb(229, 229, 229),
-        Color::rgb(102, 102, 102),
-        Color::rgb(241, 76, 76),
-        Color::rgb(35, 209, 139),
-        Color::rgb(245, 245, 67),
-        Color::rgb(59, 142, 234),
-        Color::rgb(214, 112, 214),
-        Color::rgb(41, 184, 219),
-        Color::rgb(255, 255, 255),
-    ];
     match index {
-        index @ 0..=15 => BASIC[index as usize],
+        index @ 0..=15 => Color::ansi(index),
         16..=231 => {
             let index = index as u16 - 16;
             let red = index / 36;
@@ -674,6 +774,47 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("terminal output did not arrive");
+    }
+
+    #[test]
+    fn pty_wakeup_notifications_are_coalesced_until_consumed() {
+        let (_sender, receiver, wakeup) = ui_event_channel();
+        wakeup.notify();
+        wakeup.notify();
+
+        assert!(matches!(receiver.try_recv(), Ok(UiEvent::PtyOutput)));
+        assert!(receiver.try_recv().is_err());
+
+        wakeup.clear_pending();
+        wakeup.notify();
+        assert!(matches!(receiver.try_recv(), Ok(UiEvent::PtyOutput)));
+    }
+
+    #[test]
+    fn primary_device_attribute_queries_are_answered_to_the_child_pty() {
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &[
+                "-c",
+                "stty -icanon min 1 time 0; printf '\\033[c'; response=$(dd bs=1 count=5 2>/dev/null); if [ \"$response\" = \"$(printf '\\033[?6c')\" ]; then printf 'primary-ok'; fi; sleep 5",
+            ],
+            TerminalSize::new(40, 8),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut primary_ok = false;
+        while Instant::now() < deadline {
+            session.poll_output().unwrap();
+            let scene = session.render(Rect::new(0, 0, 40, 8), false);
+            let rendered: String = scene.cells().iter().map(|cell| cell.symbol).collect();
+            if rendered.contains("primary-ok") {
+                primary_ok = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(primary_ok, "child did not receive the DA1 response");
+        session.shutdown().unwrap();
     }
 
     #[test]
@@ -781,7 +922,7 @@ mod tests {
         assert_eq!(scene.cell_at(0, 0).unwrap().symbol, 'r');
         assert_eq!(
             scene.cell_at(0, 0).unwrap().style.foreground,
-            Color::rgb(205, 49, 49)
+            Color::ansi(1)
         );
         session.write_bytes(b"\n").unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);

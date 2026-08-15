@@ -1,3 +1,4 @@
+pub mod appearance;
 pub mod backend;
 pub mod command;
 pub mod compositor;
@@ -19,6 +20,7 @@ pub mod state;
 pub mod wasm_plugin;
 pub mod widget;
 
+pub use appearance::{AppearanceError, Theme};
 pub use backend::{Backend, BackendCapabilities, CrosstermBackend, OutputMetrics};
 pub use command::{
     Command, CommandEffect, FocusCommand, FocusDirection, OverlayCommand, PaneCommand,
@@ -26,9 +28,9 @@ pub use command::{
 };
 pub use compositor::{CellSpan, Compositor, FrameDiff};
 pub use config::{
-    AppConfig, CONFIG_SCHEMA, CURRENT_CONFIG_VERSION, ConfigError, ConfigFileError,
-    ConfigMigration, LayoutConfig, LoadedConfig, OverlayConfig, PluginConfig, SplitDirection,
-    WidgetInstanceConfig, WorkspaceConfig,
+    AppConfig, AppearanceConfig, CONFIG_SCHEMA, CURRENT_CONFIG_VERSION, ConfigError,
+    ConfigFileError, ConfigMigration, LabelPolicy, LayoutConfig, LoadedConfig, OverlayConfig,
+    PluginConfig, SplitDirection, WidgetInstanceConfig, WorkspaceConfig,
 };
 pub use crash::CrashReport;
 pub use graphics::{
@@ -45,7 +47,10 @@ pub use plugin::{
 };
 pub use reload::{ConfigReloader, ReloadError};
 pub use scene::{Cell, CellStyle, CellWidth, Color, Scene};
-pub use session::{SessionError, TerminalSession, TerminalSize, kitty_stream_stats};
+pub use session::{
+    SessionError, SessionWakeup, TerminalSession, TerminalSize, UiEvent, kitty_stream_stats,
+    ui_event_channel,
+};
 #[cfg(feature = "sixel")]
 pub use sixel::{SixelError, SixelImage, SixelSubmission, encode_rgb};
 pub use state::{
@@ -55,6 +60,7 @@ pub use state::{
 #[cfg(feature = "wasm-plugins")]
 pub use wasm_plugin::{WasmLimits, WasmPluginError, WasmPluginHost, WasmPluginInstance};
 pub use widget::{
-    Widget, WidgetError, WidgetHealth, WidgetRegistry, WidgetRuntime, WidgetStatus, WidgetUpdate,
-    WidgetUpdateReport,
+    Widget, WidgetAppearance, WidgetBorderStyle, WidgetError, WidgetFactory, WidgetHealth,
+    WidgetRegistry, WidgetRuntime, WidgetRuntimeContext, WidgetStatus, WidgetUpdate,
+    WidgetUpdateReport, widget_content_area,
 };

@@ -4,6 +4,7 @@ use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::{
+    appearance::Theme,
     backend::BackendCapabilities,
     command::{
         Command, CommandEffect, FocusCommand, FocusDirection, OverlayCommand, PaneCommand,
@@ -311,6 +312,7 @@ pub struct AppState {
     workspace: WorkspaceState,
     focus: FocusState,
     backend_capabilities: BackendCapabilities,
+    theme: Theme,
     widget_runtime: WidgetRuntime,
     layout: LayoutTree,
     quit_requested: bool,
@@ -331,6 +333,7 @@ impl AppState {
             workspace: WorkspaceState::new(WorkspaceId::new(1), "default"),
             focus: FocusState::default(),
             backend_capabilities,
+            theme: Theme::default(),
             widget_runtime: WidgetRuntime::empty(),
             layout: LayoutTree::from_config(None, [], []).expect("empty layout is valid"),
             quit_requested: false,
@@ -341,6 +344,7 @@ impl AppState {
             config: AppConfig {
                 version: crate::config::CURRENT_CONFIG_VERSION,
                 workspace: crate::config::WorkspaceConfig::default(),
+                appearance: crate::config::AppearanceConfig::default(),
                 plugins: Vec::new(),
             },
             widget_registry: WidgetRegistry::builtins(),
@@ -367,7 +371,11 @@ impl AppState {
         config
             .validate()
             .map_err(AppStateConfigError::InvalidConfig)?;
-        let widget_runtime = WidgetRuntime::from_config_with_plugins(registry, plugins, config)
+        let theme = Theme::from_config(&config.appearance).map_err(|error| {
+            AppStateConfigError::InvalidConfig(ConfigError::InvalidAppearance(error.to_string()))
+        })?;
+        let registry = registry.with_theme(theme);
+        let widget_runtime = WidgetRuntime::from_config_with_plugins(&registry, plugins, config)
             .map_err(AppStateConfigError::Widget)?;
         let widget_ids = config
             .workspace
@@ -386,6 +394,7 @@ impl AppState {
             workspace: WorkspaceState::new(WorkspaceId::new(1), config.workspace.name.clone()),
             focus: FocusState::default(),
             backend_capabilities,
+            theme,
             widget_runtime,
             layout,
             quit_requested: false,
@@ -433,10 +442,7 @@ impl AppState {
                 overlay = overlay.with_primitive(OverlayPrimitive::Border {
                     area: overlay_area,
                     title: title.clone(),
-                    style: CellStyle::new(
-                        crate::scene::Color::rgb(216, 180, 254),
-                        crate::scene::Color::rgb(38, 28, 58),
-                    ),
+                    style: CellStyle::new(theme.border(), theme.overlay_background()),
                 });
             }
             if let Some(text) = &overlay_config.text {
@@ -444,10 +450,7 @@ impl AppState {
                     x: overlay_config.x.saturating_add(1),
                     y: overlay_config.y.saturating_add(1),
                     text: text.clone(),
-                    style: CellStyle::new(
-                        crate::scene::Color::rgb(245, 232, 255),
-                        crate::scene::Color::rgb(38, 28, 58),
-                    ),
+                    style: CellStyle::new(theme.overlay_foreground(), theme.overlay_background()),
                 });
             }
             state.workspace.overlays.insert(overlay_id, overlay);
@@ -465,6 +468,10 @@ impl AppState {
 
     pub fn layout(&self) -> &LayoutTree {
         &self.layout
+    }
+
+    pub const fn theme(&self) -> Theme {
+        self.theme
     }
 
     pub fn diagnostics(&self) -> &[String] {
@@ -633,16 +640,17 @@ impl AppState {
             return Ok(false);
         };
         let area = surface.area();
-        if mouse.column < area.x
-            || mouse.row < area.y
-            || mouse.column >= area.x.saturating_add(area.width)
-            || mouse.row >= area.y.saturating_add(area.height)
+        let input_area = self.widget_runtime.content_area(widget_id, area);
+        if mouse.column < input_area.x
+            || mouse.row < input_area.y
+            || mouse.column >= input_area.x.saturating_add(input_area.width)
+            || mouse.row >= input_area.y.saturating_add(input_area.height)
             || !self.widget_runtime.handles_input(widget_id)
         {
             return Ok(false);
         }
         self.widget_runtime
-            .handle_mouse(widget_id, mouse, (area.x, area.y))?;
+            .handle_mouse(widget_id, mouse, (input_area.x, input_area.y))?;
         Ok(true)
     }
 
@@ -655,12 +663,13 @@ impl AppState {
             .filter_map(|(&surface_id, &area)| {
                 let surface = self.workspace.surfaces.get(&surface_id)?;
                 let widget_id = surface.widget()?;
+                let content = self.widget_runtime.content_area(widget_id, area);
                 (self.widget_runtime.widget_kind(widget_id) == Some("terminal")
-                    && area.width >= 2
-                    && area.height > 0)
+                    && content.width >= 2
+                    && content.height > 0)
                     .then_some((
                         widget_id,
-                        crate::session::TerminalSize::new(area.width, area.height),
+                        crate::session::TerminalSize::new(content.width, content.height),
                     ))
             })
             .collect();
@@ -806,8 +815,8 @@ impl AppState {
             return;
         }
         let style = CellStyle::new(
-            crate::scene::Color::rgb(245, 232, 255),
-            crate::scene::Color::rgb(38, 28, 58),
+            self.theme.overlay_foreground(),
+            self.theme.overlay_background(),
         );
         let overlay = Overlay::new(id, area)
             .with_z_index(i16::MAX)
@@ -816,10 +825,7 @@ impl AppState {
             .with_primitive(OverlayPrimitive::Border {
                 area,
                 title: title.to_owned(),
-                style: CellStyle::new(
-                    crate::scene::Color::rgb(216, 180, 254),
-                    crate::scene::Color::rgb(38, 28, 58),
-                ),
+                style: CellStyle::new(self.theme.border(), self.theme.overlay_background()),
             });
         let mut overlay = overlay;
         for (offset, line) in text.lines().enumerate() {
@@ -1020,6 +1026,7 @@ impl AppState {
             id: new_id.get(),
             kind: source.kind,
             title: source.title,
+            label: source.label,
             text: source.text,
             format: source.format,
             command: source.command,

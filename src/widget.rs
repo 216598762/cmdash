@@ -10,11 +10,12 @@ use ratatui::layout::Rect;
 #[cfg(feature = "sixel")]
 use crate::sixel::SixelSubmission;
 use crate::{
-    config::{AppConfig, WidgetInstanceConfig},
+    appearance::Theme,
+    config::{AppConfig, LabelPolicy, WidgetInstanceConfig},
     graphics::GraphicsSubmission,
     plugin::PluginRegistry,
     scene::{CellStyle, Color, Scene},
-    session::{TerminalSession, TerminalSize},
+    session::{SessionWakeup, TerminalSession, TerminalSize},
     state::WidgetId,
 };
 
@@ -29,6 +30,173 @@ pub enum WidgetHealth {
     Healthy,
     Degraded(String),
     Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WidgetBorderStyle {
+    Rounded,
+    Square,
+    Double,
+    Heavy,
+    Ascii,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WidgetAppearance {
+    padding: u16,
+    border: WidgetBorderStyle,
+}
+
+impl Default for WidgetAppearance {
+    fn default() -> Self {
+        Self {
+            padding: 0,
+            border: WidgetBorderStyle::Rounded,
+        }
+    }
+}
+
+impl WidgetAppearance {
+    pub fn from_settings(settings: &BTreeMap<String, String>) -> Result<Self, WidgetError> {
+        let padding = settings
+            .get("padding")
+            .map(|value| {
+                value.parse::<u16>().map_err(|_| {
+                    WidgetError::InvalidConfiguration(format!(
+                        "widget padding must be a non-negative integer, got {value:?}"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let border = settings
+            .get("border")
+            .or_else(|| settings.get("border_style"))
+            .map(|value| match value.to_ascii_lowercase().as_str() {
+                "rounded" => Ok(WidgetBorderStyle::Rounded),
+                "square" => Ok(WidgetBorderStyle::Square),
+                "double" => Ok(WidgetBorderStyle::Double),
+                "heavy" => Ok(WidgetBorderStyle::Heavy),
+                "ascii" => Ok(WidgetBorderStyle::Ascii),
+                "none" => Ok(WidgetBorderStyle::None),
+                _ => Err(WidgetError::InvalidConfiguration(format!(
+                    "widget border must be rounded, square, double, heavy, ascii, or none, got {value:?}"
+                ))),
+            })
+            .transpose()?
+            .unwrap_or(WidgetBorderStyle::Rounded);
+        Ok(Self { padding, border })
+    }
+
+    pub const fn padding(self) -> u16 {
+        self.padding
+    }
+
+    pub const fn border(self) -> WidgetBorderStyle {
+        self.border
+    }
+
+    pub fn content_area(self, area: Rect) -> Rect {
+        let border_inset = if self.border == WidgetBorderStyle::None {
+            0
+        } else {
+            1
+        };
+        let inset = self.padding.saturating_add(border_inset);
+        Rect::new(
+            area.x.saturating_add(inset),
+            area.y.saturating_add(inset),
+            area.width.saturating_sub(inset.saturating_mul(2)),
+            area.height.saturating_sub(inset.saturating_mul(2)),
+        )
+    }
+
+    pub fn render_border(self, scene: &mut Scene, area: Rect, title: &str, style: CellStyle) {
+        let Some(glyphs) = self.border.glyphs() else {
+            return;
+        };
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let right = area.x.saturating_add(area.width.saturating_sub(1));
+        let bottom = area.y.saturating_add(area.height.saturating_sub(1));
+        for x in area.x..=right {
+            scene.set(x, area.y, glyphs.horizontal, style);
+            scene.set(x, bottom, glyphs.horizontal, style);
+        }
+        for y in area.y..=bottom {
+            scene.set(area.x, y, glyphs.vertical, style);
+            scene.set(right, y, glyphs.vertical, style);
+        }
+        if area.width >= 2 && area.height >= 2 {
+            scene.set(area.x, area.y, glyphs.top_left, style);
+            scene.set(right, area.y, glyphs.top_right, style);
+            scene.set(area.x, bottom, glyphs.bottom_left, style);
+            scene.set(right, bottom, glyphs.bottom_right, style);
+        }
+        if area.width > 4 {
+            scene.text(area.x.saturating_add(2), area.y, title, style.bold());
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BorderGlyphs {
+    horizontal: char,
+    vertical: char,
+    top_left: char,
+    top_right: char,
+    bottom_left: char,
+    bottom_right: char,
+}
+
+impl WidgetBorderStyle {
+    const fn glyphs(self) -> Option<BorderGlyphs> {
+        match self {
+            Self::Rounded => Some(BorderGlyphs {
+                horizontal: '─',
+                vertical: '│',
+                top_left: '╭',
+                top_right: '╮',
+                bottom_left: '╰',
+                bottom_right: '╯',
+            }),
+            Self::Square => Some(BorderGlyphs {
+                horizontal: '─',
+                vertical: '│',
+                top_left: '┌',
+                top_right: '┐',
+                bottom_left: '└',
+                bottom_right: '┘',
+            }),
+            Self::Double => Some(BorderGlyphs {
+                horizontal: '═',
+                vertical: '║',
+                top_left: '╔',
+                top_right: '╗',
+                bottom_left: '╚',
+                bottom_right: '╝',
+            }),
+            Self::Heavy => Some(BorderGlyphs {
+                horizontal: '━',
+                vertical: '┃',
+                top_left: '┏',
+                top_right: '┓',
+                bottom_left: '┗',
+                bottom_right: '┛',
+            }),
+            Self::Ascii => Some(BorderGlyphs {
+                horizontal: '-',
+                vertical: '|',
+                top_left: '+',
+                top_right: '+',
+                bottom_left: '+',
+                bottom_right: '+',
+            }),
+            Self::None => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +257,10 @@ pub trait Widget: Send {
 
     fn render(&self, area: Rect, focused: bool) -> Scene;
 
+    fn content_area(&self, area: Rect) -> Rect {
+        widget_content_area(area)
+    }
+
     fn graphics(&self, _area: Rect) -> Vec<GraphicsSubmission> {
         Vec::new()
     }
@@ -131,7 +303,46 @@ pub trait Widget: Send {
     }
 }
 
-pub type WidgetFactory = fn(&WidgetInstanceConfig) -> Result<Box<dyn Widget>, WidgetError>;
+/// Construction-time services shared by registered widget factories.
+///
+/// The context is intentionally capability-oriented: factories can use only
+/// services exposed here, rather than reaching into application state or
+/// global runtime handles.
+#[derive(Clone, Default)]
+pub struct WidgetRuntimeContext {
+    session_wakeup: Option<SessionWakeup>,
+    theme: Theme,
+}
+
+impl WidgetRuntimeContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_session_wakeup(wakeup: SessionWakeup) -> Self {
+        Self {
+            session_wakeup: Some(wakeup),
+            theme: Theme::default(),
+        }
+    }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    pub fn session_wakeup(&self) -> Option<&SessionWakeup> {
+        self.session_wakeup.as_ref()
+    }
+
+    pub const fn theme(&self) -> Theme {
+        self.theme
+    }
+}
+
+/// Creates a widget from configuration and the shared runtime context.
+pub type WidgetFactory =
+    fn(&WidgetInstanceConfig, &WidgetRuntimeContext) -> Result<Box<dyn Widget>, WidgetError>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WidgetError {
@@ -163,6 +374,7 @@ impl std::error::Error for WidgetError {}
 #[derive(Clone, Default)]
 pub struct WidgetRegistry {
     factories: BTreeMap<String, WidgetFactory>,
+    context: WidgetRuntimeContext,
 }
 
 impl WidgetRegistry {
@@ -171,7 +383,22 @@ impl WidgetRegistry {
     }
 
     pub fn builtins() -> Self {
-        let mut registry = Self::new();
+        Self::build_builtins(WidgetRuntimeContext::new())
+    }
+
+    pub fn builtins_with_wakeup(wakeup: SessionWakeup) -> Self {
+        Self::builtins_with_context(WidgetRuntimeContext::with_session_wakeup(wakeup))
+    }
+
+    pub fn builtins_with_context(context: WidgetRuntimeContext) -> Self {
+        Self::build_builtins(context)
+    }
+
+    fn build_builtins(context: WidgetRuntimeContext) -> Self {
+        let mut registry = Self {
+            factories: BTreeMap::new(),
+            context,
+        };
         registry
             .register("text", text_widget_factory)
             .expect("built-in widget types are unique");
@@ -204,12 +431,22 @@ impl WidgetRegistry {
         self.factories.contains_key(kind)
     }
 
+    pub fn context(&self) -> &WidgetRuntimeContext {
+        &self.context
+    }
+
+    pub fn with_theme(&self, theme: Theme) -> Self {
+        let mut registry = self.clone();
+        registry.context = registry.context.clone().with_theme(theme);
+        registry
+    }
+
     fn instantiate(&self, config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>, WidgetError> {
         let factory = self
             .factories
             .get(&config.kind)
             .ok_or_else(|| WidgetError::UnknownWidgetType(config.kind.clone()))?;
-        factory(config)
+        factory(config, &self.context)
     }
 }
 
@@ -252,7 +489,7 @@ impl WidgetRuntime {
                 registry.instantiate(widget_config)?
             } else if let Some(plugins) = plugins {
                 plugins
-                    .instantiate(widget_config)
+                    .instantiate(widget_config, registry.context())
                     .map_err(|error| WidgetError::Plugin(error.to_string()))?
             } else {
                 return Err(WidgetError::UnknownWidgetType(widget_config.kind.clone()));
@@ -377,6 +614,12 @@ impl WidgetRuntime {
             .is_some_and(|entry| entry.widget.handles_input())
     }
 
+    pub fn content_area(&self, id: WidgetId, area: Rect) -> Rect {
+        self.instances
+            .get(&id)
+            .map_or(area, |entry| entry.widget.content_area(area))
+    }
+
     pub fn handle_paste(&mut self, id: WidgetId, text: &str) -> Result<WidgetUpdate, String> {
         let entry = self
             .instances
@@ -487,9 +730,63 @@ impl WidgetRuntime {
     }
 }
 
+#[derive(Clone, Copy)]
+struct BorderedTextStyle {
+    foreground: Color,
+    background: Color,
+    focused_accent: Color,
+    unfocused_accent: Color,
+    text: CellStyle,
+    appearance: WidgetAppearance,
+}
+
+fn render_bordered_text(
+    area: Rect,
+    title: &str,
+    focused: bool,
+    text: &str,
+    style: BorderedTextStyle,
+) -> Scene {
+    let accent = if focused {
+        style.focused_accent
+    } else {
+        style.unfocused_accent
+    };
+    let mut scene = Scene::new(area);
+    scene.fill(area, CellStyle::new(style.foreground, style.background));
+    style.appearance.render_border(
+        &mut scene,
+        area,
+        title,
+        CellStyle::new(accent, style.background),
+    );
+
+    let content_area = style.appearance.content_area(area);
+    if content_area.width > 0 && content_area.height > 0 {
+        let mut content = Scene::new(content_area);
+        content.fill(
+            content_area,
+            CellStyle::new(style.foreground, style.background),
+        );
+        // Keep the historical one-cell text inset while allowing `padding`
+        // to add space around the widget's content area.
+        content.text(
+            content_area.x.saturating_add(1),
+            content_area.y,
+            text,
+            style.text,
+        );
+        scene.blit(&content, area);
+    }
+    scene
+}
+
 struct TextWidget {
     title: String,
+    label: bool,
     text: String,
+    appearance: WidgetAppearance,
+    theme: Theme,
 }
 
 impl Widget for TextWidget {
@@ -497,40 +794,53 @@ impl Widget for TextWidget {
         "text"
     }
 
+    fn content_area(&self, area: Rect) -> Rect {
+        self.appearance.content_area(area)
+    }
+
     fn render(&self, area: Rect, focused: bool) -> Scene {
-        let background = Color::rgb(27, 33, 44);
-        let foreground = Color::rgb(226, 232, 240);
-        let accent = if focused {
-            Color::rgb(250, 204, 21)
-        } else {
-            Color::rgb(125, 211, 252)
-        };
-        let mut scene = Scene::new(area);
-        scene.fill(area, CellStyle::new(foreground, background));
-        scene.border(area, &self.title, CellStyle::new(accent, background));
-        if area.height > 2 {
-            scene.text(
-                area.x.saturating_add(2),
-                area.y.saturating_add(1),
-                &self.text,
-                CellStyle::new(foreground, background),
-            );
-        }
-        scene
+        let background = self.theme.surface();
+        let foreground = self.theme.foreground();
+        render_bordered_text(
+            area,
+            if self.label { &self.title } else { "" },
+            focused,
+            &self.text,
+            BorderedTextStyle {
+                foreground,
+                background,
+                focused_accent: self.theme.focus(),
+                unfocused_accent: self.theme.border(),
+                text: CellStyle::new(foreground, background),
+                appearance: self.appearance,
+            },
+        )
     }
 }
 
-fn text_widget_factory(config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>, WidgetError> {
+fn text_widget_factory(
+    config: &WidgetInstanceConfig,
+    context: &WidgetRuntimeContext,
+) -> Result<Box<dyn Widget>, WidgetError> {
     Ok(Box::new(TextWidget {
         title: config.title.clone().unwrap_or_else(|| " text ".to_owned()),
+        label: config.label != LabelPolicy::Never,
         text: config.text.clone().unwrap_or_default(),
+        appearance: WidgetAppearance::from_settings(&config.settings)?,
+        theme: context
+            .theme()
+            .with_settings(&config.settings)
+            .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?,
     }))
 }
 
 struct ClockWidget {
     title: String,
+    label: bool,
     format: ClockFormat,
     text: String,
+    appearance: WidgetAppearance,
+    theme: Theme,
 }
 
 #[derive(Clone, Copy)]
@@ -561,6 +871,10 @@ impl Widget for ClockWidget {
         "clock"
     }
 
+    fn content_area(&self, area: Rect) -> Rect {
+        self.appearance.content_area(area)
+    }
+
     fn update(&mut self, now: SystemTime) -> Result<WidgetUpdate, String> {
         let text = self.display(now);
         if text == self.text {
@@ -572,31 +886,31 @@ impl Widget for ClockWidget {
     }
 
     fn render(&self, area: Rect, focused: bool) -> Scene {
-        let background = Color::rgb(27, 33, 44);
-        let foreground = Color::rgb(226, 232, 240);
-        let accent = if focused {
-            Color::rgb(250, 204, 21)
-        } else {
-            Color::rgb(134, 239, 172)
-        };
-        let mut scene = Scene::new(area);
-        scene.fill(area, CellStyle::new(foreground, background));
-        scene.border(area, &self.title, CellStyle::new(accent, background));
-        if area.height > 2 {
-            scene.text(
-                area.x.saturating_add(2),
-                area.y.saturating_add(1),
-                &self.text,
-                CellStyle::new(foreground, background).bold(),
-            );
-        }
-        scene
+        let background = self.theme.surface();
+        let foreground = self.theme.foreground();
+        render_bordered_text(
+            area,
+            if self.label { &self.title } else { "" },
+            focused,
+            &self.text,
+            BorderedTextStyle {
+                foreground,
+                background,
+                focused_accent: self.theme.focus(),
+                unfocused_accent: self.theme.success(),
+                text: CellStyle::new(foreground, background).bold(),
+                appearance: self.appearance,
+            },
+        )
     }
 }
 
 struct SystemWidget {
     title: String,
+    label: bool,
     text: String,
+    appearance: WidgetAppearance,
+    theme: Theme,
 }
 
 impl Widget for SystemWidget {
@@ -604,37 +918,58 @@ impl Widget for SystemWidget {
         "system"
     }
 
+    fn content_area(&self, area: Rect) -> Rect {
+        self.appearance.content_area(area)
+    }
+
     fn render(&self, area: Rect, focused: bool) -> Scene {
-        let background = Color::rgb(27, 45, 44);
-        let foreground = Color::rgb(220, 252, 231);
-        let accent = if focused {
-            Color::rgb(250, 204, 21)
-        } else {
-            Color::rgb(110, 231, 183)
-        };
-        let mut scene = Scene::new(area);
-        scene.fill(area, CellStyle::new(foreground, background));
-        scene.border(area, &self.title, CellStyle::new(accent, background));
-        if area.height > 2 {
-            scene.text(
-                area.x.saturating_add(2),
-                area.y.saturating_add(1),
-                &self.text,
-                CellStyle::new(foreground, background),
-            );
-        }
-        scene
+        let background = self.theme.surface();
+        let foreground = self.theme.foreground();
+        render_bordered_text(
+            area,
+            if self.label { &self.title } else { "" },
+            focused,
+            &self.text,
+            BorderedTextStyle {
+                foreground,
+                background,
+                focused_accent: self.theme.focus(),
+                unfocused_accent: self.theme.success(),
+                text: CellStyle::new(foreground, background),
+                appearance: self.appearance,
+            },
+        )
     }
 }
 
 struct TerminalWidget {
     title: String,
+    label: bool,
     session: TerminalSession,
+    appearance: WidgetAppearance,
+    theme: Theme,
+}
+
+/// Returns the content rectangle inside a one-cell widget outline.
+///
+/// Widgets that draw their own border should render content and protocol state
+/// into this rectangle so text cannot overwrite the outline.
+pub fn widget_content_area(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
 }
 
 impl Widget for TerminalWidget {
     fn kind(&self) -> &str {
         "terminal"
+    }
+
+    fn content_area(&self, area: Rect) -> Rect {
+        self.appearance.content_area(area)
     }
 
     fn initialize(&mut self) -> Result<(), String> {
@@ -668,26 +1003,34 @@ impl Widget for TerminalWidget {
     }
 
     fn render(&self, area: Rect, focused: bool) -> Scene {
-        let mut scene = self.session.render(area, focused);
         let color = if focused {
-            Color::rgb(250, 204, 21)
+            self.theme.focus()
         } else {
-            Color::rgb(216, 180, 254)
+            self.theme.border()
         };
-        scene.border(
+        let background = self.theme.background();
+        let mut scene = Scene::new(area);
+        scene.fill(area, CellStyle::new(self.theme.foreground(), background));
+        self.appearance.render_border(
+            &mut scene,
             area,
-            &self.title,
-            CellStyle::new(color, Color::rgb(18, 22, 30)),
+            if self.label { &self.title } else { "" },
+            CellStyle::new(color, background),
         );
+        let content =
+            self.session
+                .render_with_theme(self.appearance.content_area(area), focused, self.theme);
+        scene.blit(&content, area);
         scene
     }
 
     fn graphics(&self, area: Rect) -> Vec<GraphicsSubmission> {
-        self.session.graphics(area)
+        self.session.graphics(self.appearance.content_area(area))
     }
 
     fn copy_selection(&self, area: Rect) -> Option<String> {
-        self.session.selected_text(area)
+        self.session
+            .selected_text(self.appearance.content_area(area))
     }
 
     fn handles_input(&self) -> bool {
@@ -743,12 +1086,21 @@ impl Widget for TerminalWidget {
     }
 }
 
-fn terminal_widget_factory(config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>, WidgetError> {
-    let session = TerminalSession::spawn_with_session_id(
+fn terminal_widget_factory(
+    config: &WidgetInstanceConfig,
+    context: &WidgetRuntimeContext,
+) -> Result<Box<dyn Widget>, WidgetError> {
+    let appearance = WidgetAppearance::from_settings(&config.settings)?;
+    let theme = context
+        .theme()
+        .with_settings(&config.settings)
+        .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?;
+    let session = TerminalSession::spawn_with_session_id_and_wakeup(
         crate::state::SessionId::new(config.id),
         config.command.as_deref(),
         &[],
         TerminalSize::new(80, 24),
+        context.session_wakeup().cloned(),
     )
     .map_err(|error| WidgetError::InitializationFailed {
         kind: "terminal".to_owned(),
@@ -759,11 +1111,17 @@ fn terminal_widget_factory(config: &WidgetInstanceConfig) -> Result<Box<dyn Widg
             .title
             .clone()
             .unwrap_or_else(|| " terminal ".to_owned()),
+        label: config.label != LabelPolicy::Never,
         session,
+        appearance,
+        theme,
     }))
 }
 
-fn system_widget_factory(config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>, WidgetError> {
+fn system_widget_factory(
+    config: &WidgetInstanceConfig,
+    context: &WidgetRuntimeContext,
+) -> Result<Box<dyn Widget>, WidgetError> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     Ok(Box::new(SystemWidget {
@@ -771,11 +1129,20 @@ fn system_widget_factory(config: &WidgetInstanceConfig) -> Result<Box<dyn Widget
             .title
             .clone()
             .unwrap_or_else(|| " system ".to_owned()),
+        label: config.label != LabelPolicy::Never,
         text: format!("{os} / {arch}"),
+        appearance: WidgetAppearance::from_settings(&config.settings)?,
+        theme: context
+            .theme()
+            .with_settings(&config.settings)
+            .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?,
     }))
 }
 
-fn clock_widget_factory(config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>, WidgetError> {
+fn clock_widget_factory(
+    config: &WidgetInstanceConfig,
+    context: &WidgetRuntimeContext,
+) -> Result<Box<dyn Widget>, WidgetError> {
     let format = match config.format.as_deref().unwrap_or("HH:MM:SS") {
         "HH:MM" => ClockFormat::HoursMinutes,
         "HH:MM:SS" => ClockFormat::HoursMinutesSeconds,
@@ -787,8 +1154,14 @@ fn clock_widget_factory(config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>
     };
     let mut widget = ClockWidget {
         title: config.title.clone().unwrap_or_else(|| " clock ".to_owned()),
+        label: config.label != LabelPolicy::Never,
         format,
         text: String::new(),
+        appearance: WidgetAppearance::from_settings(&config.settings)?,
+        theme: context
+            .theme()
+            .with_settings(&config.settings)
+            .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?,
     };
     let _ = widget.update(SystemTime::now());
     Ok(Box::new(widget))
@@ -797,6 +1170,10 @@ fn clock_widget_factory(config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
 
     struct FailingWidget;
 
@@ -816,6 +1193,7 @@ mod tests {
 
     fn failing_widget_factory(
         _config: &WidgetInstanceConfig,
+        _context: &WidgetRuntimeContext,
     ) -> Result<Box<dyn Widget>, WidgetError> {
         Ok(Box::new(FailingWidget))
     }
@@ -841,6 +1219,100 @@ mod tests {
         assert_eq!(runtime.widget_kind(WidgetId::new(4)), Some("text"));
         let scenes = runtime.render(&areas, Some(WidgetId::new(4)));
         assert_eq!(scenes[&WidgetId::new(4)].cell_at(2, 1).unwrap().symbol, 'h');
+    }
+
+    #[test]
+    fn bordered_widget_text_stays_inside_the_outline() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 4
+            type = "text"
+            text = "01234567890123456789"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let area = Rect::new(0, 0, 10, 4);
+        let scene = runtime.render(&BTreeMap::from([(WidgetId::new(4), area)]), None);
+
+        assert_eq!(scene[&WidgetId::new(4)].cell_at(9, 1).unwrap().symbol, '│');
+    }
+
+    #[test]
+    fn appearance_settings_control_padding_and_border_style() {
+        let config = AppConfig::parse(
+            r##"
+            version = 1
+            [[workspace.widgets]]
+            id = 4
+            type = "text"
+            text = "hello"
+
+            [workspace.widgets.settings]
+            padding = "2"
+            border = "double"
+            foreground = "#010203"
+            "##,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let id = WidgetId::new(4);
+        let area = Rect::new(0, 0, 12, 10);
+        assert_eq!(runtime.content_area(id, area), Rect::new(3, 3, 6, 4));
+        let scene = runtime.render(&BTreeMap::from([(id, area)]), None);
+        assert_eq!(scene[&id].cell_at(0, 0).unwrap().symbol, '╔');
+        assert_eq!(scene[&id].cell_at(11, 1).unwrap().symbol, '║');
+        assert_eq!(
+            scene[&id].cell_at(4, 3).unwrap().style.foreground,
+            Color::rgb(1, 2, 3)
+        );
+    }
+
+    #[test]
+    fn never_label_suppresses_title_without_changing_content_geometry() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 4
+            type = "text"
+            title = " visible title "
+            label = "never"
+            text = "hello"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let id = WidgetId::new(4);
+        let area = Rect::new(0, 0, 16, 5);
+        let scene = runtime.render(&BTreeMap::from([(id, area)]), None);
+
+        assert_eq!(runtime.content_area(id, area), Rect::new(1, 1, 14, 3));
+        assert_eq!(scene[&id].cell_at(2, 0).unwrap().symbol, '─');
+    }
+
+    #[test]
+    fn invalid_appearance_settings_are_rejected() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 4
+            type = "text"
+
+            [workspace.widgets.settings]
+            padding = "wide"
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config),
+            Err(WidgetError::InvalidConfiguration(message))
+                if message.contains("padding")
+        ));
     }
 
     #[test]
@@ -915,6 +1387,39 @@ mod tests {
             WidgetUpdate::Unchanged
         );
         let _ = runtime.shutdown();
+    }
+
+    #[test]
+    fn terminal_content_is_inset_from_its_widget_border() {
+        let mut widget = TerminalWidget {
+            title: " shell ".to_owned(),
+            label: true,
+            session: TerminalSession::spawn_with_args(
+                Some("sh"),
+                &["-c", "printf x; sleep 5"],
+                TerminalSize::new(6, 3),
+            )
+            .unwrap(),
+            appearance: WidgetAppearance::default(),
+            theme: Theme::fallback(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            widget.session.poll_output().unwrap();
+            if widget.session.cursor_position() == (1, 0) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let area = Rect::new(2, 3, 8, 5);
+        let scene = widget.render(area, false);
+        assert_eq!(scene.cell_at(2, 3).unwrap().symbol, '╭');
+        assert_eq!(scene.cell_at(2, 4).unwrap().symbol, '│');
+        assert_eq!(scene.cell_at(3, 4).unwrap().symbol, 'x');
+        assert_eq!(scene.cell_at(9, 4).unwrap().symbol, '│');
+        assert_eq!(scene.cell_at(2, 7).unwrap().symbol, '╰');
+        widget.session.shutdown().unwrap();
     }
 
     #[test]

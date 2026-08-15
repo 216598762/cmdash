@@ -5,8 +5,8 @@ use serde::Deserialize;
 
 use crate::{
     config::WidgetInstanceConfig,
-    scene::{CellStyle, Color, Scene},
-    widget::{Widget, WidgetError},
+    scene::{CellStyle, Scene},
+    widget::{Widget, WidgetAppearance, WidgetError, WidgetRuntimeContext},
 };
 
 pub const PLUGIN_ABI_VERSION: u32 = 1;
@@ -206,7 +206,11 @@ pub enum PluginError {
 
 pub trait PluginModule: Send + Sync {
     fn descriptor(&self) -> PluginDescriptorV1;
-    fn create(&self, config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>, PluginError>;
+    fn create(
+        &self,
+        config: &WidgetInstanceConfig,
+        context: &WidgetRuntimeContext,
+    ) -> Result<Box<dyn Widget>, PluginError>;
 }
 
 struct LoadedPlugin {
@@ -300,12 +304,13 @@ impl PluginRegistry {
     pub fn instantiate(
         &self,
         config: &WidgetInstanceConfig,
+        context: &WidgetRuntimeContext,
     ) -> Result<Box<dyn Widget>, PluginError> {
         let plugin = self
             .modules
             .get(&config.kind)
             .ok_or_else(|| PluginError::UnknownWidgetType(config.kind.clone()))?;
-        plugin.module.create(config)
+        plugin.module.create(config, context)
     }
 }
 
@@ -357,23 +362,39 @@ impl PluginModule for ExternalTextPlugin {
             .expect("fixture descriptor is valid")
     }
 
-    fn create(&self, config: &WidgetInstanceConfig) -> Result<Box<dyn Widget>, PluginError> {
+    fn create(
+        &self,
+        config: &WidgetInstanceConfig,
+        context: &WidgetRuntimeContext,
+    ) -> Result<Box<dyn Widget>, PluginError> {
         Ok(Box::new(ExternalTextWidget {
             title: config
                 .title
                 .clone()
                 .unwrap_or_else(|| " external ".to_owned()),
+            label: config.label != crate::config::LabelPolicy::Never,
             text: config
                 .text
                 .clone()
                 .unwrap_or_else(|| "plugin widget".to_owned()),
+            appearance: WidgetAppearance::from_settings(&config.settings)
+                .map_err(PluginError::Widget)?,
+            theme: context
+                .theme()
+                .with_settings(&config.settings)
+                .map_err(|error| {
+                    PluginError::Widget(WidgetError::InvalidConfiguration(error.to_string()))
+                })?,
         }))
     }
 }
 
 struct ExternalTextWidget {
     title: String,
+    label: bool,
     text: String,
+    appearance: WidgetAppearance,
+    theme: crate::Theme,
 }
 
 impl Widget for ExternalTextWidget {
@@ -381,24 +402,37 @@ impl Widget for ExternalTextWidget {
         "external-text"
     }
 
+    fn content_area(&self, area: Rect) -> Rect {
+        self.appearance.content_area(area)
+    }
+
     fn render(&self, area: Rect, focused: bool) -> Scene {
-        let background = Color::rgb(38, 28, 58);
-        let foreground = Color::rgb(245, 232, 255);
+        let background = self.theme.overlay_background();
+        let foreground = self.theme.overlay_foreground();
         let accent = if focused {
-            Color::rgb(250, 204, 21)
+            self.theme.focus()
         } else {
-            Color::rgb(216, 180, 254)
+            self.theme.border()
         };
         let mut scene = Scene::new(area);
         scene.fill(area, CellStyle::new(foreground, background));
-        scene.border(area, &self.title, CellStyle::new(accent, background));
-        if area.height > 2 {
-            scene.text(
-                area.x.saturating_add(2),
-                area.y.saturating_add(1),
+        self.appearance.render_border(
+            &mut scene,
+            area,
+            if self.label { &self.title } else { "" },
+            CellStyle::new(accent, background),
+        );
+        let content_area = self.appearance.content_area(area);
+        if content_area.width > 0 && content_area.height > 0 {
+            let mut content = Scene::new(content_area);
+            content.fill(content_area, CellStyle::new(foreground, background));
+            content.text(
+                content_area.x.saturating_add(1),
+                content_area.y,
                 &self.text,
                 CellStyle::new(foreground, background),
             );
+            scene.blit(&content, area);
         }
         scene
     }
@@ -414,6 +448,7 @@ mod tests {
             id: 7,
             kind: "external-text".to_owned(),
             title: Some(" plugin ".to_owned()),
+            label: crate::config::LabelPolicy::Auto,
             text: Some("loaded".to_owned()),
             format: None,
             command: None,
@@ -425,12 +460,50 @@ mod tests {
     fn host_loads_and_instantiates_the_minimal_external_widget() {
         let mut registry = PluginRegistry::new(PluginHostV1::dashboard_defaults());
         registry.load(ExternalTextPlugin).unwrap();
-        let widget = registry.instantiate(&config()).unwrap();
+        let widget = registry
+            .instantiate(&config(), &WidgetRuntimeContext::new())
+            .unwrap();
         let scene = widget.render(Rect::new(0, 0, 20, 4), false);
 
         assert!(registry.contains("external-text"));
         assert_eq!(scene.cell_at(2, 1).unwrap().symbol, 'l');
         assert_eq!(registry.descriptors().count(), 1);
+    }
+
+    #[test]
+    fn external_widget_text_stays_inside_its_outline() {
+        let mut long_config = config();
+        long_config.text = Some("012345678901234567890123".to_owned());
+        let mut registry = PluginRegistry::new(PluginHostV1::dashboard_defaults());
+        registry.load(ExternalTextPlugin).unwrap();
+        let widget = registry
+            .instantiate(&long_config, &WidgetRuntimeContext::new())
+            .unwrap();
+        let scene = widget.render(Rect::new(0, 0, 20, 4), false);
+
+        assert_eq!(scene.cell_at(19, 1).unwrap().symbol, '│');
+    }
+
+    #[test]
+    fn external_widget_uses_configured_content_appearance() {
+        let mut styled_config = config();
+        styled_config
+            .settings
+            .insert("padding".to_owned(), "2".to_owned());
+        styled_config
+            .settings
+            .insert("border".to_owned(), "ascii".to_owned());
+        let mut registry = PluginRegistry::new(PluginHostV1::dashboard_defaults());
+        registry.load(ExternalTextPlugin).unwrap();
+        let widget = registry
+            .instantiate(&styled_config, &WidgetRuntimeContext::new())
+            .unwrap();
+        let area = Rect::new(0, 0, 16, 8);
+
+        assert_eq!(widget.content_area(area), Rect::new(3, 3, 10, 2));
+        let scene = widget.render(area, false);
+        assert_eq!(scene.cell_at(0, 0).unwrap().symbol, '+');
+        assert_eq!(scene.cell_at(15, 1).unwrap().symbol, '|');
     }
 
     #[test]
@@ -522,6 +595,7 @@ mod tests {
             fn create(
                 &self,
                 _config: &WidgetInstanceConfig,
+                _context: &WidgetRuntimeContext,
             ) -> Result<Box<dyn Widget>, PluginError> {
                 unreachable!()
             }

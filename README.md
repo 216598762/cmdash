@@ -9,6 +9,7 @@ The project is intentionally starting with architecture and behavior contracts b
 - [Architecture](docs/ARCHITECTURE.md) — components, render pipeline, state ownership, and proposed Rust boundaries.
 - [Roadmap](docs/ROADMAP.md) — staged implementation plan and acceptance criteria.
 - [Configuration reference](docs/CONFIGURATION.md) — TOML discovery, widget/layout options, panes, migrations, and recovery.
+- [Appearance guide](docs/APPEARANCE.md) — semantic themes, parent-terminal palette inheritance, borders, labels, and color overrides.
 - [Widget guide](docs/WIDGETS.md) — widget types, lifecycle, scenes, input, graphics, plugins, panes, and extension guidance.
 - [External library candidates](docs/DEPENDENCIES.md) — categorized crate list, evaluation criteria, and selection risks.
 - [Default configuration](config/default.toml) — a checked-in widget-only starting point.
@@ -45,7 +46,8 @@ cargo run -- --config ~/.config/cmdash/config.toml
 
 The same options work with a built binary, for example
 `./cmdash --config ~/.config/cmdash/config.toml`. Configuration is TOML; start
-with [CONFIGURATION.md](docs/CONFIGURATION.md) for the schema and
+with [CONFIGURATION.md](docs/CONFIGURATION.md) for the schema,
+[APPEARANCE.md](docs/APPEARANCE.md) for colors and widget chrome, and
 [WIDGETS.md](docs/WIDGETS.md) for widget behavior and examples.
 
 ### Daily workflow
@@ -63,6 +65,9 @@ with [CONFIGURATION.md](docs/CONFIGURATION.md) for the schema and
   changes are rejected without replacing the active workspace. Runtime pane
   changes are retained across reloads but are not automatically written to
   disk, so edit the TOML file if they should survive a restart.
+- Appearance defaults to the parent terminal's native reset/ANSI palette. Use
+  `[appearance]` and the [appearance guide](docs/APPEARANCE.md) for fixed RGB
+  themes, semantic role overrides, border styles, and no-label widgets.
 - Press `q` or `Esc` to quit.
 
 For an interactive terminal in the initial layout, add a terminal widget and
@@ -104,7 +109,8 @@ should be tested in the terminal environment where they will be used.
   `CMDASH_CRASH_DIR` before launching when a bounded crash reproduction report
   is needed.
 
-See the [configuration reference](docs/CONFIGURATION.md), [widget guide](docs/WIDGETS.md),
+See the [configuration reference](docs/CONFIGURATION.md),
+[appearance guide](docs/APPEARANCE.md), [widget guide](docs/WIDGETS.md),
 [architecture](docs/ARCHITECTURE.md), and [roadmap](docs/ROADMAP.md) for deeper
 behavior and development details.
 
@@ -123,6 +129,6 @@ cmdash is licensed under the [MIT License](LICENSE).
 
 ## Status
 
-Phase 10 configuration onboarding is complete for the current contract. The project has retained session-scoped graphics, bounded resource diagnostics, validated config reload and migration reporting, terminal selection/copy through OSC 52, a command palette/help surface, stabilized plugin metadata, Wasmtime isolation foundations, interactive pane focus/resize/close commands, fuzz targets and CI smoke runs, crash reproduction artifacts, and multi-target release packaging. `Ctrl+PageUp` / `Ctrl+PageDown` switch tabs, `Alt+Arrow` moves pane focus, `Ctrl+Shift+Arrow` adjusts pane ratios, `Ctrl+Shift+W` closes the focused pane, `Ctrl+P` opens the palette, `?` opens help, `Ctrl+Shift+C` copies a selection, and `--config <path>` / `-c <path>` enables safe reload with `Ctrl+R`; `--migrate-config --config <path>` rewrites legacy version metadata atomically.
+Phase 11 theming and appearance is complete for the current contract, including semantic roles, parent-terminal palette inheritance, RGB/ANSI overrides, border styles, and explicit label policies. Phase 10 configuration onboarding is also complete. The project has retained session-scoped graphics, bounded resource diagnostics, validated config reload and migration reporting, terminal selection/copy through OSC 52, a command palette/help surface, stabilized plugin metadata, Wasmtime isolation foundations, interactive pane focus/resize/close commands, fuzz targets and CI smoke runs, crash reproduction artifacts, and multi-target release packaging. `Ctrl+PageUp` / `Ctrl+PageDown` switch tabs, `Alt+Arrow` moves pane focus, `Ctrl+Shift+Arrow` adjusts pane ratios, `Ctrl+Shift+W` closes the focused pane, `Ctrl+P` opens the palette, `?` opens help, `Ctrl+Shift+C` copies a selection, and `--config <path>` / `-c <path>` enables safe reload with `Ctrl+R`; `--migrate-config --config <path>` rewrites legacy version metadata atomically.
 
 Optional sixel support is enabled with `--features sixel`; the default build remains capability-aware. The feature provides a bounded 16-color RGB dashboard-image encoder, while terminal-originated Kitty graphics continue to use the session-owned retained graphics path. Optional isolated WASM plugins are enabled with `--features wasm-plugins`; modules have no imports/WASI access and are subject to size and execution-budget policy.

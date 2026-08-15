@@ -18,7 +18,30 @@ pub struct AppConfig {
     #[serde(default)]
     pub workspace: WorkspaceConfig,
     #[serde(default)]
+    pub appearance: AppearanceConfig,
+    #[serde(default)]
     pub plugins: Vec<PluginConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct AppearanceConfig {
+    #[serde(default = "default_appearance_theme")]
+    pub theme: String,
+    #[serde(default)]
+    pub colors: BTreeMap<String, String>,
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        Self {
+            theme: default_appearance_theme(),
+            colors: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_appearance_theme() -> String {
+    "inherit".to_owned()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +82,8 @@ impl AppConfig {
             #[serde(default)]
             workspace: WorkspaceConfig,
             #[serde(default)]
+            appearance: AppearanceConfig,
+            #[serde(default)]
             plugins: Vec<PluginConfig>,
         }
 
@@ -81,6 +106,7 @@ impl AppConfig {
         let config = Self {
             version: CURRENT_CONFIG_VERSION,
             workspace: raw.workspace,
+            appearance: raw.appearance,
             plugins: raw.plugins,
         };
         config.validate()?;
@@ -150,6 +176,8 @@ impl AppConfig {
         if self.workspace.name.trim().is_empty() {
             return Err(ConfigError::EmptyWorkspaceName);
         }
+        crate::appearance::Theme::from_config(&self.appearance)
+            .map_err(|error| ConfigError::InvalidAppearance(error.to_string()))?;
 
         let mut ids = BTreeSet::new();
         for widget in &self.workspace.widgets {
@@ -397,6 +425,8 @@ pub struct WidgetInstanceConfig {
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
+    pub label: LabelPolicy,
+    #[serde(default)]
     pub text: Option<String>,
     #[serde(default)]
     pub format: Option<String>,
@@ -404,6 +434,15 @@ pub struct WidgetInstanceConfig {
     pub command: Option<String>,
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LabelPolicy {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -420,6 +459,7 @@ pub enum ConfigError {
     EmptyLayoutChildren,
     InvalidActiveTab(usize),
     InvalidPluginConfig,
+    InvalidAppearance(String),
     DuplicatePluginName(String),
 }
 
@@ -453,6 +493,7 @@ impl fmt::Display for ConfigError {
             Self::InvalidPluginConfig => {
                 formatter.write_str("plugin name and manifest path cannot be empty")
             }
+            Self::InvalidAppearance(message) => write!(formatter, "invalid appearance: {message}"),
             Self::DuplicatePluginName(name) => {
                 write!(formatter, "duplicate plugin name {name:?}")
             }
@@ -479,6 +520,7 @@ mod tests {
             id = 7
             type = "text"
             title = "hello"
+            label = "never"
             text = "world"
             "#,
         )
@@ -488,6 +530,25 @@ mod tests {
         assert_eq!(config.workspace.name, "monitor");
         assert_eq!(config.workspace.widgets[0].id, 7);
         assert_eq!(config.workspace.widgets[0].kind, "text");
+        assert_eq!(config.workspace.widgets[0].label, LabelPolicy::Never);
+    }
+
+    #[test]
+    fn parses_appearance_modes_and_color_overrides() {
+        let config = AppConfig::parse(
+            r##"
+            version = 1
+            [appearance]
+            theme = "fallback"
+            [appearance.colors]
+            focus = "#facc15"
+            muted = "ansi:8"
+            "##,
+        )
+        .unwrap();
+
+        assert_eq!(config.appearance.theme, "fallback");
+        assert_eq!(config.appearance.colors["muted"], "ansi:8");
     }
 
     #[test]

@@ -2,24 +2,61 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, io,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, SystemTime},
 };
 
 use cmdash::{
-    AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend, Surface, SurfaceCommand,
-    SurfaceId, WidgetRegistry,
+    AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend, SessionWakeup, Surface,
+    SurfaceCommand, SurfaceId, UiEvent, WidgetRegistry, WidgetRuntimeContext,
     dashboard::{
-        render_static_dashboard_shell_with_metrics_health_and_diagnostic,
-        render_static_dashboard_surface_scenes, static_dashboard_surface_areas,
+        render_static_dashboard_shell_with_theme,
+        render_static_dashboard_surface_scenes_with_theme, static_dashboard_surface_areas,
     },
     input::command_for_key,
     reload::ConfigReloader,
+    ui_event_channel,
 };
 use crossterm::event::{self, Event};
 use ratatui::layout::Rect;
 
 const MAX_EVENTS_PER_BATCH: usize = 32;
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
+
+struct InputReader {
+    cancellation: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl InputReader {
+    fn shutdown(mut self) {
+        self.cancellation.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct MaintenanceWaker {
+    stop_sender: Sender<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl MaintenanceWaker {
+    fn shutdown(mut self) {
+        let _ = self.stop_sender.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 fn main() -> io::Result<()> {
     let mut backend = CrosstermBackend::new(io::stdout());
@@ -41,7 +78,10 @@ fn main() -> io::Result<()> {
     let explicit_config_path = config_path(&args)?;
     let (config_path, config) = load_config(explicit_config_path.as_deref())?;
     let config_path_for_report = config_path.clone();
-    let registry = WidgetRegistry::builtins();
+    let (event_sender, event_receiver, pty_wakeup) = ui_event_channel();
+    let registry = WidgetRegistry::builtins_with_context(
+        WidgetRuntimeContext::with_session_wakeup(pty_wakeup.clone()),
+    );
     let mut state = AppState::from_config(backend.capabilities(), &registry, &config)
         .map_err(|error| io::Error::other(format!("application config rejected: {error}")))?;
     let mut compositor = Compositor::new();
@@ -50,14 +90,20 @@ fn main() -> io::Result<()> {
         .transpose()
         .map_err(|error| io::Error::other(error.to_string()))?;
     backend.enter()?;
+    let input_reader = spawn_input_reader(event_sender.clone());
+    let maintenance_waker = spawn_maintenance_waker(event_sender);
 
     let run_result = run(
         &mut backend,
         &mut state,
         &mut compositor,
+        &event_receiver,
+        &pty_wakeup,
         &registry,
         reloader.as_mut(),
     );
+    input_reader.shutdown();
+    maintenance_waker.shutdown();
     state.shutdown_widgets();
     let leave_result = backend.leave();
 
@@ -76,6 +122,8 @@ fn run<B>(
     backend: &mut B,
     state: &mut AppState,
     compositor: &mut Compositor,
+    event_receiver: &Receiver<UiEvent>,
+    pty_wakeup: &SessionWakeup,
     registry: &WidgetRegistry,
     mut reloader: Option<&mut ConfigReloader>,
 ) -> io::Result<()>
@@ -111,14 +159,15 @@ where
         sync_dashboard_surfaces(state, area)?;
         let widget_health =
             (!state.widget_runtime().is_empty()).then(|| state.widget_runtime().health_summary());
-        let base = render_static_dashboard_shell_with_metrics_health_and_diagnostic(
+        let base = render_static_dashboard_shell_with_theme(
             area,
             backend.metrics(),
             widget_health.as_deref(),
             state.latest_diagnostic(),
+            state.theme(),
         );
         let surface_scenes = if state.widget_runtime().is_empty() {
-            render_static_dashboard_surface_scenes(area, state.focus())
+            render_static_dashboard_surface_scenes_with_theme(area, state.focus(), state.theme())
         } else {
             state.widget_surface_scenes()
         };
@@ -129,7 +178,13 @@ where
         #[cfg(feature = "sixel")]
         backend.submit_sixel(diff.sixel())?;
 
-        if dispatch_available_events(state, registry, reloader.as_deref_mut())? {
+        if dispatch_available_events(
+            state,
+            event_receiver,
+            pty_wakeup,
+            registry,
+            reloader.as_deref_mut(),
+        )? {
             break;
         }
     }
@@ -192,22 +247,99 @@ fn config_path(args: &[String]) -> io::Result<Option<PathBuf>> {
     Ok(path)
 }
 
+fn spawn_input_reader(sender: Sender<UiEvent>) -> InputReader {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let thread_cancellation = Arc::clone(&cancellation);
+    let handle = thread::spawn(move || {
+        while !thread_cancellation.load(Ordering::Acquire) {
+            match event::poll(INPUT_POLL_INTERVAL) {
+                Ok(false) => {}
+                Ok(true) if thread_cancellation.load(Ordering::Acquire) => break,
+                Ok(true) => match event::read() {
+                    Ok(event) => {
+                        if sender.send(UiEvent::Input(event)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(UiEvent::InputError(error.to_string()));
+                        break;
+                    }
+                },
+                Err(error) => {
+                    let _ = sender.send(UiEvent::InputError(error.to_string()));
+                    break;
+                }
+            }
+        }
+    });
+    InputReader {
+        cancellation,
+        handle: Some(handle),
+    }
+}
+
+fn spawn_maintenance_waker(sender: Sender<UiEvent>) -> MaintenanceWaker {
+    let (stop_sender, stop_receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        loop {
+            match stop_receiver.recv_timeout(MAINTENANCE_INTERVAL) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if sender.send(UiEvent::Tick).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    MaintenanceWaker {
+        stop_sender,
+        handle: Some(handle),
+    }
+}
+
 fn dispatch_available_events(
     state: &mut AppState,
+    event_receiver: &Receiver<UiEvent>,
+    pty_wakeup: &SessionWakeup,
     registry: &WidgetRegistry,
     reloader: Option<&mut ConfigReloader>,
 ) -> io::Result<bool> {
-    if !event::poll(Duration::from_millis(250))? {
-        return Ok(false);
-    }
-
     let mut events = Vec::with_capacity(MAX_EVENTS_PER_BATCH);
-    events.push(event::read()?);
-    while events.len() < MAX_EVENTS_PER_BATCH && event::poll(Duration::ZERO)? {
-        events.push(event::read()?);
+    collect_ui_event(
+        event_receiver
+            .recv()
+            .map_err(|_| io::Error::other("input and PTY event channel disconnected"))?,
+        &mut events,
+        pty_wakeup,
+    )?;
+
+    while events.len() < MAX_EVENTS_PER_BATCH {
+        match event_receiver.try_recv() {
+            Ok(event) => collect_ui_event(event, &mut events, pty_wakeup)?,
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(io::Error::other("input and PTY event channel disconnected"));
+            }
+        }
     }
 
     dispatch_event_batch(state, registry, reloader, events)
+}
+
+fn collect_ui_event(
+    event: UiEvent,
+    events: &mut Vec<Event>,
+    pty_wakeup: &SessionWakeup,
+) -> io::Result<()> {
+    match event {
+        UiEvent::Input(event) => events.push(event),
+        UiEvent::PtyOutput => pty_wakeup.clear_pending(),
+        UiEvent::Tick => {}
+        UiEvent::InputError(message) => return Err(io::Error::other(message)),
+    }
+    Ok(())
 }
 
 fn dispatch_event_batch<I>(

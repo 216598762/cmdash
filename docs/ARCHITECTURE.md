@@ -18,6 +18,7 @@ The first implementation will use these boundaries:
 - **Workspace scope:** start with one active workspace. The state model should leave room for saved workspaces later without making them part of the first runtime contract.
 - **Plugin boundary:** use a versioned manifest and C-compatible data contract, with untrusted plugin execution isolated behind an opt-in Wasmtime host. Plugin manifests are validated before code loading, and the host must not pass Rust trait objects, terminal handles, WASI, or filesystem access across the boundary.
 - **Initial terminal capabilities:** require ANSI/VT text, cursor movement, Unicode cell output, basic colors, alternate-screen support, keyboard input, and resize handling. Treat truecolor, mouse, bracketed paste, keyboard enhancement, and Kitty graphics as optional capabilities.
+- **Appearance:** resolve semantic widget roles through a workspace `Theme`; the default uses terminal-native reset/ANSI references so the parent terminal owns inherited palette colors, while explicit RGB overrides and a deterministic fallback remain available.
 - **Fallback behavior:** downgrade optional color/input features when unavailable and omit unsupported or over-limit graphics with an in-app degraded diagnostic. Capability mismatches must never emit malformed output or corrupt text/layout.
 
 ### Non-negotiable invariants
@@ -136,7 +137,10 @@ Event collector ──► Command router ──► AppState / SessionState
                          Layout engine assigns surfaces/clip rects
                                       │
                                       ▼
-                      Each visible widget builds a backend-neutral Scene
+                      Theme + layout resolve each visible widget's appearance
+                                      │
+                                      ▼
+                    Each visible widget builds a backend-neutral Scene
                                       │
                                       ▼
                     Compositor orders, clips, and merges visible scenes
@@ -232,6 +236,21 @@ Initial behavior should retain graphics in memory while a session is alive, whet
 Eviction must never silently change the terminal's logical state. If an image cannot be restored, the scene should show a deliberate placeholder and report a diagnostic rather than corrupting adjacent text.
 
 ## 6. Rendering and backend boundaries
+
+### 6.1 Appearance and palette boundary
+
+Appearance resolution is application state, not widget-local terminal I/O. The
+runtime combines the inherited `Theme`, workspace role overrides, widget
+settings, and transient focus/health state before a widget emits its `Scene`.
+Inherited colors use `Color::Reset` and `Color::Ansi(index)`, allowing the parent
+terminal to resolve its own default and ANSI palette. Explicit `Color::Rgb`
+values are retained for configured truecolor roles and protocol-originated
+truecolor cells. See [APPEARANCE.md](APPEARANCE.md) for the public contract.
+
+Widgets and plugins must not query the terminal or write palette escape
+sequences directly. The backend translates the scene's color representation into
+Crossterm color commands, preserving the serialized frame boundary.
+
 
 Use three representations:
 

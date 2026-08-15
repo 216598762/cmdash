@@ -3,18 +3,11 @@ use std::collections::BTreeMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::{
+    appearance::Theme,
     backend::OutputMetrics,
     scene::{CellStyle, Color, Scene},
     state::{FocusState, FocusTarget, SurfaceId},
 };
-
-const BACKGROUND: Color = Color::rgb(18, 22, 30);
-const PANEL: Color = Color::rgb(27, 33, 44);
-const TEXT: Color = Color::rgb(226, 232, 240);
-const MUTED: Color = Color::rgb(148, 163, 184);
-const ACCENT: Color = Color::rgb(125, 211, 252);
-const FOCUS: Color = Color::rgb(250, 204, 21);
-const SUCCESS: Color = Color::rgb(134, 239, 172);
 
 struct Panel<'a> {
     id: SurfaceId,
@@ -70,8 +63,19 @@ pub fn render_static_dashboard(area: Rect) -> Scene {
 }
 
 pub fn render_static_dashboard_with_focus(area: Rect, focus: FocusState) -> Scene {
-    let mut scene = render_static_dashboard_shell(area);
-    for surface_scene in render_static_dashboard_surface_scenes(area, focus).values() {
+    render_static_dashboard_with_focus_and_theme(area, focus, Theme::fallback())
+}
+
+pub fn render_static_dashboard_with_focus_and_theme(
+    area: Rect,
+    focus: FocusState,
+    theme: Theme,
+) -> Scene {
+    let mut scene =
+        render_static_dashboard_shell_with_theme(area, OutputMetrics::default(), None, None, theme);
+    for surface_scene in
+        render_static_dashboard_surface_scenes_with_theme(area, focus, theme).values()
+    {
         scene.blit(surface_scene, surface_scene.area());
     }
     scene
@@ -104,23 +108,46 @@ pub fn render_static_dashboard_shell_with_metrics_health_and_diagnostic(
     widget_health: Option<&str>,
     diagnostic: Option<&str>,
 ) -> Scene {
+    render_static_dashboard_shell_with_theme(
+        area,
+        metrics,
+        widget_health,
+        diagnostic,
+        Theme::fallback(),
+    )
+}
+
+pub fn render_static_dashboard_shell_with_theme(
+    area: Rect,
+    metrics: OutputMetrics,
+    widget_health: Option<&str>,
+    diagnostic: Option<&str>,
+    theme: Theme,
+) -> Scene {
     let mut scene = Scene::new(area);
-    scene.fill(area, CellStyle::new(TEXT, BACKGROUND));
+    scene.fill(area, CellStyle::new(theme.foreground(), theme.background()));
 
     let sections = dashboard_sections(area);
     let header = sections[0];
-    scene.fill(header, CellStyle::new(TEXT, PANEL));
-    scene.border(header, " cmdash ", CellStyle::new(ACCENT, PANEL));
+    scene.fill(header, CellStyle::new(theme.foreground(), theme.surface()));
+    scene.border(
+        header,
+        " cmdash ",
+        CellStyle::new(theme.accent(), theme.surface()),
+    );
     scene.text(
         header.x.saturating_add(2),
         header.y.saturating_add(1),
         "A modular terminal dashboard",
-        CellStyle::new(TEXT, PANEL).bold(),
+        CellStyle::new(theme.foreground(), theme.surface()).bold(),
     );
 
-    scene.fill(sections[1], CellStyle::new(TEXT, BACKGROUND));
+    scene.fill(
+        sections[1],
+        CellStyle::new(theme.foreground(), theme.background()),
+    );
     let footer = sections[2];
-    scene.fill(footer, CellStyle::new(MUTED, BACKGROUND));
+    scene.fill(footer, CellStyle::new(theme.muted(), theme.background()));
     let footer_text = if metrics.bytes_saved > 0 {
         format!(
             "Tab / Shift+Tab  focus    q / Esc  quit    •    saved {} B    •    retained output",
@@ -141,7 +168,7 @@ pub fn render_static_dashboard_shell_with_metrics_health_and_diagnostic(
         footer.x.saturating_add(1),
         footer.y,
         &footer_text,
-        CellStyle::new(MUTED, BACKGROUND).dim(),
+        CellStyle::new(theme.muted(), theme.background()).dim(),
     );
     scene
 }
@@ -149,6 +176,14 @@ pub fn render_static_dashboard_shell_with_metrics_health_and_diagnostic(
 pub fn render_static_dashboard_surface_scenes(
     area: Rect,
     focus: FocusState,
+) -> BTreeMap<SurfaceId, Scene> {
+    render_static_dashboard_surface_scenes_with_theme(area, focus, Theme::fallback())
+}
+
+pub fn render_static_dashboard_surface_scenes_with_theme(
+    area: Rect,
+    focus: FocusState,
+    theme: Theme,
 ) -> BTreeMap<SurfaceId, Scene> {
     let [(workspace_id, workspace_area), (backend_id, backend_area)] =
         static_dashboard_surface_areas(area);
@@ -158,12 +193,13 @@ pub fn render_static_dashboard_surface_scenes(
         render_panel_scene(
             workspace_area,
             focus,
+            theme,
             Panel {
                 id: workspace_id,
                 title: " workspace ",
                 first_line: "No terminal sessions are running.",
                 second_line: "Dashboard widgets can work without a PTY.",
-                accent: SUCCESS,
+                accent: theme.success(),
             },
         ),
     );
@@ -172,12 +208,13 @@ pub fn render_static_dashboard_surface_scenes(
         render_panel_scene(
             backend_area,
             focus,
+            theme,
             Panel {
                 id: backend_id,
                 title: " backend ",
                 first_line: "crossterm",
                 second_line: "retained scene contract",
-                accent: ACCENT,
+                accent: theme.accent(),
             },
         ),
     );
@@ -196,36 +233,40 @@ fn dashboard_sections(area: Rect) -> [Rect; 3] {
     [sections[0], sections[1], sections[2]]
 }
 
-fn render_panel_scene(area: Rect, focus: FocusState, panel: Panel<'_>) -> Scene {
+fn render_panel_scene(area: Rect, focus: FocusState, theme: Theme, panel: Panel<'_>) -> Scene {
     let mut scene = Scene::new(area);
-    draw_panel(&mut scene, area, focus, panel);
+    draw_panel(&mut scene, area, focus, theme, panel);
     scene
 }
 
-fn draw_panel(scene: &mut Scene, area: Rect, focus: FocusState, panel: Panel<'_>) {
+fn draw_panel(scene: &mut Scene, area: Rect, focus: FocusState, theme: Theme, panel: Panel<'_>) {
     let focused = focus.is_focused(FocusTarget::Surface(panel.id));
-    let border_color = if focused { FOCUS } else { panel.accent };
-    scene.fill(area, CellStyle::new(TEXT, PANEL));
-    scene.border(area, panel.title, CellStyle::new(border_color, PANEL));
+    let border_color = if focused { theme.focus() } else { panel.accent };
+    scene.fill(area, CellStyle::new(theme.foreground(), theme.surface()));
+    scene.border(
+        area,
+        panel.title,
+        CellStyle::new(border_color, theme.surface()),
+    );
     if focused {
         scene.text(
             area.x.saturating_add(2),
             area.y.saturating_add(1),
             "focused",
-            CellStyle::new(FOCUS, PANEL).bold(),
+            CellStyle::new(theme.focus(), theme.surface()).bold(),
         );
     }
     scene.text(
         area.x.saturating_add(2),
         area.y.saturating_add(2),
         panel.first_line,
-        CellStyle::new(TEXT, PANEL),
+        CellStyle::new(theme.foreground(), theme.surface()),
     );
     scene.text(
         area.x.saturating_add(2),
         area.y.saturating_add(3),
         panel.second_line,
-        CellStyle::new(MUTED, PANEL).dim(),
+        CellStyle::new(theme.muted(), theme.surface()).dim(),
     );
 }
 

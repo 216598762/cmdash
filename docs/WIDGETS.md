@@ -102,6 +102,7 @@ Each widget instance uses the common shape below:
 id = 10
 type = "terminal"
 title = " shell "
+label = "auto"
 text = "optional type-specific text"
 format = "optional type-specific format"
 command = "sh"
@@ -109,6 +110,8 @@ command = "sh"
 [workspace.widgets.settings]
 scrollback = "4096"
 profile = "default"
+padding = "1"
+border = "rounded"
 ```
 
 | Field | Type | Required | Meaning |
@@ -116,10 +119,16 @@ profile = "default"
 | `id` | integer | yes | Unique instance and surface identity. |
 | `type` | string | yes | Registered widget type. |
 | `title` | string | no | Border/title text when the widget renders one. |
+| `label` | string | no | `auto`, `always`, or `never`; controls whether the title is drawn. |
 | `text` | string | no | Type-specific display text. |
 | `format` | string | no | Type-specific display format. The clock uses this field. |
 | `command` | string | no | Command used by a terminal instance. |
-| `settings` | string map | no | Stable extension settings passed to the widget. |
+| `settings` | string map | no | Stable extension settings passed to the widget. Built-ins and the reference plugin support `padding` and `border`. |
+
+Titles provide the border label and omitted titles use each widget's built-in
+default. The `label` policy is explicit: `auto` (default) follows normal title
+behavior, `always` renders the title, and `never` renders no label while
+preserving content geometry. An empty title is not required to suppress labels.
 
 Unknown fields are not a substitute for `settings`: keep widget-specific
 options in the string-valued settings map so the configuration contract remains
@@ -130,6 +139,41 @@ top-level schema.
 The configuration validator rejects duplicate IDs, empty types, invalid layout
 references, empty layout groups, and unsupported configuration versions. A
 widget factory may apply additional validation, such as the clock format check.
+
+### Content padding and borders
+
+Widgets that draw an outline support these optional string settings:
+
+- `padding`: a non-negative number of additional cells between the border and
+  the content area. The default is `0`.
+- `border`: `rounded` (default), `square`, `double`, `heavy`, `ascii`, or
+  `none`. `border_style` is accepted as a compatibility alias.
+- `border_color` and semantic role names such as `foreground`, `background`,
+  `focus`, and `muted`: `inherit`, `ansi:N`, or `#RRGGBB`.
+
+Custom glyph sets, per-side visibility, and animated border/title styling remain
+future extensions in Phase 12.
+
+The configured appearance controls the widget's content rectangle. Terminal PTY
+size, terminal graphics, selection, mouse routing, and resize handling all use
+that rectangle, so increasing padding cannot cause terminal output to overlap
+the border. `border = "none"` removes the outline while retaining configured
+padding. Built-in text-like widgets retain their historical one-cell text
+inset inside the content rectangle.
+
+For example:
+
+```toml
+[[workspace.widgets]]
+id = 12
+type = "text"
+title = " deploy "
+text = "production: healthy"
+
+[workspace.widgets.settings]
+padding = "2"
+border = "double"
+```
 
 ## Built-in widget types
 
@@ -342,7 +386,22 @@ children = [
 
 A widget should render to the supplied area and should not assume the whole
 terminal viewport. The scene and compositor enforce clipping so a child cannot
-draw into a neighboring pane.
+draw into a neighboring pane. The public `widget_content_area(area)` helper
+returns the one-cell-inset rectangle for widgets that draw an outline.
+
+### Widget outlines and terminal content
+
+Built-in widget borders occupy the outer edge of the assigned surface. Terminal
+content is rendered into the configured content rectangle, inset by the border
+and padding; with defaults this is one cell on every side. The terminal's PTY
+size, graphics placements, selection coordinates, and mouse origin use that
+inner rectangle as well. This keeps terminal text and cursor
+output from overwriting the outline.
+
+The layout system currently sizes widgets to their assigned surface; it does
+not provide a separate general-purpose alignment option for centering a widget
+inside a larger parent area. Splits, columns, and explicit layout geometry are
+the supported positioning controls.
 
 ### Frame composition
 
@@ -350,6 +409,20 @@ The compositor renders visible widget scenes, orders surfaces and overlays,
 clips them to the viewport, and diffs the result against the previous frame.
 Only visible layout branches contribute output. Hidden tab sessions remain
 alive and retain state, but their scenes and graphics are not submitted.
+
+### Colors and theming
+
+Static theming is implemented. The default semantic theme uses terminal-native
+reset and ANSI references so widget colors follow the parent terminal palette.
+Use `[appearance.colors]` for workspace-wide role overrides and widget
+`settings` for per-instance overrides. The complete role list, color syntax,
+precedence rules, border styles, and label policy are documented in
+[APPEARANCE.md](APPEARANCE.md).
+
+Animation is not implemented yet and remains an opt-in retained-scene feature
+planned for Phase 12. Planned options include transitions for focus, borders,
+labels, values, overlays, tabs, and panes, plus duration, easing, repetition,
+reduced-motion, and per-widget motion budgets.
 
 This separation means widget code is independent of terminal cursor movement,
 style caching, changed-cell grouping, output metrics, and backend capability
@@ -465,9 +538,45 @@ or make sixel available to terminal PTYs.
 ## Plugins and extension points
 
 Built-in widgets are registered in a `WidgetRegistry`. A factory receives a
-`WidgetInstanceConfig` and returns a boxed widget. External implementations
-use the versioned plugin contract rather than writing directly to the terminal
-backend.
+`WidgetInstanceConfig` and a shared `&WidgetRuntimeContext`, then returns a
+boxed widget. The context is the construction-time capability boundary for
+services that a widget may need; factories should not reach into global state or
+application internals.
+
+The factory contract is:
+
+```rust
+fn factory(
+    config: &WidgetInstanceConfig,
+    context: &WidgetRuntimeContext,
+) -> Result<Box<dyn Widget>, WidgetError>
+```
+
+`WidgetRuntimeContext::new()` creates a context without optional services. The
+context also exposes the resolved `Theme` used by built-in and external widgets.
+Applications that run terminal sessions can construct a context with
+`WidgetRuntimeContext::with_session_wakeup(wakeup)` and pass it to
+`WidgetRegistry::builtins_with_context`. The session wakeup is optional so
+widget-only dashboards and custom passive widgets remain usable without a PTY.
+The built-in terminal factory consumes this capability; other built-ins ignore
+it. Future runtime services should be added as explicit context capabilities
+with documented ownership and failure behavior.
+
+External in-process widgets use the same `Widget` scene contract. The public
+`WidgetRuntimeContext::theme()` method provides the resolved semantic `Theme`.
+`WidgetAppearance::from_settings` parses the common `padding` and `border`
+settings, `WidgetAppearance::content_area(area)` gives the matching inner
+rectangle, and `WidgetAppearance::render_border(...)` draws the selected
+outline. Plugins that use these helpers get the same geometry and colors for
+rendering, input, and terminal-like content. The older `widget_content_area(area)` helper
+remains available for the fixed one-cell legacy contract. The host clips the
+resulting scene to the assigned surface but does not guess arbitrary plugin
+border geometry. The checked-in `ExternalTextPlugin` is the reference
+implementation of this contract.
+
+`WidgetRegistry::builtins()` remains the no-service convenience constructor.
+External implementations use the versioned plugin contract rather than writing
+directly to the terminal backend.
 
 ### Manifest contract
 
@@ -658,6 +767,8 @@ contracts grow.
 
 - [Configuration reference](CONFIGURATION.md) — discovery, TOML fields,
   layouts, panes, overlays, migrations, and recovery.
+- [Appearance guide](APPEARANCE.md) — semantic themes, inherited terminal
+  palette colors, borders, labels, and per-widget overrides.
 - [Architecture](ARCHITECTURE.md) — state ownership, scenes, compositor, and
   backend boundaries.
 - [Dependencies](DEPENDENCIES.md) — selected crate roles and optional feature

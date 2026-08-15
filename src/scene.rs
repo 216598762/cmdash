@@ -6,15 +6,23 @@ use crate::graphics::GraphicsSubmission;
 use crate::sixel::SixelSubmission;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Color {
-    pub red: u8,
-    pub green: u8,
-    pub blue: u8,
+pub enum Color {
+    Rgb { red: u8, green: u8, blue: u8 },
+    Ansi(u8),
+    Reset,
 }
 
 impl Color {
     pub const fn rgb(red: u8, green: u8, blue: u8) -> Self {
-        Self { red, green, blue }
+        Self::Rgb { red, green, blue }
+    }
+
+    pub const fn ansi(index: u8) -> Self {
+        Self::Ansi(index)
+    }
+
+    pub const fn reset() -> Self {
+        Self::Reset
     }
 }
 
@@ -83,7 +91,7 @@ pub struct Scene {
 impl Scene {
     pub fn new(area: Rect) -> Self {
         let cell_count = area.width as usize * area.height as usize;
-        let style = CellStyle::new(Color::rgb(220, 224, 230), Color::rgb(18, 22, 30));
+        let style = CellStyle::new(Color::reset(), Color::reset());
         Self {
             area,
             cells: vec![Cell::blank(style); cell_count],

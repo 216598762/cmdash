@@ -452,10 +452,14 @@ impl<W: Write> Drop for CrosstermBackend<W> {
 }
 
 fn to_crossterm_color(color: Color) -> crossterm::style::Color {
-    crossterm::style::Color::Rgb {
-        r: color.red,
-        g: color.green,
-        b: color.blue,
+    match color {
+        Color::Rgb { red, green, blue } => crossterm::style::Color::Rgb {
+            r: red,
+            g: green,
+            b: blue,
+        },
+        Color::Ansi(index) => crossterm::style::Color::AnsiValue(index),
+        Color::Reset => crossterm::style::Color::Reset,
     }
 }
 
@@ -472,6 +476,18 @@ mod tests {
         let backend = CrosstermBackend::new(Vec::<u8>::new());
         assert!(backend.capabilities().mouse);
         assert!(backend.capabilities().bracketed_paste);
+    }
+
+    #[test]
+    fn native_palette_colors_are_preserved_for_the_parent_terminal() {
+        assert_eq!(
+            to_crossterm_color(Color::ansi(14)),
+            crossterm::style::Color::AnsiValue(14)
+        );
+        assert_eq!(
+            to_crossterm_color(Color::reset()),
+            crossterm::style::Color::Reset
+        );
     }
 
     #[test]

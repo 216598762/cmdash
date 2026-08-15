@@ -152,6 +152,105 @@ This phase makes the configuration file a first-class user-facing product surfac
 
 **Exit criteria (met):** a new user can locate a working default configuration, understand every supported option, safely customize it, and recover from invalid edits.
 
+## Phase 11 — Theming and inherited terminal palette
+
+This phase replaces the current widget-specific hard-coded RGB colors with a
+semantic theme layer that remains readable across terminal environments while
+allowing users to customize the dashboard's appearance.
+
+- [x] Define semantic color roles for surfaces, text, muted text, borders,
+  focused borders, success/warning/error states, selections, overlays, and
+  terminal defaults; widgets must consume roles rather than embed `Color::rgb`
+  constants.
+- [x] Add a versioned configuration schema for inherited/fallback themes and
+  per-role color overrides, with validation for RGB, ANSI-indexed, and
+  terminal-default color values.
+- [x] Add a backend palette abstraction that can represent the parent terminal's
+  default foreground/background and ANSI 16-color palette without coupling
+  widgets to Crossterm escape sequences.
+- [x] Make the default theme inherit the parent terminal palette through
+  terminal-native reset and ANSI references, with a deterministic RGB fallback
+  for fixed-color environments; avoid blocking startup on optional palette-query
+  protocols.
+- [x] Preserve explicit truecolor and configured theme values when available;
+  degrade to inherited/default ANSI colors without corrupting layout, contrast,
+  or terminal output.
+- [x] Provide a consistent border-style catalog covering rounded, square,
+  double-line, heavy, ASCII, and hidden styles, with predictable behavior for
+  narrow and zero-area surfaces.
+- [x] Separate border geometry, border color, and title/label content so themes
+  can control static widget chrome independently without changing content
+  geometry.
+- [x] Add an explicit label policy such as `auto`, `always`, and `never`, allowing
+  a widget to have no label without relying on an empty-string sentinel; define
+  how hidden labels affect border geometry, padding, accessibility text, and
+  plugin widgets.
+- [x] Add extended static appearance options for foreground/background roles,
+  border and focus accents, muted/disabled state, bold/dim attributes, padding,
+  and per-widget semantic color overrides.
+- [x] Define appearance precedence as inherited terminal palette, named theme,
+  widget-type defaults, widget-instance overrides, and transient focus/health
+  state, with reload-safe validation and diagnostics.
+- [x] Add theme reload behavior, documentation, and regression coverage for
+  inherited reset/ANSI colors, configured overrides, focused states, border
+  variants, hidden labels, overlays, and terminal-session color isolation.
+
+**Exit criteria (met):** widgets share a documented semantic theme API, a fresh
+installation follows the parent terminal's palette by default through native
+reset/ANSI references, explicit theme configuration overrides inherited values
+predictably, widgets support consistent border and label policies including
+no-label surfaces, and fixed-color environments receive a stable RGB fallback.
+
+## Phase 12 — Animation, transitions, and dynamic widget options
+
+This phase adds optional motion without making animation a requirement for
+correctness, input handling, or terminal-session state. Animations must produce
+ordinary retained scenes, remain bounded by the coordinator, and degrade to a
+static frame on terminals or configurations that do not support them.
+
+- [ ] Define a retained animation model with timelines, keyframes, triggers,
+  start/end values, cancellation, completion, and interruption semantics; keep
+  animation state separate from PTY/emulator state.
+- [ ] Add a versioned animation configuration contract with per-widget and
+  per-theme options for enabled state, duration, delay, easing, repeat count,
+  direction, fill mode, and trigger events.
+- [ ] Support a deliberate initial set of effects: widget enter/exit, focus
+  changes, border and label transitions, color/attribute interpolation, value
+  changes, progress updates, loading indicators, spinners, pulses, overlays,
+  tab switches, and pane creation/closure.
+- [ ] Extend border and label options for animated visibility, style changes,
+  title placement, label reveal/hide behavior, and transition-specific colors;
+  define how `label = never` or a hidden border interacts with animation and
+  content geometry.
+- [ ] Add a wakeable animation scheduler that requests frames only while an
+  animation is active, coalesces simultaneous updates, and preserves the
+  existing event-driven PTY/input path without reintroducing fixed-rate output
+  polling.
+- [ ] Define terminal-safe interpolation and fallback rules for ANSI palettes,
+  truecolor, bold/dim attributes, glyph changes, and unsupported effects;
+  alpha/transparency must never leak malformed escape sequences or corrupt
+  neighboring surfaces.
+- [ ] Add global and per-widget motion controls, including pause/resume, a
+  reduced-motion preference, an animation budget, maximum concurrent effects,
+  and a static fallback for slow or overloaded terminals.
+- [ ] Expose animation capabilities to plugins through explicit manifest/API
+  bits, bounded frame/keyframe counts, execution and memory quotas, and host
+  ownership of scheduling; plugins must not spawn unbounded animation workers.
+- [ ] Define lifecycle behavior for hidden tabs, closed panes, failed widgets,
+  reloads, and shutdown so animations cannot retain sessions, graphics, or
+  worker threads after their owner disappears.
+- [ ] Add deterministic clock injection, golden scene tests, timing-independent
+  transition tests, cancellation/restart coverage, performance benchmarks, and
+  fuzz/config validation for malformed animation options.
+- [ ] Document animation presets and extended theme options with examples for
+  dashboard status changes, terminal focus, overlays, pane transitions, and
+  plugin widgets.
+
+**Exit criteria:** animations are opt-in, bounded, interruptible, and
+accessibility-aware; active motion wakes the UI without timer-based PTY polling;
+all animated output remains clipped and session-isolated; and disabling motion
+produces a visually coherent static dashboard.
+
 ## Decision log starters
 
 | Topic | Provisional direction | Why it matters |
@@ -167,6 +266,9 @@ This phase makes the configuration file a first-class user-facing product surfac
 | Async model | Coordinator/UI owner plus per-session I/O tasks | Keeps frame submission serialized while PTYs remain responsive |
 | Configuration | TOML with checked-in `config/default.toml` and `docs/CONFIGURATION.md` | Makes the embedded fallback discoverable while keeping schema evolution explicit |
 | Default configuration discovery | Explicit CLI path, user config, example/default file, embedded fallback | Preserves safe startup while giving users an editable starting point |
+| Default widget palette | Use terminal-native reset/ANSI references, with a deterministic RGB fallback | Makes cmdash blend into the user's terminal without blocking on optional palette-query protocols |
+| Widget chrome | Explicit border-style and label policies, including a first-class no-label mode | Keeps layout/content geometry independent from decorative labels and allows themes to control borders consistently |
+| Animation model | Optional retained transitions scheduled by the UI coordinator with bounded budgets | Adds motion without compromising PTY responsiveness, deterministic rendering, or plugin isolation |
 | Initial multiplexer UX | Retained tabs plus interactive horizontal/vertical panes | Validates session isolation and restoration while keeping pane mutation command-driven |
 
 Update this table as product decisions are made; do not let provisional choices silently become public API guarantees.

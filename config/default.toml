@@ -5,6 +5,9 @@ version = 1
 [workspace]
 name = "default"
 
+[appearance]
+theme = "inherit"
+
 [[workspace.widgets]]
 id = 1
 type = "text"

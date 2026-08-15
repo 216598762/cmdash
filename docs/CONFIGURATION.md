@@ -1,5 +1,8 @@
 # Configuration
 
+Appearance details and color-role examples live in
+[APPEARANCE.md](APPEARANCE.md).
+
 cmdash uses versioned TOML configuration with the `cmdash.workspace` schema. The
 current configuration version is `1`.
 
@@ -67,6 +70,9 @@ version = 1
 [workspace]
 name = "monitor"
 
+[appearance]
+theme = "inherit"
+
 [[plugins]]
 name = "example"
 manifest = "plugins/example.toml"
@@ -75,6 +81,8 @@ enabled = true
 
 - `version` is required for new files and must be `1`.
 - `workspace.name` labels the active workspace and defaults to `default`.
+- `appearance` selects inherited/fallback theme colors and workspace role
+  overrides; see [APPEARANCE.md](APPEARANCE.md).
 - `plugins` contains named plugin manifest paths. Plugin loading remains
   capability-limited; WASM support is opt-in with `--features wasm-plugins`.
 
@@ -94,16 +102,35 @@ command = "sh"
 
 [workspace.widgets.settings]
 scrollback = "4096"
+padding = "1"
+border = "rounded"
 ```
 
 Every widget needs a unique numeric `id` and a non-empty `type`. Built-in types
 are `text`, `clock`, `system`, and `terminal`.
 
 - `title`, `text`, `format`, and `command` are optional type-specific fields.
+- `label` accepts `auto`, `always`, or `never`; it controls whether the title is
+  drawn in the widget border.
 - `settings` is a stable string-to-string map reserved for widget options.
+- `settings.padding` is a non-negative number of additional content cells.
+- `settings.border` accepts `rounded`, `square`, `double`, `heavy`, `ascii`, or
+  `none`; `border_style` is an alias.
+- `settings.border_color` and semantic role names such as `foreground`,
+  `background`, `focus`, and `muted` accept `inherit`, `ansi:N`, or `#RRGGBB`.
 - `clock.format` accepts `HH:MM` or `HH:MM:SS`.
 - A terminal widget owns its PTY, emulator, selection, graphics resources, and
   shutdown lifecycle.
+
+Appearance is configured through `[appearance]`; see
+[APPEARANCE.md](APPEARANCE.md) for semantic roles, parent-terminal palette
+inheritance, border styles, label policies, override precedence, and examples.
+The default `theme = "inherit"` uses terminal-native reset and ANSI references,
+while `theme = "fallback"` selects deterministic RGB colors.
+
+Animation options are not supported yet. The next roadmap phase reserves a
+versioned animation configuration for opt-in transitions, easing, duration,
+repetition, reduced-motion preferences, and bounded per-widget motion budgets.
 
 ## Layouts and panes
 
