@@ -12,8 +12,9 @@ use std::{
 };
 
 use cmdash::{
-    AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend, SessionWakeup, Surface,
-    SurfaceCommand, SurfaceId, TerminalWindowSize, UiEvent, WidgetRegistry, WidgetRuntimeContext,
+    ApiServer, AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend, SessionWakeup,
+    Surface, SurfaceCommand, SurfaceId, TerminalWindowSize, UiEvent, WidgetRegistry,
+    WidgetRuntimeContext,
     dashboard::{
         render_static_dashboard_shell_with_theme,
         render_static_dashboard_surface_scenes_with_theme, static_dashboard_surface_areas,
@@ -98,10 +99,15 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
     let explicit_config_path = config_path(&args)?;
-    let (config_path, config) = load_config(explicit_config_path.as_deref())?;
+    let (config_path, mut config) = load_config(explicit_config_path.as_deref())?;
+    apply_api_cli_overrides(&mut config, &args)?;
+    config
+        .validate()
+        .map_err(|error| io::Error::other(format!("application config rejected: {error}")))?;
     let config_path_for_report = config_path.clone();
     let initial_window_size = backend.window_size()?;
     let (event_sender, event_receiver, pty_wakeup) = ui_event_channel();
+    let mut api_server = ApiServer::start(&config.api, event_sender.clone())?;
     let registry = WidgetRegistry::builtins_with_context(
         WidgetRuntimeContext::with_session_wakeup(pty_wakeup.clone())
             .with_initial_terminal_size(initial_window_size.terminal_size()),
@@ -127,10 +133,14 @@ fn main() -> io::Result<()> {
             registry: &registry,
             reloader: reloader.as_mut(),
             maintenance_waker: &maintenance_waker,
+            api: api_server.as_mut(),
         },
     );
     input_reader.shutdown();
     maintenance_waker.shutdown();
+    if let Some(api) = api_server.as_mut() {
+        api.shutdown();
+    }
     state.shutdown_widgets();
     let leave_result = backend.leave();
 
@@ -151,6 +161,7 @@ struct RunContext<'a> {
     registry: &'a WidgetRegistry,
     reloader: Option<&'a mut ConfigReloader>,
     maintenance_waker: &'a MaintenanceWaker,
+    api: Option<&'a mut ApiServer>,
 }
 
 fn run<B>(
@@ -162,6 +173,7 @@ fn run<B>(
 where
     B: Backend<Error = io::Error>,
 {
+    let mut frame_generation = 0_u64;
     loop {
         context.maintenance_waker.schedule_cursor_blink(
             state.cursor_blink_schedule(),
@@ -217,6 +229,28 @@ where
         backend.submit_graphics(diff.graphics(), diff.removed_graphics())?;
         #[cfg(feature = "sixel")]
         backend.submit_sixel(diff.sixel())?;
+        frame_generation = frame_generation.wrapping_add(1);
+        if let Some(api) = context.api.as_deref_mut() {
+            api.publish_snapshot(cmdash::ApiSnapshot::from_state(
+                state,
+                &scene,
+                backend.metrics(),
+                frame_generation,
+                api.expose_graphics(),
+            ));
+            let registry = context.registry;
+            api.process_pending(state, |state| {
+                let Some(reloader) = context.reloader.as_deref_mut() else {
+                    return Err("API reload requires a file-backed configuration".to_owned());
+                };
+                let loaded = reloader
+                    .reload_with_migrations()
+                    .map_err(|error| error.to_string())?;
+                state
+                    .reload_config(registry, &loaded.config)
+                    .map_err(|error| error.to_string())
+            });
+        }
 
         if dispatch_available_events(
             state,
@@ -264,7 +298,12 @@ fn config_path(args: &[String]) -> io::Result<Option<PathBuf>> {
     let mut arguments = args.iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--migrate-config" => {}
+            "--migrate-config" | "--api" | "--api-disable" | "--api-read-only" => {}
+            "--api-socket" => {
+                let _ = arguments.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--api-socket requires a path")
+                })?;
+            }
             "--config" | "-c" => {
                 let value = arguments.next().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "--config requires a TOML path")
@@ -285,6 +324,29 @@ fn config_path(args: &[String]) -> io::Result<Option<PathBuf>> {
         }
     }
     Ok(path)
+}
+
+fn apply_api_cli_overrides(config: &mut AppConfig, args: &[String]) -> io::Result<()> {
+    let mut arguments = args.iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--api" => config.api.enabled = true,
+            "--api-disable" => config.api.enabled = false,
+            "--api-read-only" => {
+                config.api.enabled = true;
+                config.api.read_only = true;
+            }
+            "--api-socket" => {
+                let socket = arguments.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--api-socket requires a path")
+                })?;
+                config.api.socket = socket.clone();
+                config.api.enabled = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn spawn_input_reader(sender: Sender<UiEvent>) -> InputReader {
@@ -413,6 +475,7 @@ fn collect_ui_event(
         UiEvent::Input(event) => events.push(event),
         UiEvent::PtyOutput => pty_wakeup.clear_pending(),
         UiEvent::Tick => {}
+        UiEvent::ApiWakeup => {}
         UiEvent::AnimationFrame => {
             state.advance_animations(SystemTime::now());
         }
@@ -664,6 +727,27 @@ mod tests {
     #[test]
     fn config_path_rejects_missing_values_and_unknown_arguments() {
         assert!(config_path(&["--config".to_owned()]).is_err());
+        assert!(config_path(&["--api-socket".to_owned()]).is_err());
         assert!(config_path(&["--verbose".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn api_cli_overrides_have_explicit_precedence() {
+        let mut config = AppConfig::parse(
+            "version = 1\n[api]\nenabled = true\nread_only = false\nsocket = \"/tmp/from-file.sock\"\n",
+        )
+        .unwrap();
+        apply_api_cli_overrides(
+            &mut config,
+            &[
+                "--api-disable".to_owned(),
+                "--api-socket".to_owned(),
+                "/tmp/from-cli.sock".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert!(config.api.enabled);
+        assert_eq!(config.api.socket, "/tmp/from-cli.sock");
+        assert!(!config.api.read_only);
     }
 }

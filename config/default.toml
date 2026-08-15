@@ -12,6 +12,10 @@ theme = "inherit"
 [animation]
 enabled = false
 
+# Local automation is disabled by default; see docs/API.md before enabling it.
+[api]
+enabled = false
+
 [[workspace.widgets]]
 id = 1
 type = "text"

@@ -267,17 +267,17 @@ without exposing raw terminal ownership or bypassing the UI coordinator.
 
 ### Goals and boundaries
 
-- [ ] Define a stable machine-readable API for local automation, companion tools,
+- [x] Define a stable machine-readable API for local automation, companion tools,
   tests, and future dashboard clients.
-- [ ] Keep the API disabled by default and local-only unless explicitly enabled.
-- [ ] Route every mutation through the existing `AppState::dispatch(Command)` and
+- [x] Keep the API disabled by default and local-only unless explicitly enabled.
+- [x] Route every mutation through the existing `AppState::dispatch(Command)` and
   UI/coordinator path; API workers must never mutate `AppState`, widgets,
   sessions, or `Compositor` directly.
-- [ ] Expose backend-neutral state and frame data rather than terminal escape
+- [x] Expose backend-neutral state and frame data rather than terminal escape
   sequences, raw PTY streams, or backend handles.
-- [ ] Define bounded, versioned wire types before making internal Rust structs
+- [x] Define bounded, versioned wire types before making internal Rust structs
   part of a public contract.
-- [ ] Keep remote TCP access, arbitrary shell execution, raw PTY injection, and
+- [x] Keep remote TCP access, arbitrary shell execution, raw PTY injection, and
   public-network control out of the initial phase.
 
 ### Endpoint contract
@@ -316,19 +316,19 @@ private fields and implementation-specific enum layouts out of the public API.
 
 ### Transport and coordinator bridge
 
-- [ ] Choose and document a transport, with a Unix-domain socket as the preferred
+- [x] Choose and document a transport, with a Unix-domain socket as the preferred
   Linux-first implementation.
-- [ ] Define a bounded JSON request/response envelope, likely using `serde_json`,
+- [x] Define a bounded JSON request/response envelope, likely using `serde_json`,
   with API version, request ID, typed result, and typed error fields.
-- [ ] Add a transport abstraction that can later support Windows named pipes or
+- [x] Add a transport abstraction that can later support Windows named pipes or
   an explicitly enabled loopback TCP adapter without changing endpoint semantics.
-- [ ] Add a bounded API request queue and response/event bridge owned by the UI
+- [x] Add a bounded API request queue and response/event bridge owned by the UI
   coordinator.
-- [ ] Generate API snapshots at a defined point in the frame loop so related
+- [x] Generate API snapshots at a defined point in the frame loop so related
   state and frame responses share a generation.
-- [ ] Add bounded frame history or an explicit snapshot-required fallback for
+- [x] Add bounded frame history or an explicit snapshot-required fallback for
   diff requests.
-- [ ] Ensure client disconnects, full queues, and API listener failures cannot
+- [x] Ensure client disconnects, full queues, and API listener failures cannot
   stall or terminate the dashboard.
 
 The intended ownership flow is:
@@ -385,56 +385,56 @@ must be explicit.
 
 ### Security and capability policy
 
-- [ ] Keep the listener disabled by default and create local sockets with
+- [x] Keep the listener disabled by default and create local sockets with
   restrictive permissions.
-- [ ] Validate socket paths and reject unsafe configurations where practical.
-- [ ] Make read-only operation the default and use explicit mutation allowlists.
-- [ ] Reject arbitrary shell execution, raw PTY input, raw terminal escape output,
+- [x] Validate socket paths and reject unsafe configurations where practical.
+- [x] Make read-only operation the default and use explicit mutation allowlists.
+- [x] Reject arbitrary shell execution, raw PTY input, raw terminal escape output,
   clipboard contents, and unbounded graphics payloads by default.
-- [ ] Enforce request, response, client, queue, timeout, subscription, and frame
+- [x] Enforce request, response, client, queue, timeout, subscription, and frame
   history limits.
-- [ ] Advertise supported and enabled operations through `/v1/capabilities`.
-- [ ] Require explicit binding and authentication before any future TCP support.
+- [x] Advertise supported and enabled operations through `/v1/capabilities`.
+- [x] Require explicit binding and authentication before any future TCP support.
 
 ### Documentation deliverables
 
-- [ ] Add `docs/API.md` with the API versioning policy, transport setup,
+- [x] Add `docs/API.md` with the API versioning policy, transport setup,
   endpoint reference, request/response schemas, error envelopes, permissions,
   limits, examples, subscriptions, and compatibility rules.
-- [ ] Update `docs/ARCHITECTURE.md` with the API-to-coordinator ownership
+- [x] Update `docs/ARCHITECTURE.md` with the API-to-coordinator ownership
   boundary and frame-generation model.
-- [ ] Update `docs/CONFIGURATION.md` with `[api]` options, CLI overrides,
+- [x] Update `docs/CONFIGURATION.md` with `[api]` options, CLI overrides,
   security defaults, and recovery behavior.
-- [ ] Update `docs/DEPENDENCIES.md` with the selected serialization and transport
+- [x] Update `docs/DEPENDENCIES.md` with the selected serialization and transport
   dependencies and their boundary rationale.
-- [ ] Update `README.md` with automation setup, local-socket troubleshooting,
+- [x] Update `README.md` with automation setup, local-socket troubleshooting,
   and read-only/mutating deployment guidance.
 
 ### Testing and validation
 
-- [ ] Add wire serialization round-trip tests, unknown-version tests, malformed
+- [x] Add wire serialization round-trip tests, unknown-version tests, malformed
   request tests, and invalid-command tests.
-- [ ] Test read-only mode, authorization failures, capability negotiation, and
+- [x] Test read-only mode, authorization failures, capability negotiation, and
   unsupported endpoint behavior.
-- [ ] Test request/response limits, full queues, timeouts, disconnected clients,
+- [x] Test request/response limits, full queues, timeouts, disconnected clients,
   and listener shutdown.
-- [ ] Prove API mutations execute only through the coordinator and existing
+- [x] Prove API mutations execute only through the coordinator and existing
   command/state validation.
-- [ ] Verify frame snapshots contain only visible surfaces and retain
+- [x] Verify frame snapshots contain only visible surfaces and retain
   session-qualified graphics ownership.
-- [ ] Test state/frame generation consistency and diff fallback behavior.
-- [ ] Test configuration reload, CLI precedence, socket permissions, and unsafe
+- [x] Test state/frame generation consistency and diff fallback behavior.
+- [x] Test configuration reload, CLI precedence, socket permissions, and unsafe
   path rejection.
-- [ ] Add fuzz coverage for API envelopes, command payloads, oversized messages,
+- [x] Add fuzz coverage for API envelopes, command payloads, oversized messages,
   and subscription requests.
 
-**Exit criteria:** the API is disabled by default and safely enabled through
+**Exit criteria (met):** the API is disabled by default and safely enabled through
 documented options; local clients can query health, capabilities, workspace state,
 surfaces, widgets, diagnostics, metrics, and compositor frames; safe focus/tab/
 pane/reload commands can be submitted; all mutations remain coordinator-owned;
 responses are versioned, bounded, and generation-consistent; API failures cannot
 crash or stall the dashboard; and endpoint schemas, security behavior, examples,
-and compatibility rules are documented and tested.
+and compatibility rules are documented and tested in [API.md](API.md).
 
 ## Decision log starters
 

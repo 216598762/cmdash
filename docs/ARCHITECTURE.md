@@ -77,11 +77,35 @@ widgets receive bounded frame progress while the compositor and backend retain
 normal scene/output ownership. See [ANIMATION.md](ANIMATION.md) for the motion
 contract and configuration.
 
-The coordinator updates application state and schedules a frame. It does not render partial output from event handlers.
+The coordinator updates application state and schedules a frame. It does not render partial output from event handlers. API wakeups enter the same event path; listener failures and client backpressure remain local to the API boundary.
 
 ### 3.3 Application state and commands
 
-Contains workspace layout, focus, keymaps, widget configuration, session registry, and command handling. Commands should be serializable where possible so they can later support scripting or a command palette.
+Contains workspace layout, focus, keymaps, widget configuration, session registry, and command handling.
+
+### 3.4 Local API boundary
+
+The optional local API is a transport adapter around the coordinator, not a
+second application owner:
+
+```text
+Unix socket clients
+        │ bounded JSON requests
+        ▼
+API listener/client workers
+        │ bounded queue + wakeup
+        ▼
+UI coordinator ──► AppState::dispatch / reload / frame snapshot
+        │
+        └──────────► bounded response channels
+```
+
+The listener never receives `AppState`, `Compositor`, session handles, or widget
+references. A snapshot is published after composition at a frame generation;
+read requests observe that generation and mutation requests execute on the UI
+thread. See [API.md](API.md) for the wire contract and limits.
+
+### 3.5 Application state details
 
 Suggested state ownership:
 
@@ -102,7 +126,7 @@ SessionState
 └── render_cache / dirty regions
 ```
 
-### 3.4 Widget API and plugin boundary
+### 3.6 Widget API and plugin boundary
 
 Widgets should have a small lifecycle-oriented interface, conceptually similar to:
 
@@ -301,6 +325,7 @@ The UI/coordinator task owns `AppState` and all frame composition. Per-session I
 Important lifecycle behavior:
 
 - PTY output is backpressured or batched to avoid starving input and rendering.
+- API requests are bounded, batched, and rejected on queue/size limits rather than blocking frame submission.
 - Resize events update the session emulator and PTY dimensions in a defined order.
 - Closing a session cancels its I/O task, waits for child cleanup, then releases graphics resources.
 - Shutdown restores terminal modes even after a panic/error path where the backend supports it.
@@ -330,6 +355,7 @@ The core should be testable without a real terminal:
 - capability tests for terminals with and without Kitty or opt-in sixel support;
 - fuzz targets and retained seed corpora for TOML migration, plugin manifests, Kitty APC chunking, and sixel encoding;
 - pane lifecycle tests for independent PTYs, nested layout persistence, and safe reload;
-- release archive, checksum, feature-variant, and startup checks on tagged builds.
+- release archive, checksum, feature-variant, and startup checks on tagged builds;
+- API wire, authorization, queue, snapshot-generation, Unix-socket, and subscription tests.
 
 A key regression test: write a Kitty image with ID `1` in tab A, write a different image with ID `1` in tab B, switch A → B → A, and verify that each tab restores its own image without cross-contamination.

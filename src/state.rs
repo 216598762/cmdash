@@ -359,6 +359,7 @@ impl AppState {
                 workspace: crate::config::WorkspaceConfig::default(),
                 appearance: crate::config::AppearanceConfig::default(),
                 animation: crate::config::AnimationConfig::default(),
+                api: crate::config::ApiConfig::default(),
                 plugins: Vec::new(),
             },
             widget_registry: WidgetRegistry::builtins(),

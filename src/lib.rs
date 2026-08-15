@@ -1,4 +1,5 @@
 pub mod animation;
+pub mod api;
 pub mod appearance;
 pub mod backend;
 pub mod command;
@@ -25,6 +26,10 @@ pub use animation::{
     AnimationDirection, AnimationFrame, AnimationKey, AnimationManager, AnimationSample,
     AnimationSettings, AnimationSpec, Easing, FillMode,
 };
+pub use api::{
+    API_VERSION, ApiAction, ApiCapabilities, ApiCommand, ApiError, ApiExecution, ApiRequest,
+    ApiResponse, ApiServer, ApiSnapshot, ApiTransport,
+};
 pub use appearance::{AppearanceError, Theme};
 pub use backend::{
     Backend, BackendCapabilities, CrosstermBackend, OutputMetrics, TerminalWindowSize,
@@ -35,7 +40,7 @@ pub use command::{
 };
 pub use compositor::{CellSpan, Compositor, FrameDiff};
 pub use config::{
-    AnimationConfig, AppConfig, AppearanceConfig, CONFIG_SCHEMA, CURRENT_CONFIG_VERSION,
+    AnimationConfig, ApiConfig, AppConfig, AppearanceConfig, CONFIG_SCHEMA, CURRENT_CONFIG_VERSION,
     ConfigError, ConfigFileError, ConfigMigration, LabelPolicy, LayoutConfig, LoadedConfig,
     OverlayConfig, PluginConfig, SplitDirection, WidgetInstanceConfig, WorkspaceConfig,
 };

@@ -90,7 +90,12 @@ fn wait_for_marker(
                     return Ok(());
                 }
             }
-            Ok(UiEvent::Tick | UiEvent::AnimationFrame | UiEvent::CursorBlink(_)) => {}
+            Ok(
+                UiEvent::Tick
+                | UiEvent::AnimationFrame
+                | UiEvent::ApiWakeup
+                | UiEvent::CursorBlink(_),
+            ) => {}
             Ok(UiEvent::Input(_)) => return Err("unexpected input event".to_owned()),
             Ok(UiEvent::InputError(error)) => return Err(error),
             Err(error) => return Err(format!("timed out waiting for PTY output: {error}")),
@@ -126,7 +131,12 @@ fn round_trip(
                     return Ok(started.elapsed());
                 }
             }
-            Ok(UiEvent::Tick | UiEvent::AnimationFrame | UiEvent::CursorBlink(_)) => {}
+            Ok(
+                UiEvent::Tick
+                | UiEvent::AnimationFrame
+                | UiEvent::ApiWakeup
+                | UiEvent::CursorBlink(_),
+            ) => {}
             Ok(UiEvent::Input(_)) => return Err("unexpected input event".to_owned()),
             Ok(UiEvent::InputError(error)) => return Err(error),
             Err(error) => return Err(format!("timed out waiting for key echo: {error}")),

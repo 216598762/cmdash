@@ -73,6 +73,11 @@ name = "monitor"
 [appearance]
 theme = "inherit"
 
+[api]
+enabled = false
+transport = "unix"
+socket = "~/.cache/cmdash/cmdash.sock"
+
 [[plugins]]
 name = "example"
 manifest = "plugins/example.toml"
@@ -85,6 +90,8 @@ enabled = true
   overrides; see [APPEARANCE.md](APPEARANCE.md).
 - `animation` enables bounded retained motion when explicitly configured; see
   [ANIMATION.md](ANIMATION.md) for its complete contract.
+- `api` enables the local, disabled-by-default compositor API; see [API.md](API.md)
+  for endpoints, security, limits, and CLI overrides.
 - `plugins` contains named plugin manifest paths. Plugin loading remains
   capability-limited; WASM support is opt-in with `--features wasm-plugins`.
 
@@ -204,12 +211,18 @@ palette. `CMDASH_CRASH_DIR` enables bounded crash reproduction reports when the
 application exits with an error. Diagnostics are shown in the dashboard footer
 and are kept separate from PTY output.
 
-The command-line interface currently accepts only these configuration options:
+The command-line interface accepts these configuration options:
 
 ```text
 cmdash [--config <path> | -c <path>]
 cmdash --migrate-config --config <path>
+cmdash --api [--api-read-only]
+cmdash --api-socket <path>
+cmdash --api-disable
 ```
+
+API flags apply after TOML parsing. See [API.md](API.md) for the local socket
+contract and safe read-only/mutating behavior.
 
 `--migrate-config` validates the file and atomically adds or updates the schema
 version metadata. It prints each applied migration and does not start the

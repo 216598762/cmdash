@@ -36,6 +36,7 @@ These are the strongest candidates for the first executable once the package ske
 | Serialization | [`serde`](https://crates.io/crates/serde) | Versioned widget/application configuration types | Active in the initial widget configuration model; avoid serializing live PTY/emulator state in the first release. |
 | Configuration format | [`toml`](https://crates.io/crates/toml) | Initial hand-authored workspace and widget configuration | Active version-1 parser with checked-in `config/default.toml`, safe metadata-polled reload, atomic migration rewrite, and explicit schema/version handling. |
 | Animation timing | Rust standard library | Deterministic coordinator-owned animation clocks, deadlines, and bounded progress | No animation dependency is required; motion stays behind the scene/coordinator boundary. See [`ANIMATION.md`](ANIMATION.md). |
+| Local compositor API | `serde_json` + Rust Unix sockets | Bounded newline-delimited API envelopes and Linux-first local transport | Active Phase 13 implementation; no HTTP server or network listener is included. |
 | Diagnostics | [`tracing`](https://crates.io/crates/tracing) + [`tracing-subscriber`](https://crates.io/crates/tracing-subscriber) | Structured logs for sessions, plugins, frame timing, and protocol failures | Future structured logger; current recovery diagnostics are bounded and rendered in-app. |
 | Error types | [`thiserror`](https://crates.io/crates/thiserror) + [`anyhow`](https://crates.io/crates/anyhow) | Typed library errors and application-level context | Strong candidates; use typed errors at plugin/session boundaries. |
 | User paths | [`directories`](https://crates.io/crates/directories) | XDG-compatible config, cache, data, and plugin discovery paths | Strong candidate; confirm exact Linux/XDG behavior needed by the app. |
@@ -171,7 +172,7 @@ Use the existing versioned manifest and C-compatible descriptor as the logical w
 - [`notify`](https://crates.io/crates/notify) — watch configuration/plugin directories; test event coalescing and editor-save patterns on Linux.
 - [`directories`](https://crates.io/crates/directories) — platform-aware config, cache, and plugin roots.
 - [`serde`](https://crates.io/crates/serde) and [`toml`](https://crates.io/crates/toml) — typed configuration and explicit schema evolution.
-- [`serde_json`](https://crates.io/crates/serde_json) — useful for diagnostics, plugin manifests, IPC, or machine-readable state even if TOML remains the user format.
+- [`serde_json`](https://crates.io/crates/serde_json) — active for the bounded versioned compositor API envelopes and machine-readable snapshots; TOML remains the user configuration format.
 - [`url`](https://crates.io/crates/url) — only if widgets support URL-aware links/actions.
 
 Plugin discovery uses a validated manifest shape with ABI/API version, widget types, capabilities, required permissions, and human-readable metadata. The current host validates this metadata without loading dynamic code; loading a plugin must not execute arbitrary code merely because an unrelated file appears in the config directory.

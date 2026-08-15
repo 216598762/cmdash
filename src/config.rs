@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::{
     animation::{AnimationDirection, Easing, FillMode},
+    api::ApiTransport,
     state::{OverlayId, WidgetId},
 };
 
@@ -24,6 +25,8 @@ pub struct AppConfig {
     pub appearance: AppearanceConfig,
     #[serde(default)]
     pub animation: AnimationConfig,
+    #[serde(default)]
+    pub api: ApiConfig,
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
 }
@@ -95,6 +98,74 @@ fn default_appearance_theme() -> String {
     "inherit".to_owned()
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct ApiConfig {
+    pub enabled: bool,
+    pub transport: ApiTransport,
+    pub socket: String,
+    pub read_only: bool,
+    pub max_clients: usize,
+    pub max_request_bytes: usize,
+    pub max_response_bytes: usize,
+    pub event_queue_depth: usize,
+    pub frame_history_depth: usize,
+    pub expose_graphics: bool,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            transport: ApiTransport::Unix,
+            socket: "~/.cache/cmdash/cmdash.sock".to_owned(),
+            read_only: true,
+            max_clients: 4,
+            max_request_bytes: 65_536,
+            max_response_bytes: 1_048_576,
+            event_queue_depth: 64,
+            frame_history_depth: 4,
+            expose_graphics: false,
+        }
+    }
+}
+
+impl ApiConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.socket.trim().is_empty() || self.socket.contains('\0') {
+            return Err("api socket path must be non-empty and contain no NUL".to_owned());
+        }
+        if self.socket.len() > 100 {
+            return Err("api socket path must be at most 100 bytes".to_owned());
+        }
+        if !self.socket.starts_with("~/") && !std::path::Path::new(&self.socket).is_absolute() {
+            return Err("api socket path must be absolute or use ~/".to_owned());
+        }
+        if std::path::Path::new(&self.socket)
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err("api socket path must not contain '..'".to_owned());
+        }
+        if self.max_clients == 0 || self.max_clients > 64 {
+            return Err("api max_clients must be between 1 and 64".to_owned());
+        }
+        if !(1024..=1_048_576).contains(&self.max_request_bytes) {
+            return Err("api max_request_bytes must be between 1024 and 1048576".to_owned());
+        }
+        if !(4096..=8_388_608).contains(&self.max_response_bytes) {
+            return Err("api max_response_bytes must be between 4096 and 8388608".to_owned());
+        }
+        if self.event_queue_depth == 0 || self.event_queue_depth > 1024 {
+            return Err("api event_queue_depth must be between 1 and 1024".to_owned());
+        }
+        if self.frame_history_depth > 64 {
+            return Err("api frame_history_depth must be at most 64".to_owned());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoadedConfig {
     pub config: AppConfig,
@@ -137,6 +208,8 @@ impl AppConfig {
             #[serde(default)]
             animation: AnimationConfig,
             #[serde(default)]
+            api: ApiConfig,
+            #[serde(default)]
             plugins: Vec<PluginConfig>,
         }
 
@@ -161,6 +234,7 @@ impl AppConfig {
             workspace: raw.workspace,
             appearance: raw.appearance,
             animation: raw.animation,
+            api: raw.api,
             plugins: raw.plugins,
         };
         config.validate()?;
@@ -247,6 +321,7 @@ impl AppConfig {
                 "animation max_concurrent must be between 1 and 128".to_owned(),
             ));
         }
+        self.api.validate().map_err(ConfigError::InvalidApi)?;
 
         let mut ids = BTreeSet::new();
         for widget in &self.workspace.widgets {
@@ -530,6 +605,7 @@ pub enum ConfigError {
     InvalidPluginConfig,
     InvalidAppearance(String),
     InvalidAnimation(String),
+    InvalidApi(String),
     DuplicatePluginName(String),
 }
 
@@ -565,6 +641,7 @@ impl fmt::Display for ConfigError {
             }
             Self::InvalidAppearance(message) => write!(formatter, "invalid appearance: {message}"),
             Self::InvalidAnimation(message) => write!(formatter, "invalid animation: {message}"),
+            Self::InvalidApi(message) => write!(formatter, "invalid api: {message}"),
             Self::DuplicatePluginName(name) => {
                 write!(formatter, "duplicate plugin name {name:?}")
             }
@@ -652,6 +729,18 @@ mod tests {
     fn rejects_unbounded_animation_options() {
         let error = AppConfig::parse("version = 1\n[animation]\nmax_concurrent = 129").unwrap_err();
         assert!(matches!(error, ConfigError::InvalidAnimation(_)));
+    }
+
+    #[test]
+    fn validates_local_api_paths_and_limits() {
+        let config =
+            AppConfig::parse("version = 1\n[api]\nenabled = true\nsocket = \"relative.sock\"\n");
+        assert!(matches!(config, Err(ConfigError::InvalidApi(_))));
+        let config = AppConfig::parse(
+            "version = 1\n[api]\nmax_request_bytes = 2048\nsocket = \"/tmp/cmdash.sock\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.api.max_request_bytes, 2048);
     }
 
     #[test]

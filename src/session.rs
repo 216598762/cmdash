@@ -123,6 +123,7 @@ pub enum UiEvent {
     PtyOutput,
     Tick,
     AnimationFrame,
+    ApiWakeup,
     CursorBlink(u64),
     InputError(String),
 }
