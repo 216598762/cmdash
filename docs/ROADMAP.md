@@ -589,8 +589,10 @@ Reference material:
 - [x] Track primary/alternate screen ownership, scrollback-relative movement,
   resize clipping, and replay resource generations; placements no longer leak
   between alternate and primary screens.
-- [ ] Track DECSTBM scroll-region movement and cursor movement fully so every
-  image follows content inside a non-default scroll region.
+- [x] Track DECSTBM margins and cursor movement through a session-owned VT
+  observer; partial-region linefeeds, explicit scrolls, reverse index, origin
+  mode, alternate-screen state, and resize resets now move matching image
+  anchors without using primary-screen scrollback for non-default regions.
 - [ ] Preserve natural image geometry when pixel-size ioctl data is unavailable;
   use CSI 14t/16t or a documented fallback rather than shrinking an image to a
   misleading `1x1` placement.
@@ -636,13 +638,16 @@ Reference material:
   switching, hidden sessions, overlays, reload, close, and application shutdown.
 - [x] Add replay generations, unchanged-resource reuse, store cancellation on
   session shutdown/delete-all, and outer-resource cleanup when the backend leaves.
-- [ ] Add bounded retries and acknowledgement-driven outer-resource garbage
-  collection.
+- [x] Add acknowledgement-driven outer-resource garbage collection: retain
+  generation state after removal, wait for the upload acknowledgement before
+  sending a delete, and retire the resource only after the delete acknowledgement.
+- [ ] Add bounded retries for missing or failed outer acknowledgements.
 - [ ] Keep file/shared-memory transfers opt-in and sandboxed; never read arbitrary
   paths or shared-memory names merely because an inner application requested them.
 - [x] Add output metrics for graphics uploads, resource reuse, payload bytes, and
   suppressed/degraded placements.
-- [ ] Add parsed-command latency and outer-acknowledgement metrics.
+- [x] Add outer acknowledgement, acknowledgement-failure, and garbage-collection
+  metrics; parsed-command latency remains future work.
 - [ ] Bound placeholder output and avoid re-uploading unchanged resources on every
   frame; preserve UI responsiveness during large images and rapid pane switches.
 
@@ -656,6 +661,9 @@ Reference material:
   collisions.
 - [ ] Add PTY fixtures using installed `kitten icat` for detection, image upload,
   `--place`, `--unicode-placeholder`, passthrough, animation, and failure paths.
+- [x] Add deterministic captured outer-terminal byte-stream fixtures for direct
+  upload, placement-only resource reuse, deletion, Unicode placeholders,
+  tmux-style passthrough escaping, and textual fallback.
 - [ ] Add a headless or capture-based outer-terminal harness that verifies the
   emitted stream is accepted by Kitty; add Ghostty/WezTerm/Sixel/inline-image
   cases only where the advertised capability is verified.

@@ -477,6 +477,9 @@ pub struct MetricsDto {
     pub graphics_reuses: u64,
     pub graphics_bytes: u64,
     pub graphics_suppressed: u64,
+    pub graphics_acknowledgements: u64,
+    pub graphics_gc: u64,
+    pub graphics_ack_failures: u64,
 }
 
 impl From<OutputMetrics> for MetricsDto {
@@ -492,6 +495,9 @@ impl From<OutputMetrics> for MetricsDto {
             graphics_reuses: metrics.graphics_reuses,
             graphics_bytes: metrics.graphics_bytes,
             graphics_suppressed: metrics.graphics_suppressed,
+            graphics_acknowledgements: metrics.graphics_acknowledgements,
+            graphics_gc: metrics.graphics_gc,
+            graphics_ack_failures: metrics.graphics_ack_failures,
         }
     }
 }

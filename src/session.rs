@@ -13,7 +13,7 @@ use alacritty_terminal::{
     event::{Event, EventListener, WindowSize as EmulatorWindowSize},
     grid::Dimensions,
     term::{Config, Term, TermMode, cell::Flags},
-    vte::ansi::{Color as AnsiColor, NamedColor, Processor},
+    vte::ansi::{Color as AnsiColor, Handler, Mode, NamedColor, PrivateMode, Processor},
 };
 
 use crossterm::event::{
@@ -22,12 +22,13 @@ use crossterm::event::{
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::layout::Rect;
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     appearance::Theme,
     graphics::{
-        GraphicsProtocolBroker, GraphicsScreen, GraphicsSubmission, SessionGraphicsStore,
-        kitty_error_response,
+        GraphicsProtocolBroker, GraphicsScreen, GraphicsScrollRegion, GraphicsSubmission,
+        SessionGraphicsStore, kitty_error_response,
     },
     scene::{CellStyle, Color, Scene},
     state::SessionId,
@@ -213,6 +214,322 @@ fn normalize_emulator_response(text: String) -> String {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScrollScreenState {
+    region: GraphicsScrollRegion,
+    region_scroll: i64,
+    cursor: (u16, u16),
+    input_needs_wrap: bool,
+    origin: bool,
+    linefeed_newline: bool,
+    line_wrap: bool,
+}
+
+impl ScrollScreenState {
+    const fn new(_columns: u16, rows: u16) -> Self {
+        Self {
+            region: GraphicsScrollRegion::new(0, rows, rows),
+            region_scroll: 0,
+            cursor: (0, 0),
+            input_needs_wrap: false,
+            origin: false,
+            linefeed_newline: false,
+            line_wrap: true,
+        }
+    }
+
+    fn reset_region_cursor(&mut self) {
+        self.cursor = (0, if self.origin { self.region.top() } else { 0 });
+        self.input_needs_wrap = false;
+    }
+
+    fn scroll_up(&mut self, lines: usize) {
+        let height = usize::from(self.region.bottom().saturating_sub(self.region.top()));
+        self.region_scroll = self
+            .region_scroll
+            .saturating_add(i64::try_from(lines.min(height)).unwrap_or(i64::MAX));
+    }
+
+    fn scroll_down(&mut self, lines: usize) {
+        let height = usize::from(self.region.bottom().saturating_sub(self.region.top()));
+        self.region_scroll = self
+            .region_scroll
+            .saturating_sub(i64::try_from(lines.min(height)).unwrap_or(i64::MAX));
+    }
+
+    fn linefeed(&mut self, rows: u16) {
+        let next = self.cursor.1.saturating_add(1);
+        if self.cursor.1 >= self.region.top() && next == self.region.bottom() {
+            self.scroll_up(1);
+        } else if next < rows {
+            self.cursor.1 = next;
+        }
+        self.input_needs_wrap = false;
+    }
+
+    fn carriage_return(&mut self) {
+        self.cursor.0 = 0;
+        self.input_needs_wrap = false;
+    }
+}
+
+/// Observes the same VT stream as alacritty-terminal for the state it keeps
+/// private: DECSTBM margins and the scroll displacement caused by them.
+///
+/// The emulator remains the source of truth for rendered cells. This bounded
+/// observer exists only so retained graphics can resolve their logical anchors
+/// without depending on private emulator fields.
+#[derive(Clone, Debug)]
+struct ScrollRegionTracker {
+    columns: u16,
+    rows: u16,
+    active: GraphicsScreen,
+    primary: ScrollScreenState,
+    alternate: ScrollScreenState,
+}
+
+impl ScrollRegionTracker {
+    const fn new(columns: u16, rows: u16) -> Self {
+        Self {
+            columns,
+            rows,
+            active: GraphicsScreen::Primary,
+            primary: ScrollScreenState::new(columns, rows),
+            alternate: ScrollScreenState::new(columns, rows),
+        }
+    }
+
+    fn current(&self) -> ScrollScreenState {
+        match self.active {
+            GraphicsScreen::Primary => self.primary,
+            GraphicsScreen::Alternate => self.alternate,
+        }
+    }
+
+    fn current_region(&self) -> GraphicsScrollRegion {
+        self.current().region
+    }
+
+    fn current_region_scroll(&self) -> i64 {
+        self.current().region_scroll
+    }
+
+    fn active_screen(&self) -> GraphicsScreen {
+        self.active
+    }
+
+    fn current_mut(&mut self) -> &mut ScrollScreenState {
+        match self.active {
+            GraphicsScreen::Primary => &mut self.primary,
+            GraphicsScreen::Alternate => &mut self.alternate,
+        }
+    }
+
+    fn resize(&mut self, columns: u16, rows: u16) {
+        self.columns = columns;
+        self.rows = rows;
+        self.primary = ScrollScreenState::new(columns, rows);
+        self.alternate = ScrollScreenState::new(columns, rows);
+    }
+
+    fn switch_screen(&mut self, screen: GraphicsScreen) {
+        self.active = screen;
+    }
+
+    fn move_cursor(&mut self, line: i32, column: usize) {
+        let rows = self.rows.max(1);
+        let columns = self.columns;
+        let state = self.current_mut();
+        let (top, bottom) = if state.origin {
+            (state.region.top(), state.region.bottom().saturating_sub(1))
+        } else {
+            (0, rows.saturating_sub(1))
+        };
+        let line = line.clamp(i32::from(top), i32::from(bottom));
+        state.cursor = (
+            u16::try_from(column)
+                .unwrap_or(u16::MAX)
+                .min(columns.saturating_sub(1)),
+            u16::try_from(line).unwrap_or(bottom),
+        );
+        state.input_needs_wrap = false;
+    }
+}
+
+impl Handler for ScrollRegionTracker {
+    fn input(&mut self, character: char) {
+        let width = character.width().unwrap_or(0);
+        if width == 0 {
+            return;
+        }
+        let columns = self.columns.max(1);
+        let rows = self.rows;
+        let state = self.current_mut();
+        if state.input_needs_wrap {
+            state.linefeed(rows);
+            state.carriage_return();
+        }
+        if width > 1 && state.cursor.0.saturating_add(width as u16) > columns {
+            if state.line_wrap {
+                state.linefeed(rows);
+                state.carriage_return();
+            } else {
+                state.input_needs_wrap = true;
+                return;
+            }
+        }
+        if state.cursor.0.saturating_add(width as u16) < columns {
+            state.cursor.0 = state.cursor.0.saturating_add(width as u16);
+        } else {
+            state.input_needs_wrap = true;
+        }
+    }
+
+    fn goto(&mut self, line: i32, column: usize) {
+        self.move_cursor(line, column);
+    }
+
+    fn goto_line(&mut self, line: i32) {
+        let column = usize::from(self.current().cursor.0);
+        self.move_cursor(line, column);
+    }
+
+    fn goto_col(&mut self, column: usize) {
+        let line = i32::from(self.current().cursor.1);
+        self.move_cursor(line, column);
+    }
+
+    fn move_up(&mut self, lines: usize) {
+        let current = self.current().cursor;
+        self.move_cursor(
+            i32::from(current.1).saturating_sub(i32::try_from(lines).unwrap_or(i32::MAX)),
+            usize::from(current.0),
+        );
+    }
+
+    fn move_down(&mut self, lines: usize) {
+        let current = self.current().cursor;
+        self.move_cursor(
+            i32::from(current.1).saturating_add(i32::try_from(lines).unwrap_or(i32::MAX)),
+            usize::from(current.0),
+        );
+    }
+
+    fn move_forward(&mut self, columns: usize) {
+        let current = self.current().cursor;
+        self.move_cursor(
+            i32::from(current.1),
+            usize::from(current.0).saturating_add(columns),
+        );
+    }
+
+    fn move_backward(&mut self, columns: usize) {
+        let current = self.current().cursor;
+        self.move_cursor(
+            i32::from(current.1),
+            usize::from(current.0).saturating_sub(columns),
+        );
+    }
+
+    fn move_down_and_cr(&mut self, lines: usize) {
+        self.move_down(lines);
+        self.current_mut().carriage_return();
+    }
+
+    fn move_up_and_cr(&mut self, lines: usize) {
+        self.move_up(lines);
+        self.current_mut().carriage_return();
+    }
+
+    fn backspace(&mut self) {
+        let state = self.current_mut();
+        state.cursor.0 = state.cursor.0.saturating_sub(1);
+        state.input_needs_wrap = false;
+    }
+
+    fn carriage_return(&mut self) {
+        self.current_mut().carriage_return();
+    }
+
+    fn linefeed(&mut self) {
+        let rows = self.rows;
+        self.current_mut().linefeed(rows);
+    }
+
+    fn newline(&mut self) {
+        let linefeed_newline = self.current().linefeed_newline;
+        self.linefeed();
+        if linefeed_newline {
+            self.current_mut().carriage_return();
+        }
+    }
+
+    fn scroll_up(&mut self, lines: usize) {
+        self.current_mut().scroll_up(lines);
+    }
+
+    fn scroll_down(&mut self, lines: usize) {
+        self.current_mut().scroll_down(lines);
+    }
+
+    fn reverse_index(&mut self) {
+        let state = self.current_mut();
+        if state.cursor.1 == state.region.top() {
+            state.scroll_down(1);
+        } else {
+            state.cursor.1 = state.cursor.1.saturating_sub(1);
+        }
+        state.input_needs_wrap = false;
+    }
+
+    fn set_mode(&mut self, mode: Mode) {
+        if mode.raw() == 20 {
+            self.current_mut().linefeed_newline = true;
+        }
+    }
+
+    fn unset_mode(&mut self, mode: Mode) {
+        if mode.raw() == 20 {
+            self.current_mut().linefeed_newline = false;
+        }
+    }
+
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        match mode.raw() {
+            6 => self.current_mut().origin = true,
+            7 => self.current_mut().line_wrap = true,
+            47 | 1047 | 1049 => self.switch_screen(GraphicsScreen::Alternate),
+            _ => {}
+        }
+    }
+
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        match mode.raw() {
+            6 => self.current_mut().origin = false,
+            7 => self.current_mut().line_wrap = false,
+            47 | 1047 | 1049 => self.switch_screen(GraphicsScreen::Primary),
+            _ => {}
+        }
+    }
+
+    fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
+        let rows = usize::from(self.rows);
+        let top = top.saturating_sub(1).min(rows);
+        let bottom = bottom.unwrap_or(rows).min(rows);
+        if top >= bottom {
+            return;
+        }
+        let screen_lines = self.rows;
+        let new_region = GraphicsScrollRegion::new(top as u16, bottom as u16, screen_lines);
+        let state = self.current_mut();
+        if state.region != new_region {
+            state.region_scroll = 0;
+        }
+        state.region = new_region;
+        state.reset_region_cursor();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Selection {
     anchor: (u16, u16),
     active: (u16, u16),
@@ -221,6 +538,8 @@ struct Selection {
 pub struct TerminalSession {
     term: Term<SessionEventListener>,
     processor: Processor,
+    scroll_processor: Processor,
+    scroll_tracker: ScrollRegionTracker,
     emulator_responses: Receiver<String>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -311,6 +630,8 @@ impl TerminalSession {
         Ok(Self {
             term,
             processor: Processor::new(),
+            scroll_processor: Processor::new(),
+            scroll_tracker: ScrollRegionTracker::new(size.columns, size.rows),
             emulator_responses: response_receiver,
             master: pair.master,
             writer,
@@ -344,14 +665,12 @@ impl TerminalSession {
     }
 
     pub fn graphics(&self, surface: Rect) -> Vec<GraphicsSubmission> {
-        self.graphics.visible_submissions_with_state(
+        self.graphics.visible_submissions_with_scroll_state(
             surface,
             self.scrollback_lines(),
-            if self.alternate_screen() {
-                GraphicsScreen::Alternate
-            } else {
-                GraphicsScreen::Primary
-            },
+            self.scroll_tracker.active_screen(),
+            self.scroll_tracker.current_region(),
+            self.scroll_tracker.current_region_scroll(),
         )
     }
 
@@ -445,22 +764,22 @@ impl TerminalSession {
                 KittyStreamEvent::Plain(plain) => {
                     if !plain.is_empty() {
                         self.processor.advance(&mut self.term, &plain);
+                        self.scroll_processor
+                            .advance(&mut self.scroll_tracker, &plain);
                         self.flush_emulator_responses()?;
                         changed = true;
                     }
                 }
                 KittyStreamEvent::Command(parameters, payload) => {
-                    let response = match self.graphics.apply_kitty_command_with_grid_state(
+                    let response = match self.graphics.apply_kitty_command_with_scroll_region(
                         &parameters,
                         &payload,
                         self.cursor_position(),
                         (self.size.cell_width(), self.size.cell_height()),
                         self.scrollback_lines(),
-                        if self.alternate_screen() {
-                            GraphicsScreen::Alternate
-                        } else {
-                            GraphicsScreen::Primary
-                        },
+                        self.scroll_tracker.active_screen(),
+                        self.scroll_tracker.current_region(),
+                        self.scroll_tracker.current_region_scroll(),
                     ) {
                         Ok(response) => response,
                         Err(error) => {
@@ -569,6 +888,7 @@ impl TerminalSession {
             })
             .map_err(|error| SessionError::Resize(error.to_string()))?;
         self.term.resize(size);
+        self.scroll_tracker.resize(size.columns, size.rows);
         *self
             .reported_size
             .lock()
@@ -1060,6 +1380,61 @@ mod tests {
         assert_eq!(
             session.emulator_responses.try_recv().unwrap(),
             "\x1b[4;160;400t"
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn decstbm_tracker_moves_anchors_when_a_partial_region_scrolls() {
+        let mut parser = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        let mut tracker = ScrollRegionTracker::new(20, 6);
+        parser.advance(&mut tracker, b"\x1b[2;5r\x1b[5;1H");
+        assert_eq!(tracker.current_region(), GraphicsScrollRegion::new(1, 5, 6));
+        assert_eq!(tracker.current_region_scroll(), 0);
+        assert_eq!(tracker.current().cursor, (0, 4));
+
+        parser.advance(&mut tracker, b"\n");
+        assert_eq!(tracker.current_region_scroll(), 1);
+        assert_eq!(tracker.current().cursor, (0, 4));
+
+        parser.advance(&mut tracker, b"\x1b[r");
+        assert_eq!(tracker.current_region(), GraphicsScrollRegion::new(0, 6, 6));
+        assert_eq!(tracker.current_region_scroll(), 0);
+        assert_eq!(tracker.current().cursor, (0, 0));
+
+        parser.advance(&mut tracker, b"\x1b[?1049h\x1b[3;5r");
+        assert_eq!(tracker.active_screen(), GraphicsScreen::Alternate);
+        assert_eq!(tracker.current_region(), GraphicsScrollRegion::new(2, 5, 6));
+        parser.advance(&mut tracker, b"\x1b[?1049l");
+        assert_eq!(tracker.active_screen(), GraphicsScreen::Primary);
+        assert_eq!(tracker.current_region(), GraphicsScrollRegion::new(0, 6, 6));
+
+        tracker.resize(20, 8);
+        assert_eq!(tracker.current_region(), GraphicsScrollRegion::new(0, 8, 8));
+        assert_eq!(tracker.current_region_scroll(), 0);
+    }
+
+    #[test]
+    fn session_graphics_follow_decstbm_scrolling_without_primary_scrollback() {
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &["-c", "sleep 5"],
+            TerminalSize::new(20, 6),
+        )
+        .unwrap();
+        session
+            .consume_output(b"\x1b[2;5r\x1b[5;1H\x1b_Ga=T,f=24,i=33,c=1,r=1,q=2;AQID\x1b\\")
+            .unwrap();
+        assert_eq!(session.scrollback_lines(), 0);
+        assert_eq!(
+            session.graphics(Rect::new(0, 0, 20, 6))[0].placement().y(),
+            4
+        );
+
+        session.consume_output(b"\n").unwrap();
+        assert_eq!(
+            session.graphics(Rect::new(0, 0, 20, 6))[0].placement().y(),
+            3
         );
         session.shutdown().unwrap();
     }

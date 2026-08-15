@@ -34,6 +34,47 @@ pub enum GraphicsScreen {
     Alternate,
 }
 
+/// A DECSTBM scrolling region in zero-based emulator-grid coordinates.
+///
+/// `screen_lines == 0` is the compatibility value used by the store-only APIs
+/// when the caller has no terminal dimensions; it means the complete screen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphicsScrollRegion {
+    top: u16,
+    bottom: u16,
+    screen_lines: u16,
+}
+
+impl GraphicsScrollRegion {
+    pub const fn new(top: u16, bottom: u16, screen_lines: u16) -> Self {
+        Self {
+            top,
+            bottom,
+            screen_lines,
+        }
+    }
+
+    pub const fn unbounded() -> Self {
+        Self::new(0, 0, 0)
+    }
+
+    pub const fn top(self) -> u16 {
+        self.top
+    }
+
+    pub const fn bottom(self) -> u16 {
+        self.bottom
+    }
+
+    pub const fn screen_lines(self) -> u16 {
+        self.screen_lines
+    }
+
+    pub const fn is_full_screen(self) -> bool {
+        self.screen_lines == 0 || (self.top == 0 && self.bottom >= self.screen_lines)
+    }
+}
+
 /// The emulator-grid location that owns a graphics placement.
 ///
 /// `scrollback` is captured from the child emulator when the placement is
@@ -45,6 +86,8 @@ pub struct GraphicsGridAnchor {
     row: u16,
     scrollback: usize,
     screen: GraphicsScreen,
+    scroll_region: GraphicsScrollRegion,
+    region_scroll: i64,
 }
 
 impl GraphicsGridAnchor {
@@ -54,6 +97,8 @@ impl GraphicsGridAnchor {
             row,
             scrollback,
             screen: GraphicsScreen::Primary,
+            scroll_region: GraphicsScrollRegion::unbounded(),
+            region_scroll: 0,
         }
     }
 
@@ -73,13 +118,52 @@ impl GraphicsGridAnchor {
         self.screen
     }
 
+    pub const fn scroll_region(self) -> GraphicsScrollRegion {
+        self.scroll_region
+    }
+
+    pub const fn region_scroll(self) -> i64 {
+        self.region_scroll
+    }
+
     pub const fn with_screen(mut self, screen: GraphicsScreen) -> Self {
         self.screen = screen;
         self
     }
 
+    pub const fn with_scroll_region(
+        mut self,
+        scroll_region: GraphicsScrollRegion,
+        region_scroll: i64,
+    ) -> Self {
+        self.scroll_region = scroll_region;
+        self.region_scroll = region_scroll;
+        self
+    }
+
     pub fn resolve_row(self, current_scrollback: usize) -> i32 {
         i32::from(self.row) + self.scrollback as i32 - current_scrollback as i32
+    }
+
+    pub fn resolve_row_with_state(
+        self,
+        current_scrollback: usize,
+        current_region: GraphicsScrollRegion,
+        current_region_scroll: i64,
+    ) -> i32 {
+        let mut row = i32::from(self.row);
+        if self.scroll_region.is_full_screen() && current_region.is_full_screen() {
+            row += self.scrollback as i32 - current_scrollback as i32;
+        } else if self.scroll_region == current_region {
+            row -= i32::try_from(current_region_scroll - self.region_scroll).unwrap_or_else(|_| {
+                if current_region_scroll >= self.region_scroll {
+                    i32::MAX
+                } else {
+                    i32::MIN
+                }
+            });
+        }
+        row
     }
 }
 
@@ -615,6 +699,29 @@ impl SessionGraphicsStore {
         scrollback: usize,
         screen: GraphicsScreen,
     ) -> Result<Option<Vec<u8>>, GraphicsError> {
+        self.apply_kitty_command_with_scroll_region(
+            parameters,
+            encoded_payload,
+            cursor,
+            cell_size,
+            scrollback,
+            screen,
+            GraphicsScrollRegion::unbounded(),
+            0,
+        )
+    }
+
+    pub fn apply_kitty_command_with_scroll_region(
+        &mut self,
+        parameters: &[u8],
+        encoded_payload: &[u8],
+        cursor: (u16, u16),
+        cell_size: (u16, u16),
+        scrollback: usize,
+        screen: GraphicsScreen,
+        scroll_region: GraphicsScrollRegion,
+        region_scroll: i64,
+    ) -> Result<Option<Vec<u8>>, GraphicsError> {
         let values = parse_parameters(parameters)?;
         let action = values
             .get("a")
@@ -676,13 +783,15 @@ impl SessionGraphicsStore {
             }
             pending.parameters.insert("m".to_owned(), "0".to_owned());
             let parameters = serialize_parameters(&pending.parameters);
-            return self.apply_kitty_command_with_grid_state(
+            return self.apply_kitty_command_with_scroll_region(
                 &parameters,
                 &pending.encoded_payload,
                 cursor,
                 cell_size,
                 scrollback,
                 screen,
+                scroll_region,
+                region_scroll,
             );
         }
 
@@ -818,6 +927,8 @@ impl SessionGraphicsStore {
                     cell_size,
                     scrollback,
                     screen,
+                    scroll_region,
+                    region_scroll,
                     (pixel_width, pixel_height),
                 )?;
                 if quiet != 2 && requested_image != 0 {
@@ -831,7 +942,15 @@ impl SessionGraphicsStore {
                     .ok_or(GraphicsError::ImageNotFound(image))?;
                 let dimensions = (resource.pixel_width, resource.pixel_height);
                 self.insert_placement(
-                    image, &values, cursor, cell_size, scrollback, screen, dimensions,
+                    image,
+                    &values,
+                    cursor,
+                    cell_size,
+                    scrollback,
+                    screen,
+                    scroll_region,
+                    region_scroll,
+                    dimensions,
                 )?;
                 if quiet != 2 {
                     response = Some(kitty_response(image, placement_id(&values), "OK"));
@@ -888,6 +1007,8 @@ impl SessionGraphicsStore {
         cell_size: (u16, u16),
         scrollback: usize,
         screen: GraphicsScreen,
+        scroll_region: GraphicsScrollRegion,
+        region_scroll: i64,
         pixel_size: (u32, u32),
     ) -> Result<(), GraphicsError> {
         let requested_placement_id = placement_id(values);
@@ -916,7 +1037,9 @@ impl SessionGraphicsStore {
             width: placement_dimension(values, "c", pixel_size.0, cell_size.0)?,
             height: placement_dimension(values, "r", pixel_size.1, cell_size.1)?,
             z_index: parameter_i16(values, "z", 0)?,
-            anchor: GraphicsGridAnchor::new(cursor.0, cursor.1, scrollback).with_screen(screen),
+            anchor: GraphicsGridAnchor::new(cursor.0, cursor.1, scrollback)
+                .with_screen(screen)
+                .with_scroll_region(scroll_region, region_scroll),
         };
         self.placements.insert(key, placement);
         Ok(())
@@ -952,6 +1075,23 @@ impl SessionGraphicsStore {
         current_scrollback: usize,
         current_screen: GraphicsScreen,
     ) -> Vec<GraphicsSubmission> {
+        self.visible_submissions_with_scroll_state(
+            surface,
+            current_scrollback,
+            current_screen,
+            GraphicsScrollRegion::unbounded(),
+            0,
+        )
+    }
+
+    pub fn visible_submissions_with_scroll_state(
+        &self,
+        surface: Rect,
+        current_scrollback: usize,
+        current_screen: GraphicsScreen,
+        current_region: GraphicsScrollRegion,
+        current_region_scroll: i64,
+    ) -> Vec<GraphicsSubmission> {
         let mut submissions = self
             .placements
             .values()
@@ -960,7 +1100,11 @@ impl SessionGraphicsStore {
                     return None;
                 }
                 let resource = self.resources.get(&placement.resource.image())?;
-                let resolved_y = placement.anchor.resolve_row(current_scrollback);
+                let resolved_y = placement.anchor.resolve_row_with_state(
+                    current_scrollback,
+                    current_region,
+                    current_region_scroll,
+                );
                 let placement_area = (
                     i32::from(surface.x) + i32::from(placement.anchor.column()),
                     i32::from(surface.y) + resolved_y,
@@ -1266,6 +1410,52 @@ mod tests {
         assert_eq!(initial[0].placement().area(), Rect::new(1, 4, 2, 2));
         assert_eq!(scrolled[0].placement().area(), Rect::new(1, 2, 2, 2));
         assert_eq!(scrolled[0].placement().anchor().scrollback(), 3);
+    }
+
+    #[test]
+    fn partial_scroll_regions_move_only_matching_graphics_anchors() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(17));
+        let region = GraphicsScrollRegion::new(1, 5, 6);
+        store
+            .apply_kitty_command_with_scroll_region(
+                b"a=T,f=24,i=9,c=1,r=1,q=2",
+                b"AQID",
+                (1, 4),
+                (10, 20),
+                0,
+                GraphicsScreen::Primary,
+                region,
+                0,
+            )
+            .unwrap();
+
+        let initial = store.visible_submissions_with_scroll_state(
+            Rect::new(0, 0, 8, 6),
+            0,
+            GraphicsScreen::Primary,
+            region,
+            0,
+        );
+        let scrolled = store.visible_submissions_with_scroll_state(
+            Rect::new(0, 0, 8, 6),
+            0,
+            GraphicsScreen::Primary,
+            region,
+            1,
+        );
+        let different_region = store.visible_submissions_with_scroll_state(
+            Rect::new(0, 0, 8, 6),
+            0,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::new(0, 6, 6),
+            1,
+        );
+        assert_eq!(initial[0].placement().area(), Rect::new(1, 4, 1, 1));
+        assert_eq!(scrolled[0].placement().area(), Rect::new(1, 3, 1, 1));
+        assert_eq!(
+            different_region[0].placement().area(),
+            Rect::new(1, 4, 1, 1)
+        );
     }
 
     #[test]

@@ -260,10 +260,11 @@ from being silently lost when a pane is moved, resized, hidden, or redrawn. The
 mode can be selected with `CMDASH_KITTY_GRAPHICS_MODE=placeholder` (the default
 when placeholder support is detected), `direct`, or `off`; `CMDASH_KITTY_GRAPHICS=1`
 and `0` remain explicit capability overrides. Placements now retain a logical
-emulator-grid anchor and the scrollback depth at creation, then resolve against
-current history before surface clipping. This preserves ordinary primary-screen
-scroll movement while leaving scroll-region semantics and alternate-screen
-transitions for the next geometry tranche.
+emulator-grid anchor, active screen, DECSTBM region, region-scroll displacement, and the
+scrollback depth at creation, then resolve against current terminal state before
+surface clipping. Full-screen primary placements follow scrollback; partial-region
+placements follow only matching region displacement, while alternate-screen
+placements remain isolated.
 
 Graphics submission is an explicit outer-rendering contract rather than a
 successful no-op: the backend reports `Rendered`, `Degraded`, `Suppressed`, or
@@ -288,9 +289,14 @@ explicitly overridden, or actively probed, together with confidence. The
 keyboard bytes across read boundaries. Direct replay reuses uploaded resources
 by generation, passthrough wraps and ESC-doubles Kitty APCs for tmux-style hosts,
 and text fallback emits a bounded degraded marker. Primary/alternate screen
-anchors, opaque scene occlusion, and cleanup generations are retained; detailed
-scroll-region semantics and automatic ownership of the process-wide crossterm
-reader remain follow-up integration work.
+anchors, DECSTBM region tracking, opaque scene occlusion, and cleanup generations
+are retained. Outer resources now keep generation/acknowledgement state: removed
+resources wait for the upload acknowledgement before deletion and are retired
+only after the delete acknowledgement. A session-owned VT observer mirrors the emulator's private margins
+and scroll displacement so partial-region linefeeds, explicit scrolls, reverse
+index, origin mode, and resize resets move matching graphics anchors without
+confusing them with primary-screen scrollback. Automatic ownership of the
+process-wide crossterm reader remains follow-up integration work.
 
 This is why a global image map or a single terminal emulator shared by tabs is explicitly out of scope.
 
@@ -399,6 +405,10 @@ The core should be testable without a real terminal:
 - capability and outcome tests for terminals with and without Kitty, direct versus
   Unicode-placeholder mode, active probe acknowledgement/timeout, explicit
   suppression, recoverable protocol errors, and opt-in sixel support;
+- captured outer-terminal byte-stream fixtures for direct upload/reuse/delete,
+  Unicode-placeholder cells, tmux passthrough escaping, and textual fallback;
+- acknowledgement-routing tests for upload success/failure, deferred deletion,
+  delete acknowledgement, resource retirement, and bounded graphics metrics;
 - fuzz targets and retained seed corpora for TOML migration, plugin manifests, Kitty APC chunking, and sixel encoding;
 - pane lifecycle tests for independent PTYs, nested layout persistence, and safe reload;
 - release archive, checksum, feature-variant, and startup checks on tagged builds;

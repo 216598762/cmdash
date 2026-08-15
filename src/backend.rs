@@ -36,6 +36,9 @@ pub struct OutputMetrics {
     pub graphics_reuses: u64,
     pub graphics_bytes: u64,
     pub graphics_suppressed: u64,
+    pub graphics_acknowledgements: u64,
+    pub graphics_gc: u64,
+    pub graphics_ack_failures: u64,
 }
 
 /// The outer terminal's cell and pixel dimensions.
@@ -84,6 +87,14 @@ impl TerminalWindowSize {
 struct ByteCountingWriter<W> {
     inner: W,
     bytes_written: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UploadedGraphicsResource {
+    generation: u64,
+    acknowledged: bool,
+    pending_delete: bool,
+    delete_sent: bool,
 }
 
 impl<W> ByteCountingWriter<W> {
@@ -188,9 +199,19 @@ pub enum GraphicsProbeState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphicsOuterAcknowledgement {
+    pub image_id: u32,
+    pub placement_id: Option<u32>,
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OuterInputBatch {
     pub terminal_bytes: Vec<u8>,
     pub graphics_report: Option<GraphicsCapabilityReport>,
+    pub graphics_acknowledgements: Vec<GraphicsOuterAcknowledgement>,
+    pub graphics_error: Option<String>,
 }
 
 /// Active outer-terminal Kitty probe and response correlator.
@@ -601,7 +622,7 @@ pub struct CrosstermBackend<W: Write> {
     graphics_probe: GraphicsCapabilityProbe,
     graphics_input: GraphicsInputDemultiplexer,
     graphics_broker: GraphicsProtocolBroker,
-    uploaded_generations: BTreeMap<u32, u64>,
+    uploaded_generations: BTreeMap<u32, UploadedGraphicsResource>,
     entered: bool,
     frames_submitted: u64,
     frames_skipped: u64,
@@ -612,6 +633,9 @@ pub struct CrosstermBackend<W: Write> {
     graphics_reuses: u64,
     graphics_bytes: u64,
     graphics_suppressed: u64,
+    graphics_acknowledgements: u64,
+    graphics_gc: u64,
+    graphics_ack_failures: u64,
 }
 
 impl<W: Write> CrosstermBackend<W> {
@@ -633,6 +657,9 @@ impl<W: Write> CrosstermBackend<W> {
             graphics_reuses: 0,
             graphics_bytes: 0,
             graphics_suppressed: 0,
+            graphics_acknowledgements: 0,
+            graphics_gc: 0,
+            graphics_ack_failures: 0,
         }
     }
 
@@ -657,6 +684,9 @@ impl<W: Write> CrosstermBackend<W> {
             graphics_reuses: self.graphics_reuses,
             graphics_bytes: self.graphics_bytes,
             graphics_suppressed: self.graphics_suppressed,
+            graphics_acknowledgements: self.graphics_acknowledgements,
+            graphics_gc: self.graphics_gc,
+            graphics_ack_failures: self.graphics_ack_failures,
         }
     }
 
@@ -684,17 +714,29 @@ impl<W: Write> CrosstermBackend<W> {
     pub fn feed_outer_input(&mut self, bytes: &[u8]) -> OuterInputBatch {
         let mut terminal_bytes = Vec::new();
         let mut graphics_report = None;
+        let mut graphics_acknowledgements = Vec::new();
+        let mut graphics_error = None;
         for event in self.graphics_input.feed(bytes) {
             match event {
                 OuterInputEvent::TerminalInput(bytes) => terminal_bytes.extend(bytes),
                 OuterInputEvent::GraphicsResponse(bytes) => {
                     graphics_report = self.feed_graphics_probe(&bytes).or(graphics_report);
+                    if let Some(acknowledgement) = parse_graphics_acknowledgement(&bytes)
+                        && acknowledgement.image_id != 0
+                    {
+                        if let Err(error) = self.handle_graphics_acknowledgement(&acknowledgement) {
+                            graphics_error = Some(error.to_string());
+                        }
+                        graphics_acknowledgements.push(acknowledgement);
+                    }
                 }
             }
         }
         OuterInputBatch {
             terminal_bytes,
             graphics_report,
+            graphics_acknowledgements,
+            graphics_error,
         }
     }
 
@@ -730,16 +772,68 @@ impl<W: Write> CrosstermBackend<W> {
             .copied()
             .collect::<Vec<_>>()
         {
-            if self.capabilities.kitty_graphics_mode() == KittyGraphicsMode::Passthrough {
-                write_passthrough_command(&mut self.writer, |buffer| {
-                    write!(buffer, "\x1b_Ga=d,d=i,i={};\x1b\\", image_id)
-                })?;
-            } else {
-                write!(self.writer, "\x1b_Ga=d,d=i,i={};\x1b\\", image_id)?;
-            }
+            self.write_graphics_delete(image_id)?;
         }
         self.uploaded_generations.clear();
         self.writer.flush()
+    }
+
+    fn write_graphics_delete(&mut self, image_id: u32) -> io::Result<()> {
+        if self.capabilities.kitty_graphics_mode() == KittyGraphicsMode::Passthrough {
+            write_passthrough_command(&mut self.writer, |buffer| {
+                write!(buffer, "\x1b_Ga=d,d=i,i={};\x1b\\", image_id)
+            })?;
+        } else {
+            write!(self.writer, "\x1b_Ga=d,d=i,i={};\x1b\\", image_id)?;
+        }
+        Ok(())
+    }
+
+    fn request_graphics_delete(&mut self, image_id: u32) -> io::Result<()> {
+        let should_delete = if let Some(resource) = self.uploaded_generations.get_mut(&image_id) {
+            resource.pending_delete = true;
+            if resource.acknowledged && !resource.delete_sent {
+                resource.delete_sent = true;
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+        if should_delete {
+            self.write_graphics_delete(image_id)?;
+        }
+        Ok(())
+    }
+
+    fn handle_graphics_acknowledgement(
+        &mut self,
+        acknowledgement: &GraphicsOuterAcknowledgement,
+    ) -> io::Result<()> {
+        let Some(resource) = self.uploaded_generations.get_mut(&acknowledgement.image_id) else {
+            return Ok(());
+        };
+        if !acknowledgement.success {
+            self.graphics_ack_failures += 1;
+            return Ok(());
+        }
+        self.graphics_acknowledgements += 1;
+        if resource.pending_delete && resource.delete_sent {
+            self.uploaded_generations.remove(&acknowledgement.image_id);
+            self.graphics_gc += 1;
+            return Ok(());
+        }
+        resource.acknowledged = true;
+        let request_delete = resource.pending_delete && !resource.delete_sent;
+        if request_delete {
+            resource.delete_sent = true;
+        }
+        if request_delete {
+            self.write_graphics_delete(acknowledgement.image_id)?;
+            self.writer.flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -863,6 +957,9 @@ impl<W: Write> Backend for CrosstermBackend<W> {
             };
         }
         if self.capabilities.kitty_unicode_placeholders {
+            for submission in removed {
+                self.request_graphics_delete(submission.terminal_image_id())?;
+            }
             if let Some(reason) = placeholder_geometry_error(visible) {
                 return Ok(GraphicsSubmissionStatus::Failed {
                     placements: visible.len(),
@@ -872,10 +969,21 @@ impl<W: Write> Backend for CrosstermBackend<W> {
             let mut uploaded = 0;
             for submission in changed {
                 let physical_id = submission.terminal_image_id();
-                if self.uploaded_generations.get(&physical_id) != Some(&submission.generation()) {
+                let needs_upload = self
+                    .uploaded_generations
+                    .get(&physical_id)
+                    .is_none_or(|resource| resource.generation != submission.generation());
+                if needs_upload {
                     write_placeholder_upload(&mut self.writer, submission)?;
-                    self.uploaded_generations
-                        .insert(physical_id, submission.generation());
+                    self.uploaded_generations.insert(
+                        physical_id,
+                        UploadedGraphicsResource {
+                            generation: submission.generation(),
+                            acknowledged: false,
+                            pending_delete: false,
+                            delete_sent: false,
+                        },
+                    );
                     self.graphics_uploads += 1;
                     self.graphics_bytes += submission.encoded_payload().len() as u64;
                     uploaded += 1;
@@ -891,23 +999,17 @@ impl<W: Write> Backend for CrosstermBackend<W> {
             });
         }
         for submission in removed {
-            let physical_id = submission.terminal_image_id();
-            if self.capabilities.kitty_graphics_mode() == KittyGraphicsMode::Passthrough {
-                write_passthrough_command(&mut self.writer, |buffer| {
-                    write!(buffer, "\x1b_Ga=d,d=i,i={};\x1b\\", physical_id)
-                })?;
-            } else {
-                write!(self.writer, "\x1b_Ga=d,d=i,i={};\x1b\\", physical_id)?;
-            }
-            self.uploaded_generations.remove(&physical_id);
+            self.request_graphics_delete(submission.terminal_image_id())?;
         }
         let mut uploaded = 0;
         for submission in changed {
             let physical_id = submission.terminal_image_id();
             let placement = submission.placement();
             queue!(self.writer, MoveTo(placement.x(), placement.y()))?;
-            let reused =
-                self.uploaded_generations.get(&physical_id) == Some(&submission.generation());
+            let reused = self
+                .uploaded_generations
+                .get(&physical_id)
+                .is_some_and(|resource| resource.generation == submission.generation());
             if reused {
                 if self.capabilities.kitty_graphics_mode() == KittyGraphicsMode::Passthrough {
                     write_passthrough_command(&mut self.writer, |buffer| {
@@ -924,8 +1026,15 @@ impl<W: Write> Backend for CrosstermBackend<W> {
                 } else {
                     write_direct_upload(&mut self.writer, submission)?;
                 }
-                self.uploaded_generations
-                    .insert(physical_id, submission.generation());
+                self.uploaded_generations.insert(
+                    physical_id,
+                    UploadedGraphicsResource {
+                        generation: submission.generation(),
+                        acknowledged: false,
+                        pending_delete: false,
+                        delete_sent: false,
+                    },
+                );
                 self.graphics_uploads += 1;
                 self.graphics_bytes += submission.encoded_payload().len() as u64;
                 uploaded += 1;
@@ -964,7 +1073,8 @@ impl<W: Write> Backend for CrosstermBackend<W> {
     fn submit_diff(&mut self, diff: &FrameDiff) -> Result<(), Self::Error> {
         if self.capabilities.kitty_unicode_placeholders {
             for submission in diff.removed_graphics() {
-                clear_placeholder_layer(&mut self.writer, submission)?;
+                self.request_graphics_delete(submission.terminal_image_id())?;
+                clear_placeholder_cells(&mut self.writer, submission)?;
             }
         }
         if diff.is_empty() {
@@ -982,6 +1092,34 @@ impl<W: Write> Backend for CrosstermBackend<W> {
         self.bytes_saved += naive_bytes.saturating_sub(optimized_bytes);
         Ok(())
     }
+}
+
+fn parse_graphics_acknowledgement(bytes: &[u8]) -> Option<GraphicsOuterAcknowledgement> {
+    if !bytes.starts_with(b"\x1b_G") || !bytes.ends_with(b"\x1b\\") {
+        return None;
+    }
+    let body = &bytes[3..bytes.len().saturating_sub(2)];
+    let separator = body.iter().position(|byte| *byte == b';')?;
+    let mut image_id = None;
+    let mut placement_id = None;
+    for field in body[..separator].split(|byte| *byte == b',') {
+        let equals = field.iter().position(|byte| *byte == b'=')?;
+        let key = &field[..equals];
+        let value = std::str::from_utf8(&field[equals + 1..]).ok()?;
+        match key {
+            b"i" => image_id = value.parse::<u32>().ok(),
+            b"p" => placement_id = value.parse::<u32>().ok().filter(|id| *id != 0),
+            _ => {}
+        }
+    }
+    let image_id = image_id?;
+    let message = String::from_utf8_lossy(&body[separator + 1..]).into_owned();
+    Some(GraphicsOuterAcknowledgement {
+        image_id,
+        placement_id,
+        success: message == "OK",
+        message,
+    })
 }
 
 fn encode_base64(bytes: &[u8]) -> Vec<u8> {
@@ -1265,15 +1403,10 @@ fn write_placeholder_cells<W: Write>(
     writer.write_all(b"\x1b[39m")
 }
 
-fn clear_placeholder_layer<W: Write>(
+fn clear_placeholder_cells<W: Write>(
     writer: &mut W,
     submission: &GraphicsSubmission,
 ) -> io::Result<()> {
-    write!(
-        writer,
-        "\x1b_Ga=d,d=i,i={};\x1b\\",
-        submission.terminal_image_id()
-    )?;
     let placement = submission.placement();
     for row in 0..placement.height() {
         queue!(
@@ -1825,6 +1958,10 @@ mod tests {
                 first.removed_graphics(),
             )
             .unwrap();
+        let image_id = first.graphics()[0].terminal_image_id();
+        let acknowledgement = format!("\x1b_Gi={image_id};OK\x1b\\");
+        let batch = backend.feed_outer_input(acknowledgement.as_bytes());
+        assert_eq!(batch.graphics_acknowledgements.len(), 1);
         let before = backend.writer().len();
         backend.submit_diff(&second).unwrap();
         let cleanup = &backend.writer()[before..];

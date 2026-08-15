@@ -100,7 +100,7 @@ All endpoints use the `/v1` prefix.
 | `GET /v1/widgets` | Widget IDs, kinds, and bounded health summaries. |
 | `GET /v1/compositor/frame` | Current viewport, bounded cells/styles, and optional graphics metadata. |
 | `GET /v1/compositor/diff?from=N` | Empty changes for the current generation, or a bounded snapshot-required result/failure when history is unavailable. |
-| `GET /v1/metrics` | Output frame/byte metrics plus graphics uploads, resource reuse, payload bytes, and suppressed-placement counts. |
+| `GET /v1/metrics` | Output frame/byte metrics plus graphics uploads, resource reuse, payload bytes, suppressed placements, outer acknowledgements, and garbage collection. |
 | `GET /v1/diagnostics` | Bounded application/widget diagnostics. |
 
 A frame response is generated at a coordinator frame boundary. Its `generation`
@@ -240,8 +240,9 @@ inherit the Unix-socket trust model automatically.
 
 Graphics capability snapshots distinguish environment hints, explicit overrides,
 and active-probe confirmation/rejection. They also expose direct, placeholder,
-passthrough, and text-fallback modes, resource generations, and graphics output
-counters. A probe response is never serialized as child PTY output.
+passthrough, and text-fallback modes, resource generations, outer acknowledgements,
+garbage-collection outcomes, and graphics output counters. A probe response is
+never serialized as child PTY output.
 
 The API implementation tests request validation, JSON command allowlisting,
 read-only authorization, state validation, snapshot generation, diff fallback,
