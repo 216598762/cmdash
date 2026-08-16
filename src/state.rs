@@ -698,6 +698,13 @@ impl AppState {
         (self.widget_runtime.widget_kind(widget_id) == Some("terminal")).then_some(widget_id)
     }
 
+    /// Whether the focused surface is a visible terminal shell that should
+    /// capture keyboard input: only the focus-escape bindings are intercepted
+    /// and every other key is forwarded to the child PTY.
+    pub fn focused_terminal_captures_keys(&self) -> bool {
+        self.active_terminal_widget().is_some()
+    }
+
     pub fn handle_focused_key(&mut self, key: KeyEvent) -> Result<bool, String> {
         let Some(FocusTarget::Surface(surface_id)) = self.focus.target() else {
             return Ok(false);
@@ -1769,6 +1776,39 @@ mod tests {
 
         state.dispatch(Command::Focus(FocusCommand::Clear)).unwrap();
         assert_eq!(state.cursor_blink_schedule(), None);
+        state.shutdown_widgets();
+    }
+
+    #[test]
+    fn terminal_key_capture_is_scoped_to_the_focused_terminal_widget() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "terminal"
+            command = "sh"
+            [[workspace.widgets]]
+            id = 2
+            type = "text"
+            text = "plain"
+            "#,
+        )
+        .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        assert!(!state.focused_terminal_captures_keys());
+
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(SurfaceId::new(1))))
+            .unwrap();
+        assert!(state.focused_terminal_captures_keys());
+
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(SurfaceId::new(2))))
+            .unwrap();
+        assert!(!state.focused_terminal_captures_keys());
+
         state.shutdown_widgets();
     }
 

@@ -2,6 +2,22 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::command::{Command, FocusCommand, FocusDirection, PaneCommand, TabCommand};
 
+/// Commands that remain active while a terminal shell captures keyboard input.
+///
+/// Inside a focused terminal widget every key is forwarded to the child PTY
+/// except these focus-escape bindings, which still move focus to another widget
+/// so the user can reach the dashboard command surface.
+pub fn terminal_capture_command(key: KeyEvent) -> Option<Command> {
+    if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Tab => Some(Command::Focus(FocusCommand::Next)),
+        KeyCode::BackTab => Some(Command::Focus(FocusCommand::Previous)),
+        _ => None,
+    }
+}
+
 pub fn command_for_key(key: KeyEvent) -> Option<Command> {
     if key.modifiers.contains(KeyModifiers::ALT) {
         return match key.code {
@@ -63,6 +79,38 @@ pub fn command_for_key(key: KeyEvent) -> Option<Command> {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn terminal_capture_only_exposes_focus_escape_bindings() {
+        assert_eq!(
+            terminal_capture_command(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(Command::Focus(FocusCommand::Next))
+        );
+        assert_eq!(
+            terminal_capture_command(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(Command::Focus(FocusCommand::Previous))
+        );
+        assert_eq!(
+            terminal_capture_command(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            terminal_capture_command(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            terminal_capture_command(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            terminal_capture_command(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            terminal_capture_command(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+            None
+        );
+    }
 
     #[test]
     fn tab_keys_map_to_focus_navigation_commands() {

@@ -56,7 +56,7 @@ pub use graphics::{
     GraphicsResponseDestination, GraphicsScreen, GraphicsScrollRegion, GraphicsSourceRect,
     GraphicsSubmission, OuterInputEvent, SessionGraphicsStore, kitty_error_response,
 };
-pub use input::command_for_key;
+pub use input::{command_for_key, terminal_capture_command};
 pub use layout::{LayoutError, LayoutNode, LayoutTree};
 pub use notification::{copy_notification, extract_urls};
 pub use plugin::{

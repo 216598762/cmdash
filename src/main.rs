@@ -20,7 +20,7 @@ use cmdash::{
         render_static_dashboard_shell_with_theme,
         render_static_dashboard_surface_scenes_with_theme, static_dashboard_surface_areas,
     },
-    input::command_for_key,
+    input::{command_for_key, terminal_capture_command},
     reload::ConfigReloader,
     ui_event_channel,
 };
@@ -809,45 +809,54 @@ fn dispatch_event(
     event: Event,
 ) -> io::Result<bool> {
     match event {
-        Event::Key(key) => match command_for_key(key) {
-            Some(Command::CopySelection) => {
-                state.copy_focused_selection();
-                Ok(false)
-            }
-            Some(Command::ReloadConfig) => {
-                if let Some(reloader) = reloader {
-                    match reloader.reload_with_migrations() {
-                        Ok(loaded) => {
-                            for migration in &loaded.migrations {
-                                state.record_diagnostic(format!(
-                                    "config migration: {}",
-                                    migration.warning()
-                                ));
-                            }
-                            if let Err(error) = state.reload_config(registry, &loaded.config) {
-                                state.record_diagnostic(format!("config reload rejected: {error}"));
-                            }
-                        }
-                        Err(error) => {
-                            state.record_diagnostic(format!("config reload failed: {error}"));
-                        }
-                    }
-                } else {
-                    state.record_diagnostic("Ctrl+R requires --config <path>");
+        Event::Key(key) => {
+            let command = if state.focused_terminal_captures_keys() {
+                terminal_capture_command(key)
+            } else {
+                command_for_key(key)
+            };
+            match command {
+                Some(Command::CopySelection) => {
+                    state.copy_focused_selection();
+                    return Ok(false);
                 }
-                Ok(false)
+                Some(Command::ReloadConfig) => {
+                    if let Some(reloader) = reloader {
+                        match reloader.reload_with_migrations() {
+                            Ok(loaded) => {
+                                for migration in &loaded.migrations {
+                                    state.record_diagnostic(format!(
+                                        "config migration: {}",
+                                        migration.warning()
+                                    ));
+                                }
+                                if let Err(error) = state.reload_config(registry, &loaded.config) {
+                                    state.record_diagnostic(format!(
+                                        "config reload rejected: {error}"
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                state.record_diagnostic(format!("config reload failed: {error}"));
+                            }
+                        }
+                    } else {
+                        state.record_diagnostic("Ctrl+R requires --config <path>");
+                    }
+                    Ok(false)
+                }
+                Some(command) => {
+                    let effect = state.dispatch(command).map_err(|error| {
+                        io::Error::other(format!("command rejected: {error:?}"))
+                    })?;
+                    Ok(matches!(effect, cmdash::CommandEffect::Quit))
+                }
+                None => state
+                    .handle_focused_key(key)
+                    .map_err(|error| io::Error::other(format!("widget input rejected: {error}")))
+                    .map(|_| false),
             }
-            Some(command) => {
-                let effect = state
-                    .dispatch(command)
-                    .map_err(|error| io::Error::other(format!("command rejected: {error:?}")))?;
-                Ok(matches!(effect, cmdash::CommandEffect::Quit))
-            }
-            None => state
-                .handle_focused_key(key)
-                .map_err(|error| io::Error::other(format!("widget input rejected: {error}")))
-                .map(|_| false),
-        },
+        }
         Event::Paste(text) => state
             .handle_focused_paste(&text)
             .map_err(|error| io::Error::other(format!("widget paste rejected: {error}")))
@@ -1029,6 +1038,54 @@ mod tests {
         );
         assert!(state.quit_requested());
         assert_eq!(state.focus().target(), None);
+    }
+
+    #[test]
+    fn terminal_focus_captures_keys_except_the_escape_binding() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "terminal"
+            command = "sh"
+            [[workspace.widgets]]
+            id = 2
+            type = "text"
+            text = "plain"
+            "#,
+        )
+        .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        state
+            .dispatch(Command::Focus(cmdash::FocusCommand::Surface(
+                SurfaceId::new(1),
+            )))
+            .unwrap();
+        assert!(state.focused_terminal_captures_keys());
+
+        let quit = dispatch_event(
+            &mut state,
+            &registry,
+            None,
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        )
+        .unwrap();
+        assert!(!quit);
+        assert!(!state.quit_requested());
+        assert_eq!(
+            state.focus().target(),
+            Some(FocusTarget::Surface(SurfaceId::new(1)))
+        );
+
+        dispatch_event(&mut state, &registry, None, tab_event()).unwrap();
+        assert_eq!(
+            state.focus().target(),
+            Some(FocusTarget::Surface(SurfaceId::new(2)))
+        );
+
+        state.shutdown_widgets();
     }
 
     #[test]
