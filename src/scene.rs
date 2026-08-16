@@ -69,6 +69,32 @@ pub struct Cell {
     pub width: CellWidth,
 }
 
+/// Backend-neutral hardware-cursor state for a composed frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SceneCursor {
+    x: u16,
+    y: u16,
+    visible: bool,
+}
+
+impl SceneCursor {
+    pub const fn new(x: u16, y: u16, visible: bool) -> Self {
+        Self { x, y, visible }
+    }
+
+    pub const fn x(self) -> u16 {
+        self.x
+    }
+
+    pub const fn y(self) -> u16 {
+        self.y
+    }
+
+    pub const fn visible(self) -> bool {
+        self.visible
+    }
+}
+
 impl Cell {
     const fn blank(style: CellStyle) -> Self {
         Self {
@@ -83,6 +109,7 @@ impl Cell {
 pub struct Scene {
     area: Rect,
     cells: Vec<Cell>,
+    cursor: Option<SceneCursor>,
     image_layers: Vec<GraphicsSubmission>,
     placeholder_layers: Vec<GraphicsPlaceholderLayer>,
     #[cfg(feature = "sixel")]
@@ -96,6 +123,7 @@ impl Scene {
         Self {
             area,
             cells: vec![Cell::blank(style); cell_count],
+            cursor: None,
             image_layers: Vec::new(),
             placeholder_layers: Vec::new(),
             #[cfg(feature = "sixel")]
@@ -109,6 +137,20 @@ impl Scene {
 
     pub fn cell_at(&self, x: u16, y: u16) -> Option<&Cell> {
         self.index(x, y).map(|index| &self.cells[index])
+    }
+
+    pub const fn cursor(&self) -> Option<SceneCursor> {
+        self.cursor
+    }
+
+    pub fn set_cursor(&mut self, x: u16, y: u16, visible: bool) {
+        if self.index(x, y).is_some() {
+            self.cursor = Some(SceneCursor::new(x, y, visible));
+        }
+    }
+
+    pub fn clear_cursor(&mut self) {
+        self.cursor = None;
     }
 
     pub fn image_layers(&self) -> &[GraphicsSubmission] {
@@ -209,6 +251,19 @@ impl Scene {
         let y_end = (source.area.y as u32 + source.area.height as u32)
             .min(self.area.y as u32 + self.area.height as u32)
             .min(clip.y as u32 + clip.height as u32) as u16;
+
+        let cursor_in_clip = self
+            .cursor
+            .is_some_and(|cursor| contains(clip, cursor.x, cursor.y));
+        if cursor_in_clip && source.cursor.is_none() {
+            self.cursor = None;
+        }
+        if let Some(cursor) = source.cursor
+            && contains(clip, cursor.x, cursor.y)
+            && self.index(cursor.x, cursor.y).is_some()
+        {
+            self.cursor = Some(cursor);
+        }
 
         for y in y_start..y_end {
             for x in x_start..x_end {
@@ -483,6 +538,13 @@ impl Scene {
     }
 }
 
+fn contains(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && y >= area.y
+        && x < area.x.saturating_add(area.width)
+        && y < area.y.saturating_add(area.height)
+}
+
 fn intersect(first: Rect, second: Rect) -> Option<Rect> {
     let left = first.x.max(second.x);
     let top = first.y.max(second.y);
@@ -612,6 +674,28 @@ mod tests {
             )
             .is_none())
         );
+    }
+
+    #[test]
+    fn cursor_coordinates_survive_widget_to_viewport_blitting() {
+        let mut source = Scene::new(Rect::new(5, 4, 4, 2));
+        source.set_cursor(6, 5, true);
+        let mut destination = Scene::new(Rect::new(0, 0, 12, 8));
+
+        destination.blit(&source, destination.area());
+
+        assert_eq!(destination.cursor(), Some(SceneCursor::new(6, 5, true)));
+    }
+
+    #[test]
+    fn an_opaque_overlay_clears_a_cursor_inside_its_bounds() {
+        let mut scene = Scene::new(Rect::new(0, 0, 8, 4));
+        scene.set_cursor(3, 2, true);
+        let overlay = Scene::new(Rect::new(2, 1, 3, 2));
+
+        scene.blit(&overlay, overlay.area());
+
+        assert_eq!(scene.cursor(), None);
     }
 
     #[cfg(feature = "sixel")]

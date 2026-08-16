@@ -22,7 +22,7 @@ use crate::{
         GraphicsInputDemultiplexer, GraphicsPlaceholderLayer, GraphicsProtocolBroker,
         GraphicsSubmission, OuterInputEvent,
     },
-    scene::{Cell, CellStyle, CellWidth, Color, Scene},
+    scene::{Cell, CellStyle, CellWidth, Color, Scene, SceneCursor},
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -660,6 +660,7 @@ pub struct CrosstermBackend<W: Write> {
     graphics_probe: GraphicsCapabilityProbe,
     graphics_input: GraphicsInputDemultiplexer,
     graphics_broker: GraphicsProtocolBroker,
+    cursor: Option<SceneCursor>,
     uploaded_generations: BTreeMap<u32, UploadedGraphicsResource>,
     entered: bool,
     frames_submitted: u64,
@@ -684,6 +685,7 @@ impl<W: Write> CrosstermBackend<W> {
             graphics_probe: GraphicsCapabilityProbe::default(),
             graphics_input: GraphicsInputDemultiplexer::default(),
             graphics_broker: GraphicsProtocolBroker::default(),
+            cursor: None,
             uploaded_generations: BTreeMap::new(),
             entered: false,
             frames_submitted: 0,
@@ -845,6 +847,10 @@ impl<W: Write> CrosstermBackend<W> {
         // terminal accepted an upload. Accepted resources still receive the
         // normal delete command; unacknowledged work is simply abandoned.
         self.cancel_graphics_transfers()
+    }
+
+    fn restore_cursor(&mut self) -> io::Result<()> {
+        write_scene_cursor(&mut self.writer, self.cursor)
     }
 
     fn graphics_delete_bytes(&self, image_id: u32) -> io::Result<Vec<u8>> {
@@ -1035,6 +1041,7 @@ impl<W: Write> Backend for CrosstermBackend<W> {
     }
 
     fn submit(&mut self, scene: &Scene) -> Result<(), Self::Error> {
+        self.cursor = scene.cursor();
         queue!(
             self.writer,
             MoveTo(scene.area().x, scene.area().y),
@@ -1051,13 +1058,8 @@ impl<W: Write> Backend for CrosstermBackend<W> {
             write_cell(&mut self.writer, x, y, *cell)?;
         }
 
-        queue!(
-            self.writer,
-            ResetColor,
-            SetAttribute(Attribute::Reset),
-            MoveTo(area.x, area.y),
-            Show
-        )?;
+        queue!(self.writer, ResetColor, SetAttribute(Attribute::Reset))?;
+        self.restore_cursor()?;
         self.writer.flush()?;
         self.frames_submitted += 1;
         Ok(())
@@ -1101,6 +1103,9 @@ impl<W: Write> Backend for CrosstermBackend<W> {
             for submission in visible {
                 write_text_fallback(&mut self.writer, submission)?;
             }
+            if !visible.is_empty() {
+                self.restore_cursor()?;
+            }
             self.writer.flush()?;
             self.graphics_suppressed += visible.len() as u64;
             return Ok(GraphicsSubmissionStatus::Degraded {
@@ -1110,18 +1115,20 @@ impl<W: Write> Backend for CrosstermBackend<W> {
             });
         }
         if !self.capabilities.kitty_graphics {
-            return if visible.is_empty() {
-                Ok(GraphicsSubmissionStatus::Rendered {
+            let status = if visible.is_empty() {
+                GraphicsSubmissionStatus::Rendered {
                     resources: 0,
                     placements: 0,
-                })
+                }
             } else {
                 self.graphics_suppressed += visible.len() as u64;
-                Ok(GraphicsSubmissionStatus::Suppressed {
+                GraphicsSubmissionStatus::Suppressed {
                     placements: visible.len(),
                     reason: "outer terminal graphics capability is unavailable".to_owned(),
-                })
+                }
             };
+            self.writer.flush()?;
+            return Ok(status);
         }
         if self.capabilities.kitty_unicode_placeholders {
             for submission in removed {
@@ -1154,6 +1161,9 @@ impl<W: Write> Backend for CrosstermBackend<W> {
             }
             for submission in visible {
                 write_placeholder_cells(&mut self.writer, submission)?;
+            }
+            if !changed.is_empty() || !visible.is_empty() {
+                self.restore_cursor()?;
             }
             self.writer.flush()?;
             return Ok(GraphicsSubmissionStatus::Rendered {
@@ -1202,6 +1212,9 @@ impl<W: Write> Backend for CrosstermBackend<W> {
                 self.graphics_reuses += 1;
             }
         }
+        if !changed.is_empty() {
+            self.restore_cursor()?;
+        }
         self.writer.flush()?;
         Ok(GraphicsSubmissionStatus::Rendered {
             resources: uploaded,
@@ -1238,6 +1251,7 @@ impl<W: Write> Backend for CrosstermBackend<W> {
     }
 
     fn submit_diff(&mut self, diff: &FrameDiff) -> Result<(), Self::Error> {
+        self.cursor = diff.cursor();
         if self.capabilities.kitty_unicode_placeholders {
             let removed =
                 submissions_for_placeholders(diff.removed_graphics(), diff.removed_placeholders());
@@ -1351,6 +1365,14 @@ fn write_span<W: Write>(
     Ok(())
 }
 
+fn write_scene_cursor<W: Write>(writer: &mut W, cursor: Option<SceneCursor>) -> io::Result<()> {
+    queue!(writer, Hide)?;
+    if let Some(cursor) = cursor.filter(|cursor| cursor.visible()) {
+        queue!(writer, MoveTo(cursor.x(), cursor.y()), Show)?;
+    }
+    Ok(())
+}
+
 fn write_diff<W: Write>(writer: &mut W, diff: &FrameDiff, grouped: bool) -> io::Result<()> {
     queue!(writer, Hide)?;
     if diff.full_redraw() {
@@ -1366,13 +1388,8 @@ fn write_diff<W: Write>(writer: &mut W, diff: &FrameDiff, grouped: bool) -> io::
             write_cell(writer, change.x, change.y, change.cell)?;
         }
     }
-    queue!(
-        writer,
-        ResetColor,
-        SetAttribute(Attribute::Reset),
-        MoveTo(diff.viewport().x, diff.viewport().y),
-        Show
-    )?;
+    queue!(writer, ResetColor, SetAttribute(Attribute::Reset))?;
+    write_scene_cursor(writer, diff.cursor())?;
     writer.flush()
 }
 
@@ -1903,6 +1920,57 @@ mod tests {
 
         assert_eq!(backend.writer().len(), bytes_after_first);
         assert_eq!(backend.metrics().frames_skipped, 1);
+    }
+
+    #[test]
+    fn a_visible_scene_cursor_is_moved_and_shown_instead_of_the_viewport_origin() {
+        let mut backend = CrosstermBackend::new(Vec::<u8>::new());
+        let mut scene = Scene::new(Rect::new(2, 3, 4, 2));
+        scene.set_cursor(4, 4, true);
+
+        backend.submit(&scene).unwrap();
+
+        // crossterm encodes MoveTo as ESC [ row ; column H (1-based).
+        let expected = b"\x1b[5;5H";
+        assert!(
+            backend
+                .writer()
+                .windows(expected.len())
+                .any(|w| w == expected),
+            "hardware cursor was not moved to the composed cursor position"
+        );
+    }
+
+    #[test]
+    fn an_invisible_scene_cursor_hides_the_hardware_cursor() {
+        let mut backend = CrosstermBackend::new(Vec::<u8>::new());
+        let mut scene = Scene::new(Rect::new(0, 0, 4, 2));
+        scene.set_cursor(1, 1, false);
+
+        backend.submit(&scene).unwrap();
+
+        // The frame must contain a hide command and must never re-show the cursor.
+        assert!(backend.writer().windows(6).any(|w| w == b"\x1b[?25l"));
+        assert!(!backend.writer().windows(6).any(|w| w == b"\x1b[?25h"));
+    }
+
+    #[test]
+    fn a_cursor_only_diff_repositions_the_hardware_cursor() {
+        let mut backend = CrosstermBackend::new(Vec::<u8>::new());
+        let mut compositor = Compositor::new();
+        let mut scene = Scene::new(Rect::new(0, 0, 8, 4));
+        scene.set_cursor(1, 2, true);
+        compositor.diff(&scene);
+
+        let mut moved = scene.clone();
+        moved.set_cursor(5, 3, true);
+        let diff = compositor.diff(&moved);
+        backend.submit_diff(&diff).unwrap();
+
+        assert!(
+            backend.writer().windows(6).any(|w| w == b"\x1b[4;6H"),
+            "hardware cursor was not moved to the updated cursor position"
+        );
     }
 
     #[test]

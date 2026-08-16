@@ -478,7 +478,7 @@ fn direct_adapter_matches_captured_upload_stream() {
 
     assert_eq!(
         backend.writer(),
-        b"\x1b[1;1H\x1b_Ga=T,f=24,i=7,c=2,r=1,C=1,q=2,m=0;AQID\x1b\\"
+        b"\x1b[1;1H\x1b_Ga=T,f=24,i=7,c=2,r=1,C=1,q=2,m=0;AQID\x1b\\\x1b[?25l"
     );
     let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
     assert_eq!(model.actions(), &["transmit"]);
@@ -512,7 +512,7 @@ fn direct_adapter_reuses_resources_and_captures_placement_only_replay() {
 
     assert_eq!(
         &backend.writer()[first_len..],
-        b"\x1b[1;1H\x1b_Ga=p,i=8,c=1,r=1,C=1,q=2;\x1b\\"
+        b"\x1b[1;1H\x1b_Ga=p,i=8,c=1,r=1,C=1,q=2;\x1b\\\x1b[?25l"
     );
     assert_eq!(backend.metrics().graphics_uploads, 1);
     assert_eq!(backend.metrics().graphics_reuses, 1);
@@ -566,7 +566,7 @@ fn placeholder_adapter_matches_captured_upload_and_cell_stream() {
     assert_rendered(status, 1, 1);
 
     let expected = format!(
-        "{}\x1b[38;2;0;0;7m\x1b[1;1H{}{}{}{}{}{}{}{}\x1b[39m",
+        "{}\x1b[38;2;0;0;7m\x1b[1;1H{}{}{}{}{}{}{}{}\x1b[39m\x1b[?25l",
         "\x1b[1;1H\x1b_Ga=T,f=24,i=7,c=2,r=1,U=1,C=1,q=2,m=0;AQID\x1b\\",
         '\u{10eeee}',
         '\u{305}',
@@ -607,7 +607,7 @@ fn passthrough_adapter_matches_captured_escaped_stream() {
         }
         expected.push(*byte);
     }
-    expected.extend_from_slice(b"\x1b\\");
+    expected.extend_from_slice(b"\x1b\\\x1b[?25l");
 
     assert_eq!(backend.writer(), expected.as_slice());
     let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
@@ -1198,7 +1198,7 @@ fn text_fallback_matches_captured_degraded_stream() {
         )
         .expect("fallback capture should write");
     assert!(matches!(status, GraphicsSubmissionStatus::Degraded { .. }));
-    assert_eq!(backend.writer(), b"\x1b[1;1H[image:11]");
+    assert_eq!(backend.writer(), b"\x1b[1;1H[image:11]\x1b[?25l");
     let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
     assert_eq!(model.text(), "[image:11]");
     assert_eq!(model.resource_count(), 0);

@@ -963,6 +963,11 @@ impl TerminalSession {
         let mut scene = Scene::new(area);
         let default_style = CellStyle::new(theme.foreground(), theme.background());
         scene.fill(area, default_style);
+        let cursor_point = self.term.grid().cursor.point;
+        let mut cursor_cell = (
+            area.x.saturating_add(cursor_point.column.0 as u16),
+            area.y.saturating_add(cursor_point.line.0 as u16),
+        );
         for indexed in self.term.grid().display_iter() {
             let point = indexed.point;
             let cell = indexed.cell;
@@ -972,6 +977,9 @@ impl TerminalSession {
                 continue;
             }
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                if point == cursor_point {
+                    cursor_cell.0 = cursor_cell.0.saturating_sub(1);
+                }
                 continue;
             }
             let mut style = CellStyle::new(
@@ -986,13 +994,15 @@ impl TerminalSession {
             }
             scene.set(x, y, cell.c, style);
         }
-        if focused && cursor_visible && self.term.mode().contains(TermMode::SHOW_CURSOR) {
-            let cursor = self.term.grid().cursor.point;
-            let x = area.x.saturating_add(cursor.column.0 as u16);
-            let y = area.y.saturating_add(cursor.line.0 as u16);
-            if let Some(cell) = scene.cell_at(x, y).copied() {
+        if focused {
+            let terminal_cursor_visible =
+                cursor_visible && self.term.mode().contains(TermMode::SHOW_CURSOR);
+            scene.set_cursor(cursor_cell.0, cursor_cell.1, terminal_cursor_visible);
+            if terminal_cursor_visible
+                && let Some(cell) = scene.cell_at(cursor_cell.0, cursor_cell.1).copied()
+            {
                 let cursor_style = CellStyle::new(cell.style.background, cell.style.foreground);
-                scene.set(x, y, cell.symbol, cursor_style);
+                scene.set(cursor_cell.0, cursor_cell.1, cell.symbol, cursor_style);
             }
         }
         if let Some(selection) = self.selection {
@@ -1261,6 +1271,7 @@ fn indexed_color(index: u8) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SceneCursor;
     use std::time::{Duration, Instant};
 
     fn wait_for_output(session: &mut TerminalSession) {
@@ -1315,6 +1326,33 @@ mod tests {
             hidden.cell_at(0, 0).unwrap().style
         );
         assert_eq!(session.cursor_position(), (0, 0));
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn cursor_on_a_wide_continuation_cell_anchors_to_the_lead_glyph() {
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &["-c", "sleep 5"],
+            TerminalSize::new(20, 4),
+        )
+        .unwrap();
+        session
+            .processor
+            .advance(&mut session.term, "界".as_bytes());
+        session
+            .processor
+            .advance(&mut session.term, b"\x1b[?25h\x1b[1;2H");
+        assert_eq!(session.cursor_position(), (1, 0));
+
+        let scene = session.render_with_theme_and_cursor(
+            Rect::new(2, 3, 20, 4),
+            true,
+            Theme::fallback(),
+            true,
+        );
+
+        assert_eq!(scene.cursor(), Some(SceneCursor::new(2, 3, true)));
         session.shutdown().unwrap();
     }
 

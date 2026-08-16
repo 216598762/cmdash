@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use ratatui::layout::Rect;
 
 use crate::{
-    scene::{Cell, Scene},
+    scene::{Cell, Scene, SceneCursor},
     state::{AppState, SurfaceId},
 };
 
@@ -48,6 +48,8 @@ pub struct FrameDiff {
     placeholders: Vec<crate::graphics::GraphicsPlaceholderLayer>,
     visible_placeholders: Vec<crate::graphics::GraphicsPlaceholderLayer>,
     removed_placeholders: Vec<crate::graphics::GraphicsPlaceholderLayer>,
+    cursor: Option<SceneCursor>,
+    cursor_changed: bool,
     #[cfg(feature = "sixel")]
     sixel: Vec<crate::sixel::SixelSubmission>,
 }
@@ -97,6 +99,14 @@ impl FrameDiff {
         &self.removed_placeholders
     }
 
+    pub const fn cursor(&self) -> Option<SceneCursor> {
+        self.cursor
+    }
+
+    pub const fn cursor_changed(&self) -> bool {
+        self.cursor_changed
+    }
+
     #[cfg(feature = "sixel")]
     pub fn sixel(&self) -> &[crate::sixel::SixelSubmission] {
         &self.sixel
@@ -108,6 +118,7 @@ impl FrameDiff {
             && self.removed_graphics.is_empty()
             && self.placeholders.is_empty()
             && self.removed_placeholders.is_empty()
+            && !self.cursor_changed
             && {
                 #[cfg(feature = "sixel")]
                 {
@@ -200,6 +211,8 @@ impl Compositor {
             .filter_map(|area| intersect(area, viewport))
             .collect();
         let previous = self.previous.as_ref();
+        let cursor_changed =
+            full_redraw || previous.is_none_or(|previous| previous.cursor() != current.cursor());
         let graphics_changed = full_redraw
             || previous.is_none_or(|previous| {
                 previous.image_layers() != current.image_layers()
@@ -279,6 +292,8 @@ impl Compositor {
             },
             visible_placeholders: current.placeholder_layers().to_vec(),
             removed_placeholders,
+            cursor: current.cursor(),
+            cursor_changed,
             #[cfg(feature = "sixel")]
             sixel,
         }
@@ -441,6 +456,45 @@ mod tests {
         let unchanged = compositor.diff(&scene);
         assert!(!unchanged.full_redraw());
         assert!(unchanged.is_empty());
+    }
+
+    #[test]
+    fn cursor_only_changes_produce_a_non_empty_diff_and_are_not_repeated() {
+        let viewport = Rect::new(0, 0, 4, 2);
+        let mut compositor = Compositor::new();
+        let mut scene = Scene::new(viewport);
+        scene.set_cursor(1, 1, true);
+
+        let first = compositor.diff(&scene);
+        assert!(first.full_redraw());
+
+        let mut moved = scene.clone();
+        moved.set_cursor(2, 1, true);
+        let diff = compositor.diff(&moved);
+        assert!(!diff.is_empty());
+        assert!(diff.cursor_changed());
+        assert_eq!(diff.cursor(), Some(SceneCursor::new(2, 1, true)));
+        assert!(diff.changes().is_empty());
+
+        let unchanged = compositor.diff(&moved);
+        assert!(unchanged.is_empty());
+        assert!(!unchanged.cursor_changed());
+    }
+
+    #[test]
+    fn cursor_visibility_toggles_produce_a_cursor_only_diff() {
+        let viewport = Rect::new(0, 0, 4, 2);
+        let mut compositor = Compositor::new();
+        let mut scene = Scene::new(viewport);
+        scene.set_cursor(1, 1, true);
+        compositor.diff(&scene);
+
+        let mut hidden = scene.clone();
+        hidden.set_cursor(1, 1, false);
+        let diff = compositor.diff(&hidden);
+        assert!(!diff.is_empty());
+        assert!(diff.cursor_changed());
+        assert_eq!(diff.cursor(), Some(SceneCursor::new(1, 1, false)));
     }
 
     #[test]
