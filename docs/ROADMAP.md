@@ -142,8 +142,19 @@ This phase extends the current retained-tab and pane foundation into a user-muta
 - [x] Persist the pane tree, split ratios, focus target, and tab membership across safe configuration reloads.
 - [x] Add directional focus tests for nested splits, tabs, overlays, and zero-area edge cases.
 - [x] Add lifecycle regressions proving pane creation, close, merge, tab switching, and application shutdown do not leak PTYs or graphics resources.
+- [ ] Lock terminal key capture so a focused terminal shell receives every key
+  except the explicit focus-escape bindings (Tab/Shift+Tab by default).
+  Application commands — quit, help, palette, reload, copy, pane split/resize/
+  close/merge, and tab mutations — must not fire from inside a terminal; they
+  remain reachable after escaping focus to a non-terminal widget or overlay.
+- [ ] Add input-routing regressions proving a focused terminal passes `q`, `?`,
+  `Esc`, Ctrl+P, Ctrl+R, arrows, and Ctrl+C through to the PTY while Tab/Shift+Tab
+  still move focus, and that non-terminal focus retains the full command set.
 
-**Exit criteria (met):** users can create, focus, resize, merge, close, and restore independent terminal panes without cross-session state leakage.
+**Exit criteria:** users can create, focus, resize, merge, close, and restore
+independent terminal panes without cross-session state leakage, and a focused
+terminal shell receives keyboard input without the dashboard intercepting
+application commands except the explicit focus-escape bindings.
 
 ## Phase 9 — Fuzzing, release, and graphics validation
 
@@ -833,6 +844,109 @@ or plugin boundaries.
 - Promising cross-platform system metrics before provider behavior is defined.
 - Moving application commands or layout containers into ordinary dashboard widgets.
 
+## Phase 15 — Configurable keybindings
+
+This phase moves the hardcoded `command_for_key` mapping into a validated,
+reload-safe configuration layer and makes terminal key capture honor the same
+bindings, without regressing session input, focus, or pane behavior.
+
+### Goals and boundaries
+
+- [ ] Define a stable, versioned keybinding schema with a single source of truth
+  for application commands, focus navigation, and terminal passthrough.
+- [ ] Keep the current defaults byte-for-byte compatible so existing users keep
+  the same quit, help, palette, reload, copy, tab, pane, and focus keys.
+- [ ] Route all key dispatch through the configuration layer; no widget, plugin,
+  or command may hardcode its own competing key capture.
+- [ ] Resolve ambiguous or conflicting bindings deterministically, with validation
+  errors instead of silent first-match behavior.
+- [ ] Preserve the Phase 8 terminal key-capture contract: inside a terminal shell
+  only the configured focus-escape/navigation bindings are intercepted, and every
+  other key is forwarded to the PTY.
+- [ ] Keep keybindings reload-safe and backend-neutral: no raw escape sequences or
+  crossterm-only key codes in the public configuration.
+
+### Configuration schema
+
+Add a `[keybindings]` section with a stable action-to-key map:
+
+```toml
+[keybindings]
+quit = "q"
+quit_alt = "esc"
+help = "?"
+palette = "ctrl+p"
+reload = "ctrl+r"
+copy_selection = "ctrl+shift+c"
+focus_next = "tab"
+focus_previous = "shift+tab"
+focus_left = "alt+left"
+focus_right = "alt+right"
+focus_up = "alt+up"
+focus_down = "alt+down"
+tab_next = "ctrl+pagedown"
+tab_previous = "ctrl+pageup"
+pane_split_horizontal = "ctrl+shift+h"
+pane_split_vertical = "ctrl+shift+v"
+pane_grow = "ctrl+shift+right"
+pane_shrink = "ctrl+shift+left"
+pane_close = "ctrl+shift+w"
+pane_merge = "ctrl+shift+m"
+```
+
+Define the allowed key-token grammar (key names plus `ctrl`, `alt`, and `shift`
+modifiers, `esc`, function keys, arrows, `pagedown`/`pageup`, and `backtab`),
+reject unknown tokens and duplicate actions, and document precedence when one
+key is bound to multiple actions. The terminal escape set defaults to the
+focus-navigation actions (`focus_next`/`focus_previous`); remapping those also
+remaps how a user escapes terminal capture.
+
+### Implementation boundaries
+
+- [ ] Replace the hardcoded `command_for_key` dispatch with a keymap produced from
+  the validated configuration plus an immutable default fallback.
+- [ ] Keep the coordinator as the sole dispatcher: keybindings translate into the
+  existing `Command` values, so API-submitted commands and future transports share
+  the same validation path.
+- [ ] Derive terminal escape handling from the same keymap rather than a separate
+  hardcoded Tab check, so capture and navigation stay consistent.
+- [ ] Expose the resolved keymap through capability/help output and keep the
+  discoverable-bindings UI in sync after reload.
+
+### Documentation updates
+
+- [ ] Document the `[keybindings]` schema, key grammar, defaults, precedence, and
+  reload behavior in `docs/CONFIGURATION.md`.
+- [ ] Update `docs/ARCHITECTURE.md` with the keymap ownership boundary between
+  configuration, coordinator dispatch, and terminal passthrough.
+- [ ] Update the in-app help/palette text to list the currently active bindings
+  rather than hardcoded defaults.
+
+### Testing and validation
+
+- [ ] Add configuration tests for every action, the full default map, unknown
+  keys/modifiers, duplicate actions, and empty or partial maps falling back to
+  defaults.
+- [ ] Add dispatch tests proving remapped keys produce the expected `Command` and
+  unmapped keys fall through to widget input.
+- [ ] Add terminal key-capture tests proving the configured escape binding is the
+  only intercepted key inside a terminal shell, and that changing it reloads
+  correctly.
+- [ ] Add reload, conflict-resolution, and precedence regressions, plus fuzz
+  coverage for malformed key strings.
+
+**Exit criteria:** every application keybinding is configured, validated, and
+reload-safe; defaults are unchanged; the coordinator is the single dispatch
+authority; and terminal key capture uses the same keymap so a focused shell
+receives all keys except the configured focus-escape bindings.
+
+### Non-goals
+
+- Arbitrary multi-chord or leader-key sequences beyond the declared grammar.
+- Per-widget keybinding overrides.
+- Raw escape-sequence passthrough as a user-facing configuration format.
+- Mouse, paste, or resize rebinding.
+
 ## Decision log starters
 
 | Topic | Provisional direction | Why it matters |
@@ -853,5 +967,6 @@ or plugin boundaries.
 | Animation model | Optional retained transitions scheduled by the UI coordinator with bounded budgets | Adds motion without compromising PTY responsiveness, deterministic rendering, or plugin isolation |
 | Active terminal cursor | Blink only the focused visible terminal pane through the wakeable scheduler, with reduced-motion and static-cursor fallbacks | Provides familiar terminal behavior without waking hidden sessions or reintroducing timer-based PTY polling |
 | Initial multiplexer UX | Retained tabs plus interactive horizontal/vertical panes | Validates session isolation and restoration while keeping pane mutation command-driven |
+| Terminal key capture | Forward every key to a focused terminal shell except the configured focus-escape bindings (Tab/Shift+Tab), with the same keymap configurable and reload-safe | Prevents quit/help/palette/reload and pane mutations from firing inside a shell while preserving an explicit focus-escape path |
 
 Update this table as product decisions are made; do not let provisional choices silently become public API guarantees.
