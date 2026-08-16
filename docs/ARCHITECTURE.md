@@ -150,6 +150,32 @@ Widget categories can include:
 
 Container widgets should compose child widget instances rather than reimplement their behavior.
 
+### 3.7 Widget runtime helpers and scheduling
+
+The widget runtime keeps rendering, data, and scheduling concerns separate:
+
+- **Shared helpers** in `src/widget.rs` implement bounded severity styling,
+  bordered surfaces, `key: value` rows, progress bars, sparkline normalization,
+  and horizontal rules. Built-in widgets reuse them instead of duplicating
+  widget-specific rendering, and each helper clips to its area and defines
+  minimum-size behavior.
+- **Provider/render separation** keeps data sources distinct from `Scene`
+  output. Synchronous widgets recompute a value in `update(now)` and return
+  `WidgetUpdate::Redraw` only when it changed (the `clock` widget is the
+  reference); terminal widgets consume session output through their owned
+  `TerminalSession`. A data provider must be testable without an interactive
+  terminal and must not outlive its owning instance.
+- **Scheduling** is coordinator-owned. `WidgetRuntime::update` runs on the UI
+  maintenance tick; widgets do not poll or spawn timers. Only instances with an
+  assigned, visible area are rendered, so hidden or inactive widgets do not
+  produce scene work.
+- **Lifecycle ownership** is per instance: factories construct state, the
+  runtime runs `initialize`, `update`, input, `resize`, and `shutdown`, and a
+  widget error degrades or fails only that instance's health rather than the
+  dashboard, backend, or another widget.
+
+The authoring contract is documented in [CREATING_WIDGETS.md](CREATING_WIDGETS.md).
+
 ## 4. Full render pipeline
 
 The render path is retained and frame-oriented:

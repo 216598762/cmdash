@@ -13,6 +13,7 @@ The project is intentionally starting with architecture and behavior contracts b
 - [Animation guide](docs/ANIMATION.md) — retained motion, terminal cursor presentation, scheduling, accessibility, and lifecycle limits.
 - [API guide](docs/API.md) — local Unix-socket endpoints, snapshots, safe commands, limits, and security.
 - [Widget guide](docs/WIDGETS.md) — widget types, lifecycle, scenes, input, graphics, plugins, panes, and extension guidance.
+- [Creating widgets](docs/CREATING_WIDGETS.md) — the focused authoring guide with examples, the factory/context contract, rendering, lifecycle, registration, and testing.
 - [External library candidates](docs/DEPENDENCIES.md) — categorized crate list, evaluation criteria, and selection risks.
 - [Default configuration](config/default.toml) — a checked-in widget-only starting point.
 
@@ -121,6 +122,7 @@ should be tested in the terminal environment where they will be used.
 See the [configuration reference](docs/CONFIGURATION.md),
 [appearance guide](docs/APPEARANCE.md), [animation guide](docs/ANIMATION.md),
 [API guide](docs/API.md), [widget guide](docs/WIDGETS.md),
+[widget authoring guide](docs/CREATING_WIDGETS.md),
 [architecture](docs/ARCHITECTURE.md), and [roadmap](docs/ROADMAP.md) for deeper
 behavior and development details.
 

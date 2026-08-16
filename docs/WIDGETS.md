@@ -8,7 +8,8 @@ sessions are not required for a dashboard to run.
 This page documents the widget contract and runtime behavior. For the complete
 TOML schema and configuration discovery rules, see
 [CONFIGURATION.md](CONFIGURATION.md). For the ownership and frame-composition
-design, see [ARCHITECTURE.md](ARCHITECTURE.md).
+design, see [ARCHITECTURE.md](ARCHITECTURE.md). To implement, register, test, or
+distribute a widget, see [CREATING_WIDGETS.md](CREATING_WIDGETS.md).
 
 ## Widget terminology
 
@@ -848,6 +849,11 @@ scrollback.
 
 ## Developing a widget
 
+The focused, step-by-step authoring guide — with complete examples, the factory
+and runtime-context contract, scene rendering, lifecycle, registration, and
+testing — is [CREATING_WIDGETS.md](CREATING_WIDGETS.md). The summary below is a
+quick checklist rather than the full tutorial.
+
 A built-in widget implementation should:
 
 1. Define a state struct containing only the data it owns.
@@ -922,6 +928,9 @@ contracts grow.
   palette colors, borders, labels, and per-widget overrides.
 - [Animation guide](ANIMATION.md) — retained motion, cursor presentation,
   scheduling, accessibility, and lifecycle limits.
+- [Creating widgets](CREATING_WIDGETS.md) — the focused authoring guide with
+  examples, the factory/context contract, rendering, lifecycle, registration,
+  and testing.
 - [Architecture](ARCHITECTURE.md) — state ownership, scenes, compositor, and
   backend boundaries.
 - [Dependencies](DEPENDENCIES.md) — selected crate roles and optional feature

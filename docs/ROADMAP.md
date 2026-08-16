@@ -731,17 +731,17 @@ boundaries.
 
 ### Goals and boundaries
 
-- [ ] Establish a coherent catalog of useful built-in dashboard widgets.
-- [ ] Keep built-ins optional, composable, capability-aware, and usable without
+- [x] Establish a coherent catalog of useful built-in dashboard widgets.
+- [x] Keep built-ins optional, composable, capability-aware, and usable without
   terminal sessions.
-- [ ] Reuse common rendering, appearance, layout, and bounded-data helpers
+- [x] Reuse common rendering, appearance, layout, and bounded-data helpers
   instead of duplicating widget-specific behavior.
-- [ ] Define stable widget type names, defaults, settings, failure behavior, and
+- [x] Define stable widget type names, defaults, settings, failure behavior, and
   compatibility expectations.
-- [ ] Provide a complete guide for creating, testing, registering, and
+- [x] Provide a complete guide for creating, testing, registering, and
   distributing custom widgets.
-- [ ] Keep custom widgets behind the existing `Widget`/factory/context boundary.
-- [ ] Ensure widget authors never need direct access to terminal output, PTYs,
+- [x] Keep custom widgets behind the existing `Widget`/factory/context boundary.
+- [x] Ensure widget authors never need direct access to terminal output, PTYs,
   compositor internals, or global mutable state.
 
 ### Built-in widget catalog
@@ -760,7 +760,7 @@ Start with dependency-light widgets that exercise the existing contracts:
 - [x] Add a `separator` or `spacer` widget for intentional layout grouping
   without requiring a fake text widget.
 - [ ] Extend `system` only where the data source and refresh behavior are
-  portable and well-defined.
+  portable and well-defined (deferred pending a portable metrics provider).
 
 Each widget must define stable TOML type and field names, defaults, minimum useful
 geometry, update/redraw behavior, theme-role usage, focus/input behavior, bounded
@@ -774,66 +774,69 @@ and explicit security/dependency decisions.
 
 - [x] Add reusable helpers for bounded text and row rendering, status/severity
   styling, clipping, and minimum-size handling, with deterministic test data.
-- [ ] Define how data-backed widgets request wakeups or periodic updates, ensuring
+- [x] Define how data-backed widgets request wakeups or periodic updates, ensuring
   hidden or inactive widgets do not create unnecessary work.
-- [ ] Keep data providers separate from rendering so providers can be tested
+- [x] Keep data providers separate from rendering so providers can be tested
   without an interactive terminal.
-- [ ] Preserve the existing semantic theme, animation, graphics, and scene
+- [x] Preserve the existing semantic theme, animation, graphics, and scene
   contracts for all new widgets.
 
 ### Widget authoring documentation
 
-- [ ] Create `docs/CREATING_WIDGETS.md` as the focused development guide, while
+- [x] Create `docs/CREATING_WIDGETS.md` as the focused development guide, while
   keeping `docs/WIDGETS.md` primarily as the user-facing catalog and runtime
   reference.
-- [ ] Document how to choose between a built-in, in-process custom widget, and
+- [x] Document how to choose between a built-in, in-process custom widget, and
   plugin widget.
-- [ ] Document the `Widget` lifecycle, factory contract, runtime context, and
+- [x] Document the `Widget` lifecycle, factory contract, runtime context, and
   `WidgetInstanceConfig`/`settings` behavior.
-- [ ] Explain scene rendering, clipping, geometry, Unicode widths, borders,
+- [x] Explain scene rendering, clipping, geometry, Unicode widths, borders,
   labels, theme roles, focus, input, resize, graphics, and animation.
-- [ ] Document `Unchanged` versus `Redraw`, health reporting, diagnostics,
+- [x] Document `Unchanged` versus `Redraw`, health reporting, diagnostics,
   failure isolation, background work, wakeups, cancellation, and shutdown.
-- [ ] Provide a complete minimal custom-widget example and a data-backed example.
-- [ ] Document factory registration, configuration examples, testing strategy,
+- [x] Provide a complete minimal custom-widget example and a data-backed example.
+- [x] Document factory registration, configuration examples, testing strategy,
   plugin/WASM restrictions, and troubleshooting for invisible or invalid widgets.
 
 ### Documentation updates
 
-- [ ] Expand `docs/WIDGETS.md` with the built-in catalog and link to the authoring
+- [x] Expand `docs/WIDGETS.md` with the built-in catalog and link to the authoring
   guide, moving implementation tutorials into `CREATING_WIDGETS.md`.
-- [ ] Update `docs/CONFIGURATION.md` with every new built-in type, setting,
+- [x] Update `docs/CONFIGURATION.md` with every new built-in type, setting,
   default, and settings namespace.
-- [ ] Update `docs/ARCHITECTURE.md` with shared widget helpers, provider/render
+- [x] Update `docs/ARCHITECTURE.md` with shared widget helpers, provider/render
   separation, scheduling, and lifecycle ownership.
-- [ ] Update `README.md` with links to the widget catalog and authoring guide.
-- [ ] Update `docs/DEPENDENCIES.md` if a new metrics or data-provider dependency
-  is selected, including its capability and portability rationale.
+- [x] Update `README.md` with links to the widget catalog and authoring guide.
+- [x] Update `docs/DEPENDENCIES.md` if a new metrics or data-provider dependency
+  is selected, including its capability and portability rationale (no new
+  dependency was selected).
 
 ### Testing and validation
 
-- [ ] Add configuration tests for every built-in type, default, invalid setting,
+- [x] Add configuration tests for every built-in type, default, invalid setting,
   and minimum-size case.
-- [ ] Add rendering/golden tests for normal, focused, empty, clipped, narrow, and
+- [x] Add rendering/golden tests for normal, focused, empty, clipped, narrow, and
   zero-area surfaces, proving no widget draws outside its assigned scene.
-- [ ] Add deterministic update tests, redraw-coalescing tests, and hidden-widget
+- [x] Add deterministic update tests, redraw-coalescing tests, and hidden-widget
   scheduling tests.
-- [ ] Add health and failure-isolation tests for malformed or unavailable data.
-- [ ] Add reload, removal, pane-closure, and shutdown lifecycle tests.
-- [ ] Add theme, border, label, animation, reduced-motion, and optional-feature
+- [x] Add health and failure-isolation tests for malformed or unavailable data.
+- [x] Add reload, removal, pane-closure, and shutdown lifecycle tests.
+- [x] Add theme, border, label, animation, reduced-motion, and optional-feature
   compatibility tests.
-- [ ] Add an example custom-widget test that follows `CREATING_WIDGETS.md`.
-- [ ] Add plugin capability and configuration tests wherever the authoring guide
+- [x] Add an example custom-widget test that follows `CREATING_WIDGETS.md`.
+- [x] Add plugin capability and configuration tests wherever the authoring guide
   references the plugin path.
 - [ ] Validate documentation links and configuration examples in CI where
   practical.
 
-**Exit criteria:** cmdash ships with a documented, stable set of useful built-in
-widgets; every widget has bounded rendering, update, health, and lifecycle
-behavior; a new author can create and test a custom widget by following
-`docs/CREATING_WIDGETS.md`; user-facing widget documentation is separated from
-implementation guidance; and no widget bypasses the scene, coordinator, theme,
-or plugin boundaries.
+**Exit criteria (met):** cmdash ships with a documented, stable set of useful
+built-in widgets; every widget has bounded rendering, update, health, and
+lifecycle behavior; a new author can create and test a custom widget by
+following `docs/CREATING_WIDGETS.md`; user-facing widget documentation is
+separated from implementation guidance; and no widget bypasses the scene,
+coordinator, theme, or plugin boundaries. The `system` metrics extension remains
+deferred pending a portable metrics provider, and CI documentation-link
+validation remains an optional follow-up.
 
 ### Non-goals
 

@@ -2629,6 +2629,72 @@ mod tests {
     }
 
     #[test]
+    fn custom_widget_follows_the_authoring_guide() {
+        struct GreetingWidget {
+            text: String,
+            theme: Theme,
+        }
+
+        impl Widget for GreetingWidget {
+            fn kind(&self) -> &str {
+                "greeting"
+            }
+
+            fn render(&self, area: Rect, _focused: bool) -> Scene {
+                let mut scene = Scene::new(area);
+                scene.fill(
+                    area,
+                    CellStyle::new(self.theme.foreground(), self.theme.surface()),
+                );
+                scene.text(
+                    area.x,
+                    area.y,
+                    &self.text,
+                    CellStyle::new(self.theme.accent(), self.theme.surface()),
+                );
+                scene
+            }
+        }
+
+        fn greeting_factory(
+            config: &WidgetInstanceConfig,
+            context: &WidgetRuntimeContext,
+        ) -> Result<Box<dyn Widget>, WidgetError> {
+            Ok(Box::new(GreetingWidget {
+                text: config.text.clone().unwrap_or_default(),
+                theme: context
+                    .theme()
+                    .with_settings(&config.settings)
+                    .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?,
+            }))
+        }
+
+        let mut registry = WidgetRegistry::builtins();
+        registry.register("greeting", greeting_factory).unwrap();
+
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 15
+            type = "greeting"
+            text = "hi"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&registry, &config).unwrap();
+        let id = WidgetId::new(15);
+        let scene = runtime.render(&BTreeMap::from([(id, Rect::new(0, 0, 6, 2))]), None);
+
+        assert_eq!(runtime.widget_kind(id), Some("greeting"));
+        assert_eq!(scene[&id].cell_at(0, 0).unwrap().symbol, 'h');
+        assert_eq!(
+            scene[&id].cell_at(0, 0).unwrap().style.foreground,
+            Theme::inherited().accent()
+        );
+    }
+
+    #[test]
     fn terminal_widget_owns_a_session_and_accepts_input() {
         let config = AppConfig::parse(
             r#"
