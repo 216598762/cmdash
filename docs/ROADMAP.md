@@ -855,18 +855,18 @@ bindings, without regressing session input, focus, or pane behavior.
 
 ### Goals and boundaries
 
-- [ ] Define a stable, versioned keybinding schema with a single source of truth
+- [x] Define a stable, versioned keybinding schema with a single source of truth
   for application commands, focus navigation, and terminal passthrough.
-- [ ] Keep the current defaults byte-for-byte compatible so existing users keep
+- [x] Keep the current defaults byte-for-byte compatible so existing users keep
   the same quit, help, palette, reload, copy, tab, pane, and focus keys.
-- [ ] Route all key dispatch through the configuration layer; no widget, plugin,
+- [x] Route all key dispatch through the configuration layer; no widget, plugin,
   or command may hardcode its own competing key capture.
-- [ ] Resolve ambiguous or conflicting bindings deterministically, with validation
+- [x] Resolve ambiguous or conflicting bindings deterministically, with validation
   errors instead of silent first-match behavior.
-- [ ] Preserve the Phase 8 terminal key-capture contract: inside a terminal shell
+- [x] Preserve the Phase 8 terminal key-capture contract: inside a terminal shell
   only the configured focus-escape/navigation bindings are intercepted, and every
   other key is forwarded to the PTY.
-- [ ] Keep keybindings reload-safe and backend-neutral: no raw escape sequences or
+- [x] Keep keybindings reload-safe and backend-neutral: no raw escape sequences or
   crossterm-only key codes in the public configuration.
 
 ### Configuration schema
@@ -906,40 +906,40 @@ remaps how a user escapes terminal capture.
 
 ### Implementation boundaries
 
-- [ ] Replace the hardcoded `command_for_key` dispatch with a keymap produced from
+- [x] Replace the hardcoded `command_for_key` dispatch with a keymap produced from
   the validated configuration plus an immutable default fallback.
-- [ ] Keep the coordinator as the sole dispatcher: keybindings translate into the
+- [x] Keep the coordinator as the sole dispatcher: keybindings translate into the
   existing `Command` values, so API-submitted commands and future transports share
   the same validation path.
-- [ ] Derive terminal escape handling from the same keymap rather than a separate
+- [x] Derive terminal escape handling from the same keymap rather than a separate
   hardcoded Tab check, so capture and navigation stay consistent.
-- [ ] Expose the resolved keymap through capability/help output and keep the
+- [x] Expose the resolved keymap through capability/help output and keep the
   discoverable-bindings UI in sync after reload.
 
 ### Documentation updates
 
-- [ ] Document the `[keybindings]` schema, key grammar, defaults, precedence, and
+- [x] Document the `[keybindings]` schema, key grammar, defaults, precedence, and
   reload behavior in `docs/CONFIGURATION.md`.
-- [ ] Update `docs/ARCHITECTURE.md` with the keymap ownership boundary between
+- [x] Update `docs/ARCHITECTURE.md` with the keymap ownership boundary between
   configuration, coordinator dispatch, and terminal passthrough.
-- [ ] Update the in-app help/palette text to list the currently active bindings
+- [x] Update the in-app help/palette text to list the currently active bindings
   rather than hardcoded defaults.
 
 ### Testing and validation
 
-- [ ] Add configuration tests for every action, the full default map, unknown
+- [x] Add configuration tests for every action, the full default map, unknown
   keys/modifiers, duplicate actions, and empty or partial maps falling back to
   defaults.
-- [ ] Add dispatch tests proving remapped keys produce the expected `Command` and
+- [x] Add dispatch tests proving remapped keys produce the expected `Command` and
   unmapped keys fall through to widget input.
-- [ ] Add terminal key-capture tests proving the configured escape binding is the
+- [x] Add terminal key-capture tests proving the configured escape binding is the
   only intercepted key inside a terminal shell, and that changing it reloads
   correctly.
-- [ ] Add reload, conflict-resolution, and precedence regressions, plus fuzz
+- [x] Add reload, conflict-resolution, and precedence regressions, plus fuzz
   coverage for malformed key strings.
 
-**Exit criteria:** every application keybinding is configured, validated, and
-reload-safe; defaults are unchanged; the coordinator is the single dispatch
+**Exit criteria (met):** every application keybinding is configured, validated,
+and reload-safe; defaults are unchanged; the coordinator is the single dispatch
 authority; and terminal key capture uses the same keymap so a focused shell
 receives all keys except the configured focus-escape bindings.
 

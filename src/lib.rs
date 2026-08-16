@@ -9,6 +9,7 @@ pub mod crash;
 pub mod dashboard;
 pub mod graphics;
 pub mod input;
+pub mod keymap;
 pub mod layout;
 pub mod notification;
 pub mod plugin;
@@ -57,6 +58,7 @@ pub use graphics::{
     GraphicsSubmission, OuterInputEvent, SessionGraphicsStore, kitty_error_response,
 };
 pub use input::{command_for_key, terminal_capture_command};
+pub use keymap::{KeyAction, KeyChord, Keymap, KeymapError};
 pub use layout::{LayoutError, LayoutNode, LayoutTree};
 pub use notification::{copy_notification, extract_urls};
 pub use plugin::{

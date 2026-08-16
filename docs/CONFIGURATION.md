@@ -94,11 +94,58 @@ enabled = true
   for endpoints, security, limits, and CLI overrides.
 - `plugins` contains named plugin manifest paths. Plugin loading remains
   capability-limited; WASM support is opt-in with `--features wasm-plugins`.
+- `keybindings` maps stable action names to key chords; see
+  [Keybindings](#keybindings) below.
 
 Files without a version, or with legacy version `0`, are accepted with a
 migration warning. `AppConfig::migrate_source` provides the safe rewrite
 primitive used by tooling and migration tests. Unsupported future versions are
 rejected.
+
+## Keybindings
+
+```toml
+[keybindings]
+quit = "q"
+quit_alt = "esc"
+help = "?"
+palette = "ctrl+p"
+reload = "ctrl+r"
+copy_selection = "ctrl+shift+c"
+focus_next = "tab"
+focus_previous = "shift+tab"
+focus_left = "alt+left"
+focus_right = "alt+right"
+focus_up = "alt+up"
+focus_down = "alt+down"
+tab_next = "ctrl+pagedown"
+tab_previous = "ctrl+pageup"
+pane_split_horizontal = "ctrl+shift+h"
+pane_split_vertical = "ctrl+shift+v"
+pane_grow = "ctrl+shift+right"
+pane_shrink = "ctrl+shift+left"
+pane_close = "ctrl+shift+w"
+pane_merge = "ctrl+shift+m"
+```
+
+The `[keybindings]` section maps stable action names to key chords. Keys are
+written as a single key name plus optional `ctrl`, `alt`, and `shift` modifiers
+joined with `+`. Supported key names are printable characters, `space`, `esc`,
+`enter`, `tab`, `backtab` (also `shift+tab`), `backspace`, the four arrows,
+`home`, `end`, `pageup`/`pgup`, `pagedown`/`pgdn`, `delete`/`del`,
+`insert`/`ins`, and `f1` through `f12`.
+
+- Every action has a default binding; omitting `[keybindings]` entirely keeps
+  the defaults unchanged.
+- Rebinding an action removes its previous binding, so the map never contains
+  two chords for one action.
+- Binding one chord to two different actions is rejected as a conflict; unknown
+  action names and unparsable chords fail configuration validation.
+- Inside a focused terminal shell only `focus_next` and `focus_previous` are
+  intercepted; remapping them also remaps how the user escapes terminal capture.
+- Keybindings are reload-safe: `Ctrl+R` revalidates and swaps the whole keymap
+  along with the rest of the configuration, and the in-app help and command
+  palette list the currently active bindings.
 
 ## Widgets
 

@@ -83,6 +83,18 @@ The coordinator updates application state and schedules a frame. It does not ren
 
 Contains workspace layout, focus, keymaps, widget configuration, session registry, and command handling.
 
+Key dispatch is owned by a single coordinator path. `AppState` holds a
+validated `Keymap` built from the `[keybindings]` configuration (falling back
+byte-for-byte to the legacy defaults when omitted). Input events are translated
+into the existing `Command` values through that keymap, so the API and any
+future transport share the same validation path. Terminal key capture is
+resolved from the same keymap: inside a focused shell, only the configured
+`focus_next`/`focus_previous` bindings are intercepted and every other chord is
+forwarded to the PTY. The keymap is rebuilt on configuration reload, and the
+in-app help/palette text renders the currently active bindings rather than
+hardcoded defaults. Chords are backend-neutral (`ctrl`/`alt`/`shift` key
+names), never raw escape sequences or crossterm-only codes.
+
 ### 3.4 Local API boundary
 
 The optional local API is a transport adapter around the coordinator, not a
@@ -115,6 +127,7 @@ AppState
 ├── focused_surface: SurfaceId
 ├── widget_registry: WidgetCatalog
 ├── sessions: SessionRegistry
+├── keymap: Keymap
 └── backend_capabilities: Capabilities
 
 SessionState

@@ -20,7 +20,6 @@ use cmdash::{
         render_static_dashboard_shell_with_theme,
         render_static_dashboard_surface_scenes_with_theme, static_dashboard_surface_areas,
     },
-    input::{command_for_key, terminal_capture_command},
     reload::ConfigReloader,
     ui_event_channel,
 };
@@ -811,9 +810,9 @@ fn dispatch_event(
     match event {
         Event::Key(key) => {
             let command = if state.focused_terminal_captures_keys() {
-                terminal_capture_command(key)
+                state.keymap().terminal_capture_for_key(key)
             } else {
-                command_for_key(key)
+                state.keymap().command_for_key(key)
             };
             match command {
                 Some(Command::CopySelection) => {
@@ -1080,6 +1079,95 @@ mod tests {
         );
 
         dispatch_event(&mut state, &registry, None, tab_event()).unwrap();
+        assert_eq!(
+            state.focus().target(),
+            Some(FocusTarget::Surface(SurfaceId::new(2)))
+        );
+
+        state.shutdown_widgets();
+    }
+
+    #[test]
+    fn remapped_keys_drive_the_same_command_path() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [keybindings]
+            quit = "ctrl+q"
+            "#,
+        )
+        .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+
+        // The default quit binding no longer applies.
+        let quit_on_q = dispatch_event(
+            &mut state,
+            &registry,
+            None,
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        )
+        .unwrap();
+        assert!(!quit_on_q);
+        assert!(!state.quit_requested());
+
+        // The remapped binding quits.
+        let quit_on_ctrl_q = dispatch_event(
+            &mut state,
+            &registry,
+            None,
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        )
+        .unwrap();
+        assert!(quit_on_ctrl_q);
+        assert!(state.quit_requested());
+
+        state.shutdown_widgets();
+    }
+
+    #[test]
+    fn terminal_capture_uses_the_remapped_escape_binding() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "terminal"
+            command = "sh"
+            [[workspace.widgets]]
+            id = 2
+            type = "text"
+            text = "plain"
+            [keybindings]
+            focus_next = "ctrl+j"
+            focus_previous = "ctrl+k"
+            "#,
+        )
+        .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        state
+            .dispatch(Command::Focus(cmdash::FocusCommand::Surface(
+                SurfaceId::new(1),
+            )))
+            .unwrap();
+        assert!(state.focused_terminal_captures_keys());
+
+        // The old escape binding (Tab) is now forwarded to the PTY.
+        dispatch_event(&mut state, &registry, None, tab_event()).unwrap();
+        assert_eq!(
+            state.focus().target(),
+            Some(FocusTarget::Surface(SurfaceId::new(1)))
+        );
+
+        // The remapped escape binding still moves focus.
+        dispatch_event(
+            &mut state,
+            &registry,
+            None,
+            Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+        )
+        .unwrap();
         assert_eq!(
             state.focus().target(),
             Some(FocusTarget::Surface(SurfaceId::new(2)))

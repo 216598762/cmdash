@@ -1,84 +1,30 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
-use crate::command::{Command, FocusCommand, FocusDirection, PaneCommand, TabCommand};
+use crate::command::Command;
+use crate::keymap::Keymap;
+
+/// Maps a key event to an application command using the default keymap.
+///
+/// The configured keymap is owned by `AppState`; this function is the
+/// no-configuration convenience form used by tests and the legacy entry point.
+pub fn command_for_key(key: KeyEvent) -> Option<Command> {
+    Keymap::default().command_for_key(key)
+}
 
 /// Commands that remain active while a terminal shell captures keyboard input.
 ///
 /// Inside a focused terminal widget every key is forwarded to the child PTY
-/// except these focus-escape bindings, which still move focus to another widget
+/// except the focus-escape bindings, which still move focus to another widget
 /// so the user can reach the dashboard command surface.
 pub fn terminal_capture_command(key: KeyEvent) -> Option<Command> {
-    if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::CONTROL) {
-        return None;
-    }
-    match key.code {
-        KeyCode::Tab => Some(Command::Focus(FocusCommand::Next)),
-        KeyCode::BackTab => Some(Command::Focus(FocusCommand::Previous)),
-        _ => None,
-    }
-}
-
-pub fn command_for_key(key: KeyEvent) -> Option<Command> {
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        return match key.code {
-            KeyCode::Left => Some(Command::Focus(FocusCommand::Direction(
-                FocusDirection::Left,
-            ))),
-            KeyCode::Right => Some(Command::Focus(FocusCommand::Direction(
-                FocusDirection::Right,
-            ))),
-            KeyCode::Up => Some(Command::Focus(FocusCommand::Direction(FocusDirection::Up))),
-            KeyCode::Down => Some(Command::Focus(FocusCommand::Direction(
-                FocusDirection::Down,
-            ))),
-            _ => None,
-        };
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
-    {
-        match key.code {
-            KeyCode::Left => return Some(Command::Pane(PaneCommand::Shrink)),
-            KeyCode::Right => return Some(Command::Pane(PaneCommand::Grow)),
-            KeyCode::Char('h') => {
-                return Some(Command::Pane(PaneCommand::Split(
-                    crate::config::SplitDirection::Horizontal,
-                )));
-            }
-            KeyCode::Char('v') => {
-                return Some(Command::Pane(PaneCommand::Split(
-                    crate::config::SplitDirection::Vertical,
-                )));
-            }
-            KeyCode::Char('m') => return Some(Command::Pane(PaneCommand::Merge)),
-            KeyCode::Char('w') => return Some(Command::Pane(PaneCommand::Close)),
-            _ => {}
-        }
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        return match key.code {
-            KeyCode::PageDown => Some(Command::Tab(TabCommand::Next)),
-            KeyCode::PageUp => Some(Command::Tab(TabCommand::Previous)),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                Some(Command::CopySelection)
-            }
-            KeyCode::Char('p') => Some(Command::TogglePalette),
-            KeyCode::Char('r') => Some(Command::ReloadConfig),
-            _ => None,
-        };
-    }
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => Some(Command::Quit),
-        KeyCode::Char('?') => Some(Command::ToggleHelp),
-        KeyCode::Tab => Some(Command::Focus(FocusCommand::Next)),
-        KeyCode::BackTab => Some(Command::Focus(FocusCommand::Previous)),
-        _ => None,
-    }
+    Keymap::default().terminal_capture_for_key(key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crate::command::{FocusCommand, FocusDirection, PaneCommand, TabCommand};
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     #[test]
     fn terminal_capture_only_exposes_focus_escape_bindings() {

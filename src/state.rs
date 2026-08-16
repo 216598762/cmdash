@@ -17,6 +17,7 @@ use crate::{
     },
     config::{AppConfig, ConfigError},
     graphics::GraphicsSubmission,
+    keymap::{KeyAction, Keymap},
     layout::{LayoutError, LayoutTree},
     scene::{CellStyle, Scene},
     widget::{WidgetError, WidgetRegistry, WidgetRuntime, WidgetUpdateReport},
@@ -334,6 +335,7 @@ pub struct AppState {
     runtime_pane_ids: std::collections::BTreeSet<u64>,
     layout_dirty: bool,
     next_widget_id: u64,
+    keymap: Keymap,
 }
 
 impl AppState {
@@ -361,11 +363,13 @@ impl AppState {
                 animation: crate::config::AnimationConfig::default(),
                 api: crate::config::ApiConfig::default(),
                 plugins: Vec::new(),
+                keybindings: BTreeMap::new(),
             },
             widget_registry: WidgetRegistry::builtins(),
             runtime_pane_ids: std::collections::BTreeSet::new(),
             layout_dirty: false,
             next_widget_id: 1,
+            keymap: Keymap::default(),
         }
     }
 
@@ -405,6 +409,9 @@ impl AppState {
         let layout =
             LayoutTree::from_config(config.workspace.layout.as_ref(), widget_ids, overlay_ids)
                 .map_err(AppStateConfigError::Layout)?;
+        let keymap = Keymap::from_overrides(&config.keybindings).map_err(|error| {
+            AppStateConfigError::InvalidConfig(ConfigError::InvalidKeybindings(error.to_string()))
+        })?;
         let mut state = Self {
             workspace: WorkspaceState::new(WorkspaceId::new(1), config.workspace.name.clone()),
             focus: FocusState::default(),
@@ -433,6 +440,7 @@ impl AppState {
                 .max()
                 .unwrap_or(0)
                 .saturating_add(1),
+            keymap,
         };
 
         for widget in &config.workspace.widgets {
@@ -705,6 +713,48 @@ impl AppState {
         self.active_terminal_widget().is_some()
     }
 
+    /// The active, configuration-resolved keymap.
+    pub fn keymap(&self) -> &Keymap {
+        &self.keymap
+    }
+
+    fn keymap_help_text(&self) -> String {
+        let keymap = &self.keymap;
+        format!(
+            "{} / {}  focus\n{} / {}  switch tabs\n{}  command palette\n{}  reload config    {}  toggle help",
+            keymap.display_binding(KeyAction::FocusNext),
+            keymap.display_binding(KeyAction::FocusPrevious),
+            keymap.display_binding(KeyAction::TabNext),
+            keymap.display_binding(KeyAction::TabPrevious),
+            keymap.display_binding(KeyAction::Palette),
+            keymap.display_binding(KeyAction::Reload),
+            keymap.display_binding(KeyAction::Help),
+        )
+    }
+
+    fn keymap_palette_text(&self) -> String {
+        let keymap = &self.keymap;
+        format!(
+            "{} / {}       quit\n{}           next focus\n{} / {} / {} / {}  directional focus\n{} / {}  split terminal\n{} / {}  resize pane\n{} close  {} merge\n{}   previous tab\n{} next tab\n{}        reload; docs/CONFIGURATION.md",
+            keymap.display_binding(KeyAction::Quit),
+            keymap.display_binding(KeyAction::QuitAlt),
+            keymap.display_binding(KeyAction::FocusNext),
+            keymap.display_binding(KeyAction::FocusLeft),
+            keymap.display_binding(KeyAction::FocusRight),
+            keymap.display_binding(KeyAction::FocusUp),
+            keymap.display_binding(KeyAction::FocusDown),
+            keymap.display_binding(KeyAction::PaneSplitHorizontal),
+            keymap.display_binding(KeyAction::PaneSplitVertical),
+            keymap.display_binding(KeyAction::PaneGrow),
+            keymap.display_binding(KeyAction::PaneShrink),
+            keymap.display_binding(KeyAction::PaneClose),
+            keymap.display_binding(KeyAction::PaneMerge),
+            keymap.display_binding(KeyAction::TabPrevious),
+            keymap.display_binding(KeyAction::TabNext),
+            keymap.display_binding(KeyAction::Reload),
+        )
+    }
+
     pub fn handle_focused_key(&mut self, key: KeyEvent) -> Result<bool, String> {
         let Some(FocusTarget::Surface(surface_id)) = self.focus.target() else {
             return Ok(false);
@@ -953,20 +1003,22 @@ impl AppState {
                 CommandEffect::Redraw
             }
             Command::ToggleHelp => {
+                let text = self.keymap_help_text();
                 self.toggle_runtime_overlay(
                     OverlayId::new(u64::MAX),
                     Rect::new(2, 2, 54, 8),
                     " help ",
-                    "Tab / Shift+Tab  focus\nCtrl+PageUp / Ctrl+PageDown  switch tabs\nCtrl+P  command palette\nCtrl+R  reload config    ?  toggle help",
+                    &text,
                 );
                 CommandEffect::Redraw
             }
             Command::TogglePalette => {
+                let text = self.keymap_palette_text();
                 self.toggle_runtime_overlay(
                     OverlayId::new(u64::MAX - 1),
                     Rect::new(3, 3, 58, 9),
                     " command palette ",
-                    "q / Esc       quit\nTab           next focus\nAlt+Arrow     directional pane focus\nCtrl+Shift+H/V split focused terminal\nCtrl+Shift+←/→ resize pane ratio\nCtrl+Shift+W close  Ctrl+Shift+M merge\nCtrl+PageUp   previous tab\nCtrl+PageDown next tab\nCtrl+R        reload; docs/CONFIGURATION.md",
+                    &text,
                 );
                 CommandEffect::Redraw
             }
@@ -1809,6 +1861,29 @@ mod tests {
             .unwrap();
         assert!(!state.focused_terminal_captures_keys());
 
+        state.shutdown_widgets();
+    }
+
+    #[test]
+    fn keymap_reflects_config_and_updates_on_reload() {
+        let config =
+            AppConfig::parse("version = 1\n[keybindings]\nfocus_next = \"ctrl+j\"\n").unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        assert_eq!(
+            state.keymap().display_binding(KeyAction::FocusNext),
+            "ctrl+j"
+        );
+        // The default Tab binding was removed by the override.
+        assert!(state.keymap().chord_for(KeyAction::FocusNext).is_some());
+
+        let reloaded =
+            AppConfig::parse("version = 1\n[keybindings]\nfocus_next = \"ctrl+k\"\n").unwrap();
+        state.reload_config(&registry, &reloaded).unwrap();
+        assert_eq!(
+            state.keymap().display_binding(KeyAction::FocusNext),
+            "ctrl+k"
+        );
         state.shutdown_widgets();
     }
 

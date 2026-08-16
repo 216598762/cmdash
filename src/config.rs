@@ -29,6 +29,8 @@ pub struct AppConfig {
     pub api: ApiConfig,
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
+    #[serde(default)]
+    pub keybindings: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -211,6 +213,8 @@ impl AppConfig {
             api: ApiConfig,
             #[serde(default)]
             plugins: Vec<PluginConfig>,
+            #[serde(default)]
+            keybindings: BTreeMap<String, String>,
         }
 
         let raw: RawAppConfig =
@@ -236,6 +240,7 @@ impl AppConfig {
             animation: raw.animation,
             api: raw.api,
             plugins: raw.plugins,
+            keybindings: raw.keybindings,
         };
         config.validate()?;
         Ok((config, migration.into_iter().collect()))
@@ -322,6 +327,8 @@ impl AppConfig {
             ));
         }
         self.api.validate().map_err(ConfigError::InvalidApi)?;
+        crate::keymap::Keymap::from_overrides(&self.keybindings)
+            .map_err(|error| ConfigError::InvalidKeybindings(error.to_string()))?;
 
         let mut ids = BTreeSet::new();
         for widget in &self.workspace.widgets {
@@ -606,6 +613,7 @@ pub enum ConfigError {
     InvalidAppearance(String),
     InvalidAnimation(String),
     InvalidApi(String),
+    InvalidKeybindings(String),
     DuplicatePluginName(String),
 }
 
@@ -642,6 +650,9 @@ impl fmt::Display for ConfigError {
             Self::InvalidAppearance(message) => write!(formatter, "invalid appearance: {message}"),
             Self::InvalidAnimation(message) => write!(formatter, "invalid animation: {message}"),
             Self::InvalidApi(message) => write!(formatter, "invalid api: {message}"),
+            Self::InvalidKeybindings(message) => {
+                write!(formatter, "invalid keybindings: {message}")
+            }
             Self::DuplicatePluginName(name) => {
                 write!(formatter, "duplicate plugin name {name:?}")
             }
@@ -863,6 +874,45 @@ mod tests {
 
         assert_eq!(migrations, [ConfigMigration::AddedVersion]);
         assert!(rewritten.contains("version = 1"));
+    }
+
+    #[test]
+    fn parses_and_defaults_keybindings() {
+        let defaults = AppConfig::parse("version = 1").unwrap();
+        assert!(defaults.keybindings.is_empty());
+
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [keybindings]
+            quit = "ctrl+q"
+            focus_next = "ctrl+j"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.keybindings["quit"], "ctrl+q");
+        assert_eq!(config.keybindings["focus_next"], "ctrl+j");
+    }
+
+    #[test]
+    fn rejects_unknown_conflicting_and_invalid_keybindings() {
+        let unknown = AppConfig::parse("version = 1\n[keybindings]\nexplode = \"x\"\n");
+        assert!(matches!(
+            unknown.unwrap_err(),
+            ConfigError::InvalidKeybindings(_)
+        ));
+
+        let conflict = AppConfig::parse("version = 1\n[keybindings]\nquit = \"tab\"\n");
+        assert!(matches!(
+            conflict.unwrap_err(),
+            ConfigError::InvalidKeybindings(_)
+        ));
+
+        let invalid = AppConfig::parse("version = 1\n[keybindings]\nquit = \"not+a+key\"\n");
+        assert!(matches!(
+            invalid.unwrap_err(),
+            ConfigError::InvalidKeybindings(_)
+        ));
     }
 
     #[test]
