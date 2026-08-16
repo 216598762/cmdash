@@ -142,19 +142,19 @@ This phase extends the current retained-tab and pane foundation into a user-muta
 - [x] Persist the pane tree, split ratios, focus target, and tab membership across safe configuration reloads.
 - [x] Add directional focus tests for nested splits, tabs, overlays, and zero-area edge cases.
 - [x] Add lifecycle regressions proving pane creation, close, merge, tab switching, and application shutdown do not leak PTYs or graphics resources.
-- [ ] Lock terminal key capture so a focused terminal shell receives every key
+- [x] Lock terminal key capture so a focused terminal shell receives every key
   except the explicit focus-escape bindings (Tab/Shift+Tab by default).
   Application commands — quit, help, palette, reload, copy, pane split/resize/
   close/merge, and tab mutations — must not fire from inside a terminal; they
   remain reachable after escaping focus to a non-terminal widget or overlay.
-- [ ] Add input-routing regressions proving a focused terminal passes `q`, `?`,
+- [x] Add input-routing regressions proving a focused terminal passes `q`, `?`,
   `Esc`, Ctrl+P, Ctrl+R, arrows, and Ctrl+C through to the PTY while Tab/Shift+Tab
   still move focus, and that non-terminal focus retains the full command set.
 
-**Exit criteria:** users can create, focus, resize, merge, close, and restore
-independent terminal panes without cross-session state leakage, and a focused
-terminal shell receives keyboard input without the dashboard intercepting
-application commands except the explicit focus-escape bindings.
+**Exit criteria (met):** users can create, focus, resize, merge, close, and
+restore independent terminal panes without cross-session state leakage, and a
+focused terminal shell receives keyboard input without the dashboard
+intercepting application commands except the explicit focus-escape bindings.
 
 ## Phase 9 — Fuzzing, release, and graphics validation
 
