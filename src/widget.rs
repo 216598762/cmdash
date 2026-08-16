@@ -513,6 +513,15 @@ impl WidgetRegistry {
             .register("terminal", terminal_widget_factory)
             .expect("built-in widget types are unique");
         registry
+            .register("status", status_widget_factory)
+            .expect("built-in widget types are unique");
+        registry
+            .register("key_value", key_value_widget_factory)
+            .expect("built-in widget types are unique");
+        registry
+            .register("gauge", gauge_widget_factory)
+            .expect("built-in widget types are unique");
+        registry
     }
 
     pub fn register(
@@ -1278,6 +1287,341 @@ fn terminal_widget_factory(
     }))
 }
 
+/// Semantic state used by the `status` widget and shared severity styling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusLevel {
+    Neutral,
+    Success,
+    Warning,
+    Error,
+}
+
+impl StatusLevel {
+    const fn color(self, theme: Theme) -> Color {
+        match self {
+            Self::Neutral => theme.muted(),
+            Self::Success => theme.success(),
+            Self::Warning => theme.warning(),
+            Self::Error => theme.error(),
+        }
+    }
+}
+
+fn parse_status_level(value: Option<&String>) -> Result<StatusLevel, WidgetError> {
+    match value.map(String::as_str) {
+        None => Ok(StatusLevel::Neutral),
+        Some("success" | "ok" | "healthy" | "up" | "green" | "passing") => Ok(StatusLevel::Success),
+        Some("warning" | "warn" | "degraded" | "yellow") => Ok(StatusLevel::Warning),
+        Some("error" | "err" | "failed" | "failure" | "down" | "red" | "critical") => {
+            Ok(StatusLevel::Error)
+        }
+        Some("neutral" | "info" | "idle" | "none") => Ok(StatusLevel::Neutral),
+        Some(other) => Err(WidgetError::InvalidConfiguration(format!(
+            "status state must be success, warning, error, or neutral, got {other:?}"
+        ))),
+    }
+}
+
+fn parse_gauge_value(settings: &BTreeMap<String, String>) -> Result<u8, WidgetError> {
+    let Some(value) = settings.get("value") else {
+        return Ok(0);
+    };
+    let parsed = value.parse::<u8>().map_err(|_| {
+        WidgetError::InvalidConfiguration(format!(
+            "gauge value must be an integer between 0 and 100, got {value:?}"
+        ))
+    })?;
+    if parsed > 100 {
+        return Err(WidgetError::InvalidConfiguration(format!(
+            "gauge value must be between 0 and 100, got {parsed}"
+        )));
+    }
+    Ok(parsed)
+}
+
+/// Builds a filled, bordered surface and returns its inner content rectangle.
+fn bordered_chrome(
+    area: Rect,
+    title: &str,
+    focused: bool,
+    theme: Theme,
+    appearance: WidgetAppearance,
+) -> (Scene, Rect) {
+    let accent = if focused {
+        theme.focus()
+    } else {
+        theme.border()
+    };
+    let background = theme.surface();
+    let foreground = theme.foreground();
+    let mut scene = Scene::new(area);
+    scene.fill(area, CellStyle::new(foreground, background));
+    appearance.render_border(&mut scene, area, title, CellStyle::new(accent, background));
+    (scene, appearance.content_area(area))
+}
+
+/// Renders a `key: value` row clipped to the given area.
+fn render_key_value(
+    scene: &mut Scene,
+    area: Rect,
+    key: &str,
+    value: &str,
+    key_style: CellStyle,
+    value_style: CellStyle,
+    separator_style: CellStyle,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let mut column = area.x;
+    scene.text(column, area.y, key, key_style);
+    column = column.saturating_add(key.chars().count() as u16);
+    if column < area.x.saturating_add(area.width) {
+        scene.text(column, area.y, ":", separator_style);
+        column = column.saturating_add(1);
+    }
+    if column < area.x.saturating_add(area.width) {
+        scene.text(column, area.y, " ", separator_style);
+        column = column.saturating_add(1);
+    }
+    scene.text(column, area.y, value, value_style);
+}
+
+/// Renders a bounded progress bar with a textual percentage fallback.
+fn render_gauge(
+    scene: &mut Scene,
+    area: Rect,
+    value: u8,
+    label: &str,
+    fill_style: CellStyle,
+    track_style: CellStyle,
+    label_style: CellStyle,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let percent = format!("{value}%");
+    let label = if label.is_empty() {
+        percent
+    } else {
+        format!("{label} {percent}")
+    };
+    let label_width = label.chars().count() as u16;
+    if area.width <= label_width.saturating_add(1) {
+        scene.text(area.x, area.y, &label, label_style);
+        return;
+    }
+    let bar_width = area.width.saturating_sub(label_width).saturating_sub(1);
+    let filled = ((u32::from(bar_width) * u32::from(value)) / 100) as u16;
+    for column in 0..bar_width {
+        let (glyph, style) = if column < filled {
+            ('█', fill_style)
+        } else {
+            ('░', track_style)
+        };
+        scene.set(area.x.saturating_add(column), area.y, glyph, style);
+    }
+    scene.text(
+        area.x.saturating_add(bar_width).saturating_add(1),
+        area.y,
+        &label,
+        label_style,
+    );
+}
+
+struct StatusWidget {
+    title: String,
+    label: bool,
+    level: StatusLevel,
+    text: String,
+    appearance: WidgetAppearance,
+    theme: Theme,
+}
+
+impl Widget for StatusWidget {
+    fn kind(&self) -> &str {
+        "status"
+    }
+
+    fn content_area(&self, area: Rect) -> Rect {
+        self.appearance.content_area(area)
+    }
+
+    fn render(&self, area: Rect, focused: bool) -> Scene {
+        let background = self.theme.surface();
+        let status = self.level.color(self.theme);
+        render_bordered_text(
+            area,
+            if self.label { &self.title } else { "" },
+            focused,
+            &self.text,
+            BorderedTextStyle {
+                foreground: self.theme.foreground(),
+                background,
+                focused_accent: self.theme.focus(),
+                unfocused_accent: self.theme.border(),
+                text: CellStyle::new(status, background),
+                appearance: self.appearance,
+            },
+        )
+    }
+}
+
+struct KeyValueWidget {
+    title: String,
+    label: bool,
+    key: String,
+    value: String,
+    appearance: WidgetAppearance,
+    theme: Theme,
+}
+
+impl Widget for KeyValueWidget {
+    fn kind(&self) -> &str {
+        "key_value"
+    }
+
+    fn content_area(&self, area: Rect) -> Rect {
+        self.appearance.content_area(area)
+    }
+
+    fn render(&self, area: Rect, focused: bool) -> Scene {
+        let background = self.theme.surface();
+        let foreground = self.theme.foreground();
+        let (mut scene, content_area) = bordered_chrome(
+            area,
+            if self.label { &self.title } else { "" },
+            focused,
+            self.theme,
+            self.appearance,
+        );
+        if content_area.width > 0 && content_area.height > 0 {
+            let mut content = Scene::new(content_area);
+            content.fill(content_area, CellStyle::new(foreground, background));
+            render_key_value(
+                &mut content,
+                content_area,
+                &self.key,
+                &self.value,
+                CellStyle::new(self.theme.muted(), background),
+                CellStyle::new(self.theme.accent(), background).bold(),
+                CellStyle::new(self.theme.muted(), background),
+            );
+            scene.blit(&content, area);
+        }
+        scene
+    }
+}
+
+struct GaugeWidget {
+    title: String,
+    label: bool,
+    value: u8,
+    text: String,
+    appearance: WidgetAppearance,
+    theme: Theme,
+}
+
+impl Widget for GaugeWidget {
+    fn kind(&self) -> &str {
+        "gauge"
+    }
+
+    fn content_area(&self, area: Rect) -> Rect {
+        self.appearance.content_area(area)
+    }
+
+    fn render(&self, area: Rect, focused: bool) -> Scene {
+        let background = self.theme.surface();
+        let foreground = self.theme.foreground();
+        let (mut scene, content_area) = bordered_chrome(
+            area,
+            if self.label { &self.title } else { "" },
+            focused,
+            self.theme,
+            self.appearance,
+        );
+        if content_area.width > 0 && content_area.height > 0 {
+            let mut content = Scene::new(content_area);
+            content.fill(content_area, CellStyle::new(foreground, background));
+            render_gauge(
+                &mut content,
+                content_area,
+                self.value,
+                &self.text,
+                CellStyle::new(self.theme.accent(), background),
+                CellStyle::new(self.theme.muted(), background),
+                CellStyle::new(foreground, background),
+            );
+            scene.blit(&content, area);
+        }
+        scene
+    }
+}
+
+fn status_widget_factory(
+    config: &WidgetInstanceConfig,
+    context: &WidgetRuntimeContext,
+) -> Result<Box<dyn Widget>, WidgetError> {
+    Ok(Box::new(StatusWidget {
+        title: config
+            .title
+            .clone()
+            .unwrap_or_else(|| " status ".to_owned()),
+        label: config.label != LabelPolicy::Never,
+        level: parse_status_level(config.settings.get("state"))?,
+        text: config.text.clone().unwrap_or_default(),
+        appearance: WidgetAppearance::from_settings(&config.settings)?,
+        theme: context
+            .theme()
+            .with_settings(&config.settings)
+            .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?,
+    }))
+}
+
+fn key_value_widget_factory(
+    config: &WidgetInstanceConfig,
+    context: &WidgetRuntimeContext,
+) -> Result<Box<dyn Widget>, WidgetError> {
+    let key = config
+        .settings
+        .get("key")
+        .cloned()
+        .or_else(|| config.title.clone())
+        .unwrap_or_else(|| "value".to_owned());
+    Ok(Box::new(KeyValueWidget {
+        title: config
+            .title
+            .clone()
+            .unwrap_or_else(|| " key_value ".to_owned()),
+        label: config.label != LabelPolicy::Never,
+        key,
+        value: config.text.clone().unwrap_or_default(),
+        appearance: WidgetAppearance::from_settings(&config.settings)?,
+        theme: context
+            .theme()
+            .with_settings(&config.settings)
+            .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?,
+    }))
+}
+
+fn gauge_widget_factory(
+    config: &WidgetInstanceConfig,
+    context: &WidgetRuntimeContext,
+) -> Result<Box<dyn Widget>, WidgetError> {
+    Ok(Box::new(GaugeWidget {
+        title: config.title.clone().unwrap_or_else(|| " gauge ".to_owned()),
+        label: config.label != LabelPolicy::Never,
+        value: parse_gauge_value(&config.settings)?,
+        text: config.text.clone().unwrap_or_default(),
+        appearance: WidgetAppearance::from_settings(&config.settings)?,
+        theme: context
+            .theme()
+            .with_settings(&config.settings)
+            .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?,
+    }))
+}
+
 fn system_widget_factory(
     config: &WidgetInstanceConfig,
     context: &WidgetRuntimeContext,
@@ -1530,6 +1874,149 @@ mod tests {
             scenes[&WidgetId::new(5)].cell_at(2, 1).unwrap().symbol,
             std::env::consts::OS.chars().next().unwrap()
         );
+    }
+
+    #[test]
+    fn status_widget_renders_semantic_state_colors() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 7
+            type = "status"
+            text = "all good"
+            [workspace.widgets.settings]
+            state = "success"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let id = WidgetId::new(7);
+        let area = Rect::new(0, 0, 14, 3);
+        let scene = runtime.render(&BTreeMap::from([(id, area)]), None);
+        assert_eq!(scene[&id].cell_at(2, 1).unwrap().symbol, 'a');
+        assert_eq!(
+            scene[&id].cell_at(2, 1).unwrap().style.foreground,
+            Color::ansi(10)
+        );
+    }
+
+    #[test]
+    fn status_widget_rejects_unknown_state_values() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 7
+            type = "status"
+            [workspace.widgets.settings]
+            state = "bogus"
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config),
+            Err(WidgetError::InvalidConfiguration(message)) if message.contains("state")
+        ));
+    }
+
+    #[test]
+    fn key_value_widget_renders_key_and_value_with_distinct_roles() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 8
+            type = "key_value"
+            text = "42%"
+            [workspace.widgets.settings]
+            key = "CPU"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let id = WidgetId::new(8);
+        let area = Rect::new(0, 0, 20, 3);
+        let scene = runtime.render(&BTreeMap::from([(id, area)]), None);
+
+        assert_eq!(scene[&id].cell_at(1, 1).unwrap().symbol, 'C');
+        assert_eq!(
+            scene[&id].cell_at(1, 1).unwrap().style.foreground,
+            Color::ansi(8)
+        );
+        assert_eq!(scene[&id].cell_at(6, 1).unwrap().symbol, '4');
+        assert_eq!(
+            scene[&id].cell_at(6, 1).unwrap().style.foreground,
+            Color::ansi(14)
+        );
+    }
+
+    #[test]
+    fn gauge_widget_renders_a_bounded_bar_and_percentage() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 9
+            type = "gauge"
+            [workspace.widgets.settings]
+            value = "50"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let id = WidgetId::new(9);
+        let area = Rect::new(0, 0, 16, 3);
+        let scene = runtime.render(&BTreeMap::from([(id, area)]), None);
+
+        assert_eq!(scene[&id].cell_at(1, 1).unwrap().symbol, '█');
+        assert_eq!(scene[&id].cell_at(5, 1).unwrap().symbol, '█');
+        assert_eq!(scene[&id].cell_at(6, 1).unwrap().symbol, '░');
+        assert_eq!(scene[&id].cell_at(12, 1).unwrap().symbol, '5');
+        assert_eq!(scene[&id].cell_at(14, 1).unwrap().symbol, '%');
+    }
+
+    #[test]
+    fn gauge_widget_rejects_out_of_range_values() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 9
+            type = "gauge"
+            [workspace.widgets.settings]
+            value = "101"
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config),
+            Err(WidgetError::InvalidConfiguration(message)) if message.contains("between 0 and 100")
+        ));
+    }
+
+    #[test]
+    fn narrow_gauge_falls_back_to_text_without_drawing_outside_the_scene() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 9
+            type = "gauge"
+            [workspace.widgets.settings]
+            value = "73"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let id = WidgetId::new(9);
+        let area = Rect::new(0, 0, 6, 3);
+        let scene = runtime.render(&BTreeMap::from([(id, area)]), None);
+
+        assert_eq!(scene[&id].cell_at(1, 1).unwrap().symbol, '7');
+        assert_eq!(scene[&id].cell_at(5, 1).unwrap().symbol, '│');
     }
 
     #[test]

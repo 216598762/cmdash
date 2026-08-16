@@ -116,7 +116,7 @@ border = "rounded"
 ```
 
 Every widget needs a unique numeric `id` and a non-empty `type`. Built-in types
-are `text`, `clock`, `system`, and `terminal`.
+are `text`, `clock`, `system`, `status`, `key_value`, `gauge`, and `terminal`.
 
 - `title`, `text`, `format`, and `command` are optional type-specific fields.
 - `label` accepts `auto`, `always`, or `never`; it controls whether the title is
@@ -128,6 +128,11 @@ are `text`, `clock`, `system`, and `terminal`.
 - `settings.border_color` and semantic role names such as `foreground`,
   `background`, `focus`, and `muted` accept `inherit`, `ansi:N`, or `#RRGGBB`.
 - `clock.format` accepts `HH:MM` or `HH:MM:SS`.
+- `status.state` accepts `success`, `warning`, `error`, or `neutral` (plus
+  aliases such as `ok`, `warn`, `err`, and `critical`).
+- `key_value` uses `settings.key` (or the widget `title`) for the label and
+  `text` for the value.
+- `gauge.value` accepts an integer between `0` and `100`.
 - A terminal widget owns its PTY, emulator, selection, graphics resources, and
   shutdown lifecycle.
 

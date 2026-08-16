@@ -748,10 +748,10 @@ boundaries.
 
 Start with dependency-light widgets that exercise the existing contracts:
 
-- [ ] Add a `status` widget for semantic success, warning, error, and neutral
+- [x] Add a `status` widget for semantic success, warning, error, and neutral
   states.
-- [ ] Add a `key_value` widget for bounded labeled values and diagnostics.
-- [ ] Add a `gauge` widget for bounded progress or utilization displays with a
+- [x] Add a `key_value` widget for bounded labeled values and diagnostics.
+- [x] Add a `gauge` widget for bounded progress or utilization displays with a
   textual fallback.
 - [ ] Add a clipped `list` widget for bounded static or scrollable rows.
 - [ ] Add a bounded recent-message `log` widget with severity styling.
@@ -772,8 +772,8 @@ and explicit security/dependency decisions.
 
 ### Shared widget infrastructure
 
-- [ ] Add reusable helpers for bounded text and row rendering, status/severity
-  styling, clipping, minimum-size handling, and deterministic test data.
+- [x] Add reusable helpers for bounded text and row rendering, status/severity
+  styling, clipping, and minimum-size handling, with deterministic test data.
 - [ ] Define how data-backed widgets request wakeups or periodic updates, ensuring
   hidden or inactive widgets do not create unnecessary work.
 - [ ] Keep data providers separate from rendering so providers can be tested

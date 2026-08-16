@@ -230,6 +230,64 @@ The title defaults to ` system `. More detailed metrics are a future widget
 extension; this built-in should not be treated as a complete monitoring
 interface.
 
+### `status`
+
+`status` renders a message in a semantic state color. `settings.state` selects
+the role: `success`, `warning`, `error`, or `neutral`, with common aliases such
+as `ok`, `warn`, `err`, and `critical`. The message comes from `text`.
+
+```toml
+[[workspace.widgets]]
+id = 5
+type = "status"
+text = "all systems nominal"
+
+[workspace.widgets.settings]
+state = "success"
+```
+
+An unrecognized `state` fails initialization. The title defaults to ` status `.
+The message is drawn with the theme's success/warning/error/muted role.
+
+### `key_value`
+
+`key_value` renders a single labeled value as `key: value`, clipped to the
+widget. The value comes from `text`; the key comes from `settings.key` or the
+widget `title` when `settings.key` is absent.
+
+```toml
+[[workspace.widgets]]
+id = 6
+type = "key_value"
+title = " CPU "
+text = "42%"
+
+[workspace.widgets.settings]
+key = "CPU"
+```
+
+The key is rendered in the muted role and the value in the accent role.
+
+### `gauge`
+
+`gauge` renders a bounded progress bar for a value between `0` and `100`
+configured through `settings.value`. An optional `text` label is placed after
+the bar; when the widget is too narrow for both, it falls back to the textual
+percentage alone.
+
+```toml
+[[workspace.widgets]]
+id = 7
+type = "gauge"
+text = "utilization"
+
+[workspace.widgets.settings]
+value = "73"
+```
+
+Values outside `0..=100` fail initialization. The fill uses the theme accent
+role and the track uses the muted role.
+
 ### Choosing a widget type
 
 Use the smallest type that matches the job:
@@ -239,6 +297,9 @@ Use the smallest type that matches the job:
 | Static text, labels, or notes | `text` | no | no |
 | A UTC time display | `clock` | no | no |
 | Basic host identity information | `system` | no | no |
+| A semantic state indicator | `status` | no | no |
+| A labeled value or diagnostic | `key_value` | no | no |
+| A bounded progress or utilization bar | `gauge` | no | no |
 | A shell or interactive terminal program | `terminal` | yes | yes |
 
 A dashboard can contain only passive widgets. Add `terminal` instances only for
