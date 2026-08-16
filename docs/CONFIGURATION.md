@@ -116,7 +116,8 @@ border = "rounded"
 ```
 
 Every widget needs a unique numeric `id` and a non-empty `type`. Built-in types
-are `text`, `clock`, `system`, `status`, `key_value`, `gauge`, and `terminal`.
+are `text`, `clock`, `system`, `status`, `key_value`, `gauge`, `list`, `log`,
+`sparkline`, `separator`, `spacer`, and `terminal`.
 
 - `title`, `text`, `format`, and `command` are optional type-specific fields.
 - `label` accepts `auto`, `always`, or `never`; it controls whether the title is
@@ -133,6 +134,11 @@ are `text`, `clock`, `system`, `status`, `key_value`, `gauge`, and `terminal`.
 - `key_value` uses `settings.key` (or the widget `title`) for the label and
   `text` for the value.
 - `gauge.value` accepts an integer between `0` and `100`.
+- `list` and `log` split `text` on newlines into rows; `log` honors an optional
+  `[error]`/`[warning]`/`[success]`/`[info]` prefix for per-line severity.
+- `sparkline` takes `settings.values` (or `text`) as comma-separated integers;
+  `settings.max_points` (default `64`) bounds the series.
+- `separator` centers an optional `text` label in a horizontal rule.
 - A terminal widget owns its PTY, emulator, selection, graphics resources, and
   shutdown lifecycle.
 

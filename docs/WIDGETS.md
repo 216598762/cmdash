@@ -288,6 +288,83 @@ value = "73"
 Values outside `0..=100` fail initialization. The fill uses the theme accent
 role and the track uses the muted role.
 
+### `list`
+
+`list` renders `text` as newline-separated rows, clipped to the widget width and
+bounded to the visible height. It is a passive display widget for short static
+lists.
+
+```toml
+[[workspace.widgets]]
+id = 8
+type = "list"
+text = "alpha\nbeta\ngamma"
+```
+
+Rows beyond the visible height are omitted. The title defaults to ` list `.
+
+### `log`
+
+`log` renders newline-separated messages with per-line severity styling. A line
+may begin with a bracketed tag — `[error]`, `[warning]`, `[success]`, or `[info]`
+(plus aliases such as `err`, `warn`, and `ok`) — which colors the remainder of
+the line with the matching theme role and strips the tag.
+
+```toml
+[[workspace.widgets]]
+id = 9
+type = "log"
+text = "[error] connection lost\n[ok] recovered"
+```
+
+The widget keeps the most recent messages: when there are more lines than rows,
+the tail is shown. The title defaults to ` log `.
+
+### `sparkline`
+
+`sparkline` renders comma-separated integers as a compact series of block
+characters, normalized to the input range. Values come from `settings.values` or
+`text`; `settings.max_points` (default `64`) bounds the series.
+
+```toml
+[[workspace.widgets]]
+id = 10
+type = "sparkline"
+[workspace.widgets.settings]
+values = "2,4,1,5,8"
+```
+
+Narrow widgets fall back to a `min-max` textual summary. Malformed values or a
+series exceeding `max_points` fail initialization.
+
+### `separator`
+
+`separator` renders a horizontal rule across the widget with an optional
+centered label from `text`.
+
+```toml
+[[workspace.widgets]]
+id = 11
+type = "separator"
+text = "CPU"
+```
+
+The rule uses the muted role and the label uses the foreground role. Set
+`border = "none"` for a divider without the surrounding outline.
+
+### `spacer`
+
+`spacer` is an empty surface used for intentional layout gaps. It renders only
+its background and optional border and handles no input.
+
+```toml
+[[workspace.widgets]]
+id = 12
+type = "spacer"
+```
+
+Set `border = "none"` for an invisible gap.
+
 ### Choosing a widget type
 
 Use the smallest type that matches the job:
@@ -300,6 +377,11 @@ Use the smallest type that matches the job:
 | A semantic state indicator | `status` | no | no |
 | A labeled value or diagnostic | `key_value` | no | no |
 | A bounded progress or utilization bar | `gauge` | no | no |
+| A clipped static list | `list` | no | no |
+| Recent messages with severity | `log` | no | no |
+| A compact value series | `sparkline` | no | no |
+| A horizontal divider | `separator` | no | no |
+| An empty layout gap | `spacer` | no | no |
 | A shell or interactive terminal program | `terminal` | yes | yes |
 
 A dashboard can contain only passive widgets. Add `terminal` instances only for

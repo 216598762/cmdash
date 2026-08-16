@@ -753,11 +753,11 @@ Start with dependency-light widgets that exercise the existing contracts:
 - [x] Add a `key_value` widget for bounded labeled values and diagnostics.
 - [x] Add a `gauge` widget for bounded progress or utilization displays with a
   textual fallback.
-- [ ] Add a clipped `list` widget for bounded static or scrollable rows.
-- [ ] Add a bounded recent-message `log` widget with severity styling.
-- [ ] Add a `sparkline` widget for compact historical values with a scene-safe
+- [x] Add a clipped `list` widget for bounded static or scrollable rows.
+- [x] Add a bounded recent-message `log` widget with severity styling.
+- [x] Add a `sparkline` widget for compact historical values with a scene-safe
   glyph and textual fallback.
-- [ ] Add a `separator` or `spacer` widget for intentional layout grouping
+- [x] Add a `separator` or `spacer` widget for intentional layout grouping
   without requiring a fake text widget.
 - [ ] Extend `system` only where the data source and refresh behavior are
   portable and well-defined.

@@ -522,6 +522,21 @@ impl WidgetRegistry {
             .register("gauge", gauge_widget_factory)
             .expect("built-in widget types are unique");
         registry
+            .register("list", list_widget_factory)
+            .expect("built-in widget types are unique");
+        registry
+            .register("log", log_widget_factory)
+            .expect("built-in widget types are unique");
+        registry
+            .register("sparkline", sparkline_widget_factory)
+            .expect("built-in widget types are unique");
+        registry
+            .register("separator", separator_widget_factory)
+            .expect("built-in widget types are unique");
+        registry
+            .register("spacer", spacer_widget_factory)
+            .expect("built-in widget types are unique");
+        registry
     }
 
     pub fn register(
@@ -1622,6 +1637,464 @@ fn gauge_widget_factory(
     }))
 }
 
+struct LogLine {
+    text: String,
+    level: StatusLevel,
+}
+
+fn log_level(tag: &str) -> Option<StatusLevel> {
+    match tag.to_ascii_lowercase().as_str() {
+        "error" | "err" | "critical" => Some(StatusLevel::Error),
+        "warning" | "warn" => Some(StatusLevel::Warning),
+        "success" | "ok" | "healthy" => Some(StatusLevel::Success),
+        "info" | "debug" | "trace" => Some(StatusLevel::Neutral),
+        _ => None,
+    }
+}
+
+fn parse_log_line(line: &str) -> (StatusLevel, String) {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('[')
+        && let Some(close) = trimmed.find(']')
+        && let Some(level) = log_level(&trimmed[1..close])
+    {
+        (level, trimmed[close + 1..].trim_start().to_owned())
+    } else {
+        (StatusLevel::Neutral, line.to_owned())
+    }
+}
+
+fn parse_csv_numbers(raw: &str, max_points: usize) -> Result<Vec<i64>, WidgetError> {
+    let mut values = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if values.len() >= max_points {
+            return Err(WidgetError::InvalidConfiguration(format!(
+                "sparkline values exceed max_points ({max_points})"
+            )));
+        }
+        values.push(part.parse::<i64>().map_err(|_| {
+            WidgetError::InvalidConfiguration(format!(
+                "sparkline values must be comma-separated integers, got {part:?}"
+            ))
+        })?);
+    }
+    Ok(values)
+}
+
+const SPARK_GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+fn normalize_sparkline(values: &[i64]) -> Vec<u8> {
+    let Some(&min) = values.iter().min() else {
+        return Vec::new();
+    };
+    let max = values.iter().max().copied().unwrap_or(min);
+    if max == min {
+        return values.iter().map(|_| 3).collect();
+    }
+    values
+        .iter()
+        .map(|value| {
+            let numerator = (*value as i128 - min as i128) * 7;
+            let denominator = max as i128 - min as i128;
+            (numerator / denominator) as u8
+        })
+        .collect()
+}
+
+fn render_sparkline_glyphs(scene: &mut Scene, area: Rect, levels: &[u8], style: CellStyle) {
+    for (index, level) in levels.iter().enumerate() {
+        let x = area.x.saturating_add(index as u16);
+        if x >= area.x.saturating_add(area.width) {
+            break;
+        }
+        scene.set(x, area.y, SPARK_GLYPHS[usize::from(*level)], style);
+    }
+}
+
+fn render_separator(
+    scene: &mut Scene,
+    area: Rect,
+    label: &str,
+    line_style: CellStyle,
+    label_style: CellStyle,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let label_width = label.chars().count() as u16;
+    if label.is_empty() || label_width.saturating_add(2) > area.width {
+        for column in 0..area.width {
+            scene.set(area.x.saturating_add(column), area.y, '─', line_style);
+        }
+        return;
+    }
+    let dash_span = (area.width - label_width - 2) / 2;
+    for column in 0..dash_span {
+        scene.set(area.x.saturating_add(column), area.y, '─', line_style);
+    }
+    scene.text(
+        area.x.saturating_add(dash_span),
+        area.y,
+        &format!(" {label} "),
+        label_style,
+    );
+    let right = area
+        .x
+        .saturating_add(dash_span)
+        .saturating_add(label_width)
+        .saturating_add(2);
+    for column in right..area.x.saturating_add(area.width) {
+        scene.set(column, area.y, '─', line_style);
+    }
+}
+
+struct ListWidget {
+    title: String,
+    label: bool,
+    rows: Vec<String>,
+    appearance: WidgetAppearance,
+    theme: Theme,
+}
+
+impl Widget for ListWidget {
+    fn kind(&self) -> &str {
+        "list"
+    }
+
+    fn content_area(&self, area: Rect) -> Rect {
+        self.appearance.content_area(area)
+    }
+
+    fn render(&self, area: Rect, focused: bool) -> Scene {
+        let background = self.theme.surface();
+        let foreground = self.theme.foreground();
+        let (mut scene, content_area) = bordered_chrome(
+            area,
+            if self.label { &self.title } else { "" },
+            focused,
+            self.theme,
+            self.appearance,
+        );
+        if content_area.width > 0 && content_area.height > 0 {
+            let mut content = Scene::new(content_area);
+            content.fill(content_area, CellStyle::new(foreground, background));
+            let style = CellStyle::new(foreground, background);
+            for (row, item) in self
+                .rows
+                .iter()
+                .take(content_area.height as usize)
+                .enumerate()
+            {
+                content.text(
+                    content_area.x,
+                    content_area.y.saturating_add(row as u16),
+                    item,
+                    style,
+                );
+            }
+            scene.blit(&content, area);
+        }
+        scene
+    }
+}
+
+struct LogWidget {
+    title: String,
+    label: bool,
+    lines: Vec<LogLine>,
+    appearance: WidgetAppearance,
+    theme: Theme,
+}
+
+impl Widget for LogWidget {
+    fn kind(&self) -> &str {
+        "log"
+    }
+
+    fn content_area(&self, area: Rect) -> Rect {
+        self.appearance.content_area(area)
+    }
+
+    fn render(&self, area: Rect, focused: bool) -> Scene {
+        let background = self.theme.surface();
+        let foreground = self.theme.foreground();
+        let (mut scene, content_area) = bordered_chrome(
+            area,
+            if self.label { &self.title } else { "" },
+            focused,
+            self.theme,
+            self.appearance,
+        );
+        if content_area.width > 0 && content_area.height > 0 {
+            let mut content = Scene::new(content_area);
+            content.fill(content_area, CellStyle::new(foreground, background));
+            let start = self
+                .lines
+                .len()
+                .saturating_sub(content_area.height as usize);
+            for (row, line) in self.lines[start..].iter().enumerate() {
+                let style = CellStyle::new(line.level.color(self.theme), background);
+                content.text(
+                    content_area.x,
+                    content_area.y.saturating_add(row as u16),
+                    &line.text,
+                    style,
+                );
+            }
+            scene.blit(&content, area);
+        }
+        scene
+    }
+}
+
+struct SparklineWidget {
+    title: String,
+    label: bool,
+    values: Vec<i64>,
+    levels: Vec<u8>,
+    appearance: WidgetAppearance,
+    theme: Theme,
+}
+
+impl Widget for SparklineWidget {
+    fn kind(&self) -> &str {
+        "sparkline"
+    }
+
+    fn content_area(&self, area: Rect) -> Rect {
+        self.appearance.content_area(area)
+    }
+
+    fn render(&self, area: Rect, focused: bool) -> Scene {
+        let background = self.theme.surface();
+        let foreground = self.theme.foreground();
+        let (mut scene, content_area) = bordered_chrome(
+            area,
+            if self.label { &self.title } else { "" },
+            focused,
+            self.theme,
+            self.appearance,
+        );
+        if content_area.width > 0 && content_area.height > 0 {
+            let mut content = Scene::new(content_area);
+            content.fill(content_area, CellStyle::new(foreground, background));
+            if self.values.is_empty() {
+                // nothing to render
+            } else if content_area.width < 2 {
+                let min = self.values.iter().min().copied().unwrap_or(0);
+                let max = self.values.iter().max().copied().unwrap_or(0);
+                content.text(
+                    content_area.x,
+                    content_area.y,
+                    &format!("{min}-{max}"),
+                    CellStyle::new(foreground, background),
+                );
+            } else {
+                render_sparkline_glyphs(
+                    &mut content,
+                    content_area,
+                    &self.levels,
+                    CellStyle::new(self.theme.accent(), background),
+                );
+            }
+            scene.blit(&content, area);
+        }
+        scene
+    }
+}
+
+struct SeparatorWidget {
+    title: String,
+    label: bool,
+    text: String,
+    appearance: WidgetAppearance,
+    theme: Theme,
+}
+
+impl Widget for SeparatorWidget {
+    fn kind(&self) -> &str {
+        "separator"
+    }
+
+    fn content_area(&self, area: Rect) -> Rect {
+        self.appearance.content_area(area)
+    }
+
+    fn render(&self, area: Rect, focused: bool) -> Scene {
+        let background = self.theme.surface();
+        let foreground = self.theme.foreground();
+        let (mut scene, content_area) = bordered_chrome(
+            area,
+            if self.label { &self.title } else { "" },
+            focused,
+            self.theme,
+            self.appearance,
+        );
+        if content_area.width > 0 && content_area.height > 0 {
+            let mut content = Scene::new(content_area);
+            content.fill(content_area, CellStyle::new(foreground, background));
+            render_separator(
+                &mut content,
+                content_area,
+                &self.text,
+                CellStyle::new(self.theme.muted(), background),
+                CellStyle::new(foreground, background).bold(),
+            );
+            scene.blit(&content, area);
+        }
+        scene
+    }
+}
+
+struct SpacerWidget {
+    appearance: WidgetAppearance,
+    theme: Theme,
+}
+
+impl Widget for SpacerWidget {
+    fn kind(&self) -> &str {
+        "spacer"
+    }
+
+    fn content_area(&self, area: Rect) -> Rect {
+        self.appearance.content_area(area)
+    }
+
+    fn render(&self, area: Rect, _focused: bool) -> Scene {
+        let background = self.theme.surface();
+        let mut scene = Scene::new(area);
+        scene.fill(area, CellStyle::new(self.theme.foreground(), background));
+        self.appearance.render_border(
+            &mut scene,
+            area,
+            "",
+            CellStyle::new(self.theme.border(), background),
+        );
+        scene
+    }
+}
+
+fn list_widget_factory(
+    config: &WidgetInstanceConfig,
+    context: &WidgetRuntimeContext,
+) -> Result<Box<dyn Widget>, WidgetError> {
+    Ok(Box::new(ListWidget {
+        title: config.title.clone().unwrap_or_else(|| " list ".to_owned()),
+        label: config.label != LabelPolicy::Never,
+        rows: config
+            .text
+            .clone()
+            .unwrap_or_default()
+            .split('\n')
+            .map(str::to_owned)
+            .collect(),
+        appearance: WidgetAppearance::from_settings(&config.settings)?,
+        theme: context
+            .theme()
+            .with_settings(&config.settings)
+            .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?,
+    }))
+}
+
+fn log_widget_factory(
+    config: &WidgetInstanceConfig,
+    context: &WidgetRuntimeContext,
+) -> Result<Box<dyn Widget>, WidgetError> {
+    Ok(Box::new(LogWidget {
+        title: config.title.clone().unwrap_or_else(|| " log ".to_owned()),
+        label: config.label != LabelPolicy::Never,
+        lines: config
+            .text
+            .as_deref()
+            .unwrap_or("")
+            .lines()
+            .map(parse_log_line)
+            .map(|(level, text)| LogLine { text, level })
+            .collect(),
+        appearance: WidgetAppearance::from_settings(&config.settings)?,
+        theme: context
+            .theme()
+            .with_settings(&config.settings)
+            .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?,
+    }))
+}
+
+fn sparkline_widget_factory(
+    config: &WidgetInstanceConfig,
+    context: &WidgetRuntimeContext,
+) -> Result<Box<dyn Widget>, WidgetError> {
+    let max_points = config
+        .settings
+        .get("max_points")
+        .map(|value| {
+            value.parse::<usize>().map_err(|_| {
+                WidgetError::InvalidConfiguration(format!(
+                    "sparkline max_points must be an integer, got {value:?}"
+                ))
+            })
+        })
+        .transpose()?
+        .unwrap_or(64);
+    let raw = config
+        .settings
+        .get("values")
+        .or(config.text.as_ref())
+        .map(String::as_str)
+        .unwrap_or("");
+    let values = parse_csv_numbers(raw, max_points)?;
+    let levels = normalize_sparkline(&values);
+    Ok(Box::new(SparklineWidget {
+        title: config
+            .title
+            .clone()
+            .unwrap_or_else(|| " sparkline ".to_owned()),
+        label: config.label != LabelPolicy::Never,
+        values,
+        levels,
+        appearance: WidgetAppearance::from_settings(&config.settings)?,
+        theme: context
+            .theme()
+            .with_settings(&config.settings)
+            .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?,
+    }))
+}
+
+fn separator_widget_factory(
+    config: &WidgetInstanceConfig,
+    context: &WidgetRuntimeContext,
+) -> Result<Box<dyn Widget>, WidgetError> {
+    Ok(Box::new(SeparatorWidget {
+        title: config
+            .title
+            .clone()
+            .unwrap_or_else(|| " separator ".to_owned()),
+        label: config.label != LabelPolicy::Never,
+        text: config.text.clone().unwrap_or_default(),
+        appearance: WidgetAppearance::from_settings(&config.settings)?,
+        theme: context
+            .theme()
+            .with_settings(&config.settings)
+            .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?,
+    }))
+}
+
+fn spacer_widget_factory(
+    config: &WidgetInstanceConfig,
+    context: &WidgetRuntimeContext,
+) -> Result<Box<dyn Widget>, WidgetError> {
+    Ok(Box::new(SpacerWidget {
+        appearance: WidgetAppearance::from_settings(&config.settings)?,
+        theme: context
+            .theme()
+            .with_settings(&config.settings)
+            .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?,
+    }))
+}
+
 fn system_widget_factory(
     config: &WidgetInstanceConfig,
     context: &WidgetRuntimeContext,
@@ -2017,6 +2490,142 @@ mod tests {
 
         assert_eq!(scene[&id].cell_at(1, 1).unwrap().symbol, '7');
         assert_eq!(scene[&id].cell_at(5, 1).unwrap().symbol, '│');
+    }
+
+    #[test]
+    fn list_widget_renders_rows_clipped_to_height() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 10
+            type = "list"
+            text = "alpha\nbeta\ngamma"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let id = WidgetId::new(10);
+        let area = Rect::new(0, 0, 12, 4);
+        let scene = runtime.render(&BTreeMap::from([(id, area)]), None);
+
+        assert_eq!(scene[&id].cell_at(1, 1).unwrap().symbol, 'a');
+        assert_eq!(scene[&id].cell_at(1, 2).unwrap().symbol, 'b');
+        assert_eq!(scene[&id].cell_at(1, 3).unwrap().symbol, '─');
+    }
+
+    #[test]
+    fn log_widget_styles_lines_by_severity_prefix() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 11
+            type = "log"
+            text = "[error] boom\n[ok] fine"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let id = WidgetId::new(11);
+        let area = Rect::new(0, 0, 12, 4);
+        let scene = runtime.render(&BTreeMap::from([(id, area)]), None);
+
+        assert_eq!(scene[&id].cell_at(1, 1).unwrap().symbol, 'b');
+        assert_eq!(
+            scene[&id].cell_at(1, 1).unwrap().style.foreground,
+            Color::ansi(9)
+        );
+        assert_eq!(scene[&id].cell_at(1, 2).unwrap().symbol, 'f');
+        assert_eq!(
+            scene[&id].cell_at(1, 2).unwrap().style.foreground,
+            Color::ansi(10)
+        );
+    }
+
+    #[test]
+    fn sparkline_widget_renders_normalized_glyphs() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 12
+            type = "sparkline"
+            [workspace.widgets.settings]
+            values = "0,4,8"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let id = WidgetId::new(12);
+        let area = Rect::new(0, 0, 8, 3);
+        let scene = runtime.render(&BTreeMap::from([(id, area)]), None);
+
+        assert_eq!(scene[&id].cell_at(1, 1).unwrap().symbol, '▁');
+        assert_eq!(scene[&id].cell_at(2, 1).unwrap().symbol, '▄');
+        assert_eq!(scene[&id].cell_at(3, 1).unwrap().symbol, '█');
+    }
+
+    #[test]
+    fn sparkline_widget_rejects_invalid_values() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 12
+            type = "sparkline"
+            [workspace.widgets.settings]
+            values = "1,2,x"
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config),
+            Err(WidgetError::InvalidConfiguration(message)) if message.contains("comma-separated integers")
+        ));
+    }
+
+    #[test]
+    fn separator_widget_renders_a_rule_with_a_centered_label() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 13
+            type = "separator"
+            text = "CPU"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let id = WidgetId::new(13);
+        let area = Rect::new(0, 0, 12, 3);
+        let scene = runtime.render(&BTreeMap::from([(id, area)]), None);
+
+        assert_eq!(scene[&id].cell_at(1, 1).unwrap().symbol, '─');
+        assert_eq!(scene[&id].cell_at(4, 1).unwrap().symbol, 'C');
+        assert_eq!(scene[&id].cell_at(8, 1).unwrap().symbol, '─');
+    }
+
+    #[test]
+    fn spacer_widget_renders_blank_content_within_its_border() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 14
+            type = "spacer"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        let id = WidgetId::new(14);
+        let area = Rect::new(0, 0, 6, 3);
+        let scene = runtime.render(&BTreeMap::from([(id, area)]), None);
+
+        assert_eq!(scene[&id].cell_at(0, 0).unwrap().symbol, '╭');
+        assert_eq!(scene[&id].cell_at(1, 1).unwrap().symbol, ' ');
     }
 
     #[test]
