@@ -694,8 +694,10 @@ Reference material:
 - [x] Add failure tests proving unsupported capability, timeout, malformed payload,
   quota rejection, and outer write failure become visible diagnostics rather than
   empty successful frames.
-- [ ] Add performance tests for large/chunked images, rapid pane switching,
-  placeholder redraws, and bounded memory/resource cleanup.
+- [x] Add deterministic performance/pressure tests for large chunked images,
+  rapid pane switching with stable placement IDs, placeholder redraws without
+  re-upload, bounded retained bytes/resources, and repeated acknowledgement-gated
+  outer-resource cleanup.
 
 The completed conformance tranche now includes bounded session diagnostics,
 control-only Kitty APC actions, zero-ID animation continuity, lifecycle/resize/

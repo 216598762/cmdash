@@ -994,6 +994,12 @@ impl SessionGraphicsStore {
         self.resources.len()
     }
 
+    /// Total decoded bytes retained by this session's graphics resources and
+    /// animation frames. This is the value enforced by `GraphicsLimits`.
+    pub const fn decoded_bytes_total(&self) -> usize {
+        self.decoded_bytes
+    }
+
     pub fn placement_count(&self) -> usize {
         self.placements.len()
     }

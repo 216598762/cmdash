@@ -1450,6 +1450,9 @@ fn write_direct_placement<W: Write>(
     if placement.z_index() != 0 {
         write!(writer, ",z={}", placement.z_index())?;
     }
+    if let Some(placement_id) = placement.placement_id() {
+        write!(writer, ",p={placement_id}")?;
+    }
     write_source_crop(writer, placement)?;
     writer.write_all(b";\x1b\\")
 }
@@ -1512,6 +1515,9 @@ fn write_direct_upload<W: Write>(
     )?;
     if placement.z_index() != 0 {
         write!(writer, ",z={}", placement.z_index())?;
+    }
+    if let Some(placement_id) = placement.placement_id() {
+        write!(writer, ",p={placement_id}")?;
     }
     write_source_crop(writer, placement)?;
     writer.write_all(b";")?;

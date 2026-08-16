@@ -315,9 +315,14 @@ until a sandboxed provider exists. The backend's direct and placeholder adapters
 serialize only direct payloads, while tmux passthrough wraps the same bytes with
 ESC doubling. Capture fixtures feed those complete streams into a bounded
 headless terminal model and assert both acceptance state and protocol responses.
-The incremental adapter also accepts payload-less control APCs used by Kitty
-animation/deletion commands, and the session carries zero-ID continuity to the
-most recently allocated image for subsequent frame/control actions. A bounded
+Deterministic pressure fixtures also replay large chunked RGB payloads through
+an actual one-pixel-per-cell framebuffer, alternate stable placement IDs across
+rapid pane-like switches, redraw unchanged Unicode placeholders without
+re-uploading resources, and repeat acknowledgement-gated cleanup while asserting
+retained byte/resource counts remain within configured limits. The incremental
+adapter also accepts payload-less control APCs used by Kitty animation/deletion
+commands, and the session carries zero-ID continuity to the most recently
+allocated image for subsequent frame/control actions. A bounded
 raw PTY capture is available for conformance diagnostics without becoming a
 second rendering source; installed-`kitten` fixtures use it to verify real
 placement, placeholder, passthrough, animation, and failure streams. Session

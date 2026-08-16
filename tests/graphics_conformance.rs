@@ -69,6 +69,48 @@ fn captured_submission(image: u32, width: u16, height: u16) -> GraphicsSubmissio
         .expect("capture fixture should create one placement")
 }
 
+fn captured_submission_with_placement(
+    image: u32,
+    width: u16,
+    height: u16,
+    placement_id: u32,
+) -> GraphicsSubmission {
+    let mut store = SessionGraphicsStore::new(SessionId::new(0));
+    let parameters = format!("a=T,f=24,i={image},c={width},r={height},p={placement_id},q=2");
+    store
+        .apply_kitty_command_with_context(parameters.as_bytes(), b"AQID", (0, 0), (0, 0))
+        .expect("placement-id fixture image should be accepted");
+    store
+        .visible_submissions(Rect::new(0, 0, 16, 8))
+        .into_iter()
+        .next()
+        .expect("placement-id fixture should create one placement")
+}
+
+fn encode_test_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = u32::from(chunk[0]);
+        let second = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let third = u32::from(chunk.get(2).copied().unwrap_or(0));
+        let combined = (first << 16) | (second << 8) | third;
+        output.push(TABLE[((combined >> 18) & 63) as usize] as char);
+        output.push(TABLE[((combined >> 12) & 63) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            TABLE[((combined >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[(combined & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
 fn assert_rendered(status: GraphicsSubmissionStatus, resources: usize, placements: usize) {
     assert_eq!(
         status,
@@ -898,6 +940,215 @@ fn compositor_clips_graphics_for_overlays_and_hidden_panes() {
     let mut hidden_surface = cmdash::Scene::new(Rect::new(0, 0, 8, 4));
     hidden_surface.blit(&source, Rect::new(0, 0, 0, 0));
     assert!(hidden_surface.image_layers().is_empty());
+}
+
+#[test]
+fn rapid_pane_switching_reuses_resources_without_retaining_duplicate_placements() {
+    let left = captured_submission_with_placement(301, 1, 1, 1);
+    let right = captured_submission_with_placement(302, 1, 1, 1);
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+
+    for cycle in 0..128 {
+        let submission = if cycle % 2 == 0 { &left } else { &right };
+        backend
+            .submit_graphics(
+                std::slice::from_ref(submission),
+                std::slice::from_ref(submission),
+                &[],
+            )
+            .expect("pane switch replay should remain bounded");
+    }
+
+    let metrics = backend.metrics();
+    assert_eq!(metrics.graphics_uploads, 2);
+    assert_eq!(metrics.graphics_reuses, 126);
+    let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
+    assert_eq!(model.resource_count(), 2);
+    assert_eq!(model.placement_count(), 2);
+    assert_eq!(model.actions().len(), 128);
+    assert_eq!(
+        model
+            .actions()
+            .iter()
+            .filter(|action| **action == "transmit")
+            .count(),
+        2
+    );
+    assert_eq!(
+        model
+            .actions()
+            .iter()
+            .filter(|action| **action == "place")
+            .count(),
+        126
+    );
+}
+
+#[test]
+fn placeholder_redraws_do_not_reupload_an_unchanged_resource() {
+    let submission = captured_submission(303, 1, 1);
+    let mut backend =
+        CrosstermBackend::new(Vec::new()).with_capabilities(capabilities(true, true, false, false));
+
+    for frame in 0..96 {
+        let changed = if frame == 0 {
+            std::slice::from_ref(&submission)
+        } else {
+            &[]
+        };
+        backend
+            .submit_graphics_frame(changed, std::slice::from_ref(&submission), &[], &[], &[])
+            .expect("placeholder redraw should remain renderable");
+    }
+
+    let metrics = backend.metrics();
+    assert_eq!(metrics.graphics_uploads, 1);
+    assert_eq!(
+        metrics.graphics_bytes,
+        submission.encoded_payload().len() as u64
+    );
+    let model = HeadlessKittyTerminal::replay_with_framebuffer(backend.writer(), 1, 1).unwrap();
+    assert_eq!(model.resource_count(), 1);
+    assert_eq!(
+        model
+            .actions()
+            .iter()
+            .filter(|action| **action == "transmit")
+            .count(),
+        1
+    );
+    assert_eq!(model.visible_pixel_count(), 1);
+    assert_eq!(
+        model.pixel(0, 0),
+        Some(headless_kitty::HeadlessPixel::rgb(1, 2, 3))
+    );
+    assert!(model.placeholder_count() >= 96);
+}
+
+#[test]
+fn repeated_acknowledged_cleanup_does_not_leak_outer_resources() {
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+
+    for image in 320..352 {
+        let submission = captured_submission(image, 1, 1);
+        backend
+            .submit_graphics(
+                std::slice::from_ref(&submission),
+                std::slice::from_ref(&submission),
+                &[],
+            )
+            .expect("resource pressure upload should write");
+        let upload_ack = format!("\x1b_Gi={image};OK\x1b\\");
+        let batch = backend.feed_outer_input(upload_ack.as_bytes());
+        assert_eq!(batch.graphics_acknowledgements.len(), 1);
+
+        backend
+            .submit_graphics(&[], &[], std::slice::from_ref(&submission))
+            .expect("resource pressure delete should write");
+        let delete_ack = format!("\x1b_Gi={image};OK\x1b\\");
+        let batch = backend.feed_outer_input(delete_ack.as_bytes());
+        assert_eq!(batch.graphics_acknowledgements.len(), 1);
+    }
+
+    assert_eq!(backend.metrics().graphics_gc, 32);
+    assert_eq!(backend.metrics().graphics_ack_failures, 0);
+    let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
+    assert_eq!(model.resource_count(), 0);
+    assert_eq!(model.placement_count(), 0);
+}
+
+#[test]
+fn large_chunked_upload_renders_pixels_without_exceeding_headless_bounds() {
+    let width = 96_u16;
+    let height = 64_u16;
+    let mut pixels = Vec::with_capacity(usize::from(width) * usize::from(height) * 3);
+    for y in 0..height {
+        for x in 0..width {
+            pixels.extend_from_slice(&[x as u8, y as u8, (x as u8).wrapping_add(y as u8)]);
+        }
+    }
+    let encoded = encode_test_base64(&pixels);
+    let mut stream =
+        format!("\x1b_Ga=T,f=24,i=201,s={width},v={height},c={width},r={height},m=1;").into_bytes();
+    let mut chunks = encoded.as_bytes().chunks(1024).peekable();
+    stream.extend_from_slice(chunks.next().expect("large fixture has a payload"));
+    stream.extend_from_slice(b"\x1b\\");
+    while let Some(chunk) = chunks.next() {
+        stream.extend_from_slice(b"\x1b_Gm=");
+        stream.extend_from_slice(if chunks.peek().is_some() {
+            b"1;"
+        } else {
+            b"0;"
+        });
+        stream.extend_from_slice(chunk);
+        stream.extend_from_slice(b"\x1b\\");
+    }
+
+    let terminal = HeadlessKittyTerminal::replay_with_framebuffer(&stream, width, height)
+        .expect("large chunked stream should render in the bounded headless terminal");
+    assert_eq!(terminal.framebuffer_size(), Some((width, height)));
+    assert_eq!(terminal.resource_count(), 1);
+    assert_eq!(terminal.placement_count(), 1);
+    assert_eq!(
+        terminal.visible_pixel_count(),
+        usize::from(width) * usize::from(height)
+    );
+    assert_eq!(
+        terminal.pixel(0, 0),
+        Some(headless_kitty::HeadlessPixel::rgb(0, 0, 0))
+    );
+    assert_eq!(
+        terminal.pixel(width - 1, height - 1),
+        Some(headless_kitty::HeadlessPixel::rgb(95, 63, 158))
+    );
+}
+
+#[test]
+fn retained_graphics_bytes_and_resources_stay_within_session_limits() {
+    let limits = cmdash::GraphicsLimits {
+        max_decoded_bytes: 1024,
+        max_resources: 4,
+        max_placements: 8,
+    };
+    let mut store = SessionGraphicsStore::with_limits(SessionId::new(202), limits);
+    let decoded = vec![7_u8; 192];
+    let encoded = encode_test_base64(&decoded);
+
+    for _ in 0..32 {
+        store
+            .apply_kitty_command(b"a=T,f=24,i=202,c=1,r=1,q=2", encoded.as_bytes())
+            .expect("retransmitting one image should replace its retained bytes");
+    }
+    assert_eq!(store.resource_count(), 1);
+    assert_eq!(store.decoded_bytes_total(), decoded.len());
+    assert!(store.decoded_bytes_total() <= limits.max_decoded_bytes);
+
+    for image in 203..=205 {
+        let parameters = format!("a=T,f=24,i={image},c=1,r=1,q=2");
+        store
+            .apply_kitty_command(parameters.as_bytes(), encoded.as_bytes())
+            .expect("resources below the configured quota should be accepted");
+    }
+    assert_eq!(store.resource_count(), limits.max_resources);
+    assert!(store.decoded_bytes_total() <= limits.max_decoded_bytes);
+
+    store
+        .apply_kitty_command(b"a=T,f=24,i=206,c=1,r=1,q=2", encoded.as_bytes())
+        .expect("resource quota rejection should be a diagnostic outcome");
+    assert_eq!(store.resource_count(), limits.max_resources);
+    assert!(
+        store
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| { diagnostic.message().contains("resource limit") })
+    );
+
+    store.clear();
+    assert_eq!(store.resource_count(), 0);
+    assert_eq!(store.placement_count(), 0);
+    assert_eq!(store.decoded_bytes_total(), 0);
 }
 
 #[cfg(feature = "sixel")]
