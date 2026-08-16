@@ -109,6 +109,15 @@ Useful for Linux-specific process, signal, file-descriptor, and PTY operations t
 
 ## Graphics and image handling
 
+### `flate2`
+
+**Active at v1.1.9.** Used only to decode RFC 1950 zlib payloads from the Kitty
+`o=z` direct-transfer form. Decompression happens after bounded base64 input
+validation and before the per-session decoded-byte quota is applied; file,
+temporary-file, and shared-memory transfer modes remain rejected by policy.
+The dependency is not exposed to widgets or the outer-terminal adapter, and
+retained payloads are normalized to direct base64 for deterministic replay.
+
 ### `ratatui-image`
 
 Provides image widgets and protocol backends for Sixel, Kitty, iTerm2, and Unicode fallback rendering. It may help dashboard widgets display ordinary images and can serve as a reference implementation.

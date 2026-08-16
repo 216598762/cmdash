@@ -1,8 +1,10 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
+    io::Read,
 };
 
+use flate2::read::ZlibDecoder;
 use ratatui::layout::Rect;
 
 use crate::state::SessionId;
@@ -176,7 +178,45 @@ pub struct GraphicsPlacement {
     width: u16,
     height: u16,
     z_index: i16,
+    source: Option<GraphicsSourceRect>,
+    cursor_static: bool,
     anchor: GraphicsGridAnchor,
+}
+
+/// A source rectangle in the logical image, in pixels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphicsSourceRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl GraphicsSourceRect {
+    pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub const fn x(self) -> u32 {
+        self.x
+    }
+
+    pub const fn y(self) -> u32 {
+        self.y
+    }
+
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    pub const fn height(self) -> u32 {
+        self.height
+    }
 }
 
 impl GraphicsPlacement {
@@ -206,6 +246,14 @@ impl GraphicsPlacement {
 
     pub const fn z_index(&self) -> i16 {
         self.z_index
+    }
+
+    pub const fn source(&self) -> Option<GraphicsSourceRect> {
+        self.source
+    }
+
+    pub const fn cursor_static(&self) -> bool {
+        self.cursor_static
     }
 
     pub const fn anchor(&self) -> GraphicsGridAnchor {
@@ -559,12 +607,44 @@ fn parse_protocol_buffer(
         if body.len() > max_payload_bytes {
             return Err(GraphicsProtocolError::PayloadTooLarge);
         }
+        let command_end = body_start + body_end + terminator_len;
         let Some(separator) = body.iter().position(|byte| *byte == b';') else {
-            events.push(GraphicsProtocolEvent::Malformed {
-                bytes: buffer[start..body_start + body_end + terminator_len].to_vec(),
-                reason: "Kitty APC has no parameter/payload separator".to_owned(),
-            });
-            index = body_start + body_end + terminator_len;
+            // Kitty control actions such as animation frame/control and
+            // deletion may omit the payload separator entirely. Treat only a
+            // recognized action as an empty-payload command; malformed text
+            // remains recoverable as a diagnostic event.
+            let action = body
+                .split(|byte| *byte == b',')
+                .find_map(|field| field.strip_prefix(b"a="))
+                .and_then(|value| value.first().copied());
+            if matches!(
+                action,
+                Some(
+                    b'T' | b't'
+                        | b'p'
+                        | b'P'
+                        | b'f'
+                        | b'F'
+                        | b'a'
+                        | b'A'
+                        | b'c'
+                        | b'C'
+                        | b'd'
+                        | b'D'
+                        | b'q'
+                        | b'Q'
+                )
+            ) {
+                events.push(GraphicsProtocolEvent::Command(
+                    GraphicsProtocolCommand::new(body.to_vec(), Vec::new()),
+                ));
+            } else {
+                events.push(GraphicsProtocolEvent::Malformed {
+                    bytes: buffer[start..command_end].to_vec(),
+                    reason: "Kitty APC has no parameter/payload separator".to_owned(),
+                });
+            }
+            index = command_end;
             continue;
         };
         let payload = &body[separator + 1..];
@@ -574,7 +654,7 @@ fn parse_protocol_buffer(
         events.push(GraphicsProtocolEvent::Command(
             GraphicsProtocolCommand::new(body[..separator].to_vec(), payload.to_vec()),
         ));
-        index = body_start + body_end + terminator_len;
+        index = command_end;
     }
 
     Ok((events, index))
@@ -836,6 +916,19 @@ impl fmt::Display for GraphicsError {
 
 impl std::error::Error for GraphicsError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphicsAnimationState {
+    Stopped,
+    Loading,
+    Running,
+}
+
+#[derive(Clone, Debug)]
+struct GraphicsAnimationFrame {
+    payload: Vec<u8>,
+    gap_ms: Option<i32>,
+}
+
 #[derive(Clone, Debug)]
 struct GraphicsResource {
     format: u8,
@@ -844,6 +937,9 @@ struct GraphicsResource {
     pixel_height: u32,
     decoded_payload: Vec<u8>,
     encoded_payload: Vec<u8>,
+    animation_frames: BTreeMap<u32, GraphicsAnimationFrame>,
+    animation_state: GraphicsAnimationState,
+    animation_current_frame: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -863,6 +959,7 @@ pub struct SessionGraphicsStore {
     next_internal_image_id: u32,
     next_placement_key: u64,
     next_resource_generation: u64,
+    last_image_id: Option<u32>,
     outer_kitty_graphics: bool,
     diagnostics: Vec<GraphicsDiagnostic>,
 }
@@ -883,6 +980,7 @@ impl SessionGraphicsStore {
             next_internal_image_id: 1,
             next_placement_key: 1,
             next_resource_generation: 1,
+            last_image_id: None,
             outer_kitty_graphics: true,
             diagnostics: Vec::new(),
         }
@@ -906,6 +1004,24 @@ impl SessionGraphicsStore {
             .map(|resource| resource.decoded_payload.as_slice())
     }
 
+    pub fn animation_frame_count(&self, image: u32) -> Option<usize> {
+        self.resources
+            .get(&image)
+            .map(|resource| resource.animation_frames.len())
+    }
+    pub fn animation_state(&self, image: u32) -> Option<GraphicsAnimationState> {
+        self.resources
+            .get(&image)
+            .map(|resource| resource.animation_state)
+    }
+
+    pub fn animation_frame_bytes(&self, image: u32, frame: u32) -> Option<&[u8]> {
+        self.resources
+            .get(&image)
+            .and_then(|resource| resource.animation_frames.get(&frame))
+            .map(|frame| frame.payload.as_slice())
+    }
+
     pub const fn limits(&self) -> GraphicsLimits {
         self.limits
     }
@@ -923,6 +1039,7 @@ impl SessionGraphicsStore {
         self.placements.clear();
         self.pending_upload = None;
         self.decoded_bytes = 0;
+        self.last_image_id = None;
     }
 
     pub fn record_diagnostic(&mut self, image: Option<u32>, message: impl Into<String>) {
@@ -1028,7 +1145,7 @@ impl SessionGraphicsStore {
             .get("a")
             .and_then(|value| value.as_bytes().first())
             .copied();
-        let image = values
+        let requested_image = values
             .get("i")
             .map(|value| {
                 value
@@ -1037,6 +1154,10 @@ impl SessionGraphicsStore {
             })
             .transpose()?
             .unwrap_or(0);
+        let mut image = requested_image;
+        if image == 0 && matches!(action, Some(b'f' | b'F' | b'a' | b'A' | b'c' | b'C')) {
+            image = self.last_image_id.unwrap_or(0);
+        }
         let quiet = values
             .get("q")
             .map(|value| {
@@ -1055,10 +1176,14 @@ impl SessionGraphicsStore {
             })
             .transpose()?
             .unwrap_or(0);
+        let compression = values.get("o").map(String::as_str).unwrap_or("");
+        if !compression.is_empty() && compression != "z" {
+            return Err(GraphicsError::InvalidParameter("o".to_owned()));
+        }
         let max_encoded_bytes = self.limits.max_decoded_bytes.saturating_mul(2);
-        let requested_image = image;
-
-        if action.is_none() && self.pending_upload.is_some() {
+        if self.pending_upload.is_some()
+            && (action.is_none() || matches!(action, Some(b'T' | b't' | b'f')))
+        {
             let mut pending = self.pending_upload.take().expect("pending upload checked");
             if pending
                 .encoded_payload
@@ -1097,7 +1222,7 @@ impl SessionGraphicsStore {
         }
 
         if more != 0 {
-            if !matches!(action, Some(b'T') | Some(b't')) {
+            if !matches!(action, Some(b'T') | Some(b't') | Some(b'f')) {
                 return Err(GraphicsError::InvalidParameter("m".to_owned()));
             }
             let transfer = values.get("t").map(String::as_str).unwrap_or("d");
@@ -1142,8 +1267,11 @@ impl SessionGraphicsStore {
                 if transfer != "d" {
                     return Err(GraphicsError::UnsupportedTransfer(transfer.to_owned()));
                 }
-                let decoded_payload =
-                    decode_base64(encoded_payload).ok_or(GraphicsError::InvalidPayload)?;
+                let decoded_payload = decode_graphics_payload(
+                    encoded_payload,
+                    compression,
+                    self.limits.max_decoded_bytes,
+                )?;
                 let format = values
                     .get("f")
                     .map(|value| {
@@ -1170,10 +1298,7 @@ impl SessionGraphicsStore {
                     );
                     return Ok(None);
                 }
-                let previous_bytes = self
-                    .resources
-                    .get(&image)
-                    .map_or(0, |resource| resource.decoded_payload.len());
+                let previous_bytes = self.resources.get(&image).map_or(0, resource_storage_bytes);
                 let projected_bytes = self
                     .decoded_bytes
                     .saturating_sub(previous_bytes)
@@ -1214,10 +1339,14 @@ impl SessionGraphicsStore {
                         generation,
                         pixel_width,
                         pixel_height,
+                        encoded_payload: encode_base64_payload(&decoded_payload),
                         decoded_payload,
-                        encoded_payload: encoded_payload.to_vec(),
+                        animation_frames: BTreeMap::new(),
+                        animation_state: GraphicsAnimationState::Stopped,
+                        animation_current_frame: 1,
                     },
                 );
+                self.last_image_id = Some(image);
                 // Re-transmission replaces the image and all of its old
                 // placements, as required by the Kitty protocol.
                 self.remove_image_placements(image);
@@ -1257,18 +1386,176 @@ impl SessionGraphicsStore {
                     response = Some(kitty_response(image, placement_id(&values), "OK"));
                 }
             }
+            Some(b'f') => {
+                let decoded = decode_graphics_payload(
+                    encoded_payload,
+                    compression,
+                    self.limits.max_decoded_bytes,
+                )?;
+                let frame = parameter_u32(&values, "r", 0)?;
+                let resource = self
+                    .resources
+                    .get_mut(&image)
+                    .ok_or(GraphicsError::ImageNotFound(image))?;
+                let frame = if frame == 0 {
+                    resource
+                        .animation_frames
+                        .keys()
+                        .next_back()
+                        .copied()
+                        .unwrap_or(1)
+                        .saturating_add(1)
+                } else {
+                    frame
+                };
+                if frame == 0 || frame as usize > self.limits.max_placements {
+                    return Err(GraphicsError::InvalidParameter(
+                        "animation frame".to_owned(),
+                    ));
+                }
+                let previous_frame_bytes = resource
+                    .animation_frames
+                    .get(&frame)
+                    .map_or(0, |existing| existing.payload.len());
+                let projected_bytes = self
+                    .decoded_bytes
+                    .saturating_sub(previous_frame_bytes)
+                    .saturating_add(decoded.len());
+                if projected_bytes > self.limits.max_decoded_bytes {
+                    self.diagnose(
+                        Some(image),
+                        format!(
+                            "animation frame exceeds {} byte limit",
+                            self.limits.max_decoded_bytes
+                        ),
+                    );
+                    return Ok(None);
+                }
+                let gap_ms = values
+                    .get("z")
+                    .map(|raw| {
+                        raw.parse::<i32>()
+                            .map_err(|_| GraphicsError::InvalidParameter(raw.clone()))
+                    })
+                    .transpose()?;
+                resource.animation_frames.insert(
+                    frame,
+                    GraphicsAnimationFrame {
+                        payload: decoded,
+                        gap_ms,
+                    },
+                );
+                self.decoded_bytes = projected_bytes;
+                if quiet != 2 && image != 0 {
+                    response = Some(kitty_response(image, None, "OK"));
+                }
+            }
+            Some(b'a') => {
+                let resource = self
+                    .resources
+                    .get_mut(&image)
+                    .ok_or(GraphicsError::ImageNotFound(image))?;
+                if let Some(state) = values.get("s") {
+                    resource.animation_state = match state.as_str() {
+                        "1" => GraphicsAnimationState::Stopped,
+                        "2" => GraphicsAnimationState::Loading,
+                        "3" => GraphicsAnimationState::Running,
+                        _ => return Err(GraphicsError::InvalidParameter(state.clone())),
+                    };
+                }
+                if let Some(frame) = values.get("c") {
+                    let frame = frame
+                        .parse::<u32>()
+                        .map_err(|_| GraphicsError::InvalidParameter(frame.clone()))?;
+                    if frame != 1 && !resource.animation_frames.contains_key(&frame) {
+                        return Err(GraphicsError::InvalidParameter(
+                            "animation frame".to_owned(),
+                        ));
+                    }
+                    resource.animation_current_frame = frame;
+                }
+                if let (Some(frame), Some(gap)) = (values.get("r"), values.get("z")) {
+                    let frame = frame
+                        .parse::<u32>()
+                        .map_err(|_| GraphicsError::InvalidParameter(frame.clone()))?;
+                    let gap_ms = gap
+                        .parse::<i32>()
+                        .map_err(|_| GraphicsError::InvalidParameter(gap.clone()))?;
+                    let target = resource.animation_frames.get_mut(&frame).ok_or_else(|| {
+                        GraphicsError::InvalidParameter("animation frame".to_owned())
+                    })?;
+                    target.gap_ms = Some(gap_ms);
+                }
+                if quiet != 2 {
+                    response = Some(kitty_response(image, None, "OK"));
+                }
+            }
+            Some(b'c') => {
+                let resource = self
+                    .resources
+                    .get_mut(&image)
+                    .ok_or(GraphicsError::ImageNotFound(image))?;
+                let source = parameter_u32(&values, "r", 1)?;
+                let destination = parameter_u32(&values, "c", 1)?;
+                let source_exists = source == 1 || resource.animation_frames.contains_key(&source);
+                let destination_exists =
+                    destination == 1 || resource.animation_frames.contains_key(&destination);
+                if !source_exists || !destination_exists {
+                    return Err(GraphicsError::ImageNotFound(image));
+                }
+                resource.animation_current_frame = destination;
+                if quiet != 2 {
+                    response = Some(kitty_response(image, None, "OK"));
+                }
+            }
             Some(b'd') | Some(b'D') => match values.get("d").map(String::as_str) {
-                Some("a") => self.clear(),
-                Some("p") => {
+                Some("a") | Some("A") => {
+                    self.clear();
+                    self.last_image_id = None;
+                }
+                Some("p") | Some("P") => {
                     self.placements.clear();
+                }
+                Some("f") | Some("F") => {
+                    if let Some(resource) = self.resources.get_mut(&image) {
+                        resource.animation_frames.clear();
+                        resource.animation_state = GraphicsAnimationState::Stopped;
+                        resource.animation_current_frame = 1;
+                    }
+                }
+                Some("i") | Some("I") if image != 0 => {
+                    if let Some(placement) = placement_id(&values) {
+                        let key = (u64::from(image) << 32) | u64::from(placement);
+                        self.placements.remove(&key);
+                    } else {
+                        self.remove_image_placements(image);
+                    }
+                    if values.get("d").is_some_and(|value| value == "I")
+                        && self
+                            .placements
+                            .values()
+                            .all(|placement| placement.resource().image() != image)
+                    {
+                        if let Some(resource) = self.resources.remove(&image) {
+                            self.decoded_bytes = self
+                                .decoded_bytes
+                                .saturating_sub(resource_storage_bytes(&resource));
+                        }
+                        if self.last_image_id == Some(image) {
+                            self.last_image_id = None;
+                        }
+                    }
                 }
                 _ if image != 0 => {
                     if let Some(resource) = self.resources.remove(&image) {
                         self.decoded_bytes = self
                             .decoded_bytes
-                            .saturating_sub(resource.decoded_payload.len());
+                            .saturating_sub(resource_storage_bytes(&resource));
                     }
                     self.remove_image_placements(image);
+                    if self.last_image_id == Some(image) {
+                        self.last_image_id = None;
+                    }
                 }
                 _ => return Err(GraphicsError::InvalidParameter("d".to_owned())),
             },
@@ -1338,6 +1625,11 @@ impl SessionGraphicsStore {
             width: placement_dimension(values, "c", pixel_size.0, cell_size.0)?,
             height: placement_dimension(values, "r", pixel_size.1, cell_size.1)?,
             z_index: parameter_i16(values, "z", 0)?,
+            source: source_rect(values, pixel_size)?,
+            // cmdash's own outer adapters use C=1 to prevent a graphics replay
+            // from disturbing the composed text cursor. The child protocol
+            // still records an explicit C=0 as the moving-cursor form.
+            cursor_static: values.get("C").map_or(true, |value| value == "1"),
             anchor: GraphicsGridAnchor::new(cursor.0, cursor.1, scrollback)
                 .with_screen(screen)
                 .with_scroll_region(scroll_region, region_scroll),
@@ -1461,6 +1753,16 @@ fn serialize_parameters(values: &BTreeMap<String, String>) -> Vec<u8> {
         .into_bytes()
 }
 
+fn resource_storage_bytes(resource: &GraphicsResource) -> usize {
+    resource.decoded_payload.len().saturating_add(
+        resource
+            .animation_frames
+            .values()
+            .map(|frame| frame.payload.len())
+            .sum::<usize>(),
+    )
+}
+
 fn parameter_u32(
     values: &BTreeMap<String, String>,
     key: &str,
@@ -1507,6 +1809,50 @@ fn placement_id(values: &BTreeMap<String, String>) -> Option<u32> {
         .get("p")
         .and_then(|value| value.parse().ok())
         .filter(|id| *id != 0)
+}
+
+fn source_rect(
+    values: &BTreeMap<String, String>,
+    natural_size: (u32, u32),
+) -> Result<Option<GraphicsSourceRect>, GraphicsError> {
+    let has_crop = ["x", "y", "w", "h"]
+        .iter()
+        .any(|key| values.contains_key(*key));
+    if !has_crop
+        || (natural_size == (0, 0) && !values.contains_key("w") && !values.contains_key("h"))
+    {
+        // Without source dimensions, x/y alone cannot describe a bounded
+        // crop. Preserve compatibility with clients that use x/y as
+        // application-local placement metadata and wait for w/h or natural
+        // dimensions before validating a source rectangle.
+        return Ok(None);
+    }
+    let value = |key: &str, default: u32| {
+        values
+            .get(key)
+            .map(|raw| {
+                raw.parse::<u32>()
+                    .map_err(|_| GraphicsError::InvalidParameter(raw.clone()))
+            })
+            .unwrap_or(Ok(default))
+    };
+    let x = value("x", 0)?;
+    let y = value("y", 0)?;
+    let width = value("w", natural_size.0.saturating_sub(x))?;
+    let height = value("h", natural_size.1.saturating_sub(y))?;
+    if width == 0 || height == 0 {
+        return Err(GraphicsError::InvalidParameter(
+            "source crop must be nonzero".to_owned(),
+        ));
+    }
+    if natural_size.0 != 0 && (x >= natural_size.0 || width > natural_size.0.saturating_sub(x))
+        || natural_size.1 != 0 && (y >= natural_size.1 || height > natural_size.1.saturating_sub(y))
+    {
+        return Err(GraphicsError::InvalidParameter(
+            "source crop is outside image bounds".to_owned(),
+        ));
+    }
+    Ok(Some(GraphicsSourceRect::new(x, y, width, height)))
 }
 
 fn kitty_response(image: u32, placement: Option<u32>, message: &str) -> Vec<u8> {
@@ -1563,6 +1909,55 @@ fn natural_dimensions(payload: &[u8], format: u8) -> Option<(u32, u32)> {
         )),
         _ => None,
     }
+}
+
+fn encode_base64_payload(bytes: &[u8]) -> Vec<u8> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = u32::from(chunk[0]);
+        let second = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let third = u32::from(chunk.get(2).copied().unwrap_or(0));
+        let combined = (first << 16) | (second << 8) | third;
+        output.push(TABLE[((combined >> 18) & 63) as usize]);
+        output.push(TABLE[((combined >> 12) & 63) as usize]);
+        output.push(if chunk.len() > 1 {
+            TABLE[((combined >> 6) & 63) as usize]
+        } else {
+            b'='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[(combined & 63) as usize]
+        } else {
+            b'='
+        });
+    }
+    output
+}
+
+fn decode_graphics_payload(
+    payload: &[u8],
+    compression: &str,
+    max_decoded_bytes: usize,
+) -> Result<Vec<u8>, GraphicsError> {
+    if compression == "z" && payload.len() > max_decoded_bytes.saturating_mul(2).saturating_add(4) {
+        return Err(GraphicsError::InvalidPayload);
+    }
+    let encoded = decode_base64(payload).ok_or(GraphicsError::InvalidPayload)?;
+    if compression != "z" {
+        return Ok(encoded);
+    }
+    let mut decoder = ZlibDecoder::new(encoded.as_slice());
+    let mut decoded = Vec::new();
+    decoder
+        .by_ref()
+        .take(max_decoded_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut decoded)
+        .map_err(|_| GraphicsError::InvalidPayload)?;
+    if decoded.len() > max_decoded_bytes {
+        return Err(GraphicsError::InvalidPayload);
+    }
+    Ok(decoded)
 }
 
 fn decode_base64(payload: &[u8]) -> Option<Vec<u8>> {
@@ -2088,10 +2483,126 @@ mod tests {
     }
 
     #[test]
+    fn compressed_payloads_are_decoded_before_storage_and_placement() {
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(b"AQID").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let encoded = encode_base64_for_test(&compressed);
+        let mut store = SessionGraphicsStore::new(SessionId::new(23));
+        store
+            .apply_kitty_command(b"a=T,f=24,i=23,c=1,r=1,o=z,q=2", &encoded)
+            .unwrap();
+        assert_eq!(store.decoded_bytes(23), Some(&b"AQID"[..]));
+        assert_eq!(store.placement_count(), 1);
+    }
+
+    #[test]
+    fn source_crops_and_cursor_policy_are_retained_as_logical_placement_data() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(24));
+        store
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,i=24,s=10,v=10,x=2,y=3,w=4,h=5,C=0,c=2,r=2,q=2",
+                b"AQID",
+                (1, 1),
+                (10, 10),
+            )
+            .unwrap();
+        let submissions = store.visible_submissions(Rect::new(0, 0, 8, 8));
+        let placement = submissions[0].placement();
+        assert_eq!(
+            placement.source(),
+            Some(GraphicsSourceRect::new(2, 3, 4, 5))
+        );
+        assert!(!placement.cursor_static());
+    }
+
+    #[test]
+    fn animation_frames_and_controls_are_bounded_and_acknowledged() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(25));
+        store
+            .apply_kitty_command(b"a=T,f=24,i=25,c=1,r=1,q=2", b"AQID")
+            .unwrap();
+        assert_eq!(
+            store
+                .apply_kitty_command_with_context(b"a=f,i=25,r=2,z=40", b"BAUG", (0, 0), (0, 0))
+                .unwrap(),
+            Some(b"\x1b_Gi=25;OK\x1b\\".to_vec())
+        );
+        assert_eq!(store.animation_frame_count(25), Some(1));
+        assert_eq!(
+            store.animation_frame_bytes(25, 2),
+            Some(&b"\x04\x05\x06"[..])
+        );
+        store.apply_kitty_command(b"a=a,i=25,s=3,c=2", b"").unwrap();
+        assert_eq!(
+            store.animation_state(25),
+            Some(GraphicsAnimationState::Running)
+        );
+        store.apply_kitty_command(b"a=d,d=f,i=25", b"").unwrap();
+        assert_eq!(store.animation_frame_count(25), Some(0));
+    }
+
+    #[test]
+    fn transfer_negotiation_rejects_file_and_shared_memory_without_claiming_success() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(26));
+        for transfer in ["f", "s", "t"] {
+            let response = store
+                .apply_kitty_command_with_context(
+                    format!("a=q,i=26,t={transfer},f=100").as_bytes(),
+                    b"fixture",
+                    (0, 0),
+                    (0, 0),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&response).contains("ENOTSUP"));
+        }
+        assert_eq!(store.resource_count(), 0);
+    }
+
+    #[test]
+    fn placement_delete_selector_can_remove_one_placement_without_destroying_resource() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(27));
+        store
+            .apply_kitty_command(b"a=T,f=24,i=27,q=2", b"AQID")
+            .unwrap();
+        store
+            .apply_kitty_command_with_context(b"a=p,i=27,p=7,q=2", b"", (2, 0), (0, 0))
+            .unwrap();
+        assert_eq!(store.placement_count(), 2);
+        store.apply_kitty_command(b"a=d,d=i,i=27,p=7", b"").unwrap();
+        assert_eq!(store.placement_count(), 1);
+        assert_eq!(store.resource_count(), 1);
+    }
+
+    #[test]
     fn unsupported_formats_are_reported_and_ignored() {
         let mut store = SessionGraphicsStore::new(SessionId::new(6));
         store.apply_kitty_command(b"a=T,f=1,i=1", b"AQID").unwrap();
         assert_eq!(store.resource_count(), 0);
         assert!(store.diagnostics()[0].message().contains("unsupported"));
+    }
+
+    #[test]
+    fn protocol_adapter_accepts_payloadless_control_actions() {
+        let mut adapter = GraphicsProtocolAdapter::default();
+        let events = adapter
+            .feed(b"\x1b_Ga=f,i=1,r=2\x1b\\\x1b_Ga=d,d=i,i=1\x1b\\")
+            .unwrap();
+        assert_eq!(adapter.finish().unwrap(), Vec::new());
+        assert_eq!(
+            events
+                .into_iter()
+                .filter_map(|event| match event {
+                    GraphicsProtocolEvent::Command(command) => Some(command),
+                    _ => None,
+                })
+                .map(|command| command.parameters().to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"a=f,i=1,r=2".to_vec(), b"a=d,d=i,i=1".to_vec()]
+        );
     }
 }

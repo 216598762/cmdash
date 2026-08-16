@@ -1,15 +1,35 @@
 use std::{
+    process::Command,
     thread,
     time::{Duration, Instant},
 };
 
-use cmdash::{SessionId, TerminalSession, TerminalSize};
+use cmdash::{
+    GraphicsProtocolAdapter, GraphicsProtocolEvent, SessionId, TerminalSession, TerminalSize,
+};
 use ratatui::layout::Rect;
 
 const TERMINAL_AREA: Rect = Rect::new(0, 0, 80, 12);
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(2);
 const NEGOTIATION_MARKER: &str = "icat-negotiation-ok";
 const UPLOAD_MARKER: &str = "icat-upload-ok";
+const TINY_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x01, 0x44, 0x00, 0x3b,
+];
+const ANIMATED_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x0a, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x01, 0x44, 0x00, 0x21, 0xf9, 0x04, 0x01, 0x0a, 0x00, 0x00,
+    0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x01, 0x44, 0x00, 0x3b,
+];
+
+fn write_image_fixture(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("cmdash-kitty-{name}-{}.gif", std::process::id()));
+    std::fs::write(&path, bytes).expect("could not write the Kitty image fixture");
+    path
+}
 
 /// A shell-based stand-in for kitty's `kitten icat` detection handshake.
 ///
@@ -156,14 +176,7 @@ fn installed_kitten_detect_support_completes_inside_the_pty_fixture() {
 #[test]
 #[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
 fn installed_kitten_image_upload_reaches_the_retained_graphics_store() {
-    const TINY_GIF: &[u8] = &[
-        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00,
-        0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x01, 0x44, 0x00, 0x3b,
-    ];
-    let path =
-        std::env::temp_dir().join(format!("cmdash-kitty-fixture-{}.gif", std::process::id()));
-    std::fs::write(&path, TINY_GIF).expect("could not write the tiny GIF fixture");
+    let path = write_image_fixture("upload", TINY_GIF);
 
     let mut session = TerminalSession::spawn_with_session_id(
         SessionId::new(200_003),
@@ -211,4 +224,300 @@ fn installed_kitten_image_upload_reaches_the_retained_graphics_store() {
     session
         .shutdown()
         .expect("could not shut down kitten image fixture");
+}
+
+#[test]
+#[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
+fn installed_kitten_place_option_reaches_the_expected_retained_geometry() {
+    let path = write_image_fixture("place", TINY_GIF);
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(200_004),
+        Some("kitten"),
+        &[
+            "icat",
+            "--use-window-size",
+            "80,12,800,240",
+            "--place",
+            "2x1@3x2",
+            "--scale-up",
+            "--transfer-mode",
+            "stream",
+            "--stdin=no",
+            path.to_str().expect("fixture path is not valid UTF-8"),
+        ],
+        TerminalSize::with_pixels(80, 12, 800, 240),
+    )
+    .expect("could not spawn kitten placement fixture");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut submissions = Vec::new();
+    while Instant::now() < deadline {
+        session.poll_output().expect("kitten placement PTY failed");
+        submissions = session.graphics(TERMINAL_AREA);
+        if !submissions.is_empty() || session.is_closed() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(submissions.len(), 1, "kitten emitted no retained placement");
+    assert_eq!(submissions[0].placement().area(), Rect::new(3, 2, 2, 1));
+    session
+        .shutdown()
+        .expect("could not shut down kitten placement fixture");
+}
+
+#[test]
+#[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
+fn installed_kitten_unicode_placeholder_option_reaches_the_pty_session() {
+    let path = write_image_fixture("placeholder", TINY_GIF);
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(200_005),
+        Some("kitten"),
+        &[
+            "icat",
+            "--use-window-size",
+            "80,12,800,240",
+            "--place",
+            "1x1@3x2",
+            "--unicode-placeholder",
+            "--transfer-mode",
+            "stream",
+            "--stdin=no",
+            path.to_str().expect("fixture path is not valid UTF-8"),
+        ],
+        TerminalSize::with_pixels(80, 12, 800, 240),
+    )
+    .expect("could not spawn kitten placeholder fixture");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut submissions = Vec::new();
+    let mut cell_is_placeholder = false;
+    while Instant::now() < deadline {
+        session
+            .poll_output()
+            .expect("kitten placeholder PTY failed");
+        submissions = session.graphics(TERMINAL_AREA);
+        cell_is_placeholder = session
+            .render(TERMINAL_AREA, false)
+            .cell_at(3, 2)
+            .is_some_and(|cell| cell.symbol != ' ');
+        if !submissions.is_empty() && cell_is_placeholder {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        submissions.len(),
+        1,
+        "kitten emitted no retained placeholder image"
+    );
+    assert!(
+        cell_is_placeholder,
+        "Kitty placeholder did not reach the PTY scene"
+    );
+    session
+        .shutdown()
+        .expect("could not shut down kitten placeholder fixture");
+}
+
+#[test]
+#[ignore = "requires installed kitten and tmux executables, but not a Kitty terminal"]
+fn installed_kitten_tmux_passthrough_reaches_the_session_adapter() {
+    let path = write_image_fixture("passthrough", TINY_GIF);
+    if !Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipping passthrough fixture: tmux is not installed");
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    // icat writes graphics to the PTY's controlling TTY, not redirected
+    // stdout. The fixture starts a private tmux server so icat can query the
+    // passthrough policy, while the session still receives the wrapped bytes.
+    let socket = std::env::temp_dir().join(format!("cmdash-tmux-{}", std::process::id()));
+    let session_name = format!("cmdash-{}", std::process::id());
+    let script = format!(
+        "tmux -S {} new-session -d -s {} && pid=$(tmux -S {} display-message -p '#{{pid}}') && TMUX={},$pid,0 TMUX_PANE=%0 TERM=screen-256color kitten icat --use-window-size 80,12,800,240 --place 1x1@2x1 --passthrough tmux --transfer-mode stream --stdin=no {} ; result=$?; tmux -S {} kill-server >/dev/null 2>&1; exit $result",
+        socket.display(),
+        session_name,
+        socket.display(),
+        socket.display(),
+        path.display(),
+        socket.display()
+    );
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(200_006),
+        Some("sh"),
+        &["-c", &script],
+        TerminalSize::with_pixels(80, 12, 800, 240),
+    )
+    .expect("could not spawn kitten passthrough fixture");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !session.is_closed() {
+        session
+            .poll_output()
+            .expect("kitten passthrough PTY failed");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let bytes = session.graphics_protocol_capture();
+    assert!(
+        bytes.windows(7).any(|window| window == b"\x1bPtmux;"),
+        "Kitty emitted no tmux wrapper: bytes={bytes:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+
+    let mut adapter = GraphicsProtocolAdapter::default();
+    let mut events = adapter
+        .feed(bytes)
+        .expect("passthrough capture was rejected");
+    events.extend(
+        adapter
+            .finish()
+            .expect("passthrough capture was incomplete"),
+    );
+    let commands = events
+        .into_iter()
+        .filter_map(|event| match event {
+            GraphicsProtocolEvent::Command(command) => Some(command),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !commands.is_empty(),
+        "Kitty emitted no passthrough graphics command: bytes={bytes:?}"
+    );
+    assert!(
+        commands.iter().any(|command| {
+            command.parameters().windows(3).any(|field| field == b"a=T")
+                && command.parameters().windows(3).any(|field| field == b"U=1")
+        }),
+        "unexpected installed passthrough parameters: {:?}",
+        commands
+            .iter()
+            .map(|command| String::from_utf8_lossy(command.parameters()).into_owned())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        session.graphics(TERMINAL_AREA).len(),
+        1,
+        "installed passthrough bytes were captured but not retained: diagnostics={:?}",
+        session.graphics_diagnostics()
+    );
+    session
+        .shutdown()
+        .expect("could not shut down kitten passthrough fixture");
+}
+
+#[test]
+#[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
+fn installed_kitten_animation_reaches_the_retained_frame_store() {
+    let path = write_image_fixture("animation", ANIMATED_GIF);
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(200_007),
+        Some("kitten"),
+        &[
+            "icat",
+            "--use-window-size",
+            "80,12,800,240",
+            "--place",
+            "1x1@0x0",
+            "--loop",
+            "1",
+            "--transfer-mode",
+            "stream",
+            "--stdin=no",
+            path.to_str().expect("fixture path is not valid UTF-8"),
+        ],
+        TerminalSize::with_pixels(80, 12, 800, 240),
+    )
+    .expect("could not spawn kitten animation fixture");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut image_id = None;
+    while Instant::now() < deadline {
+        session.poll_output().expect("kitten animation PTY failed");
+        image_id = session
+            .graphics(TERMINAL_AREA)
+            .first()
+            .map(|item| item.resource().image());
+        if image_id
+            .is_some_and(|image| session.graphics_animation_frame_count(image).unwrap_or(0) > 0)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = std::fs::remove_file(&path);
+    let image_id = image_id.expect("kitten emitted no retained animation image");
+    assert!(
+        session
+            .graphics_animation_frame_count(image_id)
+            .unwrap_or(0)
+            > 0,
+        "kitten emitted no retained animation frames: closed={}, failure={:?}, diagnostics={:?}",
+        session.is_closed(),
+        session.failure(),
+        session.graphics_diagnostics()
+    );
+    session
+        .shutdown()
+        .expect("could not shut down kitten animation fixture");
+}
+
+#[test]
+#[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
+fn installed_kitten_failure_path_does_not_create_a_graphics_frame() {
+    let missing = std::env::temp_dir().join(format!(
+        "cmdash-kitty-missing-{}-{}.gif",
+        std::process::id(),
+        200_008
+    ));
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(200_008),
+        Some("kitten"),
+        &[
+            "icat",
+            "--use-window-size",
+            "80,12,800,240",
+            "--transfer-mode",
+            "stream",
+            "--stdin=no",
+            missing.to_str().expect("fixture path is not valid UTF-8"),
+        ],
+        TerminalSize::with_pixels(80, 12, 800, 240),
+    )
+    .expect("could not spawn kitten failure fixture");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut rendered = String::new();
+    let mut submissions = Vec::new();
+    while Instant::now() < deadline {
+        session.poll_output().expect("kitten failure PTY failed");
+        submissions = session.graphics(TERMINAL_AREA);
+        let scene = session.render(TERMINAL_AREA, false);
+        rendered.clear();
+        for y in TERMINAL_AREA.y..TERMINAL_AREA.y.saturating_add(TERMINAL_AREA.height) {
+            for x in TERMINAL_AREA.x..TERMINAL_AREA.x.saturating_add(TERMINAL_AREA.width) {
+                if let Some(cell) = scene.cell_at(x, y) {
+                    rendered.push(cell.symbol);
+                }
+            }
+        }
+        if session.is_closed() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(submissions.is_empty());
+    assert!(
+        rendered.to_ascii_lowercase().contains("error")
+            || rendered.to_ascii_lowercase().contains("not found")
+            || rendered.to_ascii_lowercase().contains("no such")
+    );
+    session
+        .shutdown()
+        .expect("could not shut down kitten failure fixture");
 }

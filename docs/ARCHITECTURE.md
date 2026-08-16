@@ -296,12 +296,34 @@ bounded degraded marker. Primary/alternate screen anchors, DECSTBM region
 tracking, opaque scene occlusion, and cleanup generations are retained. Outer
 resources now keep generation/acknowledgement state: removed resources wait for
 the upload acknowledgement before deletion and are retired only after the delete
-acknowledgement. Image and placeholder regions are first-class retained scene
-layers; the compositor clips, orders, diffs, and occludes both before any
+acknowledgement. Missing or failed outer acknowledgements are retried by the UI
+coordinator with a fixed two-retry budget and a 250 ms deadline; cancellation
+abandons unacknowledged work while accepted resources still follow delete
+acknowledgement cleanup. Image and placeholder regions are first-class retained
+scene layers; the compositor clips, orders, diffs, and occludes both before any
 terminal-specific adapter emits bytes. A session-owned VT observer mirrors the
 emulator's private margins and scroll displacement so partial-region linefeeds,
 explicit scrolls, reverse index, origin mode, and resize resets move matching
 graphics anchors without confusing them with primary-screen scrollback.
+
+The protocol store accepts zlib-compressed direct payloads, normalizes retained
+payloads for safe replay, preserves source crops and explicit cursor policy,
+tracks bounded animation frames/control state, and implements the supported
+image/placement delete selectors. File, temporary-file, and shared-memory
+transfers are capability-negotiated but intentionally rejected with `ENOTSUP`
+until a sandboxed provider exists. The backend's direct and placeholder adapters
+serialize only direct payloads, while tmux passthrough wraps the same bytes with
+ESC doubling. Capture fixtures feed those complete streams into a bounded
+headless terminal model and assert both acceptance state and protocol responses.
+The incremental adapter also accepts payload-less control APCs used by Kitty
+animation/deletion commands, and the session carries zero-ID continuity to the
+most recently allocated image for subsequent frame/control actions. A bounded
+raw PTY capture is available for conformance diagnostics without becoming a
+second rendering source; installed-`kitten` fixtures use it to verify real
+placement, placeholder, passthrough, animation, and failure streams. Session
+resize, alternate-screen/scroll-region tracking, hidden-surface composition,
+overlay occlusion, reload/close ownership, and shutdown cleanup are validated
+before an outer adapter reports a rendered result.
 
 This is why a global image map or a single terminal emulator shared by tabs is explicitly out of scope.
 
@@ -366,7 +388,7 @@ Candidate crates are cataloged in [External library candidates](DEPENDENCIES.md)
 | PTY management | `portable-pty`, with narrow `nix` adapters if needed |
 | Escape parsing | Parser APIs exposed by `alacritty_terminal`, with `vte` only if a narrow adapter is required |
 | Terminal emulation | `alacritty_terminal`, one instance per session |
-| Kitty/image output | Cmdash-owned session adapter and retained `Scene` image layers; optional dependency-free sixel encoder/submission path for dashboard RGB images |
+| Kitty/image output | Cmdash-owned session adapter and retained `Scene` image layers; zlib decoding is isolated to bounded direct payloads, while the optional sixel encoder/submission path remains dependency-free |
 | Dynamic plugins | Versioned manifest plus opt-in Wasmtime host with no imports | Isolates plugin faults and keeps terminal/filesystem capabilities explicit |
 | Errors/logging | `thiserror`, `anyhow`, `tracing`, `tracing-subscriber` |
 | Config/serialization | `serde` + `toml` |
@@ -417,8 +439,12 @@ The core should be testable without a real terminal:
   replacement, z-order, placeholder references, viewport clipping, z-index
   occlusion, randomized chunk boundaries, malformed sequences, bounded input
   rejection, and delete-acknowledgement acceptance;
+- an optional one-pixel-per-cell headless RGB framebuffer that decodes bounded
+  RGB/RGBA fixtures, applies crops, alpha blending, clipping, z-order, deletion,
+  and placeholder pixels, including a PTY-to-outer-stream acceptance fixture;
 - acknowledgement-routing tests for upload success/failure, deferred deletion,
-  delete acknowledgement, resource retirement, and bounded graphics metrics;
+  delete acknowledgement, resource retirement, bounded retries/cancellation, and
+  graphics metrics;
 - fuzz targets and retained seed corpora for TOML migration, plugin manifests, Kitty APC chunking, and sixel encoding;
 - pane lifecycle tests for independent PTYs, nested layout persistence, and safe reload;
 - release archive, checksum, feature-variant, and startup checks on tagged builds;

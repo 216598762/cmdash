@@ -4,10 +4,33 @@ mod headless_kitty;
 use cmdash::{
     Backend, BackendCapabilities, CrosstermBackend, GraphicsCapabilityConfidence,
     GraphicsCapabilitySource, GraphicsSubmission, GraphicsSubmissionStatus, SessionGraphicsStore,
-    SessionId,
+    SessionId, TerminalSession, TerminalSize,
 };
 use headless_kitty::HeadlessKittyTerminal;
 use ratatui::layout::Rect;
+use std::{
+    io::{self, Write},
+    thread,
+    time::{Duration, Instant},
+};
+
+struct FailingWriter;
+
+impl Write for FailingWriter {
+    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "synthetic outer-terminal write failure",
+        ))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "synthetic outer-terminal flush failure",
+        ))
+    }
+}
 
 fn capabilities(
     kitty_graphics: bool,
@@ -202,6 +225,88 @@ fn headless_model_validates_placeholder_clipping_and_z_index_occlusion() {
 }
 
 #[test]
+fn headless_framebuffer_renders_rgb_pixels_and_applies_z_order() {
+    let stream = b"\x1b[1;1H\x1b_Ga=T,f=24,i=51,s=2,v=2,c=2,r=2,z=-2;/wAAAP8AAAD/////\x1b\\";
+    let terminal = HeadlessKittyTerminal::replay_with_framebuffer(stream, 4, 3).unwrap();
+
+    assert_eq!(terminal.framebuffer_size(), Some((4, 3)));
+    assert_eq!(
+        terminal.pixel(0, 0),
+        Some(headless_kitty::HeadlessPixel::rgb(255, 0, 0))
+    );
+    assert_eq!(
+        terminal.pixel(1, 0),
+        Some(headless_kitty::HeadlessPixel::rgb(0, 255, 0))
+    );
+    assert_eq!(
+        terminal.pixel(0, 1),
+        Some(headless_kitty::HeadlessPixel::rgb(0, 0, 255))
+    );
+    assert_eq!(
+        terminal.pixel(1, 1),
+        Some(headless_kitty::HeadlessPixel::rgb(255, 255, 255))
+    );
+    assert_eq!(terminal.visible_pixel_count(), 4);
+
+    let layered = b"\x1b[1;2H\x1b_Ga=T,f=24,i=61,s=1,v=1,c=1,r=1,z=-3;/wAA\x1b\\\x1b[1;2H\x1b_Ga=T,f=24,i=62,s=1,v=1,c=1,r=1,z=4;AP8A\x1b\\";
+    let terminal = HeadlessKittyTerminal::replay_with_framebuffer(layered, 4, 2).unwrap();
+    assert_eq!(
+        terminal.pixel(1, 0),
+        Some(headless_kitty::HeadlessPixel::rgb(0, 255, 0))
+    );
+}
+
+#[test]
+fn headless_framebuffer_applies_source_crops_and_delete_updates_pixels() {
+    let upload = b"\x1b_Ga=t,f=24,i=63,s=2,v=1; /wAA AAD/\x1b\\"
+        .iter()
+        .copied()
+        .filter(|byte| *byte != b' ')
+        .collect::<Vec<_>>();
+    let mut stream = upload;
+    stream.extend_from_slice(b"\x1b[1;1H\x1b_Ga=p,i=63,c=2,r=1,x=1,y=0,w=1,h=1;\x1b\\");
+    let terminal = HeadlessKittyTerminal::replay_with_framebuffer(&stream, 3, 1).unwrap();
+    assert_eq!(
+        terminal.pixel(0, 0),
+        Some(headless_kitty::HeadlessPixel::rgb(0, 0, 255))
+    );
+    assert_eq!(
+        terminal.pixel(1, 0),
+        Some(headless_kitty::HeadlessPixel::rgb(0, 0, 255))
+    );
+
+    let mut deleted = stream;
+    deleted.extend_from_slice(b"\x1b_Ga=d,d=i,i=63;\x1b\\");
+    let terminal = HeadlessKittyTerminal::replay_with_framebuffer(&deleted, 3, 1).unwrap();
+    assert_eq!(terminal.visible_pixel_count(), 0);
+    assert_eq!(terminal.resource_count(), 0);
+}
+
+#[test]
+fn headless_framebuffer_renders_unicode_placeholder_cells() {
+    let mut stream =
+        b"\x1b_Ga=T,f=24,i=71,s=2,v=1,c=2,r=1,U=1; /wAAAAD/\x1b\\\x1b[38;2;0;0;71m\x1b[1;1H"
+            .iter()
+            .copied()
+            .filter(|byte| *byte != b' ')
+            .collect::<Vec<_>>();
+    stream.extend_from_slice(
+        "\u{10eeee}\u{305}\u{305}\u{305}\u{10eeee}\u{305}\u{30d}\u{305}".as_bytes(),
+    );
+    let terminal = HeadlessKittyTerminal::replay_with_framebuffer(&stream, 3, 1).unwrap();
+
+    assert_eq!(
+        terminal.pixel(0, 0),
+        Some(headless_kitty::HeadlessPixel::rgb(255, 0, 0))
+    );
+    assert_eq!(
+        terminal.pixel(1, 0),
+        Some(headless_kitty::HeadlessPixel::rgb(0, 0, 255))
+    );
+    assert_eq!(terminal.visible_pixel_count(), 2);
+}
+
+#[test]
 fn headless_model_rejects_malformed_and_unbounded_streams() {
     let unterminated_apc = b"\x1b_Ga=T,f=24,i=1;AQID";
     assert!(
@@ -262,6 +367,56 @@ fn headless_model_rejects_malformed_and_unbounded_streams() {
             .unwrap_err()
             .contains("bounded input limit")
     );
+}
+
+#[test]
+fn pty_session_upload_reaches_a_rendered_headless_framebuffer() {
+    let script = r"printf '\033_Ga=T,f=24,i=91,s=2,v=2,c=2,r=2,q=2;/wAAAP8AAAD/////\033\\'";
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(91),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(20, 5),
+    )
+    .expect("could not spawn the framebuffer PTY fixture");
+    let area = Rect::new(0, 0, 20, 5);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let submissions = loop {
+        session.poll_output().expect("framebuffer PTY failed");
+        let submissions = session.graphics(area);
+        if !submissions.is_empty() || Instant::now() >= deadline {
+            break submissions;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(submissions.len(), 1);
+
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+    backend
+        .submit_graphics(&submissions, &submissions, &[])
+        .expect("outer adapter should serialize the PTY image");
+    let terminal = HeadlessKittyTerminal::replay_with_framebuffer(backend.writer(), 4, 3)
+        .expect("headless outer terminal should accept the PTY stream");
+    assert_eq!(
+        terminal.pixel(0, 0),
+        Some(headless_kitty::HeadlessPixel::rgb(255, 0, 0))
+    );
+    assert_eq!(
+        terminal.pixel(1, 0),
+        Some(headless_kitty::HeadlessPixel::rgb(0, 255, 0))
+    );
+    assert_eq!(
+        terminal.pixel(0, 1),
+        Some(headless_kitty::HeadlessPixel::rgb(0, 0, 255))
+    );
+    assert_eq!(
+        terminal.pixel(1, 1),
+        Some(headless_kitty::HeadlessPixel::rgb(255, 255, 255))
+    );
+    session
+        .shutdown()
+        .expect("could not shut down framebuffer PTY");
 }
 
 #[test]
@@ -503,6 +658,72 @@ fn resource_gc_waits_for_upload_ack_then_delete_ack() {
 }
 
 #[test]
+fn missing_outer_acknowledgements_are_retried_with_a_bounded_budget() {
+    let submission = captured_submission(15, 1, 1);
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+    backend
+        .submit_graphics(
+            std::slice::from_ref(&submission),
+            std::slice::from_ref(&submission),
+            &[],
+        )
+        .unwrap();
+    let original_len = backend.writer().len();
+    let now = Instant::now();
+    assert_eq!(
+        backend
+            .poll_graphics_retries(now + Duration::from_secs(1))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .poll_graphics_retries(now + Duration::from_secs(2))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .poll_graphics_retries(now + Duration::from_secs(3))
+            .unwrap(),
+        0
+    );
+    assert_eq!(backend.metrics().graphics_ack_failures, 1);
+    assert!(backend.writer().len() > original_len);
+}
+
+#[test]
+fn cancelling_outer_graphics_drops_unacknowledged_work_but_cleans_accepted_work() {
+    let submission = captured_submission(16, 1, 1);
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+    backend
+        .submit_graphics(
+            std::slice::from_ref(&submission),
+            std::slice::from_ref(&submission),
+            &[],
+        )
+        .unwrap();
+    let before_cancel = backend.writer().len();
+    backend.cancel_graphics_transfers().unwrap();
+    assert_eq!(backend.writer().len(), before_cancel);
+
+    backend
+        .submit_graphics(
+            std::slice::from_ref(&submission),
+            std::slice::from_ref(&submission),
+            &[],
+        )
+        .unwrap();
+    backend.feed_outer_input(b"\x1b_Gi=16;OK\x1b\\");
+    let before_cleanup = backend.writer().len();
+    backend.cancel_graphics_transfers().unwrap();
+    assert!(backend.writer().len() > before_cleanup);
+    assert!(backend.writer()[before_cleanup..].ends_with(b"\x1b_Ga=d,d=i,i=16;\x1b\\"));
+}
+
+#[test]
 fn outer_graphics_failures_are_reported_without_collecting_resources() {
     let submission = captured_submission(13, 1, 1);
     let mut backend = CrosstermBackend::new(Vec::new())
@@ -521,6 +742,195 @@ fn outer_graphics_failures_are_reported_without_collecting_resources() {
     assert_eq!(batch.graphics_acknowledgements[0].message, "ENOENT:missing");
     assert_eq!(backend.metrics().graphics_ack_failures, 1);
     assert_eq!(backend.metrics().graphics_gc, 0);
+}
+
+#[test]
+fn graphics_failure_paths_are_explicit_and_diagnostic() {
+    let submission = captured_submission(101, 1, 1);
+    let mut suppressed = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(false, false, false, false));
+    let status = suppressed
+        .submit_graphics(
+            std::slice::from_ref(&submission),
+            std::slice::from_ref(&submission),
+            &[],
+        )
+        .expect("unsupported graphics should be reported, not fail the frame");
+    assert!(matches!(
+        status,
+        GraphicsSubmissionStatus::Suppressed {
+            placements: 1,
+            ref reason
+        } if reason.contains("unavailable")
+    ));
+    assert!(suppressed.writer().is_empty());
+
+    let limits = cmdash::GraphicsLimits {
+        max_decoded_bytes: 2,
+        max_resources: 1,
+        max_placements: 1,
+    };
+    let mut quota_store = SessionGraphicsStore::with_limits(SessionId::new(102), limits);
+    quota_store
+        .apply_kitty_command(b"a=T,f=24,i=102", b"AQID")
+        .expect("quota rejection is a handled diagnostic outcome");
+    assert_eq!(quota_store.resource_count(), 0);
+    assert!(
+        quota_store
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message().contains("byte limit"))
+    );
+
+    let mut probe = cmdash::GraphicsCapabilityProbe::new(Duration::from_millis(1), 128);
+    let started = Instant::now();
+    probe.begin(started).expect("probe should start");
+    let report = probe
+        .poll_timeout(started + Duration::from_millis(2))
+        .expect("probe timeout should produce a report");
+    assert!(!report.kitty_graphics);
+    assert!(
+        report
+            .diagnostic
+            .as_deref()
+            .is_some_and(|message| message.contains("timeout"))
+    );
+
+    let mut write_failure = CrosstermBackend::new(FailingWriter)
+        .with_capabilities(capabilities(true, false, false, false));
+    let error = write_failure
+        .submit_graphics(
+            std::slice::from_ref(&submission),
+            std::slice::from_ref(&submission),
+            &[],
+        )
+        .expect_err("outer write failure must not become a successful frame");
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+}
+
+#[test]
+fn malformed_pty_graphics_become_session_diagnostics() {
+    let script = r"printf '\033_Ga=T,f=24,i=103;!!!!\033\\'; sleep 2";
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(103),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(20, 4),
+    )
+    .expect("could not spawn malformed graphics fixture");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline && session.graphics_diagnostics().is_empty() {
+        session.poll_output().expect("malformed fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        session
+            .graphics_diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message().contains("base64"))
+    );
+    assert!(session.graphics(Rect::new(0, 0, 20, 4)).is_empty());
+    session
+        .shutdown()
+        .expect("could not shut down malformed graphics fixture");
+}
+
+#[test]
+fn graphics_lifecycle_preserves_anchors_across_resize_and_clears_on_shutdown() {
+    let script = r"printf '\033[2;2H\033_Ga=T,f=24,i=104,c=2,r=1,q=2;AQID\033\\'; sleep 2";
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(104),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(20, 6),
+    )
+    .expect("could not spawn graphics lifecycle fixture");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let submissions = loop {
+        session.poll_output().expect("lifecycle fixture PTY failed");
+        let submissions = session.graphics(Rect::new(0, 0, 20, 6));
+        if !submissions.is_empty() || Instant::now() >= deadline {
+            break submissions;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].placement().area(), Rect::new(1, 1, 2, 1));
+
+    session
+        .resize(TerminalSize::new(30, 8))
+        .expect("graphics lifecycle resize should succeed");
+    let resized = session.graphics(Rect::new(5, 3, 20, 5));
+    assert_eq!(resized.len(), 1);
+    assert_eq!(resized[0].placement().area(), Rect::new(6, 4, 2, 1));
+
+    session
+        .shutdown()
+        .expect("could not shut down graphics lifecycle fixture");
+    assert!(session.is_closed());
+    assert!(session.graphics(Rect::new(0, 0, 30, 8)).is_empty());
+}
+
+#[test]
+fn compositor_clips_graphics_for_overlays_and_hidden_panes() {
+    let mut store = SessionGraphicsStore::new(SessionId::new(105));
+    store
+        .apply_kitty_command_with_context(b"a=T,f=24,i=105,c=6,r=2,q=2", b"AQID", (0, 0), (0, 0))
+        .unwrap();
+    let submission = store
+        .visible_submissions(Rect::new(0, 0, 8, 4))
+        .into_iter()
+        .next()
+        .expect("fixture image should have a placement");
+
+    let mut source = cmdash::Scene::new(Rect::new(0, 0, 8, 4));
+    source.add_image_layer(submission);
+    let mut composed = cmdash::Scene::new(Rect::new(0, 0, 8, 4));
+    composed.blit(&source, Rect::new(0, 0, 8, 4));
+
+    let overlay = cmdash::Scene::new(Rect::new(2, 0, 2, 2));
+    composed.blit(&overlay, overlay.area());
+    assert!(composed.image_layers().iter().all(|layer| {
+        let area = layer.placement().area();
+        area.x + area.width <= 2 || area.x >= 4 || area.y >= 2
+    }));
+
+    let mut hidden_surface = cmdash::Scene::new(Rect::new(0, 0, 8, 4));
+    hidden_surface.blit(&source, Rect::new(0, 0, 0, 0));
+    assert!(hidden_surface.image_layers().is_empty());
+}
+
+#[cfg(feature = "sixel")]
+#[test]
+fn sixel_adapter_is_accepted_as_a_bounded_outer_stream() {
+    use cmdash::{SixelImage, SixelSubmission};
+
+    let image = SixelSubmission::new(
+        1,
+        2,
+        SixelImage {
+            width: 1,
+            height: 1,
+            rgb: &[255, 255, 255],
+        },
+    )
+    .unwrap();
+    let capabilities = BackendCapabilities {
+        truecolor: true,
+        mouse: true,
+        bracketed_paste: true,
+        kitty_graphics: false,
+        kitty_unicode_placeholders: false,
+        graphics_source: GraphicsCapabilitySource::Unavailable,
+        graphics_confidence: GraphicsCapabilityConfidence::Rejected,
+        kitty_passthrough: false,
+        kitty_text_fallback: false,
+        sixel: true,
+    };
+    let mut backend = CrosstermBackend::new(Vec::new()).with_capabilities(capabilities);
+    backend.submit_sixel(&[image]).unwrap();
+    assert!(backend.writer().starts_with(b"\x1b[3;2H\x1bPq"));
+    assert!(backend.writer().ends_with(b"\x1b\\"));
 }
 
 #[test]

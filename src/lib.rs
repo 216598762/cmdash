@@ -49,12 +49,12 @@ pub use config::{
 };
 pub use crash::CrashReport;
 pub use graphics::{
-    GraphicsDiagnostic, GraphicsError, GraphicsGridAnchor, GraphicsInputDemultiplexer,
-    GraphicsLimits, GraphicsPlaceholderLayer, GraphicsPlacement, GraphicsProtocolAdapter,
-    GraphicsProtocolBroker, GraphicsProtocolCommand, GraphicsProtocolError, GraphicsProtocolEvent,
-    GraphicsResourceId, GraphicsResponse, GraphicsResponseDestination, GraphicsScreen,
-    GraphicsScrollRegion, GraphicsSubmission, OuterInputEvent, SessionGraphicsStore,
-    kitty_error_response,
+    GraphicsAnimationState, GraphicsDiagnostic, GraphicsError, GraphicsGridAnchor,
+    GraphicsInputDemultiplexer, GraphicsLimits, GraphicsPlaceholderLayer, GraphicsPlacement,
+    GraphicsProtocolAdapter, GraphicsProtocolBroker, GraphicsProtocolCommand,
+    GraphicsProtocolError, GraphicsProtocolEvent, GraphicsResourceId, GraphicsResponse,
+    GraphicsResponseDestination, GraphicsScreen, GraphicsScrollRegion, GraphicsSourceRect,
+    GraphicsSubmission, OuterInputEvent, SessionGraphicsStore, kitty_error_response,
 };
 pub use input::command_for_key;
 pub use layout::{LayoutError, LayoutNode, LayoutTree};

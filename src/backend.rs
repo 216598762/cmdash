@@ -90,12 +90,18 @@ struct ByteCountingWriter<W> {
     bytes_written: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+const GRAPHICS_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_GRAPHICS_RETRIES: u8 = 2;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct UploadedGraphicsResource {
     generation: u64,
     acknowledged: bool,
     pending_delete: bool,
     delete_sent: bool,
+    retries: u8,
+    last_sent: Instant,
+    last_command: Vec<u8>,
 }
 
 impl<W> ByteCountingWriter<W> {
@@ -596,6 +602,12 @@ pub trait Backend {
         }
     }
 
+    /// Gives an outer adapter a coordinator-owned opportunity to retry bounded
+    /// graphics transfers. Backends without acknowledgement state do nothing.
+    fn poll_graphics_retries(&mut self, _now: Instant) -> Result<usize, Self::Error> {
+        Ok(0)
+    }
+
     fn submit_graphics(
         &mut self,
         _changed: &[GraphicsSubmission],
@@ -791,26 +803,69 @@ impl<W: Write> CrosstermBackend<W> {
         self.writer.flush()
     }
 
-    fn clear_uploaded_graphics(&mut self) -> io::Result<()> {
-        for image_id in self
-            .uploaded_generations
-            .keys()
-            .copied()
-            .collect::<Vec<_>>()
-        {
-            self.write_graphics_delete(image_id)?;
-        }
-        self.uploaded_generations.clear();
-        self.writer.flush()
+    fn track_uploaded_resource(&mut self, image_id: u32, generation: u64, command: Vec<u8>) {
+        self.uploaded_generations.insert(
+            image_id,
+            UploadedGraphicsResource {
+                generation,
+                acknowledged: false,
+                pending_delete: false,
+                delete_sent: false,
+                retries: 0,
+                last_sent: Instant::now(),
+                last_command: command,
+            },
+        );
     }
 
-    fn write_graphics_delete(&mut self, image_id: u32) -> io::Result<()> {
+    fn direct_upload_bytes(&self, submission: &GraphicsSubmission) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        queue!(
+            &mut bytes,
+            MoveTo(submission.placement().x(), submission.placement().y())
+        )?;
         if self.capabilities.kitty_graphics_mode() == KittyGraphicsMode::Passthrough {
-            write_passthrough_command(&mut self.writer, |buffer| {
+            write_passthrough_command(&mut bytes, |buffer| {
+                write_direct_upload(buffer, submission)
+            })?;
+        } else {
+            write_direct_upload(&mut bytes, submission)?;
+        }
+        Ok(bytes)
+    }
+
+    fn placeholder_upload_bytes(&self, submission: &GraphicsSubmission) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        write_placeholder_upload(&mut bytes, submission)?;
+        Ok(bytes)
+    }
+
+    fn clear_uploaded_graphics(&mut self) -> io::Result<()> {
+        // Leaving the backend is cancellation, not proof that the outer
+        // terminal accepted an upload. Accepted resources still receive the
+        // normal delete command; unacknowledged work is simply abandoned.
+        self.cancel_graphics_transfers()
+    }
+
+    fn graphics_delete_bytes(&self, image_id: u32) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        if self.capabilities.kitty_graphics_mode() == KittyGraphicsMode::Passthrough {
+            write_passthrough_command(&mut bytes, |buffer| {
                 write!(buffer, "\x1b_Ga=d,d=i,i={};\x1b\\", image_id)
             })?;
         } else {
-            write!(self.writer, "\x1b_Ga=d,d=i,i={};\x1b\\", image_id)?;
+            write!(&mut bytes, "\x1b_Ga=d,d=i,i={};\x1b\\", image_id)?;
+        }
+        Ok(bytes)
+    }
+
+    fn write_graphics_delete(&mut self, image_id: u32) -> io::Result<()> {
+        let bytes = self.graphics_delete_bytes(image_id)?;
+        self.writer.write_all(&bytes)?;
+        if let Some(resource) = self.uploaded_generations.get_mut(&image_id) {
+            resource.last_command = bytes;
+            resource.retries = 0;
+            resource.last_sent = Instant::now();
         }
         Ok(())
     }
@@ -851,6 +906,8 @@ impl<W: Write> CrosstermBackend<W> {
             return Ok(());
         }
         resource.acknowledged = true;
+        resource.retries = 0;
+        resource.last_command.clear();
         let request_delete = resource.pending_delete && !resource.delete_sent;
         if request_delete {
             resource.delete_sent = true;
@@ -860,6 +917,62 @@ impl<W: Write> CrosstermBackend<W> {
             self.writer.flush()?;
         }
         Ok(())
+    }
+
+    /// Retries unacknowledged uploads/deletes with a small fixed budget. The
+    /// coordinator can call this from its existing wakeable timer path; no
+    /// background graphics worker is created and no PTY polling is involved.
+    pub fn poll_graphics_retries(&mut self, now: Instant) -> io::Result<usize> {
+        let due = self
+            .uploaded_generations
+            .iter()
+            .filter(|(_, resource)| {
+                !resource.last_command.is_empty()
+                    && now.saturating_duration_since(resource.last_sent) >= GRAPHICS_ACK_TIMEOUT
+            })
+            .map(|(image_id, _)| *image_id)
+            .collect::<Vec<_>>();
+        let mut retried = 0;
+        for image_id in due {
+            let Some(resource) = self.uploaded_generations.get(&image_id) else {
+                continue;
+            };
+            if resource.retries >= MAX_GRAPHICS_RETRIES {
+                self.graphics_ack_failures += 1;
+                if let Some(resource) = self.uploaded_generations.get_mut(&image_id) {
+                    resource.last_command.clear();
+                }
+                continue;
+            }
+            let command = resource.last_command.clone();
+            self.writer.write_all(&command)?;
+            if let Some(resource) = self.uploaded_generations.get_mut(&image_id) {
+                resource.retries = resource.retries.saturating_add(1);
+                resource.last_sent = now;
+            }
+            retried += 1;
+        }
+        if retried != 0 {
+            self.writer.flush()?;
+        }
+        Ok(retried)
+    }
+
+    /// Cancels pending outer transfers without pretending that an unacknowledged
+    /// upload reached the terminal. Already accepted resources are cleaned up
+    /// through the normal acknowledgement-gated delete path.
+    pub fn cancel_graphics_transfers(&mut self) -> io::Result<()> {
+        let acknowledged = self
+            .uploaded_generations
+            .iter()
+            .filter_map(|(image_id, resource)| resource.acknowledged.then_some(*image_id))
+            .collect::<Vec<_>>();
+        for image_id in acknowledged {
+            self.request_graphics_delete(image_id)?;
+        }
+        self.uploaded_generations
+            .retain(|_, resource| resource.acknowledged);
+        self.writer.flush()
     }
 }
 
@@ -1029,14 +1142,10 @@ impl<W: Write> Backend for CrosstermBackend<W> {
                     .is_none_or(|resource| resource.generation != submission.generation());
                 if needs_upload {
                     write_placeholder_upload(&mut self.writer, submission)?;
-                    self.uploaded_generations.insert(
+                    self.track_uploaded_resource(
                         physical_id,
-                        UploadedGraphicsResource {
-                            generation: submission.generation(),
-                            acknowledged: false,
-                            pending_delete: false,
-                            delete_sent: false,
-                        },
+                        submission.generation(),
+                        self.placeholder_upload_bytes(submission)?,
                     );
                     self.graphics_uploads += 1;
                     self.graphics_bytes += submission.encoded_payload().len() as u64;
@@ -1080,14 +1189,10 @@ impl<W: Write> Backend for CrosstermBackend<W> {
                 } else {
                     write_direct_upload(&mut self.writer, submission)?;
                 }
-                self.uploaded_generations.insert(
+                self.track_uploaded_resource(
                     physical_id,
-                    UploadedGraphicsResource {
-                        generation: submission.generation(),
-                        acknowledged: false,
-                        pending_delete: false,
-                        delete_sent: false,
-                    },
+                    submission.generation(),
+                    self.direct_upload_bytes(submission)?,
                 );
                 self.graphics_uploads += 1;
                 self.graphics_bytes += submission.encoded_payload().len() as u64;
@@ -1126,6 +1231,10 @@ impl<W: Write> Backend for CrosstermBackend<W> {
 
     fn feed_outer_input(&mut self, bytes: &[u8]) -> OuterInputBatch {
         CrosstermBackend::feed_outer_input(self, bytes)
+    }
+
+    fn poll_graphics_retries(&mut self, now: Instant) -> Result<usize, Self::Error> {
+        CrosstermBackend::poll_graphics_retries(self, now)
     }
 
     fn submit_diff(&mut self, diff: &FrameDiff) -> Result<(), Self::Error> {
@@ -1341,7 +1450,25 @@ fn write_direct_placement<W: Write>(
     if placement.z_index() != 0 {
         write!(writer, ",z={}", placement.z_index())?;
     }
+    write_source_crop(writer, placement)?;
     writer.write_all(b";\x1b\\")
+}
+
+fn write_source_crop<W: Write>(
+    writer: &mut W,
+    placement: &crate::graphics::GraphicsPlacement,
+) -> io::Result<()> {
+    if let Some(source) = placement.source() {
+        write!(
+            writer,
+            ",x={},y={},w={},h={}",
+            source.x(),
+            source.y(),
+            source.width(),
+            source.height()
+        )?;
+    }
+    Ok(())
 }
 
 fn write_passthrough_command<W: Write>(
@@ -1386,6 +1513,7 @@ fn write_direct_upload<W: Write>(
     if placement.z_index() != 0 {
         write!(writer, ",z={}", placement.z_index())?;
     }
+    write_source_crop(writer, placement)?;
     writer.write_all(b";")?;
     writer.write_all(submission.encoded_payload())?;
     writer.write_all(b"\x1b\\")
@@ -1409,6 +1537,7 @@ fn write_placeholder_upload<W: Write>(
     if placement.z_index() != 0 {
         write!(writer, ",z={}", placement.z_index())?;
     }
+    write_source_crop(writer, placement)?;
     writer.write_all(b";")?;
     writer.write_all(submission.encoded_payload())?;
     writer.write_all(b"\x1b\\")

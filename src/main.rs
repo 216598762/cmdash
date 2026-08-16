@@ -181,6 +181,10 @@ where
 {
     let mut frame_generation = 0_u64;
     loop {
+        // Outer graphics acknowledgements are asynchronous; retry policy is
+        // coordinator-owned and shares the existing wakeable loop rather than
+        // creating a graphics-specific worker or PTY polling timer.
+        backend.poll_graphics_retries(Instant::now())?;
         context.maintenance_waker.schedule_cursor_blink(
             state.cursor_blink_schedule(),
             state.cursor_blink_generation(),

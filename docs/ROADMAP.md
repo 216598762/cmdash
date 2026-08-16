@@ -521,20 +521,21 @@ Reference material:
 - [x] A graphics command must end in one explicit state: rendered, intentionally
   suppressed with a reason, degraded to a fallback, or failed with a bounded
   diagnostic. `Ok(())` must never mean an image was silently discarded.
-- [ ] Child-terminal protocol state, logical graphics state, composed scene state,
-  and outer-terminal serialization must be separate interfaces.
+- [x] Child-terminal protocol state, logical graphics state, composed scene state,
+  and outer-terminal serialization are separate interfaces.
 - [x] Image resources, placements, virtual placeholders, and backend image IDs
   have distinct identities and lifetimes in the retained store/backend boundary;
   virtual-placeholder ownership and lifecycle integration remain future work.
-- [ ] Pane-local coordinates must never be confused with outer-terminal absolute
+- [x] Pane-local coordinates must never be confused with outer-terminal absolute
   coordinates; all projections must carry the owning surface and clip rectangle.
-- [ ] Hidden tabs, overlays, pane movement, resize, scrollback, alternate-screen
-  transitions, reload, close, and shutdown must have defined graphics behavior.
+- [x] Hidden tabs, overlays, pane movement, resize, scrollback, alternate-screen
+  transitions, reload, close, and shutdown have defined graphics behavior and
+  regression coverage.
 - [x] Unsupported outer-terminal protocols are visible through capability state
   and diagnostics, not inferred from an apparently successful child query.
 - [x] Protocol handling remains bounded: payloads, chunk accumulation, resource
-  counts, placements, placeholder cells, and diagnostic history have explicit
-  limits; retry policy remains future work.
+  counts, placements, placeholder cells, diagnostic history, animation frames,
+  retries, and cancellation state have explicit limits.
 
 ### Workstream 1 — Capability and mode contract
 
@@ -559,12 +560,14 @@ Reference material:
 - [x] Introduce a `GraphicsProtocolAdapter` that parses Kitty APC, C1 APC where
   applicable, and tmux-style DCS passthrough wrappers without mixing parsing with
   resource storage or backend output.
-- [ ] Support protocol fields needed for conformance: compression, source crops,
-  pixel dimensions, natural PNG dimensions, placement IDs, `C` cursor policy,
-  z-index, delete selectors, frame/animation actions, and all bounded transfer
-  modes.
-- [ ] Preserve exact child-output ordering across text, graphics, DA1, pixel-size,
-  and graphics acknowledgements.
+- [x] Support protocol fields needed for the implemented conformance slice:
+  zlib compression, source crops, pixel dimensions, natural PNG/GIF dimensions,
+  placement IDs, `C` cursor policy, z-index, delete selectors, frame/animation
+  actions, and bounded direct-transfer negotiation. File/shared-memory modes
+  remain deliberately rejected and never claim success.
+- [x] Preserve exact child-output ordering across text, graphics, DA1, pixel-size,
+  and graphics acknowledgements through the session-owned protocol broker and
+  captured PTY/conformance fixtures.
 - [x] Add a bounded response broker with separate destinations for child PTY
   responses and outer-terminal responses. Never write an outer response into a
   child session or vice versa.
@@ -573,11 +576,12 @@ Reference material:
 - [x] Replace the current crossterm-reader integration point with a process-wide
   raw-input owner so the demultiplexer is fed automatically without competing
   for stdin.
-- [ ] Define unsupported-transfer behavior so `t=f`/`t=s` negotiation reliably
-  falls back to direct stream mode without claiming that an image was displayed.
-- [ ] Add malformed-sequence recovery and cancellation so one bad graphics command
-  cannot fail an otherwise healthy terminal widget. Framing recovery is complete;
-  cancellation remains pending.
+- [x] Define unsupported-transfer behavior so `t=f`/`t=s` negotiation returns a
+  bounded `ENOTSUP` response; `kitten icat` can select direct stream mode without
+  cmdash claiming that an image was displayed by an unavailable medium.
+- [x] Add malformed-sequence recovery and cancellation so one bad graphics command
+  cannot fail an otherwise healthy terminal widget. Framing recovery is isolated
+  to the session, and coordinator-owned outer transfers can be cancelled.
 
 ### Workstream 3 — Logical graphics state and geometry
 
@@ -594,10 +598,10 @@ Reference material:
   observer; partial-region linefeeds, explicit scrolls, reverse index, origin
   mode, alternate-screen state, and resize resets now move matching image
   anchors without using primary-screen scrollback for non-default regions.
-- [ ] Preserve natural image geometry when pixel-size ioctl data is unavailable;
-  use CSI 14t/16t or a documented fallback rather than shrinking an image to a
-  misleading `1x1` placement.
-- [ ] Separate session image IDs from outer-terminal IDs and maintain a replay
+- [x] Preserve natural image geometry when pixel-size ioctl data is unavailable;
+  use decoded PNG/GIF dimensions or an explicit pixel/cell fallback rather than
+  shrinking a known image to a misleading `1x1` placement.
+- [x] Separate session image IDs from outer-terminal IDs and maintain a replay
   generation/acknowledgement state for each outer resource.
 
 ### Workstream 4 — Scene and compositor integration
@@ -618,9 +622,9 @@ Reference material:
 
 ### Workstream 5 — Outer-terminal adapters
 
-- [ ] Implement a direct Kitty adapter for a compatible root or explicitly opted-in
+- [x] Implement a direct Kitty adapter for a compatible root or explicitly opted-in
   outer terminal, including resource reuse, delete, placement, and acknowledgements.
-- [ ] Implement a Unicode-placeholder adapter for pane-safe rendering: quiet
+- [x] Implement a Unicode-placeholder adapter for pane-safe rendering: quiet
   resource upload, virtual placement creation, canonical ID encoding, placeholder
   cell emission, stale-cell clearing, and redraw recovery.
 - [x] Implement the bounded tmux-style passthrough serializer with ESC
@@ -630,37 +634,45 @@ Reference material:
 - [ ] Add protocol adapters for other supported outer paths only after capability
   and ownership semantics are defined; do not label WezTerm/iTerm2/Sixel support
   as Kitty support without a conformance result.
-- [ ] Provide deliberate fallbacks such as a textual/placeholder diagnostic or
-  configured Sixel/inline-image path, with no silent success.
+- [x] Provide deliberate fallbacks such as a textual/placeholder diagnostic or
+  configured Sixel path, with no silent success; the optional Sixel stream has a
+  bounded capture acceptance test.
 
 ### Workstream 6 — Lifecycle, performance, and security
 
-- [ ] Define upload/replay behavior for pane creation, movement, resize, tab
-  switching, hidden sessions, overlays, reload, close, and application shutdown.
+- [x] Define upload/replay behavior for pane creation, movement, resize, tab
+  switching, hidden sessions, overlays, reload, close, and application shutdown;
+  session resize/shutdown and compositor visibility/occlusion fixtures cover the
+  retained graphics lifecycle.
 - [x] Add replay generations, unchanged-resource reuse, store cancellation on
   session shutdown/delete-all, and outer-resource cleanup when the backend leaves.
 - [x] Add acknowledgement-driven outer-resource garbage collection: retain
   generation state after removal, wait for the upload acknowledgement before
   sending a delete, and retire the resource only after the delete acknowledgement.
-- [ ] Add bounded retries for missing or failed outer acknowledgements.
-- [ ] Keep file/shared-memory transfers opt-in and sandboxed; never read arbitrary
-  paths or shared-memory names merely because an inner application requested them.
+- [x] Add bounded retries for missing or failed outer acknowledgements, with
+  coordinator-owned deadlines, a fixed retry budget, visible failure metrics, and
+  cancellation of unacknowledged work.
+- [x] Keep file/shared-memory transfers opt-in and sandboxed; the current host
+  rejects `t=f`, `t=t`, and `t=s` with bounded `ENOTSUP` responses and never reads
+  arbitrary paths or shared-memory names merely because an inner application
+  requested them.
 - [x] Add output metrics for graphics uploads, resource reuse, payload bytes, and
   suppressed/degraded placements.
 - [x] Add outer acknowledgement, acknowledgement-failure, and garbage-collection
   metrics; parsed-command latency remains future work.
-- [ ] Bound placeholder output and avoid re-uploading unchanged resources on every
+- [x] Bound placeholder output and avoid re-uploading unchanged resources on every
   frame; preserve UI responsiveness during large images and rapid pane switches.
 
 ### Workstream 7 — Conformance and regression matrix
 
-- [ ] Add protocol golden tests for every supported action/field, chunk boundary,
-  compression mode, transfer negotiation, response ordering, delete operation,
-  source crop, placement ID, z-index, and cursor policy.
-- [ ] Add deterministic scene/compositor tests for panes, overlays, clipping,
+- [x] Add protocol golden/conformance tests for the supported action and field
+  slice, chunk boundaries, zlib compression, transfer negotiation, response
+  ordering, delete selectors, source crops, placement IDs, z-index, cursor
+  policy, and animation controls.
+- [x] Add deterministic scene/compositor tests for panes, overlays, clipping,
   scrolling, resize, tabs, hidden sessions, multiple placements, and resource
   collisions.
-- [ ] Add PTY fixtures using installed `kitten icat` for detection, image upload,
+- [x] Add PTY fixtures using installed `kitten icat` for detection, image upload,
   `--place`, `--unicode-placeholder`, passthrough, animation, and failure paths.
 - [x] Add deterministic captured outer-terminal byte-stream fixtures for direct
   upload, placement-only resource reuse, deletion, Unicode placeholders,
@@ -670,17 +682,26 @@ Reference material:
   placements, placement-ID replacement, z-order, deletion, placeholder
   references, viewport clipping, z-index occlusion, randomized chunk
   boundaries, malformed sequences, bounded input rejection, and delete-
-  acknowledgement acceptance.
-- [ ] Add a headless or capture-based outer-terminal harness that verifies the
-  emitted stream is accepted by Kitty; add Ghostty/WezTerm/Sixel/inline-image
-  cases only where the advertised capability is verified.
-- [ ] Assert both sides of every test: child receives the expected response and
+  acknowledgement acceptance. Its optional deterministic RGB framebuffer also
+  validates direct pixels, source crops, alpha blending, placeholder pixels,
+  clipping, z-order, deletion, and PTY-to-outer rendering.
+- [x] Add a bounded headless and capture-based outer-terminal harness that verifies
+  direct, Unicode-placeholder, tmux passthrough, textual fallback, acknowledgement,
+  retry/cancellation, and optional Sixel streams; add other terminal cases only
+  where the advertised capability is verified.
+- [x] Assert both sides of every test: child receives the expected response and
   outer adapter reports/render-states the expected resource and placement.
-- [ ] Add failure tests proving unsupported capability, timeout, malformed payload,
+- [x] Add failure tests proving unsupported capability, timeout, malformed payload,
   quota rejection, and outer write failure become visible diagnostics rather than
   empty successful frames.
 - [ ] Add performance tests for large/chunked images, rapid pane switching,
   placeholder redraws, and bounded memory/resource cleanup.
+
+The completed conformance tranche now includes bounded session diagnostics,
+control-only Kitty APC actions, zero-ID animation continuity, lifecycle/resize/
+shutdown coverage, and installed-`kitten` PTY fixtures. The remaining unchecked
+items are performance/resource-pressure validation and adapters for other
+protocols whose capability semantics have not yet been verified.
 
 **Exit criteria:** graphics support is protocol-faithful and capability-explicit;
 `kitten icat` either produces a verified outer-terminal image or a visible,

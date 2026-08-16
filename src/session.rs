@@ -24,6 +24,8 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
 
+const MAX_GRAPHICS_PROTOCOL_CAPTURE_BYTES: usize = 256 * 1024;
+
 use crate::{
     appearance::Theme,
     graphics::{
@@ -555,6 +557,7 @@ pub struct TerminalSession {
     graphics: SessionGraphicsStore,
     graphics_broker: GraphicsProtocolBroker,
     graphics_protocol: GraphicsProtocolAdapter,
+    graphics_protocol_capture: Vec<u8>,
     selection: Option<Selection>,
 }
 
@@ -647,6 +650,7 @@ impl TerminalSession {
             graphics: SessionGraphicsStore::new(session_id),
             graphics_broker: GraphicsProtocolBroker::default(),
             graphics_protocol: GraphicsProtocolAdapter::default(),
+            graphics_protocol_capture: Vec::new(),
             selection: None,
         })
     }
@@ -679,6 +683,24 @@ impl TerminalSession {
 
     pub fn graphics_diagnostics(&self) -> &[crate::graphics::GraphicsDiagnostic] {
         self.graphics.diagnostics()
+    }
+
+    pub fn graphics_animation_frame_count(&self, image: u32) -> Option<usize> {
+        self.graphics.animation_frame_count(image)
+    }
+
+    pub fn graphics_animation_state(
+        &self,
+        image: u32,
+    ) -> Option<crate::graphics::GraphicsAnimationState> {
+        self.graphics.animation_state(image)
+    }
+
+    /// Returns the bounded raw PTY capture used by protocol conformance tests
+    /// and diagnostics. It includes text alongside graphics bytes and is never
+    /// used as the source of rendering state.
+    pub fn graphics_protocol_capture(&self) -> &[u8] {
+        &self.graphics_protocol_capture
     }
 
     pub fn set_kitty_graphics_support(&mut self, supported: bool) {
@@ -758,6 +780,10 @@ impl TerminalSession {
     }
 
     fn consume_output(&mut self, bytes: &[u8]) -> Result<bool, SessionError> {
+        let remaining = MAX_GRAPHICS_PROTOCOL_CAPTURE_BYTES
+            .saturating_sub(self.graphics_protocol_capture.len());
+        self.graphics_protocol_capture
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
         let events = match self.graphics_protocol.feed(bytes) {
             Ok(events) => events,
             Err(error) => {
