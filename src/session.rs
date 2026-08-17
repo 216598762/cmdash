@@ -34,6 +34,10 @@ const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 /// Upper bound on a single extracted shell-integration notification.
 const MAX_NOTIFICATION_BYTES: usize = 256;
 
+/// How long a session waits for the outer terminal to answer an OSC 52
+/// clipboard-read query before falling back to the session's cached copy.
+const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
 use crate::{
     appearance::Theme,
     backend::kitty_diacritic_index,
@@ -139,9 +143,14 @@ pub enum UiEvent {
     /// Bytes classified by the process-wide raw-input owner as outer-terminal
     /// graphics responses, before crossterm's event decoder sees them.
     OuterInput(Vec<u8>),
+    /// Bytes classified as an outer-terminal OSC 52 clipboard-read response.
+    OuterClipboard(Vec<u8>),
     PtyOutput,
     /// A child application copied text to the clipboard via OSC 52.
     ClipboardStore(String),
+    /// A child application requested the clipboard via OSC 52; the frontend
+    /// should query the outer terminal and deliver the answer back.
+    ClipboardRead(SessionId),
     /// The terminal bell rang in a session (`BEL`), for a visual signal.
     Bell(SessionId),
     /// Bounded shell-integration metadata (OSC 9/777 notify) from a session.
@@ -196,11 +205,29 @@ struct SessionOutput {
 /// Shells use these requests for capability negotiation. In particular, fish
 /// sends a Primary Device Attribute query during startup and waits for the
 /// emulator's response before continuing.
+type ClipboardFormatter = Arc<dyn Fn(&str) -> String + Sync + Send + 'static>;
+
+/// A child's outstanding OSC 52 clipboard-read, held until the outer terminal
+/// answers (or the read times out and the cached copy is used as a fallback).
+#[derive(Default)]
+struct PendingClipboardLoad {
+    formatter: Option<ClipboardFormatter>,
+    deadline: Option<Instant>,
+}
+
+impl PendingClipboardLoad {
+    fn take(&mut self) -> Option<ClipboardFormatter> {
+        self.deadline = None;
+        self.formatter.take()
+    }
+}
+
 struct SessionEventListener {
     pty_writer: Sender<String>,
     size: Arc<Mutex<TerminalSize>>,
     ui: Option<Sender<UiEvent>>,
     clipboard: Arc<Mutex<Option<String>>>,
+    pending_clipboard: Arc<Mutex<PendingClipboardLoad>>,
     session_id: SessionId,
 }
 
@@ -237,13 +264,27 @@ impl EventListener for SessionEventListener {
                 }
             }
             Event::ClipboardLoad(_, formatter) => {
-                let content = self
-                    .clipboard
-                    .lock()
-                    .expect("clipboard mutex poisoned")
-                    .clone()
-                    .unwrap_or_default();
-                self.send_to_pty(formatter(&content));
+                if let Some(ui) = &self.ui {
+                    // Defer answering until the outer terminal's system
+                    // clipboard arrives, falling back to the session cache if
+                    // the read times out. Without a frontend there is no host
+                    // terminal to query, so answer from the cache immediately.
+                    let mut pending = self
+                        .pending_clipboard
+                        .lock()
+                        .expect("clipboard mutex poisoned");
+                    pending.formatter = Some(formatter);
+                    pending.deadline = Some(Instant::now() + CLIPBOARD_READ_TIMEOUT);
+                    let _ = ui.send(UiEvent::ClipboardRead(self.session_id));
+                } else {
+                    let content = self
+                        .clipboard
+                        .lock()
+                        .expect("clipboard mutex poisoned")
+                        .clone()
+                        .unwrap_or_default();
+                    self.send_to_pty(formatter(&content));
+                }
             }
             Event::Bell => {
                 if let Some(ui) = &self.ui {
@@ -646,6 +687,8 @@ pub struct TerminalSession {
     selection: Option<Selection>,
     scrollback_limit: usize,
     ui: Option<Sender<UiEvent>>,
+    clipboard: Arc<Mutex<Option<String>>>,
+    pending_clipboard: Arc<Mutex<PendingClipboardLoad>>,
     session_id: SessionId,
 }
 
@@ -727,12 +770,14 @@ impl TerminalSession {
         // 52 copy/paste path: `CSI > 1 u` pushes the disambiguation mode, `CSI
         // ? u` is answered with the active flags, and `key_bytes` consults
         // `term.mode()` when forwarding keys. OSC 52 store/load are forwarded
-        // to the session's clipboard cache and the frontend.
+        // to the session's clipboard cache and the frontend; a load is deferred
+        // until the outer terminal's system clipboard answers the read query.
         let config = Config {
             kitty_keyboard: true,
             osc52: Osc52::CopyPaste,
             ..Config::default()
         };
+        let pending_clipboard = Arc::new(Mutex::new(PendingClipboardLoad::default()));
         let term = Term::new(
             config,
             &size,
@@ -741,6 +786,7 @@ impl TerminalSession {
                 size: Arc::clone(&reported_size),
                 ui: ui.clone(),
                 clipboard: Arc::clone(&clipboard),
+                pending_clipboard: Arc::clone(&pending_clipboard),
                 session_id,
             },
         );
@@ -766,6 +812,8 @@ impl TerminalSession {
             selection: None,
             scrollback_limit: 10_000,
             ui,
+            clipboard,
+            pending_clipboard,
             session_id,
         })
     }
@@ -937,7 +985,32 @@ impl TerminalSession {
         if self.flush_expired_sync_output() {
             changed = true;
         }
+        // Answer a deferred OSC 52 clipboard-read from the session cache if
+        // the outer terminal did not respond before the timeout, so a child
+        // waiting on the clipboard cannot hang.
+        self.poll_clipboard_load()?;
         Ok(changed)
+    }
+
+    /// Answers a deferred OSC 52 clipboard-read from the session cache once
+    /// its outer-terminal query has timed out.
+    fn poll_clipboard_load(&mut self) -> Result<(), SessionError> {
+        let expired = self
+            .pending_clipboard
+            .lock()
+            .expect("clipboard mutex poisoned")
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if !expired {
+            return Ok(());
+        }
+        let fallback = self
+            .clipboard
+            .lock()
+            .expect("clipboard mutex poisoned")
+            .clone()
+            .unwrap_or_default();
+        self.answer_clipboard_load(&fallback)
     }
 
     /// Flushes a pending synchronized-output burst when its timeout has
@@ -1177,6 +1250,21 @@ impl TerminalSession {
             .write_all(bytes)
             .and_then(|_| self.writer.flush())
             .map_err(|error| SessionError::Io(error.to_string()))
+    }
+
+    /// Answers a deferred OSC 52 clipboard-read with the host terminal's
+    /// decoded clipboard content. No-op when no read is pending, so the
+    /// frontend can broadcast a response to every terminal widget.
+    pub fn answer_clipboard_load(&mut self, text: &str) -> Result<(), SessionError> {
+        let formatter = self
+            .pending_clipboard
+            .lock()
+            .expect("clipboard mutex poisoned")
+            .take();
+        if let Some(formatter) = formatter {
+            self.write_bytes(formatter(text).as_bytes())?;
+        }
+        Ok(())
     }
 
     pub fn write_key(&mut self, key: KeyEvent) -> Result<(), SessionError> {
@@ -2896,6 +2984,118 @@ mod tests {
             session.emulator_responses.try_recv().unwrap(),
             "\x1b]52;c;aGVsbG8=\x07"
         );
+        session.shutdown().unwrap();
+    }
+
+    /// Whether a session is still waiting on an outer-terminal clipboard read.
+    fn has_pending_clipboard_load(session: &TerminalSession) -> bool {
+        session
+            .pending_clipboard
+            .lock()
+            .unwrap()
+            .formatter
+            .is_some()
+    }
+
+    #[test]
+    fn osc52_load_defers_to_the_outer_terminal_when_a_frontend_is_present() {
+        let (_, receiver, wakeup) = ui_event_channel();
+        let clipboard = Arc::new(Mutex::new(Some("cached".to_owned())));
+        let mut session = TerminalSession::spawn_with_session_id_and_wakeup(
+            SessionId::new(12),
+            Some("sh"),
+            &["-c", "sleep 5"],
+            TerminalSize::new(20, 4),
+            Some(wakeup),
+            "xterm-256color",
+            Arc::clone(&clipboard),
+        )
+        .unwrap();
+        session
+            .processor
+            .advance(&mut session.term, b"\x1b]52;c;?\x07");
+        // The read is not answered from the cache; it asks the frontend to
+        // query the outer terminal instead.
+        assert!(session.emulator_responses.try_recv().is_err());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(UiEvent::ClipboardRead(id)) if id.get() == 12
+        ));
+        assert!(has_pending_clipboard_load(&session));
+        // Delivering the host clipboard consumes the pending formatter.
+        session.answer_clipboard_load("host clipboard").unwrap();
+        assert!(!has_pending_clipboard_load(&session));
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn osc52_load_times_out_to_the_cached_clipboard() {
+        let (_, _receiver, wakeup) = ui_event_channel();
+        let clipboard = Arc::new(Mutex::new(Some("cached".to_owned())));
+        let mut session = TerminalSession::spawn_with_session_id_and_wakeup(
+            SessionId::new(13),
+            Some("sh"),
+            &["-c", "sleep 5"],
+            TerminalSize::new(20, 4),
+            Some(wakeup),
+            "xterm-256color",
+            Arc::clone(&clipboard),
+        )
+        .unwrap();
+        session
+            .processor
+            .advance(&mut session.term, b"\x1b]52;c;?\x07");
+        assert!(has_pending_clipboard_load(&session));
+        // Expire the read so the timeout fallback answers from the cache.
+        session.pending_clipboard.lock().unwrap().deadline =
+            Some(Instant::now() - Duration::from_secs(1));
+        session.poll_clipboard_load().unwrap();
+        assert!(!has_pending_clipboard_load(&session));
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn osc52_paste_round_trips_the_host_clipboard_through_the_child() {
+        let (_, receiver, wakeup) = ui_event_channel();
+        let clipboard = Arc::new(Mutex::new(None));
+        // The child echoes the delivered OSC 52 response back over its PTY, so
+        // the emulator re-parses it as a fresh clipboard store of the same text.
+        let mut session = TerminalSession::spawn_with_session_id_and_wakeup(
+            SessionId::new(14),
+            Some("sh"),
+            &[
+                "-c",
+                "stty -icanon min 1 time 0; dd bs=1 2>/dev/null; sleep 5",
+            ],
+            TerminalSize::new(30, 4),
+            Some(wakeup),
+            "xterm-256color",
+            Arc::clone(&clipboard),
+        )
+        .unwrap();
+        session
+            .processor
+            .advance(&mut session.term, b"\x1b]52;c;?\x07");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(UiEvent::ClipboardRead(id)) if id.get() == 14
+        ));
+        session.answer_clipboard_load("roundtrip").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut stored = None;
+        while Instant::now() < deadline {
+            session.poll_output().unwrap();
+            while let Ok(event) = receiver.try_recv() {
+                if let UiEvent::ClipboardStore(text) = event {
+                    stored = Some(text);
+                }
+            }
+            if stored.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(stored.as_deref(), Some("roundtrip"));
         session.shutdown().unwrap();
     }
 

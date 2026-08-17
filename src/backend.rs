@@ -23,7 +23,7 @@ use crate::{
     compositor::{CellSpan, FrameDiff},
     graphics::{
         GraphicsInputDemultiplexer, GraphicsPlaceholderLayer, GraphicsProtocolBroker,
-        GraphicsSubmission, OuterInputEvent,
+        GraphicsSubmission, OuterInputEvent, decode_base64,
     },
     scene::{Cell, CellStyle, CellWidth, Color, Scene, SceneCursor, Underline},
 };
@@ -222,6 +222,9 @@ pub struct OuterInputBatch {
     pub graphics_report: Option<GraphicsCapabilityReport>,
     pub graphics_acknowledgements: Vec<GraphicsOuterAcknowledgement>,
     pub graphics_error: Option<String>,
+    /// Text decoded from an outer-terminal OSC 52 clipboard-read response,
+    /// produced when the host terminal answers `request_clipboard`.
+    pub clipboard_text: Option<String>,
 }
 
 /// Active outer-terminal Kitty probe and response correlator.
@@ -612,6 +615,7 @@ pub trait Backend {
             graphics_report: None,
             graphics_acknowledgements: Vec::new(),
             graphics_error: None,
+            clipboard_text: None,
         }
     }
 
@@ -663,6 +667,14 @@ pub trait Backend {
     }
 
     fn submit_clipboard(&mut self, _text: &str) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Requests the outer terminal's system clipboard via an OSC 52 read query
+    /// (`ESC ] 52 ; c ; ? ST`). The host's base64 answer arrives through
+    /// [`Backend::feed_outer_input`], which reports it as
+    /// [`OuterInputBatch::clipboard_text`].
+    fn request_clipboard(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -769,6 +781,7 @@ impl<W: Write> CrosstermBackend<W> {
         let mut graphics_report = None;
         let mut graphics_acknowledgements = Vec::new();
         let mut graphics_error = None;
+        let mut clipboard_text = None;
         for event in self.graphics_input.feed(bytes) {
             match event {
                 OuterInputEvent::TerminalInput(bytes) => terminal_bytes.extend(bytes),
@@ -783,6 +796,9 @@ impl<W: Write> CrosstermBackend<W> {
                         graphics_acknowledgements.push(acknowledgement);
                     }
                 }
+                OuterInputEvent::ClipboardResponse(bytes) => {
+                    clipboard_text = parse_clipboard_response(&bytes).or(clipboard_text);
+                }
             }
         }
         OuterInputBatch {
@@ -790,6 +806,7 @@ impl<W: Write> CrosstermBackend<W> {
             graphics_report,
             graphics_acknowledgements,
             graphics_error,
+            clipboard_text,
         }
     }
 
@@ -1255,6 +1272,11 @@ impl<W: Write> Backend for CrosstermBackend<W> {
         self.writer.flush()
     }
 
+    fn request_clipboard(&mut self) -> Result<(), Self::Error> {
+        self.writer.write_all(b"\x1b]52;c;?\x07")?;
+        self.writer.flush()
+    }
+
     fn feed_outer_input(&mut self, bytes: &[u8]) -> OuterInputBatch {
         CrosstermBackend::feed_outer_input(self, bytes)
     }
@@ -1344,6 +1366,19 @@ fn encode_base64(bytes: &[u8]) -> Vec<u8> {
         });
     }
     output
+}
+
+/// Decodes a host terminal's OSC 52 clipboard-read response into its text
+/// content. Accepts both BEL- and ST-terminated forms and any clipboard
+/// selector (`c`, `p`, `s`, `pc`, ...) ahead of the base64 payload.
+fn parse_clipboard_response(bytes: &[u8]) -> Option<String> {
+    let body = bytes.strip_prefix(b"\x1b]52;")?;
+    let payload = body
+        .strip_suffix(b"\x1b\\")
+        .or_else(|| body.strip_suffix(b"\x07"))?;
+    let separator = payload.iter().position(|byte| *byte == b';')?;
+    let decoded = decode_base64(&payload[separator + 1..])?;
+    String::from_utf8(decoded).ok()
 }
 
 fn write_cell<W: Write>(writer: &mut W, x: u16, y: u16, cell: Cell) -> io::Result<()> {
@@ -2109,6 +2144,33 @@ mod tests {
                 .windows(8)
                 .any(|window| window == b"Y29weQ==")
         );
+    }
+
+    #[test]
+    fn clipboard_read_request_and_response_decode() {
+        let mut backend = CrosstermBackend::new(Vec::<u8>::new());
+        backend.request_clipboard().unwrap();
+        assert_eq!(backend.writer().as_slice(), b"\x1b]52;c;?\x07");
+
+        // BEL-terminated answer with the `c` selector.
+        let batch = backend.feed_outer_input(b"\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(batch.clipboard_text.as_deref(), Some("hello"));
+        assert!(batch.terminal_bytes.is_empty());
+
+        // ST-terminated answer with a combined selector decodes too.
+        let batch = backend.feed_outer_input(b"\x1b]52;pc;d29ybGQ=\x1b\\");
+        assert_eq!(batch.clipboard_text.as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn clipboard_response_parser_rejects_non_osc52_frames() {
+        assert_eq!(
+            parse_clipboard_response(b"\x1b]52;c;aGVsbG8=\x07").as_deref(),
+            Some("hello")
+        );
+        assert_eq!(parse_clipboard_response(b"\x1b]0;title\x07"), None);
+        assert_eq!(parse_clipboard_response(b"\x1b]52;c;not-base64!\x07"), None);
+        assert_eq!(parse_clipboard_response(b"garbage"), None);
     }
 
     #[test]

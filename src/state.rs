@@ -887,6 +887,13 @@ impl AppState {
         }
     }
 
+    /// Delivers the host terminal's decoded clipboard content to any terminal
+    /// widget with a pending OSC 52 clipboard-read, so a child application's
+    /// paste request receives the outer terminal's system clipboard.
+    pub fn deliver_clipboard(&mut self, text: String) {
+        self.widget_runtime.broadcast_clipboard(&text);
+    }
+
     pub fn handle_focused_mouse(&mut self, mouse: MouseEvent) -> Result<bool, String> {
         let Some(FocusTarget::Surface(surface_id)) = self.focus.target() else {
             return Ok(false);

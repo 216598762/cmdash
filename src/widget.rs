@@ -433,6 +433,13 @@ pub trait Widget: Send {
         Ok(WidgetUpdate::Unchanged)
     }
 
+    /// Delivers the host terminal's decoded clipboard content to a widget that
+    /// answered an OSC 52 clipboard-read request. Non-terminal widgets ignore
+    /// this; a terminal answers its pending read with the supplied text.
+    fn handle_clipboard(&mut self, _text: &str) -> Result<WidgetUpdate, String> {
+        Ok(WidgetUpdate::Unchanged)
+    }
+
     fn copy_selection(&self, _area: Rect) -> Option<String> {
         None
     }
@@ -861,6 +868,15 @@ impl WidgetRuntime {
             .get_mut(&id)
             .ok_or_else(|| format!("widget {} is not registered", id.get()))?;
         entry.widget.handle_paste(text)
+    }
+
+    /// Delivers the host terminal's decoded clipboard content to every widget.
+    /// Only the terminal that requested the read answers it; the rest ignore
+    /// the value, so a single response can service any number of pending reads.
+    pub fn broadcast_clipboard(&mut self, text: &str) {
+        for entry in self.instances.values_mut() {
+            let _ = entry.widget.handle_clipboard(text);
+        }
     }
 
     pub fn copy_selection(&self, id: WidgetId, area: Rect) -> Option<String> {
@@ -1394,6 +1410,13 @@ impl Widget for TerminalWidget {
     fn handle_paste(&mut self, text: &str) -> Result<WidgetUpdate, String> {
         self.session
             .write_paste(text)
+            .map(|_| WidgetUpdate::Unchanged)
+            .map_err(|error| error.to_string())
+    }
+
+    fn handle_clipboard(&mut self, text: &str) -> Result<WidgetUpdate, String> {
+        self.session
+            .answer_clipboard_load(text)
             .map(|_| WidgetUpdate::Unchanged)
             .map_err(|error| error.to_string())
     }

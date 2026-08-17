@@ -291,9 +291,11 @@ XTVERSION (`CSI > q`) and replies with a `DCS > | cmdash <version> ST`
 identity. The emulator's OSC 52 handling is enabled (`Osc52::CopyPaste`): a
 child store and the terminal's own selection both populate a session-shared,
 byte-bounded clipboard cache (and the backend submission queue), and a child
-load answers from that cache as a base64 OSC 52 response — a bounded
-paste-what-was-copied model rather than an outer-terminal system-clipboard
-round trip. `BEL` becomes a bounded, deduplicated frontend diagnostic, and
+load defers to an outer-terminal system-clipboard query. The backend emits
+`ESC ] 52 ; c ; ? ST`, the raw-input owner demultiplexes the host's base64
+answer apart from keyboard input, and the decoded text is delivered back to
+any session with a pending read; if the host does not answer within the read
+timeout (or no frontend is attached), the session falls back to the cache. `BEL` becomes a bounded, deduplicated frontend diagnostic, and
 OSC 9/777 notifications are parsed from the plain output stream into truncated
 frontend diagnostics (OSC 133/1337 markers are recognized but ignored). These
 session-to-frontend events ride the existing `UiEvent` channel, so sessions

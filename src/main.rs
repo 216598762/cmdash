@@ -528,6 +528,11 @@ fn spawn_input_reader(sender: Sender<UiEvent>) -> InputReader {
                             return;
                         }
                     }
+                    OuterInputEvent::ClipboardResponse(bytes) => {
+                        if sender.send(UiEvent::OuterClipboard(bytes)).is_err() {
+                            return;
+                        }
+                    }
                     OuterInputEvent::TerminalInput(bytes) => {
                         for event in decode_terminal_input(&bytes) {
                             if sender.send(UiEvent::Input(event)).is_err() {
@@ -777,8 +782,20 @@ fn collect_ui_event<B: Backend<Error = io::Error>>(
                 state.record_diagnostic(format!("outer graphics input rejected: {error}"));
             }
         }
+        UiEvent::OuterClipboard(bytes) => {
+            let batch = backend.feed_outer_input(&bytes);
+            if let Some(error) = batch.graphics_error {
+                state.record_diagnostic(format!("outer graphics input rejected: {error}"));
+            }
+            if let Some(text) = batch.clipboard_text {
+                state.deliver_clipboard(text);
+            }
+        }
         UiEvent::PtyOutput => pty_wakeup.clear_pending(),
         UiEvent::ClipboardStore(text) => state.record_clipboard(text),
+        UiEvent::ClipboardRead(_) => {
+            backend.request_clipboard()?;
+        }
         UiEvent::Bell(_) => state.record_bell(),
         UiEvent::Notification(_, message) => state.record_diagnostic(message),
         UiEvent::Tick => {}

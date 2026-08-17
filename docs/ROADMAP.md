@@ -1271,10 +1271,10 @@ captured-sequence or PTY conformance fixture.
 - [x] **OSC 52 clipboard** — the emulator's OSC 52 handling is enabled and
   both directions are wired: a child's store (copy) and the terminal's own
   selection both land in a session-shared, byte-bounded cache and are
-  submitted to the backend, while a child's load (paste) answers from that
-  cache as a base64 OSC 52 response. The read path is a bounded paste-what-
-  was-copied cache rather than a query of the outer terminal's system
-  clipboard, which remains a future outer-input round trip.
+  submitted to the backend, while a child's load (paste) queries the outer
+  terminal's system clipboard (`ESC ] 52 ; c ; ? ST`) and delivers the
+  decoded answer back to the session, falling back to the cache when the host
+  does not respond within the read timeout (and when no frontend is attached).
 - [x] **Text presentation attributes** — italic, reverse, strikeout, and hidden
   (SGR 3/7/9/8) plus underline now flow from the emulator through
   `CellStyle`/`Scene`/backend serialization instead of being dropped; blink

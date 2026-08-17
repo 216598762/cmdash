@@ -101,11 +101,13 @@ fn wait_for_marker(
                 | UiEvent::ApiWakeup
                 | UiEvent::CursorBlink(_)
                 | UiEvent::ClipboardStore(_)
+                | UiEvent::ClipboardRead(_)
                 | UiEvent::Bell(_)
                 | UiEvent::Notification(_, _),
             ) => {}
             Ok(UiEvent::Input(_)) => return Err("unexpected input event".to_owned()),
             Ok(UiEvent::OuterInput(_)) => {}
+            Ok(UiEvent::OuterClipboard(_)) => {}
             Ok(UiEvent::InputError(error)) => return Err(error),
             Err(error) => return Err(format!("timed out waiting for PTY output: {error}")),
         }
@@ -146,11 +148,13 @@ fn round_trip(
                 | UiEvent::ApiWakeup
                 | UiEvent::CursorBlink(_)
                 | UiEvent::ClipboardStore(_)
+                | UiEvent::ClipboardRead(_)
                 | UiEvent::Bell(_)
                 | UiEvent::Notification(_, _),
             ) => {}
             Ok(UiEvent::Input(_)) => return Err("unexpected input event".to_owned()),
             Ok(UiEvent::OuterInput(_)) => {}
+            Ok(UiEvent::OuterClipboard(_)) => {}
             Ok(UiEvent::InputError(error)) => return Err(error),
             Err(error) => return Err(format!("timed out waiting for key echo: {error}")),
         }

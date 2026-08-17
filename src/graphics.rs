@@ -583,6 +583,7 @@ impl GraphicsProtocolBroker {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OuterInputEvent {
     GraphicsResponse(Vec<u8>),
+    ClipboardResponse(Vec<u8>),
     TerminalInput(Vec<u8>),
 }
 
@@ -909,14 +910,13 @@ impl GraphicsInputDemultiplexer {
             let csi = self.pending[index..]
                 .windows(2)
                 .position(|window| window == b"\x1b[");
+            let osc = self.pending[index..]
+                .windows(2)
+                .position(|window| window == b"\x1b]");
             let apc = self.pending[index..]
                 .windows(3)
                 .position(|window| window == b"\x1b_G");
-            let Some(offset) = (match (csi, apc) {
-                (Some(csi), Some(apc)) => Some(csi.min(apc)),
-                (Some(offset), None) | (None, Some(offset)) => Some(offset),
-                (None, None) => None,
-            }) else {
+            let Some(offset) = [csi, osc, apc].into_iter().flatten().min() else {
                 let keep = usize::from(self.pending.last() == Some(&0x1b));
                 let end = self.pending.len().saturating_sub(keep);
                 if end > index {
@@ -942,6 +942,32 @@ impl GraphicsInputDemultiplexer {
                 events.push(OuterInputEvent::GraphicsResponse(
                     self.pending[start..end].to_vec(),
                 ));
+                index = end;
+                continue;
+            }
+            if self.pending[start..].starts_with(b"\x1b]") {
+                // OSC is terminated by BEL or ST; clipboard read responses
+                // (`ESC ] 52 ; ...`) are routed separately so they never leak
+                // into the keyboard decoder.
+                let rest = &self.pending[start + 2..];
+                let bel = rest.iter().position(|byte| *byte == 0x07);
+                let st = find_bytes(rest, b"\x1b\\");
+                let Some(term_offset) = (match (bel, st) {
+                    (Some(bel), Some(st)) => Some(bel.min(st)),
+                    (Some(offset), None) | (None, Some(offset)) => Some(offset),
+                    (None, None) => None,
+                }) else {
+                    self.pending = self.pending[start..].to_vec();
+                    return events;
+                };
+                let term_len = usize::from(rest[term_offset] == 0x1b) + 1;
+                let end = start + 2 + term_offset + term_len;
+                let sequence = &self.pending[start..end];
+                if sequence.starts_with(b"\x1b]52;") {
+                    events.push(OuterInputEvent::ClipboardResponse(sequence.to_vec()));
+                } else {
+                    events.push(OuterInputEvent::TerminalInput(sequence.to_vec()));
+                }
                 index = end;
                 continue;
             }
@@ -5227,7 +5253,7 @@ fn resolve_transfer_payload(
     }
 }
 
-fn decode_base64(payload: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn decode_base64(payload: &[u8]) -> Option<Vec<u8>> {
     let mut output = Vec::new();
     let mut accumulator = 0u32;
     let mut bits = 0u8;
@@ -6150,6 +6176,34 @@ mod tests {
             Some(&OuterInputEvent::GraphicsResponse(
                 b"\x1b_Gi=0;OK\x1b\\".to_vec()
             ))
+        );
+    }
+
+    #[test]
+    fn outer_input_demultiplexer_routes_osc52_clipboard_responses_apart_from_keys() {
+        let mut demux = GraphicsInputDemultiplexer::new(256);
+        assert_eq!(
+            demux.feed(b"a\x1b]52;c;aGVsbG8=\x07b"),
+            vec![
+                OuterInputEvent::TerminalInput(b"a".to_vec()),
+                OuterInputEvent::ClipboardResponse(b"\x1b]52;c;aGVsbG8=\x07".to_vec()),
+                OuterInputEvent::TerminalInput(b"b".to_vec()),
+            ]
+        );
+
+        // ST-terminated responses are recognized too.
+        assert_eq!(
+            demux.feed(b"\x1b]52;pc;aGVsbG8=\x1b\\"),
+            vec![OuterInputEvent::ClipboardResponse(
+                b"\x1b]52;pc;aGVsbG8=\x1b\\".to_vec()
+            )]
+        );
+
+        // Non-clipboard OSC stays on the terminal-input path so the keyboard
+        // decoder owns it rather than the clipboard reader.
+        assert_eq!(
+            demux.feed(b"\x1b]0;title\x07"),
+            vec![OuterInputEvent::TerminalInput(b"\x1b]0;title\x07".to_vec())]
         );
     }
 
