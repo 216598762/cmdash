@@ -809,6 +809,29 @@ impl TerminalSession {
         Some(lines.join("\n"))
     }
 
+    /// Returns the URI of the OSC 8 hyperlink covering the given grid cell,
+    /// if any. The position is in content-area-relative cell coordinates
+    /// (column, row), matching the selection and render mapping.
+    pub fn hyperlink_at(&self, position: (u16, u16)) -> Option<String> {
+        for indexed in self.term.grid().display_iter() {
+            let point = indexed.point;
+            if point.column.0 as u16 == position.0 && point.line.0 as u16 == position.1 {
+                return indexed.cell.hyperlink().map(|link| link.uri().to_owned());
+            }
+        }
+        None
+    }
+
+    /// Returns the URI of the hyperlink under the current selection's anchor,
+    /// if the selection is non-empty and that cell carries an OSC 8 link.
+    pub fn selected_hyperlink(&self) -> Option<String> {
+        let selection = self.selection?;
+        if selection.anchor == selection.active {
+            return None;
+        }
+        self.hyperlink_at(selection.anchor)
+    }
+
     pub fn poll_output(&mut self) -> Result<bool, SessionError> {
         let mut changed = false;
         let mut reader_finished = false;
@@ -843,7 +866,34 @@ impl TerminalSession {
         if reader_finished && child_exited {
             self.closed = true;
         }
+        // A child that opens a synchronized-output burst (`?2026h`) without
+        // the matching close (`?2026l`) must not strand its output: flush the
+        // buffered burst once the emulator's sync timeout elapses, matching
+        // Kitty and Ghostty.
+        if self.flush_expired_sync_output() {
+            changed = true;
+        }
         Ok(changed)
+    }
+
+    /// Flushes a pending synchronized-output burst when its timeout has
+    /// elapsed, so output from a child that never emits the matching ESU is
+    /// not stranded in the parser's sync buffer. Returns whether anything was
+    /// flushed.
+    fn flush_expired_sync_output(&mut self) -> bool {
+        let expired = self
+            .processor
+            .sync_timeout()
+            .sync_timeout()
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if !expired || self.processor.sync_bytes_count() == 0 {
+            return false;
+        }
+        // Both parsers buffer the same plain bytes, so they must be flushed
+        // together to keep the scroll-region observer aligned with the grid.
+        self.processor.stop_sync(&mut self.term);
+        self.scroll_processor.stop_sync(&mut self.scroll_tracker);
+        true
     }
 
     fn consume_output(&mut self, bytes: &[u8]) -> Result<bool, SessionError> {
@@ -1065,9 +1115,23 @@ impl TerminalSession {
         mouse: MouseEvent,
         origin: (u16, u16),
     ) -> Result<(), SessionError> {
-        let bytes = mouse_bytes(mouse, origin)
-            .ok_or_else(|| SessionError::Io("unsupported mouse event".to_owned()))?;
-        self.write_bytes(&bytes)
+        // Without a mouse-reporting mode the event belongs to the terminal's
+        // own selection/scrollback, so nothing is forwarded to the child.
+        if let Some(bytes) = mouse_bytes(mouse, origin, *self.term.mode()) {
+            self.write_bytes(&bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Forwards a focus-in/out report to the child when it has negotiated
+    /// `?1004`. A real terminal sends `CSI I`/`CSI O` as the window focus
+    /// changes so full-screen applications can dim or suspend themselves.
+    pub fn write_focus(&mut self, focused: bool) -> Result<(), SessionError> {
+        if self.closed || !self.term.mode().contains(TermMode::FOCUS_IN_OUT) {
+            return Ok(());
+        }
+        let bytes: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+        self.write_bytes(bytes)
     }
 
     pub fn cursor_position(&self) -> (u16, u16) {
@@ -1108,6 +1172,13 @@ impl TerminalSession {
     pub fn captures_mouse_scroll(&self) -> bool {
         let mode = self.term.mode();
         mode.contains(TermMode::ALT_SCREEN) || mode.intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Whether the child application has enabled mouse reporting (`?1000`,
+    /// `?1002`, or `?1003`), so mouse events should be forwarded to the PTY
+    /// instead of driving the terminal's own selection.
+    pub fn reports_mouse(&self) -> bool {
+        self.term.mode().intersects(TermMode::MOUSE_MODE)
     }
 
     /// Scrolls the viewport back to the live screen, like a real terminal that
@@ -1674,24 +1745,76 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
-fn mouse_bytes(mouse: MouseEvent, origin: (u16, u16)) -> Option<Vec<u8>> {
+/// Encodes a mouse event using the encoding the application negotiated
+/// (`?1006` SGR, `?1005` UTF-8, or legacy X10), returning `None` when the
+/// enabled reporting mode does not cover this event. A press is reported under
+/// any of `?1000`/`?1002`/`?1003`; releases and drags need `?1002` or `?1003`;
+/// and button-less motion needs `?1003`.
+fn mouse_bytes(mouse: MouseEvent, origin: (u16, u16), mode: TermMode) -> Option<Vec<u8>> {
+    let report = match mouse.kind {
+        MouseEventKind::Down(_) => mode.intersects(TermMode::MOUSE_MODE),
+        MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
+            mode.contains(TermMode::MOUSE_DRAG) || mode.contains(TermMode::MOUSE_MOTION)
+        }
+        MouseEventKind::Moved => mode.contains(TermMode::MOUSE_MOTION),
+        MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => mode.intersects(TermMode::MOUSE_MODE),
+    };
+    if !report {
+        return None;
+    }
     let x = mouse.column.saturating_sub(origin.0).saturating_add(1);
     let y = mouse.row.saturating_sub(origin.1).saturating_add(1);
-    let modifiers = mouse.modifiers;
-    let modifier_bits = u16::from(modifiers.contains(KeyModifiers::SHIFT)) * 4
-        + u16::from(modifiers.contains(KeyModifiers::ALT)) * 8
-        + u16::from(modifiers.contains(KeyModifiers::CONTROL)) * 16;
-    let (button, suffix) = match mouse.kind {
-        MouseEventKind::Down(button) => (mouse_button(button) + modifier_bits, 'M'),
-        MouseEventKind::Up(button) => (mouse_button(button) + modifier_bits, 'm'),
-        MouseEventKind::Drag(button) => (32 + mouse_button(button) + modifier_bits, 'M'),
-        MouseEventKind::Moved => (35 + modifier_bits, 'M'),
-        MouseEventKind::ScrollUp => (64 + modifier_bits, 'M'),
-        MouseEventKind::ScrollDown => (65 + modifier_bits, 'M'),
-        MouseEventKind::ScrollLeft => (66 + modifier_bits, 'M'),
-        MouseEventKind::ScrollRight => (67 + modifier_bits, 'M'),
+    let modifier_bits = u16::from(mouse.modifiers.contains(KeyModifiers::SHIFT)) * 4
+        + u16::from(mouse.modifiers.contains(KeyModifiers::ALT)) * 8
+        + u16::from(mouse.modifiers.contains(KeyModifiers::CONTROL)) * 16;
+    // xterm reports every release as button 3, not the released button.
+    let (button, release) = match mouse.kind {
+        MouseEventKind::Down(button) => (mouse_button(button) + modifier_bits, false),
+        MouseEventKind::Up(_) => (3 + modifier_bits, true),
+        MouseEventKind::Drag(button) => (32 + mouse_button(button) + modifier_bits, false),
+        MouseEventKind::Moved => (35 + modifier_bits, false),
+        MouseEventKind::ScrollUp => (64 + modifier_bits, false),
+        MouseEventKind::ScrollDown => (65 + modifier_bits, false),
+        MouseEventKind::ScrollLeft => (66 + modifier_bits, false),
+        MouseEventKind::ScrollRight => (67 + modifier_bits, false),
     };
-    Some(format!("\x1b[<{button};{x};{y}{suffix}").into_bytes())
+    if mode.contains(TermMode::SGR_MOUSE) {
+        let suffix = if release { 'm' } else { 'M' };
+        Some(format!("\x1b[<{button};{x};{y}{suffix}").into_bytes())
+    } else if mode.contains(TermMode::UTF8_MOUSE) {
+        let mut bytes = vec![0x1b, b'[', b'M'];
+        bytes.push(button as u8 + 32);
+        push_utf8_mouse_coord(&mut bytes, x);
+        push_utf8_mouse_coord(&mut bytes, y);
+        Some(bytes)
+    } else {
+        Some(vec![
+            0x1b,
+            b'[',
+            b'M',
+            (button + 32) as u8,
+            (x + 32) as u8,
+            (y + 32) as u8,
+        ])
+    }
+}
+
+/// Appends a UTF-8 mouse-mode (`?1005`) coordinate byte to `bytes`.
+///
+/// Coordinates are encoded as the value plus 32; values that would land in the
+/// C1 range (128+) are re-encoded as a two-byte UTF-8 sequence so a single
+/// byte never aliases a control character.
+fn push_utf8_mouse_coord(bytes: &mut Vec<u8>, value: u16) {
+    let encoded = value.saturating_add(32);
+    if encoded < 0x80 {
+        bytes.push(encoded as u8);
+    } else {
+        bytes.push(0xC0 | (encoded >> 6) as u8);
+        bytes.push(0x80 | (encoded & 0x3F) as u8);
+    }
 }
 
 fn mouse_button(button: MouseButton) -> u16 {
@@ -2349,6 +2472,7 @@ mod tests {
                     modifiers: KeyModifiers::NONE,
                 },
                 (2, 3),
+                TermMode::SGR_MOUSE | TermMode::MOUSE_REPORT_CLICK,
             ),
             Some(b"\x1b[<0;3;3M".to_vec())
         );
@@ -2357,6 +2481,207 @@ mod tests {
             b"\x1b[200~paste\x1b[201~".to_vec()
         );
         assert_eq!(paste_bytes("paste", false), b"paste".to_vec());
+    }
+
+    #[test]
+    fn mouse_encoding_gates_on_the_negotiated_reporting_mode() {
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let release = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 4,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        // No reporting mode: nothing reaches the PTY.
+        assert_eq!(mouse_bytes(press, (0, 0), TermMode::NONE), None);
+        assert_eq!(
+            mouse_bytes(press, (0, 0), TermMode::SGR_MOUSE),
+            None,
+            "SGR alone does not enable reporting"
+        );
+        // Clicks (`?1000`) report presses but never releases.
+        let clicks = TermMode::SGR_MOUSE | TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(
+            mouse_bytes(press, (0, 0), clicks),
+            Some(b"\x1b[<0;5;6M".to_vec())
+        );
+        assert_eq!(mouse_bytes(release, (0, 0), clicks), None);
+        // Drag (`?1002`) and motion (`?1003`) also report releases; xterm
+        // encodes every release as button 3.
+        for mode in [
+            TermMode::SGR_MOUSE | TermMode::MOUSE_DRAG,
+            TermMode::SGR_MOUSE | TermMode::MOUSE_MOTION,
+        ] {
+            assert_eq!(
+                mouse_bytes(release, (0, 0), mode),
+                Some(b"\x1b[<3;5;6m".to_vec())
+            );
+        }
+        // Button-less motion is only reported by `?1003`.
+        let motion = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 4,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            mouse_bytes(motion, (0, 0), TermMode::SGR_MOUSE | TermMode::MOUSE_DRAG),
+            None
+        );
+        assert_eq!(
+            mouse_bytes(motion, (0, 0), TermMode::SGR_MOUSE | TermMode::MOUSE_MOTION),
+            Some(b"\x1b[<35;5;6M".to_vec())
+        );
+    }
+
+    #[test]
+    fn mouse_encoding_uses_legacy_and_utf8_formats_without_sgr() {
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Legacy X10 encoding (`?1000` without `?1006`).
+        assert_eq!(
+            mouse_bytes(press, (0, 0), TermMode::MOUSE_REPORT_CLICK),
+            Some(b"\x1b[M %&".to_vec())
+        );
+        // UTF-8 encoding (`?1005`) re-encodes coordinates past 127 as UTF-8.
+        let far = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 200,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            mouse_bytes(
+                far,
+                (0, 0),
+                TermMode::UTF8_MOUSE | TermMode::MOUSE_REPORT_CLICK,
+            ),
+            Some(b"\x1b[M \xc3\xa9\"".to_vec())
+        );
+    }
+
+    #[test]
+    fn focus_reports_are_forwarded_to_the_child_when_1004_is_enabled() {
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &[
+                "-c",
+                "stty -icanon min 1 time 0; printf '\\033[?1004h'; in=$(dd bs=1 count=3 2>/dev/null); out=$(dd bs=1 count=3 2>/dev/null); if [ \"$in\" = \"$(printf '\\033[I')\" ] && [ \"$out\" = \"$(printf '\\033[O')\" ]; then printf 'focus-ok'; fi; sleep 5",
+            ],
+            TerminalSize::new(40, 8),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut enabled = false;
+        while Instant::now() < deadline {
+            session.poll_output().unwrap();
+            if session.term.mode().contains(TermMode::FOCUS_IN_OUT) {
+                enabled = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(enabled, "child never enabled ?1004");
+        session.write_focus(true).unwrap();
+        session.write_focus(false).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut focus_ok = false;
+        while Instant::now() < deadline {
+            session.poll_output().unwrap();
+            let scene = session.render(Rect::new(0, 0, 40, 8), false);
+            let rendered: String = scene.cells().iter().map(|cell| cell.symbol).collect();
+            if rendered.contains("focus-ok") {
+                focus_ok = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(focus_ok, "child did not receive the focus-in/out reports");
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn hyperlink_targets_are_exposed_from_osc_8_links() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        session.processor.advance(
+            &mut session.term,
+            b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\tail",
+        );
+        assert_eq!(
+            session.hyperlink_at((0, 0)).as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            session.hyperlink_at((3, 0)).as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            session.hyperlink_at((4, 0)),
+            None,
+            "the link closed at cell 4"
+        );
+
+        session.begin_selection((0, 0));
+        session.update_selection((3, 0));
+        assert_eq!(
+            session.selected_hyperlink().as_deref(),
+            Some("https://example.com")
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn synchronized_output_is_batched_until_the_matching_esu() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        session.processor.advance(&mut session.term, b"\x1b[?2026h");
+        session.processor.advance(&mut session.term, b"hello");
+        // The burst is buffered: nothing has reached the grid yet.
+        assert_eq!(session.cursor_position(), (0, 0));
+        // The matching ESU flushes the buffered burst in one go.
+        session.processor.advance(&mut session.term, b"\x1b[?2026l");
+        assert_eq!(session.cursor_position(), (5, 0));
+        let scene = session.render(Rect::new(0, 0, 20, 4), false);
+        assert_eq!(scene.cell_at(0, 0).unwrap().symbol, 'h');
+        assert_eq!(scene.cell_at(4, 0).unwrap().symbol, 'o');
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn synchronized_output_flushes_when_the_timeout_expires_without_esu() {
+        // A silent child keeps the PTY output channel empty so the flush is
+        // driven solely by the expired sync deadline.
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &["-c", "sleep 5"],
+            TerminalSize::new(20, 4),
+        )
+        .unwrap();
+        session.processor.advance(&mut session.term, b"\x1b[?2026h");
+        session
+            .scroll_processor
+            .advance(&mut session.scroll_tracker, b"\x1b[?2026h");
+        session.processor.advance(&mut session.term, b"hello");
+        session
+            .scroll_processor
+            .advance(&mut session.scroll_tracker, b"hello");
+        assert_eq!(session.cursor_position(), (0, 0));
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            session.poll_output().unwrap(),
+            "an expired burst should flush"
+        );
+        assert_eq!(session.cursor_position(), (5, 0));
+        session.shutdown().unwrap();
     }
 
     #[test]

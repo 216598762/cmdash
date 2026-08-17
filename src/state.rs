@@ -850,7 +850,16 @@ impl AppState {
             return false;
         };
         self.pending_clipboard = Some(text.clone());
-        self.record_diagnostic(crate::notification::copy_notification(&text));
+        // Surface an OSC 8 hyperlink's target URL when the selection is over
+        // one, even though the copied text is the link's display text.
+        let hyperlink = self
+            .widget_runtime
+            .selected_hyperlink(widget_id, surface.area());
+        let notification = match hyperlink {
+            Some(url) => crate::notification::url_copied_notification(&url),
+            None => crate::notification::copy_notification(&text),
+        };
+        self.record_diagnostic(notification);
         true
     }
 
@@ -1133,6 +1142,7 @@ impl AppState {
     }
 
     fn apply_focus(&mut self, command: FocusCommand) -> Result<(), CommandError> {
+        let old_target = self.focus.target();
         let old_surface = self.focused_surface_area();
         match command {
             FocusCommand::Surface(id) => {
@@ -1162,6 +1172,7 @@ impl AppState {
             FocusCommand::Direction(direction) => self.navigate_direction(direction),
             FocusCommand::Clear => self.focus.clear(),
         }
+        self.emit_focus_reports(old_target, self.focus.target());
         let new_surface = self.focused_surface_area();
         if old_surface != new_surface {
             self.start_animation(AnimationKey::Focus);
@@ -1174,6 +1185,34 @@ impl AppState {
         }
         self.reset_cursor_blink();
         Ok(())
+    }
+
+    /// Sends focus-in/out reports to terminal widgets when focus moves, so a
+    /// child application that negotiated `?1004` is notified like in a real
+    /// terminal. Non-terminal widgets ignore the report.
+    fn emit_focus_reports(&mut self, old: Option<FocusTarget>, new: Option<FocusTarget>) {
+        if old == new {
+            return;
+        }
+        self.emit_focus_report(old, false);
+        self.emit_focus_report(new, true);
+    }
+
+    fn emit_focus_report(&mut self, target: Option<FocusTarget>, focused: bool) {
+        let Some(FocusTarget::Surface(surface_id)) = target else {
+            return;
+        };
+        let Some(widget_id) = self
+            .workspace
+            .surfaces
+            .get(&surface_id)
+            .and_then(|surface| surface.widget())
+        else {
+            return;
+        };
+        if let Err(error) = self.widget_runtime.handle_focus(widget_id, focused) {
+            self.record_diagnostic(format!("focus report failed: {error}"));
+        }
     }
 
     fn focused_surface_area(&self) -> Option<Rect> {

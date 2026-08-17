@@ -1242,11 +1242,15 @@ Plan and prioritize these as separate, capability-gated workstreams; do not
 imply support from the presence of `alacritty_terminal` alone. Each requires a
 captured-sequence or PTY conformance fixture.
 
-- [ ] **OSC 8 hyperlinks** — parse/emit hyperlink runs so `ls --hyperlink` and
-  shell integration URLs survive composition; bound the number of active
-  links and expose them to copy/notify.
-- [ ] **Synchronized output** (DEC 2026/2027 BSU/ESU) — batch child output
-  bursts into single outer frames to reduce flicker and partial-line tearing.
+- [x] **OSC 8 hyperlinks** — OSC 8 links are parsed by the emulator and
+  retained per cell; `hyperlink_at`/`selected_hyperlink` expose the target URI
+  so a copied selection over a link notifies the URL even when its display
+  text differs, and the copy path prefers the link target. Link-count bounding
+  and click-to-open remain out of scope.
+- [x] **Synchronized output** (DEC 2026/2027 BSU/ESU) — the emulator's parser
+  buffers a `?2026h`…`?2026l` burst and flushes it atomically on the ESU; the
+  session now also enforces the 150 ms sync timeout, flushing a burst whose
+  ESU never arrives so a misbehaving child cannot strand output.
 - [x] **Kitty keyboard protocol** — extended key encoding (`CSI number ;
   modifier u`) for disambiguation, negotiated through the kitty
   progressive-enhancement stack (`CSI >`/`=`/`<` push/set/pop and `CSI ? u`
@@ -1255,9 +1259,13 @@ captured-sequence or PTY conformance fixture.
   keep the C0/ESC/`CSI ~` encodings. The child's `TERM` must still advertise
   the protocol before programs will request it (see capability advertisement
   below).
-- [ ] **Mouse protocols** — SGR mouse (1006), any-event/motion tracking (1002,
-  1003), and focus reporting (1004), routed to the focused child and honored
-  during selection/copy.
+- [x] **Mouse protocols** — SGR mouse (1006), UTF-8 mouse (1005), and the
+  legacy X10 fallback are emitted only after the app negotiates a reporting
+  mode: `?1000` reports presses, `?1002` adds drags/releases, and `?1003` adds
+  button-less motion, with every release encoded as button 3. Mouse reporting
+  also suppresses the terminal's own selection so events reach the child
+  verbatim. Focus reporting (`?1004`) sends `CSI I`/`CSI O` as focus moves
+  between panes.
 - [ ] **OSC 52 clipboard** — complete the read/write path (selection copy exists
   today) with bounded payloads and a documented permission policy.
 - [x] **Text presentation attributes** — italic, reverse, strikeout, and hidden
@@ -1293,9 +1301,10 @@ captured-sequence or PTY conformance fixture.
   cursor policy), image numbers, transient hints, and the full delete-selector
   matrix.
 - [ ] Add captured-sequence fixtures for hyperlinks, synchronized output,
-  keyboard protocol, mouse/focus reports, OSC 52, text presentation
-  attributes, underline styles, bell, and notifications; assert the outer
-  stream and the child acknowledgement sides.
+  OSC 52, bell, and notifications; assert the outer stream and the child
+  acknowledgement sides. Session-level PTY and emulator fixtures already cover
+  keyboard protocol, mouse/focus reports, text presentation attributes, and
+  underline styles.
 - [x] Add bounded-pressure tests (long-running sessions, rapid scroll, many
   images) proving memory stays within the configured history/byte quotas.
 

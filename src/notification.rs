@@ -15,9 +15,15 @@ pub fn extract_urls(text: &str) -> Vec<String> {
 
 pub fn copy_notification(text: &str) -> String {
     match extract_urls(text).first() {
-        Some(url) => format!("URL copied: {url}"),
+        Some(url) => url_copied_notification(url),
         None => "selection copied".to_owned(),
     }
+}
+
+/// Notification for copying an OSC 8 hyperlink whose target URL differs from
+/// the selected display text.
+pub fn url_copied_notification(url: &str) -> String {
+    format!("URL copied: {url}")
 }
 
 #[cfg(test)]

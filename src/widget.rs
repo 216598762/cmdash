@@ -436,12 +436,25 @@ pub trait Widget: Send {
         None
     }
 
+    /// Returns the URI of the hyperlink under the widget's current selection,
+    /// if any, so the copy path can surface a link even when its display text
+    /// differs from the target URL (OSC 8).
+    fn selected_hyperlink(&self, _area: Rect) -> Option<String> {
+        None
+    }
+
     fn handle_mouse(
         &mut self,
         _mouse: MouseEvent,
         _origin: (u16, u16),
     ) -> Result<WidgetUpdate, String> {
         Ok(WidgetUpdate::Unchanged)
+    }
+
+    /// Forwards a focus-in/out transition so a terminal can report it to the
+    /// child application when `?1004` is enabled.
+    fn handle_focus(&mut self, _focused: bool) -> Result<(), String> {
+        Ok(())
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
@@ -846,6 +859,12 @@ impl WidgetRuntime {
             .and_then(|entry| entry.widget.copy_selection(area))
     }
 
+    pub fn selected_hyperlink(&self, id: WidgetId, area: Rect) -> Option<String> {
+        self.instances
+            .get(&id)
+            .and_then(|entry| entry.widget.selected_hyperlink(area))
+    }
+
     pub fn handle_mouse(
         &mut self,
         id: WidgetId,
@@ -857,6 +876,14 @@ impl WidgetRuntime {
             .get_mut(&id)
             .ok_or_else(|| format!("widget {} is not registered", id.get()))?;
         entry.widget.handle_mouse(mouse, origin)
+    }
+
+    pub fn handle_focus(&mut self, id: WidgetId, focused: bool) -> Result<(), String> {
+        let entry = self
+            .instances
+            .get_mut(&id)
+            .ok_or_else(|| format!("widget {} is not registered", id.get()))?;
+        entry.widget.handle_focus(focused)
     }
 
     pub fn resize(&mut self, id: WidgetId, size: TerminalSize) -> Result<WidgetUpdate, String> {
@@ -1321,6 +1348,10 @@ impl Widget for TerminalWidget {
             .selected_text(self.appearance.content_area(area))
     }
 
+    fn selected_hyperlink(&self, _area: Rect) -> Option<String> {
+        self.session.selected_hyperlink()
+    }
+
     fn handles_input(&self) -> bool {
         true
     }
@@ -1384,14 +1415,28 @@ impl Widget for TerminalWidget {
             mouse.column.saturating_sub(origin.0),
             mouse.row.saturating_sub(origin.1),
         );
-        match mouse.kind {
-            crossterm::event::MouseEventKind::Down(_) => self.session.begin_selection(position),
-            crossterm::event::MouseEventKind::Drag(_) => self.session.update_selection(position),
-            _ => {}
+        // When the child has captured mouse reporting the terminal forwards
+        // the event verbatim and must not run its own selection.
+        if !self.session.reports_mouse() {
+            match mouse.kind {
+                crossterm::event::MouseEventKind::Down(_) => {
+                    self.session.begin_selection(position);
+                }
+                crossterm::event::MouseEventKind::Drag(_) => {
+                    self.session.update_selection(position);
+                }
+                _ => {}
+            }
         }
         self.session
             .write_mouse(mouse, origin)
             .map(|_| WidgetUpdate::Unchanged)
+            .map_err(|error| error.to_string())
+    }
+
+    fn handle_focus(&mut self, focused: bool) -> Result<(), String> {
+        self.session
+            .write_focus(focused)
             .map_err(|error| error.to_string())
     }
 

@@ -266,6 +266,23 @@ serializes them as SGR (`3`, `4:x`, `58`, `9`, `7`, `8`), leaving degradation
 to the outer terminal's own SGR handling rather than discarding the attribute
 from the scene model.
 
+Input and output protocol surface is honored the way a real terminal honors
+it. `mouse_bytes` gates on the emulator's negotiated mouse mode: nothing is
+emitted without `?1000`/`?1002`/`?1003`, presses alone are reported under
+`?1000`, drags and releases additionally under `?1002`, button-less motion
+under `?1003`, and the encoding follows `?1006` (SGR), `?1005` (UTF-8), or
+legacy X10, with releases encoded as button 3. When the child owns the mouse
+the terminal's own selection is suppressed so events pass through verbatim,
+and focus reporting (`?1004`) forwards `CSI I`/`CSI O` on focus transitions
+through the widget runtime. OSC 8 hyperlinks are retained per cell by the
+emulator and exposed as `hyperlink_at`/`selected_hyperlink`, so a copied
+selection over a link surfaces the target URL rather than its display text.
+Synchronized output relies on the vte parser's built-in BSU/ESU buffering
+(`CSI ? 2026 h/l`), which already flushes a burst atomically on the ESU; the
+session additionally enforces the parser's 150 ms sync timeout so a burst
+whose ESU never arrives cannot strand output in the grid or its scroll
+observer.
+
 ### 5.2 Kitty graphics model
 
 Kitty graphics are treated as terminal-session state, not as a global backend cache. `alacritty_terminal` remains the text/parser owner, while cmdash intercepts Kitty APC sequences and retains resources and placements in a session-owned adapter. The current flow is:
