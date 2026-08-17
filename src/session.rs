@@ -14,7 +14,7 @@ use std::{
 use alacritty_terminal::{
     event::{Event, EventListener, WindowSize as EmulatorWindowSize},
     grid::{Dimensions, Scroll},
-    term::{Config, Term, TermMode, cell::Flags},
+    term::{Config, Osc52, Term, TermMode, cell::Flags},
     vte::ansi::{ClearMode, Color as AnsiColor, Handler, Mode, NamedColor, PrivateMode, Processor},
 };
 
@@ -27,6 +27,12 @@ use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
 
 const MAX_GRAPHICS_PROTOCOL_CAPTURE_BYTES: usize = 256 * 1024;
+
+/// Upper bound on a single clipboard entry retained for OSC 52 paste.
+const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
+
+/// Upper bound on a single extracted shell-integration notification.
+const MAX_NOTIFICATION_BYTES: usize = 256;
 
 use crate::{
     appearance::Theme,
@@ -134,6 +140,12 @@ pub enum UiEvent {
     /// graphics responses, before crossterm's event decoder sees them.
     OuterInput(Vec<u8>),
     PtyOutput,
+    /// A child application copied text to the clipboard via OSC 52.
+    ClipboardStore(String),
+    /// The terminal bell rang in a session (`BEL`), for a visual signal.
+    Bell(SessionId),
+    /// Bounded shell-integration metadata (OSC 9/777 notify) from a session.
+    Notification(SessionId, String),
     Tick,
     AnimationFrame,
     ApiWakeup,
@@ -158,6 +170,12 @@ impl SessionWakeup {
     pub fn clear_pending(&self) {
         self.pending.store(false, Ordering::Release);
     }
+
+    /// The frontend event sender, used by sessions to surface clipboard
+    /// stores, bells, and shell-integration notifications.
+    pub fn ui_sender(&self) -> Sender<UiEvent> {
+        self.sender.clone()
+    }
 }
 
 pub fn ui_event_channel() -> (Sender<UiEvent>, Receiver<UiEvent>, SessionWakeup) {
@@ -181,6 +199,9 @@ struct SessionOutput {
 struct SessionEventListener {
     pty_writer: Sender<String>,
     size: Arc<Mutex<TerminalSize>>,
+    ui: Option<Sender<UiEvent>>,
+    clipboard: Arc<Mutex<Option<String>>>,
+    session_id: SessionId,
 }
 
 impl SessionEventListener {
@@ -205,6 +226,29 @@ impl EventListener for SessionEventListener {
                     cell_width: size.cell_width(),
                     cell_height: size.cell_height(),
                 }));
+            }
+            Event::ClipboardStore(_, text) => {
+                // Bound the retained copy so a large OSC 52 store cannot grow
+                // the session cache without limit.
+                let bounded = truncate_bounded(&text, MAX_CLIPBOARD_BYTES);
+                *self.clipboard.lock().expect("clipboard mutex poisoned") = Some(bounded);
+                if let Some(ui) = &self.ui {
+                    let _ = ui.send(UiEvent::ClipboardStore(text));
+                }
+            }
+            Event::ClipboardLoad(_, formatter) => {
+                let content = self
+                    .clipboard
+                    .lock()
+                    .expect("clipboard mutex poisoned")
+                    .clone()
+                    .unwrap_or_default();
+                self.send_to_pty(formatter(&content));
+            }
+            Event::Bell => {
+                if let Some(ui) = &self.ui {
+                    let _ = ui.send(UiEvent::Bell(self.session_id));
+                }
             }
             _ => {}
         }
@@ -601,6 +645,8 @@ pub struct TerminalSession {
     graphics_protocol_capture: Vec<u8>,
     selection: Option<Selection>,
     scrollback_limit: usize,
+    ui: Option<Sender<UiEvent>>,
+    session_id: SessionId,
 }
 
 impl TerminalSession {
@@ -622,7 +668,15 @@ impl TerminalSession {
         args: &[&str],
         size: TerminalSize,
     ) -> Result<Self, SessionError> {
-        Self::spawn_with_session_id_and_wakeup(session_id, command, args, size, None)
+        Self::spawn_with_session_id_and_wakeup(
+            session_id,
+            command,
+            args,
+            size,
+            None,
+            "xterm-256color",
+            Arc::new(Mutex::new(None)),
+        )
     }
 
     pub fn spawn_with_session_id_and_wakeup(
@@ -631,6 +685,8 @@ impl TerminalSession {
         args: &[&str],
         size: TerminalSize,
         wakeup: Option<SessionWakeup>,
+        term_env: &str,
+        clipboard: Arc<Mutex<Option<String>>>,
     ) -> Result<Self, SessionError> {
         let size = size.validate()?;
         let pty_system = native_pty_system();
@@ -648,7 +704,7 @@ impl TerminalSession {
             None => default_command(),
         };
         command_builder.args(args.iter().copied());
-        command_builder.env("TERM", "xterm-256color");
+        command_builder.env("TERM", term_env);
         let child = pair
             .slave
             .spawn_command(command_builder)
@@ -661,17 +717,20 @@ impl TerminalSession {
             .master
             .take_writer()
             .map_err(|error| SessionError::Io(error.to_string()))?;
+        let ui = wakeup.as_ref().map(SessionWakeup::ui_sender);
         let output = SessionOutput {
             receiver: spawn_reader(reader, wakeup),
         };
         let (response_sender, response_receiver) = mpsc::channel();
         let reported_size = Arc::new(Mutex::new(size));
-        // Enable the emulator's Kitty keyboard protocol handling so the child
-        // can negotiate `CSI u` key encoding: `CSI > 1 u` pushes the
-        // disambiguation mode, `CSI ? u` is answered with the active flags,
-        // and `key_bytes` consults `term.mode()` when forwarding keys.
+        // Enable the emulator's Kitty keyboard protocol handling and the OSC
+        // 52 copy/paste path: `CSI > 1 u` pushes the disambiguation mode, `CSI
+        // ? u` is answered with the active flags, and `key_bytes` consults
+        // `term.mode()` when forwarding keys. OSC 52 store/load are forwarded
+        // to the session's clipboard cache and the frontend.
         let config = Config {
             kitty_keyboard: true,
+            osc52: Osc52::CopyPaste,
             ..Config::default()
         };
         let term = Term::new(
@@ -680,6 +739,9 @@ impl TerminalSession {
             SessionEventListener {
                 pty_writer: response_sender,
                 size: Arc::clone(&reported_size),
+                ui: ui.clone(),
+                clipboard: Arc::clone(&clipboard),
+                session_id,
             },
         );
 
@@ -703,6 +765,8 @@ impl TerminalSession {
             graphics_protocol_capture: Vec::new(),
             selection: None,
             scrollback_limit: 10_000,
+            ui,
+            session_id,
         })
     }
 
@@ -926,6 +990,24 @@ impl TerminalSession {
                         self.processor.advance(&mut self.term, &plain);
                         self.scroll_processor
                             .advance(&mut self.scroll_tracker, &plain);
+                        // The emulator does not answer XTVERSION (`CSI > q`),
+                        // so reply here with a cmdash identity before flushing
+                        // queued child responses.
+                        if contains_xtversion_query(&plain)
+                            && !self.graphics_broker.queue_child(xtversion_response())
+                        {
+                            self.graphics.record_diagnostic(
+                                None,
+                                "child response queue is full; XTVERSION response was dropped",
+                            );
+                        }
+                        // Surface bounded shell-integration notifications
+                        // (OSC 9/777) as frontend diagnostics.
+                        if let Some(ui) = &self.ui {
+                            for message in extract_shell_notifications(&plain) {
+                                let _ = ui.send(UiEvent::Notification(self.session_id, message));
+                            }
+                        }
                         self.flush_emulator_responses()?;
                         let erases = self.scroll_tracker.take_erases();
                         if !erases.is_empty() {
@@ -1743,6 +1825,97 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     } else {
         text.as_bytes().to_vec()
     }
+}
+
+/// Truncates a string to at most `limit` bytes on a UTF-8 character boundary.
+fn truncate_bounded(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// Whether a plain output chunk carries the XTVERSION query (`CSI > q`,
+/// optionally with a `0` parameter), which the emulator does not answer.
+fn contains_xtversion_query(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|window| window == b"\x1b[>q")
+        || bytes.windows(5).any(|window| window == b"\x1b[>0q")
+}
+
+/// The XTVERSION reply: `DCS > | cmdash <version> ST`.
+fn xtversion_response() -> Vec<u8> {
+    format!("\x1bP>|cmdash {}\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes()
+}
+
+/// Extracts bounded shell-integration notifications (OSC 9/777 notify and
+/// progress) from a plain output chunk. Incomplete sequences straddling a
+/// chunk boundary are left for the next chunk.
+fn extract_shell_notifications(bytes: &[u8]) -> Vec<String> {
+    let mut notifications = Vec::new();
+    let mut index = 0;
+    while index + 2 <= bytes.len() {
+        if bytes[index] != 0x1b || bytes[index + 1] != b']' {
+            index += 1;
+            continue;
+        }
+        let payload_start = index + 2;
+        let Some(terminator) = (payload_start..bytes.len())
+            .find(|&i| bytes[i] == 0x07 || (bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\')))
+        else {
+            break;
+        };
+        if let Some(message) = shell_notification(&bytes[payload_start..terminator]) {
+            notifications.push(message);
+        }
+        index = terminator + if bytes[terminator] == 0x07 { 1 } else { 2 };
+    }
+    notifications
+}
+
+/// Formats a bounded notification message from an OSC payload, or `None` when
+/// the payload is not a supported notification (OSC 9/777).
+fn shell_notification(payload: &[u8]) -> Option<String> {
+    let mut parts = payload.splitn(2, |&byte| byte == b';');
+    let code = parts.next()?;
+    let rest = parts.next().unwrap_or(&[]);
+    let message = match code {
+        // OSC 777 ; notify ; title ; body
+        b"777" => {
+            let mut fields = rest.splitn(3, |&byte| byte == b';');
+            let _kind = fields.next();
+            let title = String::from_utf8_lossy(fields.next().unwrap_or(&[]));
+            let body = String::from_utf8_lossy(fields.next().unwrap_or(&[]));
+            format!("{} {}", title.trim(), body.trim())
+                .trim()
+                .to_owned()
+        }
+        // OSC 9 ; [4 ; progress ;] message
+        b"9" => {
+            let mut fields = rest.splitn(3, |&byte| byte == b';');
+            let first = fields.next().unwrap_or(&[]);
+            if first == b"4" {
+                let progress = String::from_utf8_lossy(fields.next().unwrap_or(&[]));
+                let message = String::from_utf8_lossy(fields.next().unwrap_or(&[]));
+                format!("progress {}% {}", progress.trim(), message.trim())
+                    .trim()
+                    .to_owned()
+            } else {
+                String::from_utf8_lossy(first).trim().to_owned()
+            }
+        }
+        _ => return None,
+    };
+    if message.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "notification: {}",
+        truncate_bounded(&message, MAX_NOTIFICATION_BYTES)
+    ))
 }
 
 /// Encodes a mouse event using the encoding the application negotiated
@@ -2637,6 +2810,151 @@ mod tests {
             session.selected_hyperlink().as_deref(),
             Some("https://example.com")
         );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn xtversion_detection_and_response_format() {
+        assert!(contains_xtversion_query(b"\x1b[>q"));
+        assert!(contains_xtversion_query(b"\x1b[>0q"));
+        assert!(!contains_xtversion_query(b"\x1b[>c"));
+        assert!(!contains_xtversion_query(b"no query here"));
+        let response = xtversion_response();
+        assert!(response.starts_with(b"\x1bP>|cmdash "));
+        assert!(response.ends_with(b"\x1b\\"));
+    }
+
+    #[test]
+    fn xtversion_queries_are_answered_to_the_child_pty() {
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &[
+                "-c",
+                "stty -icanon min 1 time 0; printf '\\033[>q'; response=$(dd bs=1 count=18 2>/dev/null); case \"$response\" in *cmdash*) printf 'xt-ok';; esac; sleep 5",
+            ],
+            TerminalSize::new(40, 8),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut xt_ok = false;
+        while Instant::now() < deadline {
+            session.poll_output().unwrap();
+            let scene = session.render(Rect::new(0, 0, 40, 8), false);
+            let rendered: String = scene.cells().iter().map(|cell| cell.symbol).collect();
+            if rendered.contains("xt-ok") {
+                xt_ok = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(xt_ok, "child did not receive the XTVERSION response");
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn osc52_store_updates_the_clipboard_cache_and_notifies_the_frontend() {
+        let (_, receiver, wakeup) = ui_event_channel();
+        let clipboard = Arc::new(Mutex::new(None));
+        let mut session = TerminalSession::spawn_with_session_id_and_wakeup(
+            SessionId::new(8),
+            Some("sh"),
+            &["-c", "sleep 5"],
+            TerminalSize::new(20, 4),
+            Some(wakeup),
+            "xterm-256color",
+            Arc::clone(&clipboard),
+        )
+        .unwrap();
+        session
+            .processor
+            .advance(&mut session.term, b"\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(clipboard.lock().unwrap().as_deref(), Some("hello"));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(UiEvent::ClipboardStore(text)) if text == "hello"
+        ));
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn osc52_load_responds_with_the_cached_clipboard() {
+        let clipboard = Arc::new(Mutex::new(Some("hello".to_owned())));
+        let mut session = TerminalSession::spawn_with_session_id_and_wakeup(
+            SessionId::new(9),
+            Some("sh"),
+            &["-c", "sleep 5"],
+            TerminalSize::new(20, 4),
+            None,
+            "xterm-256color",
+            Arc::clone(&clipboard),
+        )
+        .unwrap();
+        session
+            .processor
+            .advance(&mut session.term, b"\x1b]52;c;?\x07");
+        assert_eq!(
+            session.emulator_responses.try_recv().unwrap(),
+            "\x1b]52;c;aGVsbG8=\x07"
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn bell_is_reported_to_the_frontend() {
+        let (_, receiver, wakeup) = ui_event_channel();
+        let mut session = TerminalSession::spawn_with_session_id_and_wakeup(
+            SessionId::new(10),
+            Some("sh"),
+            &["-c", "sleep 5"],
+            TerminalSize::new(20, 4),
+            Some(wakeup),
+            "xterm-256color",
+            Arc::new(Mutex::new(None)),
+        )
+        .unwrap();
+        session.processor.advance(&mut session.term, b"\x07");
+        assert!(matches!(receiver.try_recv(), Ok(UiEvent::Bell(_))));
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shell_notification_parses_osc9_and_osc777() {
+        assert_eq!(
+            shell_notification(b"777;notify;Build;failed"),
+            Some("notification: Build failed".to_owned())
+        );
+        assert_eq!(
+            shell_notification(b"9;4;50;compiling"),
+            Some("notification: progress 50% compiling".to_owned())
+        );
+        assert_eq!(
+            shell_notification(b"9;hello"),
+            Some("notification: hello".to_owned())
+        );
+        assert_eq!(shell_notification(b"2;window title"), None);
+        assert_eq!(shell_notification(b"133;A"), None);
+    }
+
+    #[test]
+    fn shell_integration_notifications_are_surfaced_to_the_frontend() {
+        let (_, receiver, wakeup) = ui_event_channel();
+        let mut session = TerminalSession::spawn_with_session_id_and_wakeup(
+            SessionId::new(11),
+            Some("sh"),
+            &["-c", "sleep 5"],
+            TerminalSize::new(20, 4),
+            Some(wakeup),
+            "xterm-256color",
+            Arc::new(Mutex::new(None)),
+        )
+        .unwrap();
+        session
+            .consume_output(b"\x1b]777;notify;Build;failed\x07")
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(UiEvent::Notification(_, message)) if message == "notification: Build failed"
+        ));
         session.shutdown().unwrap();
     }
 

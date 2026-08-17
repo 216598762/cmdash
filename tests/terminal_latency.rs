@@ -1,5 +1,8 @@
 use std::{
-    sync::mpsc::{Receiver, TryRecvError},
+    sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, TryRecvError},
+    },
     time::{Duration, Instant},
 };
 
@@ -27,6 +30,8 @@ fn terminal_key_to_echo_latency_benchmark() {
         ],
         TerminalSize::new(80, 24),
         Some(wakeup.clone()),
+        "xterm-256color",
+        Arc::new(Mutex::new(None)),
     )
     .expect("could not spawn the latency benchmark PTY");
 
@@ -94,7 +99,10 @@ fn wait_for_marker(
                 UiEvent::Tick
                 | UiEvent::AnimationFrame
                 | UiEvent::ApiWakeup
-                | UiEvent::CursorBlink(_),
+                | UiEvent::CursorBlink(_)
+                | UiEvent::ClipboardStore(_)
+                | UiEvent::Bell(_)
+                | UiEvent::Notification(_, _),
             ) => {}
             Ok(UiEvent::Input(_)) => return Err("unexpected input event".to_owned()),
             Ok(UiEvent::OuterInput(_)) => {}
@@ -136,7 +144,10 @@ fn round_trip(
                 UiEvent::Tick
                 | UiEvent::AnimationFrame
                 | UiEvent::ApiWakeup
-                | UiEvent::CursorBlink(_),
+                | UiEvent::CursorBlink(_)
+                | UiEvent::ClipboardStore(_)
+                | UiEvent::Bell(_)
+                | UiEvent::Notification(_, _),
             ) => {}
             Ok(UiEvent::Input(_)) => return Err("unexpected input event".to_owned()),
             Ok(UiEvent::OuterInput(_)) => {}

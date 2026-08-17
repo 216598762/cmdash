@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -473,6 +474,7 @@ pub struct WidgetRuntimeContext {
     initial_terminal_size: Option<TerminalSize>,
     kitty_graphics: bool,
     theme: Theme,
+    clipboard: Arc<Mutex<Option<String>>>,
 }
 
 impl WidgetRuntimeContext {
@@ -486,6 +488,7 @@ impl WidgetRuntimeContext {
             initial_terminal_size: None,
             kitty_graphics: false,
             theme: Theme::default(),
+            clipboard: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -518,6 +521,13 @@ impl WidgetRuntimeContext {
 
     pub const fn theme(&self) -> Theme {
         self.theme
+    }
+
+    /// The session-shared clipboard cache (bounded to the last copied text),
+    /// shared between the frontend's selection copy and each terminal's OSC 52
+    /// store/load path.
+    pub fn clipboard(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.clipboard)
     }
 }
 
@@ -1544,6 +1554,23 @@ fn terminal_widget_factory(
         .theme()
         .with_settings(&config.settings)
         .map_err(|error| WidgetError::InvalidConfiguration(error.to_string()))?;
+    // `TERM` advertises the implemented feature set to the child; the default
+    // `xterm-256color` is universally available, while `xterm-kitty` (or
+    // `xterm-ghostty`) opts programs into the negotiated protocols.
+    let term_env = config
+        .settings
+        .get("term")
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() || value.len() > 64 || value.contains('\0') {
+                return Err(WidgetError::InvalidConfiguration(format!(
+                    "terminal term must be a non-empty TERM name, got {value:?}"
+                )));
+            }
+            Ok(value.to_owned())
+        })
+        .transpose()?
+        .unwrap_or_else(|| "xterm-256color".to_owned());
     let mut session = TerminalSession::spawn_with_session_id_and_wakeup(
         crate::state::SessionId::new(config.id),
         config.command.as_deref(),
@@ -1552,6 +1579,8 @@ fn terminal_widget_factory(
             .initial_terminal_size()
             .unwrap_or_else(|| TerminalSize::new(80, 24)),
         context.session_wakeup().cloned(),
+        &term_env,
+        context.clipboard(),
     )
     .map_err(|error| WidgetError::InitializationFailed {
         kind: "terminal".to_owned(),

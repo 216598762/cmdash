@@ -778,6 +778,9 @@ fn collect_ui_event<B: Backend<Error = io::Error>>(
             }
         }
         UiEvent::PtyOutput => pty_wakeup.clear_pending(),
+        UiEvent::ClipboardStore(text) => state.record_clipboard(text),
+        UiEvent::Bell(_) => state.record_bell(),
+        UiEvent::Notification(_, message) => state.record_diagnostic(message),
         UiEvent::Tick => {}
         UiEvent::ApiWakeup => {}
         UiEvent::AnimationFrame => {

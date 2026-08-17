@@ -195,6 +195,11 @@ are `text`, `clock`, `system`, `status`, `key_value`, `gauge`, `list`, `log`,
 - `settings.scrollback` is a non-negative line count (default `10000`) bounding
   the terminal's history. Images that scroll above that limit are evicted and
   their decoded bytes released.
+- `settings.term` sets the child's `TERM` environment variable (default
+  `xterm-256color`, the universally available value). Set `xterm-kitty` (or
+  another capability-rich entry whose terminfo is installed) to make programs
+  opt in to the negotiated Kitty keyboard protocol and graphics; the value must
+  be a non-empty name of at most 64 bytes.
 
 Appearance is configured through `[appearance]`; see
 [APPEARANCE.md](APPEARANCE.md) for semantic roles, parent-terminal palette

@@ -849,7 +849,7 @@ impl AppState {
         else {
             return false;
         };
-        self.pending_clipboard = Some(text.clone());
+        self.record_clipboard(text.clone());
         // Surface an OSC 8 hyperlink's target URL when the selection is over
         // one, even though the copied text is the link's display text.
         let hyperlink = self
@@ -865,6 +865,26 @@ impl AppState {
 
     pub fn take_clipboard(&mut self) -> Option<String> {
         self.pending_clipboard.take()
+    }
+
+    /// Records text copied to the clipboard — from a terminal's own selection
+    /// or from a child's OSC 52 store — in both the backend submission queue
+    /// and the session-shared cache used to answer OSC 52 paste requests.
+    pub fn record_clipboard(&mut self, text: String) {
+        let clipboard = self.widget_registry.context().clipboard();
+        if let Ok(mut cached) = clipboard.lock() {
+            *cached = Some(text.clone());
+        }
+        self.pending_clipboard = Some(text);
+    }
+
+    /// Surfaces a terminal bell (`BEL`) as a bounded visual signal. Consecutive
+    /// bells collapse into a single diagnostic so a bell flood cannot spam the
+    /// status area.
+    pub fn record_bell(&mut self) {
+        if self.latest_diagnostic() != Some("bell") {
+            self.record_diagnostic("bell");
+        }
     }
 
     pub fn handle_focused_mouse(&mut self, mouse: MouseEvent) -> Result<bool, String> {
@@ -1810,6 +1830,44 @@ mod tests {
             .unwrap();
         assert!(!state.copy_focused_selection());
         assert_eq!(state.take_clipboard(), None);
+    }
+
+    #[test]
+    fn clipboard_records_reach_the_submission_queue_and_session_cache() {
+        let config =
+            AppConfig::parse("version = 1\n[[workspace.widgets]]\nid = 1\ntype = \"text\"\n")
+                .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        state.record_clipboard("copy me".to_owned());
+        assert_eq!(state.take_clipboard().as_deref(), Some("copy me"));
+        assert_eq!(
+            state
+                .widget_registry
+                .context()
+                .clipboard()
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("copy me")
+        );
+    }
+
+    #[test]
+    fn consecutive_bells_collapse_into_a_single_diagnostic() {
+        let mut state = AppState::new(capabilities());
+        state.record_bell();
+        state.record_bell();
+        state.record_bell();
+        assert_eq!(state.latest_diagnostic(), Some("bell"));
+        assert_eq!(
+            state
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.as_str() == "bell")
+                .count(),
+            1
+        );
     }
 
     #[test]

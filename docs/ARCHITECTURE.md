@@ -283,6 +283,22 @@ session additionally enforces the parser's 150 ms sync timeout so a burst
 whose ESU never arrives cannot strand output in the grid or its scroll
 observer.
 
+Capability advertisement, the clipboard, bells, and shell notifications round
+out the session surface. `TERM` is configurable per terminal (`settings.term`,
+default `xterm-256color`; `xterm-kitty` opts programs into the negotiated
+protocols) and the emulator answers DA1/DA2, while the session intercepts
+XTVERSION (`CSI > q`) and replies with a `DCS > | cmdash <version> ST`
+identity. The emulator's OSC 52 handling is enabled (`Osc52::CopyPaste`): a
+child store and the terminal's own selection both populate a session-shared,
+byte-bounded clipboard cache (and the backend submission queue), and a child
+load answers from that cache as a base64 OSC 52 response — a bounded
+paste-what-was-copied model rather than an outer-terminal system-clipboard
+round trip. `BEL` becomes a bounded, deduplicated frontend diagnostic, and
+OSC 9/777 notifications are parsed from the plain output stream into truncated
+frontend diagnostics (OSC 133/1337 markers are recognized but ignored). These
+session-to-frontend events ride the existing `UiEvent` channel, so sessions
+spawned without a frontend (tests) simply drop them.
+
 ### 5.2 Kitty graphics model
 
 Kitty graphics are treated as terminal-session state, not as a global backend cache. `alacritty_terminal` remains the text/parser owner, while cmdash intercepts Kitty APC sequences and retains resources and placements in a session-owned adapter. The current flow is:

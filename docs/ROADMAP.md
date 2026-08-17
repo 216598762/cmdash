@@ -987,22 +987,24 @@ implicit.
 
 ### Goals and boundaries
 
-- [ ] Give every terminal session one scrollback buffer that text and graphics
+- [x] Give every terminal session one scrollback buffer that text and graphics
   move through together, matching how Kitty/Ghostty anchor images to the cell
   grid instead of to absolute pixels.
-- [ ] Let the user navigate history (mouse wheel, Shift+PageUp/PageDown,
+- [x] Let the user navigate history (mouse wheel, Shift+PageUp/PageDown,
   touchpad) without disturbing the live child process or leaking state between
   panes/tabs.
-- [ ] Bound history by a configurable line count and evict image data past that
+- [x] Bound history by a configurable line count and evict image data past that
   limit, so a long-running session cannot grow the retained store without bound.
-- [ ] Model the protocol's erase/reset semantics for graphics (clear-screen,
+- [x] Model the protocol's erase/reset semantics for graphics (clear-screen,
   reset, alternate-screen switch) instead of only tracking scroll displacement.
-- [ ] Keep emulator state (`alacritty_terminal`) the source of truth for text,
+- [x] Keep emulator state (`alacritty_terminal`) the source of truth for text,
   and keep graphics state an observation/retention layer, as today.
-- [ ] Land the remaining Kitty graphics surface (relative placements, image
+- [x] Land the remaining Kitty graphics surface (relative placements, image
   numbers, usage hints, the full delete-selector set, storage-quota eviction)
   only with conformance coverage; never claim support without a verified result.
-- [ ] Plan terminal feature parity (hyperlinks, synchronized output, the Kitty
+  Three residuals stay open below: frame `z` gap normalization, `I`-addressed
+  error acknowledgements, and deep negative z-index layering.
+- [x] Plan terminal feature parity (hyperlinks, synchronized output, the Kitty
   keyboard protocol, mouse/focus reports, OSC 52 clipboard, underline styles,
   bell, and notifications) as explicit, capability-aware workstreams.
 
@@ -1266,8 +1268,13 @@ captured-sequence or PTY conformance fixture.
   also suppresses the terminal's own selection so events reach the child
   verbatim. Focus reporting (`?1004`) sends `CSI I`/`CSI O` as focus moves
   between panes.
-- [ ] **OSC 52 clipboard** — complete the read/write path (selection copy exists
-  today) with bounded payloads and a documented permission policy.
+- [x] **OSC 52 clipboard** — the emulator's OSC 52 handling is enabled and
+  both directions are wired: a child's store (copy) and the terminal's own
+  selection both land in a session-shared, byte-bounded cache and are
+  submitted to the backend, while a child's load (paste) answers from that
+  cache as a base64 OSC 52 response. The read path is a bounded paste-what-
+  was-copied cache rather than a query of the outer terminal's system
+  clipboard, which remains a future outer-input round trip.
 - [x] **Text presentation attributes** — italic, reverse, strikeout, and hidden
   (SGR 3/7/9/8) plus underline now flow from the emulator through
   `CellStyle`/`Scene`/backend serialization instead of being dropped; blink
@@ -1276,16 +1283,21 @@ captured-sequence or PTY conformance fixture.
   from SGR 4:x and DECSET 58 are retained on the cell and emitted as
   `4:x`/`58` SGR; an outer terminal that lacks the style degrades to its own
   underline rendering.
-- [ ] **Bell and visual bell** — route BEL to a bounded audible/visual signal
-  without corrupting the scene or waking hidden sessions.
-- [ ] **Notifications and shell integration** — OSC 9/777 and OSC 133/1337
-  progress/prompt markers as bounded, capability-gated metadata, not arbitrary
-  output.
-- [ ] **Capability advertisement** — report a `TERM`/`XTVERSION`/DA surface
-  that matches the implemented feature set so programs actually opt in to
-  hyperlinks, synchronized output, and enhanced keyboard; today children spawn
-  with `TERM=xterm-256color`, which suppresses every feature above even once
-  it is parsed.
+- [x] **Bell and visual bell** — `BEL` is routed from the emulator to the
+  frontend and surfaced as a bounded visual diagnostic; consecutive bells
+  collapse so a bell flood cannot spam the status area. No audio is available
+  from a TUI, and bells from hidden sessions do not wake them.
+- [x] **Notifications and shell integration** — OSC 9 (message/progress) and
+  OSC 777 (notify) sequences are parsed from the output stream into bounded,
+  truncated frontend diagnostics rather than being treated as arbitrary
+  output. OSC 133/1337 prompt markers are recognized but intentionally
+  ignored, since cmdash renders the live grid directly and does not need
+  shell-integration grouping.
+- [x] **Capability advertisement** — the terminal's `TERM` is now configurable
+  (`settings.term`, default `xterm-256color`; set `xterm-kitty` to opt
+  programs into the negotiated keyboard/graphics protocols), DA1/DA2 are
+  already answered by the emulator, and XTVERSION (`CSI > q`) is now answered
+  with a `DCS > | cmdash <version> ST` identity.
 
 ### Testing and validation
 
@@ -1302,9 +1314,10 @@ captured-sequence or PTY conformance fixture.
   matrix.
 - [ ] Add captured-sequence fixtures for hyperlinks, synchronized output,
   OSC 52, bell, and notifications; assert the outer stream and the child
-  acknowledgement sides. Session-level PTY and emulator fixtures already cover
-  keyboard protocol, mouse/focus reports, text presentation attributes, and
-  underline styles.
+  acknowledgement sides. Session-level PTY and emulator fixtures now cover
+  keyboard protocol, mouse/focus reports, text presentation attributes,
+  underline styles, OSC 52 store/load, bells, shell notifications, and
+  XTVERSION.
 - [x] Add bounded-pressure tests (long-running sessions, rapid scroll, many
   images) proving memory stays within the configured history/byte quotas.
 
