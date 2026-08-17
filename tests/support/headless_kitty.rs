@@ -48,8 +48,38 @@ struct Resource {
     pixel_width: u16,
     pixel_height: u16,
     z: i16,
+    image_number: u32,
     payload: Vec<u8>,
     pixels: Option<Vec<HeadlessPixel>>,
+    animation_frames: BTreeMap<u32, Frame>,
+}
+
+/// An animation frame added via Kitty's `a=f` action, mirroring the store's
+/// `GraphicsAnimationFrame`. `pixels` holds the transmitted rectangle bytes for
+/// a delta frame, or the full coalesced image for a standalone keyframe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Frame {
+    pixels: Vec<HeadlessPixel>,
+    width: u16,
+    height: u16,
+    x: u16,
+    y: u16,
+    base_frame: u32,
+    compose_mode: u8,
+    bgcolor: Option<HeadlessPixel>,
+}
+
+impl Frame {
+    /// Whether this frame already holds the full image at the origin with no
+    /// base frame to coalesce and no background canvas to fill.
+    fn is_full_keyframe(&self, image_width: u16, image_height: u16) -> bool {
+        self.base_frame == 0
+            && self.bgcolor.is_none()
+            && self.x == 0
+            && self.y == 0
+            && self.width == image_width
+            && self.height == image_height
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +102,13 @@ pub struct HeadlessPlacement {
     pub height: u16,
     pub z: i16,
     source: Option<SourceRect>,
+}
+
+impl HeadlessPlacement {
+    /// The placement's source crop as `(x, y, width, height)` in pixels.
+    pub fn source(&self) -> Option<(u16, u16, u16, u16)> {
+        self.source.map(|source| (source.x, source.y, source.width, source.height))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +138,7 @@ pub struct HeadlessKittyTerminal {
     acknowledgements: Vec<Vec<u8>>,
     pending_input: Vec<u8>,
     virtual_placements: BTreeMap<u32, (u16, u16, i16)>,
+    next_image_id: u32,
     framebuffer: Option<Framebuffer>,
 }
 
@@ -255,6 +293,10 @@ impl HeadlessKittyTerminal {
         self.placements.len()
     }
 
+    pub fn virtual_placement_count(&self) -> usize {
+        self.virtual_placements.len()
+    }
+
     pub fn placeholder_count(&self) -> usize {
         self.placeholder_cells.len()
     }
@@ -296,7 +338,8 @@ impl HeadlessKittyTerminal {
 
     pub fn placements_in_z_order(&self) -> Vec<HeadlessPlacement> {
         let mut placements = self.placements.clone();
-        placements.sort_by_key(|placement| placement.z);
+        // Equal-z overlaps tie-break by ascending image id, matching Kitty.
+        placements.sort_by_key(|placement| (placement.z, placement.image_id));
         placements
     }
 
@@ -314,9 +357,46 @@ impl HeadlessKittyTerminal {
             .map(|resource| resource.payload.as_slice())
     }
 
+    /// The resource's current wire format (`100` for a still-raw PNG/GIF, `32`
+    /// once a composition has decoded it to RGBA).
+    pub fn resource_format(&self, image_id: u32) -> Option<u8> {
+        self.resources.get(&image_id).map(|resource| resource.format)
+    }
+
+    /// The resource's decoded root-frame pixels.
+    pub fn resource_pixels(&self, image_id: u32) -> Option<&[HeadlessPixel]> {
+        self.resources
+            .get(&image_id)
+            .and_then(|resource| resource.pixels.as_deref())
+    }
+
+    /// The number of animation frames stored for an image (excluding the root).
+    pub fn animation_frame_count(&self, image_id: u32) -> Option<usize> {
+        self.resources
+            .get(&image_id)
+            .map(|resource| resource.animation_frames.len())
+    }
+
+    /// A stored animation frame's raw (delta or keyframe) pixels.
+    pub fn animation_frame_pixels(
+        &self,
+        image_id: u32,
+        frame: u32,
+    ) -> Option<&[HeadlessPixel]> {
+        self.resources
+            .get(&image_id)
+            .and_then(|resource| resource.animation_frames.get(&frame))
+            .map(|frame| frame.pixels.as_slice())
+    }
+
     /// Responses the headless terminal would send after accepting commands.
     pub fn acknowledgements(&self) -> &[Vec<u8>] {
         &self.acknowledgements
+    }
+
+    /// The terminal's cursor position (column, row) after the last command.
+    pub fn cursor(&self) -> (u16, u16) {
+        self.cursor
     }
 
     fn feed_inner(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -529,15 +609,35 @@ impl HeadlessKittyTerminal {
     ) -> Result<(), String> {
         match parameter_string(&parameters, "a") {
             Some("T") | Some("t") => {
-                let image_id = parameter_u32(&parameters, "i")?;
+                let image_id = self.resolve_transmit_image(&parameters)?;
+                let image_number = parameter_u32(&parameters, "I").unwrap_or(0);
                 let format = parameter_u32(&parameters, "f")? as u8;
                 let width = parameter_u16(&parameters, "c", 1)?;
                 let height = parameter_u16(&parameters, "r", 1)?;
-                let pixel_width = parameter_u16(&parameters, "s", width)?;
-                let pixel_height = parameter_u16(&parameters, "v", height)?;
                 if image_id == 0 {
                     return Err("headless model requires a nonzero image id".to_owned());
                 }
+                // A non-raw (PNG/GIF) image contributes its natural pixel
+                // dimensions; `s`/`v` override them when present. Raw formats
+                // take their dimensions from `s`/`v` directly.
+                let (pixels, pixel_width, pixel_height) = if format == 100 {
+                    let natural = decode_raster(payload);
+                    let (natural_width, natural_height) = natural
+                        .as_ref()
+                        .map(|(_, width, height)| (*width, *height))
+                        .unwrap_or((width, height));
+                    let pixel_width = parameter_u16(&parameters, "s", natural_width)?;
+                    let pixel_height = parameter_u16(&parameters, "v", natural_height)?;
+                    (natural.map(|(pixels, _, _)| pixels), pixel_width, pixel_height)
+                } else {
+                    let pixel_width = parameter_u16(&parameters, "s", width)?;
+                    let pixel_height = parameter_u16(&parameters, "v", height)?;
+                    (
+                        decode_rgba_pixels(format, payload, pixel_width, pixel_height),
+                        pixel_width,
+                        pixel_height,
+                    )
+                };
                 self.resources.insert(
                     image_id,
                     Resource {
@@ -547,8 +647,10 @@ impl HeadlessKittyTerminal {
                         pixel_width,
                         pixel_height,
                         z: parameter_i16(&parameters, "z", 0)?,
+                        image_number,
                         payload: payload.to_vec(),
-                        pixels: decode_pixels(format, payload, pixel_width, pixel_height),
+                        pixels,
+                        animation_frames: BTreeMap::new(),
                     },
                 );
                 self.placements
@@ -567,7 +669,7 @@ impl HeadlessKittyTerminal {
                 }
             }
             Some("p") | Some("P") => {
-                let image_id = parameter_u32(&parameters, "i")?;
+                let image_id = self.resolve_reference_image(&parameters)?;
                 let resource = self
                     .resources
                     .get(&image_id)
@@ -597,23 +699,362 @@ impl HeadlessKittyTerminal {
                     self.acknowledgements.push(kitty_acknowledgement(image_id));
                 }
                 Some("p") | Some("P") => {
-                    self.placements.clear();
+                    // Delete placements intersecting the 1-based x/y cell.
+                    // Virtual placements have no physical location, so this
+                    // selector never affects them (matching Kitty).
+                    let column = parameter_u32(&parameters, "x")
+                        .map(|value| value.saturating_sub(1))
+                        .unwrap_or(0);
+                    let row = parameter_u32(&parameters, "y")
+                        .map(|value| value.saturating_sub(1))
+                        .unwrap_or(0);
+                    self.placements.retain(|placement| {
+                        !(u32::from(placement.x) <= column
+                            && column < u32::from(placement.x.saturating_add(placement.width))
+                            && u32::from(placement.y) <= row
+                            && row < u32::from(placement.y.saturating_add(placement.height)))
+                    });
                     self.actions.push("delete");
                 }
                 Some("a") | Some("A") => {
-                    self.resources.clear();
-                    self.virtual_placements.clear();
+                    // Delete all visible real placements; virtual placements
+                    // and retained image data survive (matching Kitty).
                     self.placements.clear();
                     self.actions.push("delete");
                 }
                 _ => return Err("unsupported Kitty delete selector".to_owned()),
             },
+            Some("f") | Some("F") => self.apply_frame(&parameters, payload)?,
+            Some("c") | Some("C") => self.compose_animation_frame(&parameters)?,
             Some("q") | Some("Q") => self.actions.push("query"),
             None => return Err("unsupported Kitty APC without an action".to_owned()),
             Some(action) => return Err(format!("unsupported Kitty action {action}")),
         }
         self.render_frame();
         Ok(())
+    }
+
+    /// Applies a Kitty `a=f` animation-frame command, mirroring the store's
+    /// `handle_animation_frame_load_command`. Frame 1 is the root frame; a new
+    /// frame is stored as a delta with its composition metadata, while editing
+    /// an existing frame coalesces and re-composes it.
+    fn apply_frame(
+        &mut self,
+        parameters: &BTreeMap<String, String>,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        let image_id = self.resolve_reference_image(parameters)?;
+        let (pixel_width, pixel_height, format) = {
+            let resource = self
+                .resources
+                .get(&image_id)
+                .ok_or_else(|| format!("animation frame references unknown image {image_id}"))?;
+            (resource.pixel_width, resource.pixel_height, resource.format)
+        };
+        let requested_frame = parameter_u32_default(parameters, "r", 0)?;
+        let frame = if requested_frame == 0 {
+            self.resources
+                .get(&image_id)
+                .map_or(2, |resource| {
+                    resource
+                        .animation_frames
+                        .keys()
+                        .next_back()
+                        .copied()
+                        .unwrap_or(1)
+                        .saturating_add(1)
+                })
+        } else {
+            requested_frame
+        };
+        if frame == 0 {
+            return Err("animation frame number must be nonzero".to_owned());
+        }
+        let edits_existing = frame == 1
+            || self
+                .resources
+                .get(&image_id)
+                .is_some_and(|resource| resource.animation_frames.contains_key(&frame));
+        let rect_width = parameter_u16(parameters, "s", pixel_width)?;
+        let rect_height = parameter_u16(parameters, "v", pixel_height)?;
+        let offset_x = parameter_u16(parameters, "x", 0)?;
+        let offset_y = parameter_u16(parameters, "y", 0)?;
+        let base_frame = parameter_u32_default(parameters, "c", 0)?;
+        let compose_mode = parameter(parameters, "X").unwrap_or(0);
+        let bgcolor = match parameter_string(parameters, "Y") {
+            Some(raw) => Some(parse_bgcolor(raw)?),
+            None => None,
+        };
+        // A non-raw (PNG/GIF) image cannot be composed byte-for-byte, so a
+        // delta frame for one is rejected exactly like the store.
+        let composes = base_frame != 0
+            || bgcolor.is_some()
+            || compose_mode != 0
+            || offset_x != 0
+            || offset_y != 0
+            || rect_width != pixel_width
+            || rect_height != pixel_height;
+        if composes && format == 100 {
+            return Err("cannot compose animation frames for a non-raw (PNG/GIF) image".to_owned());
+        }
+        if base_frame != 0
+            && base_frame != 1
+            && !self
+                .resources
+                .get(&image_id)
+                .is_some_and(|resource| resource.animation_frames.contains_key(&base_frame))
+        {
+            return Err(format!("animation frame references unknown frame {base_frame}"));
+        }
+        let frame_pixels = decode_rgba_pixels(format, payload, rect_width, rect_height)
+            .ok_or_else(|| "animation frame payload does not match its dimensions".to_owned())?;
+
+        let (stored, width, height, x, y, base, mode, color) = if edits_existing && format != 100 {
+            let mut under = self.coalesce_frame(image_id, frame)?;
+            compose_rect(
+                &mut under,
+                pixel_width,
+                &frame_pixels,
+                offset_x,
+                offset_y,
+                rect_width,
+                rect_height,
+                compose_mode == 0 && format != 24,
+            );
+            (under, pixel_width, pixel_height, 0, 0, 0, 0, None)
+        } else {
+            (
+                frame_pixels,
+                rect_width,
+                rect_height,
+                offset_x,
+                offset_y,
+                base_frame,
+                compose_mode,
+                bgcolor,
+            )
+        };
+        if frame == 1 {
+            let resource = self
+                .resources
+                .get_mut(&image_id)
+                .expect("resource validated above");
+            resource.pixels = Some(stored);
+            resource.pixel_width = width;
+            resource.pixel_height = height;
+        } else {
+            self.resources
+                .get_mut(&image_id)
+                .expect("resource validated above")
+                .animation_frames
+                .insert(
+                    frame,
+                    Frame {
+                        pixels: stored,
+                        width,
+                        height,
+                        x,
+                        y,
+                        base_frame: base,
+                        compose_mode: mode,
+                        bgcolor: color,
+                    },
+                );
+        }
+        self.actions.push("frame");
+        Ok(())
+    }
+
+    /// Applies a Kitty `a=c` animation-frame composition, mirroring the
+    /// store's `compose_animation_frame`: `r`/`c` are the source/destination
+    /// frame numbers, `X`/`Y` the source origin, `x`/`y` the destination
+    /// origin, `w`/`h` the rectangle size, and `C` the mode (0 alpha-blend,
+    /// 1 overwrite). A non-raw (PNG/GIF) root frame is decoded to RGBA so it
+    /// can be composed, and composing onto it converts the format to 32.
+    fn compose_animation_frame(
+        &mut self,
+        parameters: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let image_id = self.resolve_reference_image(parameters)?;
+        let (format, pixel_width, pixel_height) = {
+            let resource = self
+                .resources
+                .get(&image_id)
+                .ok_or_else(|| format!("composition references unknown image {image_id}"))?;
+            (resource.format, resource.pixel_width, resource.pixel_height)
+        };
+        if !matches!(format, 24 | 32 | 100) {
+            return Err("cannot compose animation frames for an unsupported format".to_owned());
+        }
+        let source_frame = parameter_u32_default(parameters, "r", 1)?;
+        let destination_frame = parameter_u32_default(parameters, "c", 1)?;
+        let source_x = parameter_u16(parameters, "X", 0)?;
+        let source_y = parameter_u16(parameters, "Y", 0)?;
+        let destination_x = parameter_u16(parameters, "x", 0)?;
+        let destination_y = parameter_u16(parameters, "y", 0)?;
+        let compose_mode = parameter(parameters, "C").unwrap_or(0);
+        let width = parameter_u16(parameters, "w", 0)?;
+        let height = parameter_u16(parameters, "h", 0)?;
+        let width = if width == 0 { pixel_width } else { width };
+        let height = if height == 0 { pixel_height } else { height };
+        if width == 0 || height == 0 {
+            return Err("composition rectangle must be nonzero".to_owned());
+        }
+        if source_x.saturating_add(width) > pixel_width
+            || source_y.saturating_add(height) > pixel_height
+            || destination_x.saturating_add(width) > pixel_width
+            || destination_y.saturating_add(height) > pixel_height
+        {
+            return Err("composition rectangle is out of bounds".to_owned());
+        }
+        if source_frame == destination_frame
+            && rectangles_overlap(
+                (source_x, source_y),
+                (destination_x, destination_y),
+                (width, height),
+            )
+        {
+            return Err("same-frame composition rectangles overlap".to_owned());
+        }
+        let source_exists = source_frame == 1
+            || self
+                .resources
+                .get(&image_id)
+                .is_some_and(|resource| resource.animation_frames.contains_key(&source_frame));
+        let destination_exists = destination_frame == 1
+            || self
+                .resources
+                .get(&image_id)
+                .is_some_and(|resource| resource.animation_frames.contains_key(&destination_frame));
+        if !source_exists || !destination_exists {
+            return Err(format!("composition references an unknown frame of image {image_id}"));
+        }
+
+        let source_full = self.coalesce_frame(image_id, source_frame)?;
+        let mut destination_full = self.coalesce_frame(image_id, destination_frame)?;
+        // Read the source rectangle into an owned buffer so a same-frame
+        // composition cannot observe its own writes.
+        let mut source_rect = Vec::with_capacity(usize::from(width) * usize::from(height));
+        for row in 0..height {
+            let start = usize::from(source_y.saturating_add(row)) * usize::from(pixel_width)
+                + usize::from(source_x);
+            source_rect.extend_from_slice(
+                &source_full[start..start + usize::from(width)],
+            );
+        }
+        let blends = format != 24 && compose_mode == 0;
+        for row in 0..height {
+            let destination_row = usize::from(destination_y.saturating_add(row))
+                * usize::from(pixel_width)
+                + usize::from(destination_x);
+            for column in 0..width {
+                let destination_index = destination_row + usize::from(column);
+                let source_index = usize::from(row) * usize::from(width) + usize::from(column);
+                if blends {
+                    blend_onto(
+                        &mut destination_full[destination_index],
+                        source_rect[source_index],
+                    );
+                } else {
+                    destination_full[destination_index] = source_rect[source_index];
+                }
+            }
+        }
+
+        let resource = self
+            .resources
+            .get_mut(&image_id)
+            .expect("resource validated above");
+        if destination_frame == 1 {
+            // Composing onto a non-raw root decodes it to RGBA, so the
+            // resource now stores raw RGBA (format 32).
+            if resource.format == 100 {
+                resource.format = 32;
+            }
+            resource.pixels = Some(destination_full);
+        } else {
+            let animation_frame = resource
+                .animation_frames
+                .get_mut(&destination_frame)
+                .expect("frame validated above");
+            animation_frame.pixels = destination_full;
+            animation_frame.width = pixel_width;
+            animation_frame.height = pixel_height;
+            animation_frame.x = 0;
+            animation_frame.y = 0;
+            animation_frame.base_frame = 0;
+            animation_frame.compose_mode = 0;
+            animation_frame.bgcolor = None;
+        }
+        self.actions.push("compose");
+        Ok(())
+    }
+
+    /// Coalesces an animation frame into a full-image pixel buffer, applying
+    /// any `a=f` composition metadata. Frame 1 is the root frame; a delta
+    /// frame composes its rectangle onto its `c` base frame (or a `Y`
+    /// background canvas when standalone). Mirrors the store's
+    /// `get_coalesced_frame_data` chain resolution.
+    fn coalesce_frame(&self, image_id: u32, frame: u32) -> Result<Vec<HeadlessPixel>, String> {
+        self.coalesce_frame_depth(image_id, frame, 0)
+    }
+
+    fn coalesce_frame_depth(
+        &self,
+        image_id: u32,
+        frame: u32,
+        depth: u32,
+    ) -> Result<Vec<HeadlessPixel>, String> {
+        if depth > 32 {
+            return Err("animation frame reference chain is too deep".to_owned());
+        }
+        let resource = self
+            .resources
+            .get(&image_id)
+            .ok_or_else(|| format!("image {image_id} not found"))?;
+        let (image_width, image_height) = (resource.pixel_width, resource.pixel_height);
+        if frame == 1 {
+            return resource
+                .pixels
+                .clone()
+                .ok_or_else(|| format!("image {image_id} has no decoded pixels"));
+        }
+        let animation_frame = resource
+            .animation_frames
+            .get(&frame)
+            .ok_or_else(|| format!("animation frame {frame} not found"))?;
+        if animation_frame.is_full_keyframe(image_width, image_height) {
+            return Ok(animation_frame.pixels.clone());
+        }
+        let (base_frame, bgcolor, x, y, width, height, compose_mode) = (
+            animation_frame.base_frame,
+            animation_frame.bgcolor,
+            animation_frame.x,
+            animation_frame.y,
+            animation_frame.width,
+            animation_frame.height,
+            animation_frame.compose_mode,
+        );
+        let mut under = if base_frame != 0 {
+            self.coalesce_frame_depth(image_id, base_frame, depth + 1)?
+        } else {
+            let total = usize::from(image_width) * usize::from(image_height);
+            match bgcolor {
+                Some(color) => vec![color; total],
+                None => vec![HeadlessPixel::TRANSPARENT; total],
+            }
+        };
+        compose_rect(
+            &mut under,
+            image_width,
+            &animation_frame.pixels,
+            x,
+            y,
+            width,
+            height,
+            compose_mode == 0 && resource.format != 24,
+        );
+        Ok(under)
     }
 
     fn place(
@@ -631,17 +1072,133 @@ impl HeadlessKittyTerminal {
                 !(placement.image_id == image_id && placement.placement_id == Some(placement_id))
             });
         }
+        let width = parameter_u16(parameters, "c", default_width)?;
+        let height = parameter_u16(parameters, "r", default_height)?;
+        // Relative placements (P/Q) are anchored to their parent's top-left
+        // cell plus an H/V cell offset, and never move the cursor.
+        let (x, y, moves_cursor) = if parameters.contains_key("P") || parameters.contains_key("Q") {
+            let parent_image = parameter_u32(parameters, "P")?;
+            let parent_placement_id = parameter_u32(parameters, "Q")?;
+            let Some((parent_x, parent_y)) =
+                self.resolve_relative_parent(parent_image, parent_placement_id)?
+            else {
+                // A virtual parent with no placeholder cells yet has no
+                // physical location; the child is invisible (not placed).
+                return Ok(());
+            };
+            let horizontal = parameter_i32(parameters, "H", 0)?;
+            let vertical = parameter_i32(parameters, "V", 0)?;
+            let x = (i32::from(parent_x) + horizontal).clamp(0, i32::from(u16::MAX)) as u16;
+            let y = (i32::from(parent_y) + vertical).clamp(0, i32::from(u16::MAX)) as u16;
+            (x, y, false)
+        } else {
+            (
+                self.cursor.0,
+                self.cursor.1,
+                parameter(parameters, "C").unwrap_or(0) != 1,
+            )
+        };
         self.placements.push(HeadlessPlacement {
             image_id,
             placement_id,
-            x: self.cursor.0,
-            y: self.cursor.1,
-            width: parameter_u16(parameters, "c", default_width)?,
-            height: parameter_u16(parameters, "r", default_height)?,
+            x,
+            y,
+            width,
+            height,
             z: parameter_i16(parameters, "z", 0)?,
             source: source_rect(parameters)?,
         });
+        // A real graphics terminal advances the cursor right by `c` cells and
+        // down by `r` cells after a placement, unless the client requested a
+        // static cursor with C=1. Virtual placements (U=1) never reach this
+        // path, matching the protocol's physical-location exclusion.
+        if moves_cursor {
+            self.cursor.0 = self.cursor.0.saturating_add(width);
+            self.cursor.1 = self.cursor.1.saturating_add(height);
+        }
         Ok(())
+    }
+
+    /// Resolves a relative placement's parent to a physical cell origin.
+    ///
+    /// A normal parent contributes its own `x`/`y`; a virtual (`U=1`) parent
+    /// has no cell of its own and instead contributes the min x / min y of its
+    /// Unicode placeholder cells (Kitty's `resolve_cell_ref`). `Ok(None)`
+    /// means the parent is a virtual placement with no placeholder cells yet,
+    /// so the relative child is invisible rather than mis-anchored.
+    fn resolve_relative_parent(
+        &self,
+        parent_image: u32,
+        parent_placement_id: u32,
+    ) -> Result<Option<(u16, u16)>, String> {
+        if let Some(parent) = self.placements.iter().find(|placement| {
+            placement.image_id == parent_image
+                && placement.placement_id == Some(parent_placement_id)
+        }) {
+            return Ok(Some((parent.x, parent.y)));
+        }
+        if !self.virtual_placements.contains_key(&parent_image) {
+            return Err("relative placement references a missing parent".to_owned());
+        }
+        let mut min_x: Option<u16> = None;
+        let mut min_y: Option<u16> = None;
+        for cell in &self.placeholder_cells {
+            if cell.image_id != parent_image {
+                continue;
+            }
+            min_x = Some(min_x.map_or(cell.x, |current| current.min(cell.x)));
+            min_y = Some(min_y.map_or(cell.y, |current| current.min(cell.y)));
+        }
+        Ok(min_x.zip(min_y))
+    }
+
+    /// Resolves the image id for a transmit command: an explicit `i` id, or a
+    /// fresh id allocated for a numbered (`I`) image.
+    fn resolve_transmit_image(&mut self, parameters: &BTreeMap<String, String>) -> Result<u32, String> {
+        if parameters.contains_key("i") && parameters.contains_key("I") {
+            return Err("i and I are mutually exclusive".to_owned());
+        }
+        if let Some(raw) = parameters.get("i") {
+            let image_id = raw
+                .parse::<u32>()
+                .map_err(|error| format!("invalid Kitty APC i: {error}"))?;
+            if image_id == 0 {
+                return Err("headless model requires a nonzero image id".to_owned());
+            }
+            return Ok(image_id);
+        }
+        if parameters.contains_key("I") {
+            self.next_image_id = self.next_image_id.saturating_add(1).max(1);
+            return Ok(self.next_image_id);
+        }
+        Err("headless model requires an i or I image key".to_owned())
+    }
+
+    /// Resolves the image id for a command that references an already
+    /// transmitted image: an explicit `i` id, or the newest image with a
+    /// given `I` number.
+    fn resolve_reference_image(&self, parameters: &BTreeMap<String, String>) -> Result<u32, String> {
+        if parameters.contains_key("i") && parameters.contains_key("I") {
+            return Err("i and I are mutually exclusive".to_owned());
+        }
+        if let Some(raw) = parameters.get("i") {
+            return raw
+                .parse::<u32>()
+                .map_err(|error| format!("invalid Kitty APC i: {error}"));
+        }
+        if let Some(raw) = parameters.get("I") {
+            let number = raw
+                .parse::<u32>()
+                .map_err(|error| format!("invalid Kitty APC I: {error}"))?;
+            return self
+                .resources
+                .iter()
+                .filter(|(_, resource)| resource.image_number == number)
+                .map(|(image_id, _)| *image_id)
+                .max()
+                .ok_or_else(|| format!("placement references unknown image number {number}"));
+        }
+        Err("headless model requires an i or I image key".to_owned())
     }
 
     fn render_frame(&mut self) {
@@ -744,17 +1301,20 @@ fn source_rect(parameters: &BTreeMap<String, String>) -> Result<Option<SourceRec
     }))
 }
 
-fn decode_pixels(
+/// Decodes a raw RGB/RGBA payload into pixels. Format 100 is treated as RGBA
+/// for `a=f` frame payloads, which a non-raw image stores in decoded form.
+fn decode_rgba_pixels(
     format: u8,
     payload: &[u8],
     width: u16,
     height: u16,
 ) -> Option<Vec<HeadlessPixel>> {
-    if !matches!(format, 24 | 32) {
-        return None;
-    }
+    let channels = match format {
+        24 => 3usize,
+        32 | 100 => 4usize,
+        _ => return None,
+    };
     let decoded = decode_base64(payload)?;
-    let channels = usize::from(format / 8);
     let expected = usize::from(width)
         .checked_mul(usize::from(height))?
         .checked_mul(channels)?;
@@ -768,10 +1328,184 @@ fn decode_pixels(
                 red: pixel[0],
                 green: pixel[1],
                 blue: pixel[2],
-                alpha: if format == 32 { pixel[3] } else { 255 },
+                alpha: if channels == 4 { pixel[3] } else { 255 },
             })
             .collect(),
     )
+}
+
+/// Decodes a PNG or GIF payload into RGBA pixels plus its natural dimensions,
+/// so a non-raw (`f=100`) frame can be composed like a raw one.
+fn decode_raster(payload: &[u8]) -> Option<(Vec<HeadlessPixel>, u16, u16)> {
+    let bytes = decode_base64(payload)?;
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        decode_png_rgba(&bytes)
+    } else if bytes.starts_with(b"GIF") {
+        decode_gif_rgba(&bytes)
+    } else {
+        None
+    }
+}
+
+/// Decodes a PNG into RGBA pixels, normalizing every color type to RGBA via
+/// the same `EXPAND | STRIP_16 | ALPHA` transformations as the store.
+fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<HeadlessPixel>, u16, u16)> {
+    let mut decoder = png::Decoder::new(bytes);
+    decoder.set_transformations(
+        png::Transformations::EXPAND
+            | png::Transformations::STRIP_16
+            | png::Transformations::ALPHA,
+    );
+    let mut reader = decoder.read_info().ok()?;
+    let mut buffer = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buffer).ok()?;
+    let (width, height) = (info.width, info.height);
+    if width == 0 || height == 0 || width > u16::MAX as u32 || height > u16::MAX as u32 {
+        return None;
+    }
+    // With EXPAND + ALPHA the output is RGBA or grayscale+alpha; normalize
+    // both to RGBA.
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => buffer,
+        png::ColorType::GrayscaleAlpha => {
+            let mut rgba = Vec::with_capacity(buffer.len().saturating_mul(2));
+            for pixel in buffer.chunks_exact(2) {
+                rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
+            }
+            rgba
+        }
+        _ => return None,
+    };
+    let pixels = rgba
+        .chunks_exact(4)
+        .map(|pixel| HeadlessPixel {
+            red: pixel[0],
+            green: pixel[1],
+            blue: pixel[2],
+            alpha: pixel[3],
+        })
+        .collect();
+    Some((pixels, width as u16, height as u16))
+}
+
+/// Decodes a GIF's first frame into RGBA pixels, compositing its opaque pixels
+/// onto a transparent canvas.
+fn decode_gif_rgba(bytes: &[u8]) -> Option<(Vec<HeadlessPixel>, u16, u16)> {
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::RGBA);
+    let mut decoder = options.read_info(bytes).ok()?;
+    let width = decoder.width();
+    let height = decoder.height();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let mut canvas = vec![HeadlessPixel::TRANSPARENT; usize::from(width) * usize::from(height)];
+    let frame = decoder.read_next_frame().ok()??;
+    let frame_width = usize::from(frame.width);
+    let frame_height = usize::from(frame.height);
+    let left = usize::from(frame.left);
+    let top = usize::from(frame.top);
+    if left.checked_add(frame_width)? > usize::from(width)
+        || top.checked_add(frame_height)? > usize::from(height)
+    {
+        return None;
+    }
+    for row in 0..frame_height {
+        for column in 0..frame_width {
+            let source = &frame.buffer[(row * frame_width + column) * 4..][..4];
+            if source[3] != 0 {
+                canvas[(top + row) * usize::from(width) + left + column] = HeadlessPixel {
+                    red: source[0],
+                    green: source[1],
+                    blue: source[2],
+                    alpha: source[3],
+                };
+            }
+        }
+    }
+    Some((canvas, width, height))
+}
+
+/// Parses Kitty's `Y` background-canvas color, a packed 0xRRGGBBAA value.
+fn parse_bgcolor(raw: &str) -> Result<HeadlessPixel, String> {
+    let value = raw
+        .parse::<u32>()
+        .map_err(|error| format!("invalid Kitty APC Y: {error}"))?;
+    Ok(HeadlessPixel {
+        red: ((value >> 24) & 0xff) as u8,
+        green: ((value >> 16) & 0xff) as u8,
+        blue: ((value >> 8) & 0xff) as u8,
+        alpha: (value & 0xff) as u8,
+    })
+}
+
+/// Whether two same-image rectangles overlap, matching the store's
+/// `rect_overlap` same-frame composition guard.
+fn rectangles_overlap(a: (u16, u16), b: (u16, u16), size: (u16, u16)) -> bool {
+    let (a_x, a_y) = a;
+    let (b_x, b_y) = b;
+    let (width, height) = size;
+    let x_overlaps = a_x.max(b_x) < a_x.min(b_x).saturating_add(width);
+    let y_overlaps = a_y.max(b_y) < a_y.min(b_y).saturating_add(height);
+    x_overlaps && y_overlaps
+}
+
+/// Source-over alpha blends a source pixel onto a destination pixel, matching
+/// Kitty's `alpha_blend` for animation composition.
+fn blend_onto(destination: &mut HeadlessPixel, source: HeadlessPixel) {
+    let source_alpha = u16::from(source.alpha);
+    if source_alpha == 0 {
+        return;
+    }
+    if source_alpha == 255 {
+        *destination = source;
+        return;
+    }
+    let destination_alpha = u16::from(destination.alpha);
+    let output_alpha = source_alpha.saturating_add(destination_alpha.saturating_mul(255 - source_alpha) / 255);
+    if output_alpha == 0 {
+        *destination = HeadlessPixel::TRANSPARENT;
+        return;
+    }
+    let channel = |foreground: u8, background: u8| {
+        let foreground = u16::from(foreground) * source_alpha;
+        let background = u16::from(background) * destination_alpha * (255 - source_alpha) / 255;
+        ((foreground + background) / output_alpha).min(255) as u8
+    };
+    *destination = HeadlessPixel {
+        red: channel(source.red, destination.red),
+        green: channel(source.green, destination.green),
+        blue: channel(source.blue, destination.blue),
+        alpha: output_alpha.min(255) as u8,
+    };
+}
+
+/// Composes a pixel rectangle (`over`, sized `over_width` x `over_height`) onto
+/// a full-frame buffer (`under`, `under_width` wide) at `(over_x, over_y)`.
+#[allow(clippy::too_many_arguments)]
+fn compose_rect(
+    under: &mut [HeadlessPixel],
+    under_width: u16,
+    over: &[HeadlessPixel],
+    over_x: u16,
+    over_y: u16,
+    over_width: u16,
+    over_height: u16,
+    blend: bool,
+) {
+    for row in 0..over_height {
+        let under_row = usize::from(over_y.saturating_add(row)) * usize::from(under_width)
+            + usize::from(over_x);
+        for column in 0..over_width {
+            let destination_index = under_row + usize::from(column);
+            let source_index = usize::from(row) * usize::from(over_width) + usize::from(column);
+            if blend {
+                blend_onto(&mut under[destination_index], over[source_index]);
+            } else {
+                under[destination_index] = over[source_index];
+            }
+        }
+    }
 }
 
 fn decode_base64(payload: &[u8]) -> Option<Vec<u8>> {
@@ -889,11 +1623,41 @@ fn parameter_u32(parameters: &BTreeMap<String, String>, key: &str) -> Result<u32
         .map_err(|error| format!("invalid Kitty APC {key}: {error}"))
 }
 
+fn parameter_u32_default(
+    parameters: &BTreeMap<String, String>,
+    key: &str,
+    default: u32,
+) -> Result<u32, String> {
+    parameters
+        .get(key)
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|error| format!("invalid Kitty APC {key}: {error}"))
+        })
+        .unwrap_or(Ok(default))
+}
+
 fn parameter_u16(
     parameters: &BTreeMap<String, String>,
     key: &str,
     default: u16,
 ) -> Result<u16, String> {
+    parameters
+        .get(key)
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|error| format!("invalid Kitty APC {key}: {error}"))
+        })
+        .unwrap_or(Ok(default))
+}
+
+fn parameter_i32(
+    parameters: &BTreeMap<String, String>,
+    key: &str,
+    default: i32,
+) -> Result<i32, String> {
     parameters
         .get(key)
         .map(|value| {

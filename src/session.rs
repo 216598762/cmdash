@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fmt,
     io::{self, Read, Write},
     sync::{
@@ -7,13 +8,14 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use alacritty_terminal::{
     event::{Event, EventListener, WindowSize as EmulatorWindowSize},
-    grid::Dimensions,
+    grid::{Dimensions, Scroll},
     term::{Config, Term, TermMode, cell::Flags},
-    vte::ansi::{Color as AnsiColor, Handler, Mode, NamedColor, PrivateMode, Processor},
+    vte::ansi::{ClearMode, Color as AnsiColor, Handler, Mode, NamedColor, PrivateMode, Processor},
 };
 
 use crossterm::event::{
@@ -28,11 +30,13 @@ const MAX_GRAPHICS_PROTOCOL_CAPTURE_BYTES: usize = 256 * 1024;
 
 use crate::{
     appearance::Theme,
+    backend::kitty_diacritic_index,
     graphics::{
-        GraphicsProtocolAdapter, GraphicsProtocolBroker, GraphicsProtocolEvent, GraphicsScreen,
-        GraphicsScrollRegion, GraphicsSubmission, SessionGraphicsStore, kitty_error_response,
+        GraphicsErase, GraphicsPlaceholderCell, GraphicsProtocolAdapter, GraphicsProtocolBroker,
+        GraphicsProtocolEvent, GraphicsScreen, GraphicsScrollRegion, GraphicsSubmission,
+        SessionGraphicsStore, kitty_error_response, should_emit_response,
     },
-    scene::{CellStyle, Color, Scene},
+    scene::{CellStyle, Color, Scene, Underline},
     state::SessionId,
 };
 
@@ -290,6 +294,7 @@ struct ScrollRegionTracker {
     active: GraphicsScreen,
     primary: ScrollScreenState,
     alternate: ScrollScreenState,
+    pending_erases: Vec<GraphicsErase>,
 }
 
 impl ScrollRegionTracker {
@@ -300,7 +305,12 @@ impl ScrollRegionTracker {
             active: GraphicsScreen::Primary,
             primary: ScrollScreenState::new(columns, rows),
             alternate: ScrollScreenState::new(columns, rows),
+            pending_erases: Vec::new(),
         }
+    }
+
+    fn take_erases(&mut self) -> Vec<GraphicsErase> {
+        std::mem::take(&mut self.pending_erases)
     }
 
     fn current(&self) -> ScrollScreenState {
@@ -336,8 +346,17 @@ impl ScrollRegionTracker {
         self.alternate = ScrollScreenState::new(columns, rows);
     }
 
+    fn reset(&mut self) {
+        self.primary = ScrollScreenState::new(self.columns, self.rows);
+        self.alternate = ScrollScreenState::new(self.columns, self.rows);
+        self.active = GraphicsScreen::Primary;
+    }
+
     fn switch_screen(&mut self, screen: GraphicsScreen) {
         self.active = screen;
+        // Entering or leaving the alternate screen discards its images; a
+        // real terminal resets the alternate buffer on entry.
+        self.pending_erases.push(GraphicsErase::Alternate);
     }
 
     fn move_cursor(&mut self, line: i32, column: usize) {
@@ -532,6 +551,28 @@ impl Handler for ScrollRegionTracker {
         state.region = new_region;
         state.reset_region_cursor();
     }
+
+    fn clear_screen(&mut self, mode: ClearMode) {
+        // `ED 2` clears the visible screen; Kitty erases visible images rather
+        // than scrolling them into history. `ED 0`/`ED 1` erase from the
+        // cursor to the bottom/top of the screen at row granularity, and
+        // `ED 3` clears the scrollback (primary screen only).
+        let cursor_row = self.current().cursor.1;
+        let erase = match mode {
+            ClearMode::All => GraphicsErase::ClearScreen(self.active),
+            ClearMode::Below => GraphicsErase::ClearBelow(self.active, cursor_row),
+            ClearMode::Above => GraphicsErase::ClearAbove(self.active, cursor_row),
+            ClearMode::Saved => GraphicsErase::ClearScrollback,
+        };
+        self.pending_erases.push(erase);
+    }
+
+    fn reset_state(&mut self) {
+        // RIS clears the scrollback and both screens, so every retained image
+        // is erased and the tracker returns to the primary screen.
+        self.reset();
+        self.pending_erases.push(GraphicsErase::All);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -559,6 +600,7 @@ pub struct TerminalSession {
     graphics_protocol: GraphicsProtocolAdapter,
     graphics_protocol_capture: Vec<u8>,
     selection: Option<Selection>,
+    scrollback_limit: usize,
 }
 
 impl TerminalSession {
@@ -624,8 +666,16 @@ impl TerminalSession {
         };
         let (response_sender, response_receiver) = mpsc::channel();
         let reported_size = Arc::new(Mutex::new(size));
+        // Enable the emulator's Kitty keyboard protocol handling so the child
+        // can negotiate `CSI u` key encoding: `CSI > 1 u` pushes the
+        // disambiguation mode, `CSI ? u` is answered with the active flags,
+        // and `key_bytes` consults `term.mode()` when forwarding keys.
+        let config = Config {
+            kitty_keyboard: true,
+            ..Config::default()
+        };
         let term = Term::new(
-            Config::default(),
+            config,
             &size,
             SessionEventListener {
                 pty_writer: response_sender,
@@ -652,6 +702,7 @@ impl TerminalSession {
             graphics_protocol: GraphicsProtocolAdapter::default(),
             graphics_protocol_capture: Vec::new(),
             selection: None,
+            scrollback_limit: 10_000,
         })
     }
 
@@ -678,6 +729,7 @@ impl TerminalSession {
             self.scroll_tracker.active_screen(),
             self.scroll_tracker.current_region(),
             self.scroll_tracker.current_region_scroll(),
+            self.scrollback_offset(),
         )
     }
 
@@ -694,6 +746,12 @@ impl TerminalSession {
         image: u32,
     ) -> Option<crate::graphics::GraphicsAnimationState> {
         self.graphics.animation_state(image)
+    }
+
+    /// Advances this session's Kitty animation frames to `now`, returning the
+    /// duration until the next frame deadline (`None` when nothing is playing).
+    pub fn advance_graphics_animations(&mut self, now: Instant) -> Option<Duration> {
+        self.graphics.advance_animations(now)
     }
 
     /// Returns the bounded raw PTY capture used by protocol conformance tests
@@ -752,28 +810,37 @@ impl TerminalSession {
     }
 
     pub fn poll_output(&mut self) -> Result<bool, SessionError> {
-        if self.closed {
-            return Ok(false);
-        }
         let mut changed = false;
-        while let Ok(result) = self.output.receiver.try_recv() {
-            match result {
-                Ok(bytes) => {
+        let mut reader_finished = false;
+        // Always drain available output, even after the child has exited: a
+        // slow reader thread may still be delivering the final buffered bytes,
+        // and an early `closed` flag would strand them.
+        loop {
+            match self.output.receiver.try_recv() {
+                Ok(Ok(bytes)) => {
                     changed = self.consume_output(&bytes)? || changed || !bytes.is_empty();
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     let message = error.to_string();
                     self.failure = Some(message.clone());
                     return Err(SessionError::Io(message));
                 }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    reader_finished = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
             }
         }
-        if self
+        // Reap the child when it exits. The session is only considered closed
+        // once the reader has also drained the PTY to EOF, so the child-exit
+        // observation cannot race ahead of the final output.
+        let child_exited = self
             .child
             .try_wait()
             .map_err(|error| SessionError::Io(error.to_string()))?
-            .is_some()
-        {
+            .is_some();
+        if reader_finished && child_exited {
             self.closed = true;
         }
         Ok(changed)
@@ -799,10 +866,34 @@ impl TerminalSession {
             match event {
                 GraphicsProtocolEvent::Plain(plain) => {
                     if !plain.is_empty() {
+                        // Capture the scrollback depth *before* the emulator
+                        // consumes this chunk: `ED 2` pushes the viewport into
+                        // history and `ED 3` clears it, so resolving an erase
+                        // against the post-feed depth would mis-anchor images
+                        // (visible images would slide into history, and a
+                        // scrolled-out image would resurrect on `ED 3`).
+                        let scrollback_before = self.scrollback_lines();
                         self.processor.advance(&mut self.term, &plain);
                         self.scroll_processor
                             .advance(&mut self.scroll_tracker, &plain);
                         self.flush_emulator_responses()?;
+                        let erases = self.scroll_tracker.take_erases();
+                        if !erases.is_empty() {
+                            let region = self.scroll_tracker.current_region();
+                            let region_scroll = self.scroll_tracker.current_region_scroll();
+                            for erase in erases {
+                                self.graphics.apply_erase(
+                                    erase, scrollback_before, region, region_scroll,
+                                );
+                            }
+                        }
+                        // Refresh the store's view of the Unicode placeholder
+                        // cells now that this chunk has been written into the
+                        // grid. A relative placement anchored to a virtual
+                        // (`U=1`) parent resolves against these cells, so they
+                        // must be current before any following command event
+                        // is processed.
+                        self.graphics.set_placeholder_cells(self.scan_placeholder_cells());
                         changed = true;
                     }
                 }
@@ -827,9 +918,15 @@ impl TerminalSession {
                                 .and_then(|value| std::str::from_utf8(value).ok())
                                 .and_then(|value| value.parse::<u32>().ok());
                             self.graphics.record_diagnostic(image, error.to_string());
-                            image
-                                .filter(|image| *image != 0)
-                                .map(|_| kitty_error_response(&parameters, &error))
+                            // Kitty suppresses failure responses when `q=2`;
+                            // the diagnostic above is still recorded either way.
+                            if suppress_graphics_error_response(parameters) {
+                                None
+                            } else {
+                                image
+                                    .filter(|image| *image != 0)
+                                    .map(|_| kitty_error_response(&parameters, &error))
+                            }
                         }
                     };
                     if let Some(response) = response
@@ -839,6 +936,18 @@ impl TerminalSession {
                             None,
                             "child graphics response queue is full; response was dropped",
                         );
+                    }
+                    // A real Kitty terminal advances its cursor past a placed
+                    // image (right by `c` cells, down by `r` cells) unless the
+                    // client requested C=1. Emulate that so trailing text and
+                    // subsequent images follow the image instead of stacking
+                    // on its top-left cell.
+                    if let Some((columns, rows)) = self.graphics.take_last_cursor_advance() {
+                        let advance = graphics_cursor_advance_bytes(columns, rows);
+                        if !advance.is_empty() {
+                            self.processor.advance(&mut self.term, &advance);
+                            self.scroll_processor.advance(&mut self.scroll_tracker, &advance);
+                        }
                     }
                     changed = true;
                 }
@@ -854,8 +963,58 @@ impl TerminalSession {
                 }
             }
         }
+        // Drop placements (and their decoded bytes) that have scrolled above
+        // the top of the bounded history, exactly like a real graphics
+        // terminal frees images once they pass the scrollback limit.
+        if self.graphics.evict_beyond_scrollback_limit(
+            self.scrollback_limit,
+            self.scroll_tracker.active_screen(),
+            self.scroll_tracker.current_region(),
+            self.scroll_tracker.current_region_scroll(),
+        ) {
+            changed = true;
+        }
         self.flush_emulator_responses()?;
         Ok(changed)
+    }
+
+    /// Scans the visible text grid for Kitty Unicode-placeholder glyphs
+    /// (U+10EEEE + combining marks) and returns the image-id -> cell map the
+    /// graphics store uses to resolve virtual-parent origins.
+    fn scan_placeholder_cells(&self) -> BTreeMap<u32, Vec<GraphicsPlaceholderCell>> {
+        let mut cells: BTreeMap<u32, Vec<GraphicsPlaceholderCell>> = BTreeMap::new();
+        let scrollback = self.scrollback_lines();
+        for indexed in self.term.grid().display_iter() {
+            let cell = indexed.cell;
+            if cell.c != '\u{10eeee}' {
+                continue;
+            }
+            // History lines (negative `line`) are outside the visible screen;
+            // they carry an unrepresentable `u16` row, so they are skipped.
+            if indexed.point.line.0 < 0 {
+                continue;
+            }
+            // The lower 24 bits of the image id are the foreground color and
+            // the high 8 bits are the third combining mark.
+            let AnsiColor::Spec(rgb) = cell.fg else {
+                continue;
+            };
+            let high = cell
+                .zerowidth()
+                .and_then(|marks| marks.get(2))
+                .and_then(|mark| kitty_diacritic_index(*mark))
+                .unwrap_or(0);
+            let image = (u32::from(high) << 24)
+                | (u32::from(rgb.r) << 16)
+                | (u32::from(rgb.g) << 8)
+                | u32::from(rgb.b);
+            cells.entry(image).or_default().push(GraphicsPlaceholderCell::new(
+                indexed.point.column.0 as u16,
+                indexed.point.line.0 as u16,
+                scrollback,
+            ));
+        }
+        cells
     }
 
     fn flush_emulator_responses(&mut self) -> Result<(), SessionError> {
@@ -889,12 +1048,14 @@ impl TerminalSession {
     }
 
     pub fn write_key(&mut self, key: KeyEvent) -> Result<(), SessionError> {
-        let bytes = key_bytes(key)
+        self.scroll_to_bottom();
+        let bytes = key_bytes(key, *self.term.mode())
             .ok_or_else(|| SessionError::Io(format!("unsupported key event {:?}", key.code)))?;
         self.write_bytes(&bytes)
     }
 
     pub fn write_paste(&mut self, text: &str) -> Result<(), SessionError> {
+        self.scroll_to_bottom();
         let bytes = paste_bytes(text, self.term.mode().contains(TermMode::BRACKETED_PASTE));
         self.write_bytes(&bytes)
     }
@@ -922,6 +1083,59 @@ impl TerminalSession {
         self.term.grid().history_size()
     }
 
+    /// Number of history lines currently scrolled above the live viewport.
+    pub fn scrollback_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// Scrolls the scrollback viewport, returning whether the view changed.
+    ///
+    /// The emulator's grid is the source of truth: this reuses its
+    /// `display_offset` machinery so the same code that pins the view during
+    /// new output also drives explicit history navigation.
+    pub fn scroll_display(&mut self, scroll: Scroll) -> bool {
+        let before = self.term.grid().display_offset();
+        self.term.scroll_display(scroll);
+        self.term.grid().display_offset() != before
+    }
+
+    /// Whether mouse wheel events should be delivered to the child application
+    /// instead of scrolling the terminal's own scrollback.
+    ///
+    /// A full-featured terminal forwards wheel events when the alternate screen
+    /// is active (apps such as `less` draw their own scrolling) or the
+    /// application has enabled mouse reporting, so its scroll is captured.
+    pub fn captures_mouse_scroll(&self) -> bool {
+        let mode = self.term.mode();
+        mode.contains(TermMode::ALT_SCREEN) || mode.intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Scrolls the viewport back to the live screen, like a real terminal that
+    /// returns to the bottom when new input is typed while viewing history.
+    fn scroll_to_bottom(&mut self) {
+        if self.term.grid().display_offset() != 0 {
+            self.term.scroll_display(Scroll::Bottom);
+        }
+    }
+
+    /// The configured maximum number of scrollback history lines.
+    pub const fn scrollback_limit(&self) -> usize {
+        self.scrollback_limit
+    }
+
+    /// Re-bounds the emulator's scrollback history and evicts any retained
+    /// image data that no longer fits inside it.
+    pub fn set_scrollback_limit(&mut self, limit: usize) {
+        self.scrollback_limit = limit;
+        self.term.grid_mut().update_history(limit);
+        self.graphics.evict_beyond_scrollback_limit(
+            self.scrollback_limit,
+            self.scroll_tracker.active_screen(),
+            self.scroll_tracker.current_region(),
+            self.scroll_tracker.current_region_scroll(),
+        );
+    }
+
     pub fn resize(&mut self, size: TerminalSize) -> Result<(), SessionError> {
         let size = size.validate()?;
         if self.closed {
@@ -935,7 +1149,24 @@ impl TerminalSession {
                 pixel_height: size.pixel_height,
             })
             .map_err(|error| SessionError::Resize(error.to_string()))?;
+        // Capture the pre-resize graphics state so image placements can be
+        // re-anchored across the emulator's text reflow below.
+        let old_columns = self.size.columns;
+        let old_scrollback = self.scrollback_lines();
+        let old_region = self.scroll_tracker.current_region();
+        let old_region_scroll = self.scroll_tracker.current_region_scroll();
         self.term.resize(size);
+        // A column change rewraps text and moves its scrollback depth without
+        // scrolling content uniformly, so full-screen placements must keep
+        // their grid row instead of being shifted by the rewrap.
+        self.graphics.reanchor_on_resize(
+            old_columns,
+            size.columns,
+            old_scrollback,
+            self.scrollback_lines(),
+            old_region,
+            old_region_scroll,
+        );
         self.scroll_tracker.resize(size.columns, size.rows);
         *self
             .reported_size
@@ -992,17 +1223,40 @@ impl TerminalSession {
             if cell.flags.contains(Flags::DIM) {
                 style = style.dim();
             }
+            if cell.flags.contains(Flags::ITALIC) {
+                style = style.italic();
+            }
+            style = style.underline_style(cell_underline(cell.flags));
+            if let Some(color) = cell.underline_color().and_then(underline_color_to_scene) {
+                style = style.underline_color(color);
+            }
+            if cell.flags.contains(Flags::STRIKEOUT) {
+                style = style.strikeout();
+            }
+            if cell.flags.contains(Flags::INVERSE) {
+                style = style.reverse();
+            }
+            if cell.flags.contains(Flags::HIDDEN) {
+                style = style.hidden();
+            }
             scene.set(x, y, cell.c, style);
         }
         if focused {
-            let terminal_cursor_visible =
-                cursor_visible && self.term.mode().contains(TermMode::SHOW_CURSOR);
-            scene.set_cursor(cursor_cell.0, cursor_cell.1, terminal_cursor_visible);
-            if terminal_cursor_visible
-                && let Some(cell) = scene.cell_at(cursor_cell.0, cursor_cell.1).copied()
-            {
-                let cursor_style = CellStyle::new(cell.style.background, cell.style.foreground);
-                scene.set(cursor_cell.0, cursor_cell.1, cell.symbol, cursor_style);
+            // When the viewport is scrolled back into history the live cursor
+            // belongs to the bottom of the buffer, so it must not be drawn
+            // over the scrolled view.
+            if self.term.grid().display_offset() != 0 {
+                scene.clear_cursor();
+            } else {
+                let terminal_cursor_visible =
+                    cursor_visible && self.term.mode().contains(TermMode::SHOW_CURSOR);
+                scene.set_cursor(cursor_cell.0, cursor_cell.1, terminal_cursor_visible);
+                if terminal_cursor_visible
+                    && let Some(cell) = scene.cell_at(cursor_cell.0, cursor_cell.1).copied()
+                {
+                    let cursor_style = CellStyle::new(cell.style.background, cell.style.foreground);
+                    scene.set(cursor_cell.0, cursor_cell.1, cell.symbol, cursor_style);
+                }
             }
         }
         if let Some(selection) = self.selection {
@@ -1029,7 +1283,19 @@ impl TerminalSession {
         if self.closed {
             return Ok(());
         }
-        let kill_result = self.child.kill();
+        // `poll_output` may already have reaped a short-lived child; signalling
+        // a reaped PID could hit a reused process, so only kill a child that is
+        // still running.
+        let child_reaped = self
+            .child
+            .try_wait()
+            .map_err(|error| SessionError::Io(error.to_string()))?
+            .is_some();
+        let kill_result = if child_reaped {
+            Ok(())
+        } else {
+            self.child.kill()
+        };
         let wait_result = self.child.wait();
         self.graphics.clear();
         let _ = self.graphics_protocol.finish();
@@ -1105,6 +1371,20 @@ fn extract_kitty_events(buffer: &[u8]) -> (Vec<KittyStreamEvent>, Vec<u8>) {
     (mapped, adapter.pending_bytes().to_vec())
 }
 
+/// Emits the VT cursor movement implied by a Kitty image placement: the cursor
+/// is advanced right by the placement's columns and down by its rows, matching
+/// the protocol's default (`C=0`) behavior in a real graphics terminal.
+fn graphics_cursor_advance_bytes(columns: u16, rows: u16) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(12);
+    if columns != 0 {
+        bytes.extend_from_slice(format!("\x1b[{columns}C").as_bytes());
+    }
+    if rows != 0 {
+        bytes.extend_from_slice(format!("\x1b[{rows}B").as_bytes());
+    }
+    bytes
+}
+
 fn default_command() -> CommandBuilder {
     if let Some(shell) = std::env::var_os("SHELL") {
         CommandBuilder::new(shell)
@@ -1150,33 +1430,240 @@ fn spawn_reader(
     receiver
 }
 
-fn key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+/// Whether a failed Kitty command's error response should be suppressed under
+/// the command's `q` quiet key, matching Kitty's `finish_command_response`:
+/// `q=1` still delivers failure responses while any `q >= 2` suppresses them.
+fn suppress_graphics_error_response(parameters: &[u8]) -> bool {
+    let quiet = parameters
+        .split(|byte| *byte == b',')
+        .find_map(|parameter| parameter.strip_prefix(b"q="))
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(0);
+    !should_emit_response(quiet, false)
+}
+
+/// Encodes a key event for the child PTY, honoring the Kitty keyboard
+/// protocol mode the child negotiated through the emulator (`TermMode`).
+///
+/// In the default (legacy) mode text keys keep their C0/ESC/plain encoding and
+/// functional keys keep their `CSI ... ~`/`CSI letter` forms, so existing
+/// programs are unaffected. Once the child enables disambiguation (`CSI > 1 u`)
+/// or all-keys-as-escapes (`CSI = 8 u`), modified and ambiguous keys are sent
+/// as `CSI number ; modifier u` sequences instead.
+fn key_bytes(key: KeyEvent, mode: TermMode) -> Option<Vec<u8>> {
+    let modifiers = key.modifiers;
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
+    let super_mod = modifiers.contains(KeyModifiers::SUPER);
+    let report_all = mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC);
+    let disambiguate = mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) || report_all;
+
     match key.code {
-        KeyCode::Char(character) if control && character.is_ascii_alphabetic() => {
-            Some(vec![character.to_ascii_lowercase() as u8 - b'a' + 1])
+        KeyCode::Char(character) => {
+            let code = unshifted_codepoint(character);
+            // Combinations whose legacy encoding is missing or ambiguous use
+            // CSI u, as do ctrl/alt text keys once disambiguation is on.
+            let needs_csi = report_all
+                || super_mod
+                || (ctrl && shift)
+                || (alt && shift)
+                || (disambiguate && (ctrl || alt));
+            if needs_csi {
+                return Some(csi_u_bytes(code, modifiers));
+            }
+            // Legacy text-key encoding: ESC prefix for alt, C0 mapping for
+            // ctrl, and the (already shifted) character otherwise.
+            let mut bytes = Vec::new();
+            if alt {
+                bytes.push(0x1b);
+            }
+            if ctrl {
+                if let Some(control) = legacy_ctrl_byte(character) {
+                    bytes.push(control);
+                    return Some(bytes);
+                }
+                // ctrl on a key with no C0 mapping has no legacy form.
+                return Some(csi_u_bytes(code, modifiers));
+            }
+            bytes.extend(character.to_string().bytes());
+            Some(bytes)
         }
-        KeyCode::Char(character) => Some(character.to_string().into_bytes()),
-        KeyCode::Enter => Some(vec![b'\r']),
-        KeyCode::Tab => Some(vec![b'\t']),
-        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
-        KeyCode::Backspace => Some(vec![0x7f]),
-        KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Home => Some(b"\x1b[H".to_vec()),
-        KeyCode::End => Some(b"\x1b[F".to_vec()),
-        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
-        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
-        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
-        KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
-        KeyCode::F(number) if (1..=12).contains(&number) => {
-            Some(format!("\x1b[{}~", 10 + number).into_bytes())
+        KeyCode::Enter => {
+            if report_all {
+                Some(csi_u_bytes(13, modifiers))
+            } else if alt {
+                Some(b"\x1b\r".to_vec())
+            } else {
+                Some(vec![b'\r'])
+            }
+        }
+        KeyCode::Tab => {
+            if report_all {
+                Some(csi_u_bytes(9, modifiers))
+            } else if shift {
+                Some(b"\x1b[Z".to_vec())
+            } else if alt {
+                Some(b"\x1b\t".to_vec())
+            } else {
+                Some(vec![b'\t'])
+            }
+        }
+        KeyCode::BackTab => {
+            if report_all {
+                Some(csi_u_bytes(9, modifiers))
+            } else {
+                Some(b"\x1b[Z".to_vec())
+            }
+        }
+        KeyCode::Backspace => {
+            if report_all {
+                Some(csi_u_bytes(127, modifiers))
+            } else if alt {
+                Some(b"\x1b\x7f".to_vec())
+            } else if ctrl {
+                Some(vec![0x08])
+            } else {
+                Some(vec![0x7f])
+            }
+        }
+        KeyCode::Esc => {
+            if disambiguate && !modifiers.is_empty() {
+                Some(csi_u_bytes(27, modifiers))
+            } else if alt {
+                Some(b"\x1b\x1b".to_vec())
+            } else {
+                Some(vec![0x1b])
+            }
+        }
+        KeyCode::Up => Some(csi_letter_bytes('A', modifiers)),
+        KeyCode::Down => Some(csi_letter_bytes('B', modifiers)),
+        KeyCode::Right => Some(csi_letter_bytes('C', modifiers)),
+        KeyCode::Left => Some(csi_letter_bytes('D', modifiers)),
+        KeyCode::Home => Some(csi_letter_bytes('H', modifiers)),
+        KeyCode::End => Some(csi_letter_bytes('F', modifiers)),
+        KeyCode::Insert => Some(csi_tilde_bytes(2, modifiers)),
+        KeyCode::Delete => Some(csi_tilde_bytes(3, modifiers)),
+        KeyCode::PageUp => Some(csi_tilde_bytes(5, modifiers)),
+        KeyCode::PageDown => Some(csi_tilde_bytes(6, modifiers)),
+        KeyCode::F(number) => {
+            function_key_code(number).map(|code| csi_tilde_bytes(code, modifiers))
         }
         _ => None,
     }
+}
+
+/// The Kitty keyboard protocol modifier encoding: the active-modifier bitmask
+/// (shift 1, alt 2, ctrl 4, super 8) plus one, so "no modifiers" is `1`.
+fn kitty_modifier_code(modifiers: KeyModifiers) -> u16 {
+    let mut bits = 0u16;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        bits |= 1;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        bits |= 2;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        bits |= 4;
+    }
+    if modifiers.contains(KeyModifiers::SUPER) {
+        bits |= 8;
+    }
+    bits + 1
+}
+
+/// Encodes a key as `CSI <code> ; <modifier> u`.
+fn csi_u_bytes(code: u32, modifiers: KeyModifiers) -> Vec<u8> {
+    format!("\x1b[{code};{}u", kitty_modifier_code(modifiers)).into_bytes()
+}
+
+/// Encodes a functional key as `CSI <number> ; <modifier> ~`, omitting the
+/// modifier field when none are present.
+fn csi_tilde_bytes(number: u16, modifiers: KeyModifiers) -> Vec<u8> {
+    if modifiers.is_empty() {
+        format!("\x1b[{number}~").into_bytes()
+    } else {
+        format!("\x1b[{number};{}~", kitty_modifier_code(modifiers)).into_bytes()
+    }
+}
+
+/// Encodes a cursor/functional key as `CSI 1 ; <modifier> <letter>`, omitting
+/// the `1 ;` prefix when no modifiers are present (so plain arrows stay
+/// `CSI A` for legacy compatibility).
+fn csi_letter_bytes(letter: char, modifiers: KeyModifiers) -> Vec<u8> {
+    if modifiers.is_empty() {
+        format!("\x1b[{letter}").into_bytes()
+    } else {
+        format!("\x1b[1;{}{letter}", kitty_modifier_code(modifiers)).into_bytes()
+    }
+}
+
+/// The unshifted (base-layout) Unicode codepoint for a CSI u key code. Letters
+/// are lowercased and the common US-layout shifted symbols map back to their
+/// unshifted key.
+fn unshifted_codepoint(character: char) -> u32 {
+    match character {
+        'A'..='Z' => u32::from(character.to_ascii_lowercase()),
+        '!' => u32::from('1'),
+        '@' => u32::from('2'),
+        '#' => u32::from('3'),
+        '$' => u32::from('4'),
+        '%' => u32::from('5'),
+        '^' => u32::from('6'),
+        '&' => u32::from('7'),
+        '*' => u32::from('8'),
+        '(' => u32::from('9'),
+        ')' => u32::from('0'),
+        _ => u32::from(character),
+    }
+}
+
+/// Maps a text key with ctrl held down to its legacy C0 control byte, using
+/// Kitty's superset of the VT-100 table. Returns `None` for keys that have no
+/// control-code mapping.
+fn legacy_ctrl_byte(character: char) -> Option<u8> {
+    match character {
+        ' ' | '@' => Some(0),
+        'a'..='z' | 'A'..='Z' => Some(character.to_ascii_lowercase() as u8 - b'a' + 1),
+        '[' => Some(27),
+        '\\' => Some(28),
+        ']' => Some(29),
+        '^' | '~' => Some(30),
+        '_' | '?' => Some(31),
+        '0' => Some(b'0'),
+        '1' => Some(b'1'),
+        '2' => Some(0),
+        '3' => Some(27),
+        '4' => Some(28),
+        '5' => Some(29),
+        '6' => Some(30),
+        '7' => Some(31),
+        '8' => Some(127),
+        '9' => Some(b'9'),
+        '/' => Some(31),
+        _ => None,
+    }
+}
+
+/// The Kitty functional-key `~` code for F1 through F12. F13+ are not exposed
+/// by the legacy encoding and are currently unsupported.
+fn function_key_code(number: u8) -> Option<u16> {
+    Some(match number {
+        1 => 11,
+        2 => 12,
+        3 => 13,
+        4 => 14,
+        5 => 15,
+        6 => 17,
+        7 => 18,
+        8 => 19,
+        9 => 20,
+        10 => 21,
+        11 => 23,
+        12 => 24,
+        _ => return None,
+    })
 }
 
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
@@ -1220,6 +1707,38 @@ fn color_to_scene(color: AnsiColor, fallback: Color) -> Color {
         AnsiColor::Spec(rgb) => Color::rgb(rgb.r, rgb.g, rgb.b),
         AnsiColor::Indexed(index) => indexed_color(index),
         AnsiColor::Named(named) => named_color(named).unwrap_or(fallback),
+    }
+}
+
+/// Maps a cell's underline flag bits to the scene's underline style.
+///
+/// alacritty encodes the underline variant as mutually exclusive flag bits
+/// (`UNDERCURL`, `DOTTED_UNDERLINE`, `DASHED_UNDERLINE`, `DOUBLE_UNDERLINE`)
+/// layered on top of the plain `UNDERLINE` bit.
+fn cell_underline(flags: Flags) -> Underline {
+    if flags.contains(Flags::UNDERCURL) {
+        Underline::Curly
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        Underline::Dotted
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        Underline::Dashed
+    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        Underline::Double
+    } else if flags.contains(Flags::UNDERLINE) {
+        Underline::Plain
+    } else {
+        Underline::None
+    }
+}
+
+/// Converts an underline color to a scene color, or `None` when the color is
+/// a named terminal default (foreground/background) that should be inherited
+/// rather than emitted as an explicit SGR 58 value.
+fn underline_color_to_scene(color: AnsiColor) -> Option<Color> {
+    match color {
+        AnsiColor::Spec(rgb) => Some(Color::rgb(rgb.r, rgb.g, rgb.b)),
+        AnsiColor::Indexed(index) => Some(indexed_color(index)),
+        AnsiColor::Named(named) => named_color(named),
     }
 }
 
@@ -1283,6 +1802,18 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("terminal output did not arrive");
+    }
+
+    #[test]
+    fn graphics_error_responses_follow_kitty_quiet_suppression() {
+        // q=0 and q=1 deliver failure responses; q=2 suppresses them (matching
+        // Kitty's `finish_command_response`).
+        assert!(!suppress_graphics_error_response(b"a=p,i=999,q=0"));
+        assert!(!suppress_graphics_error_response(b"a=p,i=999,q=1"));
+        assert!(suppress_graphics_error_response(b"a=p,i=999,q=2"));
+        // A missing or malformed `q` key defaults to no suppression.
+        assert!(!suppress_graphics_error_response(b"a=p,i=999"));
+        assert!(!suppress_graphics_error_response(b"a=p,i=999,q=bogus"));
     }
 
     #[test]
@@ -1470,8 +2001,10 @@ mod tests {
             TerminalSize::new(20, 6),
         )
         .unwrap();
+        // C=1 keeps the cursor on the region's bottom line so the linefeed
+        // below exercises DECSTBM scrolling rather than cursor movement.
         session
-            .consume_output(b"\x1b[2;5r\x1b[5;1H\x1b_Ga=T,f=24,i=33,c=1,r=1,q=2;AQID\x1b\\")
+            .consume_output(b"\x1b[2;5r\x1b[5;1H\x1b_Ga=T,f=24,i=33,c=1,r=1,C=1,q=2;AQID\x1b\\")
             .unwrap();
         assert_eq!(session.scrollback_lines(), 0);
         assert_eq!(
@@ -1483,6 +2016,174 @@ mod tests {
         assert_eq!(
             session.graphics(Rect::new(0, 0, 20, 6))[0].placement().y(),
             3
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn session_graphics_follow_the_scrollback_view_as_text_scrolls() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 6)).unwrap();
+        // C=1 keeps the cursor still so the placement anchors at row 0.
+        session
+            .consume_output(b"\x1b_Ga=T,f=24,i=33,c=1,r=1,C=1,q=2;AQID\x1b\\")
+            .unwrap();
+        assert_eq!(session.scrollback_lines(), 0);
+        assert_eq!(
+            session.graphics(Rect::new(0, 0, 20, 6))[0].placement().y(),
+            0
+        );
+
+        // Scroll twelve lines of text; the image follows into history.
+        for line in 0..12u8 {
+            session
+                .consume_output(format!("row{line}\r\n").as_bytes())
+                .unwrap();
+        }
+        let history = session.scrollback_lines();
+        assert!(history > 0);
+        // In the live viewport the image has scrolled out and is clipped away.
+        assert!(session.graphics(Rect::new(0, 0, 20, 6)).is_empty());
+
+        // Scrolling the view to the top re-shows the image on its original row.
+        assert!(session.scroll_display(Scroll::Top));
+        assert_eq!(session.scrollback_offset(), history);
+        let graphics = session.graphics(Rect::new(0, 0, 20, 6));
+        assert_eq!(graphics.len(), 1);
+        assert_eq!(graphics[0].placement().y(), 0);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn scrollback_limit_bounds_history_and_evicts_scrolled_out_graphics() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        session.set_scrollback_limit(3);
+        assert_eq!(session.scrollback_limit(), 3);
+
+        // C=1 keeps the cursor still so the placement anchors at row 0.
+        session
+            .consume_output(b"\x1b_Ga=T,f=24,i=33,c=1,r=1,C=1,q=2;AQID\x1b\\")
+            .unwrap();
+        assert_eq!(session.graphics(Rect::new(0, 0, 20, 4)).len(), 1);
+
+        // Eight lines scroll past a three-line history cap.
+        for line in 0..8u8 {
+            session
+                .consume_output(format!("row{line}\r\n").as_bytes())
+                .unwrap();
+        }
+        assert_eq!(session.scrollback_lines(), 3);
+
+        // The image scrolled above the retained history and was evicted, so
+        // nothing remains even after scrolling the view to the top.
+        session.scroll_display(Scroll::Top);
+        assert!(session.graphics(Rect::new(0, 0, 20, 4)).is_empty());
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn session_graphics_follow_clear_screen_reset_and_screen_switches() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        let place = b"\x1b_Ga=T,f=24,i=33,c=1,r=1,C=1,q=2;AQID\x1b\\";
+
+        // ED 2 clears the visible image.
+        session.consume_output(place).unwrap();
+        assert_eq!(session.graphics(Rect::new(0, 0, 20, 4)).len(), 1);
+        session.consume_output(b"\x1b[2J").unwrap();
+        assert!(session.graphics(Rect::new(0, 0, 20, 4)).is_empty());
+
+        // RIS (reset) clears all retained graphics.
+        session.consume_output(place).unwrap();
+        assert_eq!(session.graphics(Rect::new(0, 0, 20, 4)).len(), 1);
+        session.consume_output(b"\x1bc").unwrap();
+        assert!(session.graphics(Rect::new(0, 0, 20, 4)).is_empty());
+
+        // Entering the alternate screen, placing an image, and leaving erases
+        // the alternate screen's image.
+        session.consume_output(b"\x1b[?1049h").unwrap();
+        session.consume_output(place).unwrap();
+        assert_eq!(session.graphics(Rect::new(0, 0, 20, 4)).len(), 1);
+        session.consume_output(b"\x1b[?1049l").unwrap();
+        assert!(session.graphics(Rect::new(0, 0, 20, 4)).is_empty());
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn session_graphics_follow_partial_and_scrollback_erases() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        // `ED 0` erases from the cursor row down. Place images on rows 0 and 2,
+        // move the cursor to row 1, and erase below: only the row-0 image stays.
+        session
+            .consume_output(b"\x1b_Ga=T,f=24,i=1,c=1,r=1,C=1,q=2;AQID\x1b\\")
+            .unwrap();
+        session
+            .consume_output(b"\x1b[3;1H\x1b_Ga=T,f=24,i=2,c=1,r=1,C=1,q=2;AQID\x1b\\")
+            .unwrap();
+        assert_eq!(session.graphics(Rect::new(0, 0, 20, 4)).len(), 2);
+        session.consume_output(b"\x1b[2;1H\x1b[0J").unwrap();
+        let below = session.graphics(Rect::new(0, 0, 20, 4));
+        assert_eq!(below.len(), 1);
+        assert_eq!(below[0].placement().y(), 0);
+
+        // `ED 1` erases from the top down to the cursor row. Re-place the
+        // bottom image, move to row 1, and erase above: the row-2 image stays.
+        session
+            .consume_output(b"\x1b[3;1H\x1b_Ga=T,f=24,i=3,c=1,r=1,C=1,q=2;AQID\x1b\\")
+            .unwrap();
+        session.consume_output(b"\x1b[2;1H\x1b[1J").unwrap();
+        let above = session.graphics(Rect::new(0, 0, 20, 4));
+        assert_eq!(above.len(), 1);
+        assert_eq!(above[0].placement().y(), 2);
+
+        // `ED 3` clears the scrollback. Push an image into history with text,
+        // then clear the scrollback: the scrolled-out image must be gone, not
+        // merely hidden.
+        session.consume_output(b"\x1bc").unwrap();
+        session
+            .consume_output(b"\x1b_Ga=T,f=24,i=4,c=1,r=1,C=1,q=2;AQID\x1b\\")
+            .unwrap();
+        for line in 0..5u8 {
+            session
+                .consume_output(format!("line{line}\r\n").as_bytes())
+                .unwrap();
+        }
+        assert!(session.scrollback_lines() > 0);
+        assert!(session.graphics(Rect::new(0, 0, 20, 4)).is_empty());
+        session.consume_output(b"\x1b[3J").unwrap();
+        assert_eq!(session.scrollback_lines(), 0);
+        assert!(session.graphics(Rect::new(0, 0, 20, 4)).is_empty());
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn text_reflows_and_graphics_reanchor_across_a_column_resize() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 6)).unwrap();
+        // A full-width line followed by a short second line.
+        session
+            .consume_output(b"abcdefghijklmnopqrst\r\nABCDE")
+            .unwrap();
+        // Anchor a static-cursor image on the second line at column 5.
+        session
+            .consume_output(b"\x1b_Ga=T,f=24,i=33,c=1,r=1,C=1,q=2;AQID\x1b\\")
+            .unwrap();
+        assert_eq!(
+            session.graphics(Rect::new(0, 0, 20, 6))[0].placement().area(),
+            Rect::new(5, 1, 1, 1)
+        );
+        assert_eq!(session.scrollback_lines(), 0);
+
+        // Shrink to 10 columns: the 20-column line rewraps into two rows and
+        // pushes a line into scrollback, but the image must keep its grid cell
+        // (row 1, column 5) instead of being shifted by the rewrap.
+        session.resize(TerminalSize::new(10, 6)).unwrap();
+        assert!(session.scrollback_lines() > 0);
+        let scene = session.render(Rect::new(0, 0, 10, 6), false);
+        // The wrapped continuation now occupies row 0 and "ABCDE" stays on the
+        // line below it, proving the text reflowed rather than truncating.
+        assert_eq!(scene.cell_at(0, 0).unwrap().symbol, 'k');
+        assert_eq!(scene.cell_at(0, 1).unwrap().symbol, 'A');
+        assert_eq!(
+            session.graphics(Rect::new(0, 0, 10, 6))[0].placement().area(),
+            Rect::new(5, 1, 1, 1)
         );
         session.shutdown().unwrap();
     }
@@ -1659,6 +2360,55 @@ mod tests {
     }
 
     #[test]
+    fn text_attributes_survive_rendering() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        // italic, underline, strikeout, reverse, and hidden on the same cell.
+        session
+            .processor
+            .advance(&mut session.term, b"\x1b[3;4;9;7;8mX\x1b[0m");
+        let scene = session.render(Rect::new(0, 0, 20, 4), false);
+        let style = scene.cell_at(0, 0).unwrap().style;
+        assert!(style.italic);
+        assert_eq!(style.underline, Underline::Plain);
+        assert!(style.strikeout);
+        assert!(style.reverse);
+        assert!(style.hidden);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn underline_styles_and_color_survive_rendering() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        session.processor.advance(
+            &mut session.term,
+            b"\x1b[4ma\x1b[4:2mb\x1b[4:3mc\x1b[4:4md\x1b[4:5me\x1b[0m\x1b[4m\x1b[58;2;255;0;0mf\x1b[0m",
+        );
+        let scene = session.render(Rect::new(0, 0, 20, 4), false);
+        let styles: Vec<_> = (0..6)
+            .map(|column| scene.cell_at(column, 0).unwrap().style)
+            .collect();
+        assert_eq!(styles[0].underline, Underline::Plain);
+        assert_eq!(styles[1].underline, Underline::Double);
+        assert_eq!(styles[2].underline, Underline::Curly);
+        assert_eq!(styles[3].underline, Underline::Dotted);
+        assert_eq!(styles[4].underline, Underline::Dashed);
+        assert_eq!(styles[5].underline, Underline::Plain);
+        assert_eq!(styles[5].underline_color, Some(Color::rgb(255, 0, 0)));
+        assert_eq!(styles[0].underline_color, None);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn underline_flag_mapping_is_exhaustive() {
+        assert_eq!(cell_underline(Flags::empty()), Underline::None);
+        assert_eq!(cell_underline(Flags::UNDERLINE), Underline::Plain);
+        assert_eq!(cell_underline(Flags::DOUBLE_UNDERLINE), Underline::Double);
+        assert_eq!(cell_underline(Flags::UNDERCURL), Underline::Curly);
+        assert_eq!(cell_underline(Flags::DOTTED_UNDERLINE), Underline::Dotted);
+        assert_eq!(cell_underline(Flags::DASHED_UNDERLINE), Underline::Dashed);
+    }
+
+    #[test]
     fn kitty_apc_commands_are_removed_from_text_and_survive_chunk_boundaries() {
         let first = b"before\x1b_Ga=T,f=24,i=1;AQ";
         let second = b"ID\x1b\\after";
@@ -1695,17 +2445,233 @@ mod tests {
 
     #[test]
     fn key_encoding_covers_text_control_and_navigation_input() {
+        let legacy = TermMode::empty();
         assert_eq!(
-            key_bytes(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            key_bytes(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                legacy,
+            ),
             Some(vec![3])
         );
         assert_eq!(
-            key_bytes(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            key_bytes(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), legacy),
             Some(vec![b'\r'])
         );
         assert_eq!(
-            key_bytes(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            key_bytes(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), legacy),
             Some(b"\x1b[A".to_vec())
         );
+        // Modified arrows keep the `CSI 1 ; modifier letter` form.
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), legacy),
+            Some(b"\x1b[1;5A".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_disambiguation_encodes_modified_keys_as_csi_u() {
+        let disambiguate = TermMode::DISAMBIGUATE_ESC_CODES;
+        assert_eq!(
+            key_bytes(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                disambiguate,
+            ),
+            Some(b"\x1b[99;5u".to_vec())
+        );
+        assert_eq!(
+            key_bytes(
+                KeyEvent::new(
+                    KeyCode::Char('C'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ),
+                disambiguate,
+            ),
+            Some(b"\x1b[99;6u".to_vec())
+        );
+        assert_eq!(
+            key_bytes(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+                disambiguate,
+            ),
+            Some(b"\x1b[97;3u".to_vec())
+        );
+        // Plain text keys are unaffected by disambiguation.
+        assert_eq!(
+            key_bytes(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                disambiguate,
+            ),
+            Some(b"a".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_legacy_ctrl_and_alt_mapping_is_faithful() {
+        let legacy = TermMode::empty();
+        assert_eq!(
+            key_bytes(
+                KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL),
+                legacy,
+            ),
+            Some(vec![0])
+        );
+        assert_eq!(
+            key_bytes(
+                KeyEvent::new(KeyCode::Char('8'), KeyModifiers::CONTROL),
+                legacy,
+            ),
+            Some(vec![127])
+        );
+        assert_eq!(
+            key_bytes(
+                KeyEvent::new(KeyCode::Char('0'), KeyModifiers::CONTROL),
+                legacy,
+            ),
+            Some(b"0".to_vec())
+        );
+        // alt prefixes with ESC in legacy mode.
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT), legacy),
+            Some(b"\x1bx".to_vec())
+        );
+        // ctrl+shift is ambiguous even in legacy mode and uses CSI u.
+        assert_eq!(
+            key_bytes(
+                KeyEvent::new(
+                    KeyCode::Char('I'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ),
+                legacy,
+            ),
+            Some(b"\x1b[105;6u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_mode_is_negotiated_through_the_emulator() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        assert!(
+            !session
+                .term
+                .mode()
+                .contains(TermMode::DISAMBIGUATE_ESC_CODES)
+        );
+
+        // `CSI > 1 u` pushes the disambiguation flag.
+        session.consume_output(b"\x1b[>1u").unwrap();
+        assert!(
+            session
+                .term
+                .mode()
+                .contains(TermMode::DISAMBIGUATE_ESC_CODES)
+        );
+
+        // `CSI = 8 ; 2 u` unions in report-all-keys-as-escapes.
+        session.consume_output(b"\x1b[=8;2u").unwrap();
+        assert!(
+            session
+                .term
+                .mode()
+                .contains(TermMode::REPORT_ALL_KEYS_AS_ESC)
+        );
+
+        // `CSI < u` pops the stack, restoring the prior mode.
+        session.consume_output(b"\x1b[<u").unwrap();
+        assert!(
+            !session
+                .term
+                .mode()
+                .contains(TermMode::REPORT_ALL_KEYS_AS_ESC)
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn kitty_keyboard_mode_query_is_answered_to_the_child_pty() {
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &[
+                "-c",
+                "stty -icanon min 1 time 0; printf '\\033[>1u\\033[?u'; response=$(dd bs=1 count=5 2>/dev/null); if [ \"$response\" = \"$(printf '\\033[?1u')\" ]; then printf 'kb-ok'; fi; sleep 5",
+            ],
+            TerminalSize::new(40, 8),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut kb_ok = false;
+        while Instant::now() < deadline {
+            session.poll_output().unwrap();
+            let scene = session.render(Rect::new(0, 0, 40, 8), false);
+            let rendered: String = scene.cells().iter().map(|cell| cell.symbol).collect();
+            if rendered.contains("kb-ok") {
+                kb_ok = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(kb_ok, "child did not receive the keyboard mode response");
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn scrollback_view_offset_scrolls_into_history_and_hides_the_cursor() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        for line in 0..10u8 {
+            session
+                .processor
+                .advance(&mut session.term, format!("row{line}\r\n").as_bytes());
+        }
+        assert!(session.scrollback_lines() > 0);
+        assert_eq!(session.scrollback_offset(), 0);
+
+        assert!(session.scroll_display(Scroll::PageUp));
+        assert!(session.scrollback_offset() > 0);
+
+        let scene = session.render_with_theme_and_cursor(
+            Rect::new(0, 0, 20, 4),
+            true,
+            Theme::fallback(),
+            true,
+        );
+        assert_eq!(scene.cursor(), None);
+
+        assert!(session.scroll_display(Scroll::Bottom));
+        assert_eq!(session.scrollback_offset(), 0);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn typing_while_scrolled_returns_to_the_live_viewport() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        for line in 0..10u8 {
+            session
+                .processor
+                .advance(&mut session.term, format!("row{line}\r\n").as_bytes());
+        }
+        assert!(session.scroll_display(Scroll::Top));
+        assert_eq!(session.scrollback_offset(), session.scrollback_lines());
+
+        session
+            .write_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(session.scrollback_offset(), 0);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn mouse_scroll_is_captured_only_when_the_app_requests_it() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        assert!(!session.captures_mouse_scroll());
+
+        session.processor.advance(&mut session.term, b"\x1b[?1000h");
+        assert!(session.captures_mouse_scroll());
+        session.processor.advance(&mut session.term, b"\x1b[?1000l");
+        assert!(!session.captures_mouse_scroll());
+
+        session.processor.advance(&mut session.term, b"\x1b[?1049h");
+        assert!(session.captures_mouse_scroll());
+        session.processor.advance(&mut session.term, b"\x1b[?1049l");
+        assert!(!session.captures_mouse_scroll());
+        session.shutdown().unwrap();
     }
 }

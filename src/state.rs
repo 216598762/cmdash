@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
@@ -327,6 +327,7 @@ pub struct AppState {
     cursor_blink_generation: u64,
     animations: AnimationManager,
     animation_now: SystemTime,
+    graphics_animation_next: Option<Duration>,
     pending_invalidations: Vec<Rect>,
     diagnostics: Vec<String>,
     pending_clipboard: Option<String>,
@@ -353,6 +354,7 @@ impl AppState {
             cursor_blink_generation: 0,
             animations: AnimationManager::new(crate::config::AnimationConfig::default()),
             animation_now: SystemTime::now(),
+            graphics_animation_next: None,
             pending_invalidations: Vec::new(),
             diagnostics: Vec::new(),
             pending_clipboard: None,
@@ -425,6 +427,7 @@ impl AppState {
             cursor_blink_generation: 0,
             animations: AnimationManager::new(config.animation),
             animation_now: SystemTime::now(),
+            graphics_animation_next: None,
             pending_invalidations: Vec::new(),
             diagnostics: Vec::new(),
             pending_clipboard: None,
@@ -568,6 +571,9 @@ impl AppState {
         if report.requests_redraw() || !report.failed().is_empty() {
             self.redraw_requested = true;
         }
+        // Terminal-driven Kitty animations advance on wall-clock time; capture
+        // the next frame deadline so the scheduler can wake the render loop.
+        self.graphics_animation_next = self.widget_runtime.advance_graphics_animations(Instant::now());
         let active_terminal = self.active_terminal_widget();
         if active_terminal.is_some_and(|id| report.changed().contains(&id)) {
             self.reset_cursor_blink();
@@ -595,6 +601,12 @@ impl AppState {
 
     pub fn animation_schedule(&self) -> Option<Duration> {
         self.animations.next_wakeup(self.animation_now)
+    }
+
+    /// The delay until the next terminal-driven Kitty animation frame deadline
+    /// (`None` when no visible session is animating).
+    pub fn graphics_animation_schedule(&self) -> Option<Duration> {
+        self.graphics_animation_next
     }
 
     pub fn advance_animations(&mut self, now: SystemTime) -> bool {

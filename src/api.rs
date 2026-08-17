@@ -20,7 +20,7 @@ use crate::{
     backend::{BackendCapabilities, OutputMetrics},
     command::{Command, FocusCommand, PaneCommand, TabCommand},
     config::{ApiConfig, SplitDirection},
-    scene::{Cell, CellStyle, CellWidth, Color, Scene},
+    scene::{Cell, CellStyle, CellWidth, Color, Scene, Underline},
     session::UiEvent,
     state::{AppState, FocusTarget},
     widget::WidgetHealth,
@@ -366,6 +366,12 @@ pub struct StyleDto {
     pub background: ColorDto,
     pub bold: bool,
     pub dim: bool,
+    pub italic: bool,
+    pub underline: &'static str,
+    pub underline_color: Option<ColorDto>,
+    pub strikeout: bool,
+    pub reverse: bool,
+    pub hidden: bool,
 }
 
 impl From<CellStyle> for StyleDto {
@@ -375,7 +381,24 @@ impl From<CellStyle> for StyleDto {
             background: ColorDto::from(style.background),
             bold: style.bold,
             dim: style.dim,
+            italic: style.italic,
+            underline: underline_name(style.underline),
+            underline_color: style.underline_color.map(ColorDto::from),
+            strikeout: style.strikeout,
+            reverse: style.reverse,
+            hidden: style.hidden,
         }
+    }
+}
+
+fn underline_name(underline: Underline) -> &'static str {
+    match underline {
+        Underline::None => "none",
+        Underline::Plain => "plain",
+        Underline::Double => "double",
+        Underline::Curly => "curly",
+        Underline::Dotted => "dotted",
+        Underline::Dashed => "dashed",
     }
 }
 

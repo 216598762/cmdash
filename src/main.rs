@@ -188,9 +188,16 @@ where
             state.cursor_blink_schedule(),
             state.cursor_blink_generation(),
         );
+        let animation_schedule = match (
+            state.animation_schedule(),
+            state.graphics_animation_schedule(),
+        ) {
+            (Some(ui), Some(graphics)) => Some(ui.min(graphics)),
+            (schedule, None) | (None, schedule) => schedule,
+        };
         context
             .maintenance_waker
-            .schedule_animation(state.animation_schedule());
+            .schedule_animation(animation_schedule);
         if let Some(reloader) = context.reloader.as_deref_mut() {
             match reloader.poll_with_migrations() {
                 Ok(Some(loaded)) => {

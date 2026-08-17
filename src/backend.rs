@@ -8,7 +8,10 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{DisableMouseCapture, EnableMouseCapture},
     execute, queue,
-    style::{Attribute, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    style::{
+        Attribute, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+        SetUnderlineColor,
+    },
     terminal::{
         self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
         enable_raw_mode,
@@ -22,7 +25,7 @@ use crate::{
         GraphicsInputDemultiplexer, GraphicsPlaceholderLayer, GraphicsProtocolBroker,
         GraphicsSubmission, OuterInputEvent,
     },
-    scene::{Cell, CellStyle, CellWidth, Color, Scene, SceneCursor},
+    scene::{Cell, CellStyle, CellWidth, Color, Scene, SceneCursor, Underline},
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -564,6 +567,16 @@ fn kitty_diacritic(value: u16) -> Option<char> {
     KITTY_DIACRITICS
         .get(usize::from(value))
         .and_then(|codepoint| char::from_u32(*codepoint))
+}
+
+/// Inverse of [`kitty_diacritic`]: the index a Kitty placeholder combining mark
+/// encodes. Used to decode the high 8 bits of an image id from the third
+/// combining mark following a U+10EEEE placeholder glyph.
+pub(crate) fn kitty_diacritic_index(character: char) -> Option<u16> {
+    KITTY_DIACRITICS
+        .iter()
+        .position(|codepoint| *codepoint == character as u32)
+        .map(|index| index as u16)
 }
 
 pub trait Backend {
@@ -1433,6 +1446,29 @@ fn write_style<W: Write>(writer: &mut W, style: CellStyle) -> io::Result<()> {
     if style.dim {
         queue!(writer, SetAttribute(Attribute::Dim))?;
     }
+    if style.italic {
+        queue!(writer, SetAttribute(Attribute::Italic))?;
+    }
+    match style.underline {
+        Underline::None => {}
+        Underline::Plain => queue!(writer, SetAttribute(Attribute::Underlined))?,
+        Underline::Double => queue!(writer, SetAttribute(Attribute::DoubleUnderlined))?,
+        Underline::Curly => queue!(writer, SetAttribute(Attribute::Undercurled))?,
+        Underline::Dotted => queue!(writer, SetAttribute(Attribute::Underdotted))?,
+        Underline::Dashed => queue!(writer, SetAttribute(Attribute::Underdashed))?,
+    }
+    if let Some(color) = style.underline_color {
+        queue!(writer, SetUnderlineColor(to_crossterm_color(color)))?;
+    }
+    if style.strikeout {
+        queue!(writer, SetAttribute(Attribute::CrossedOut))?;
+    }
+    if style.reverse {
+        queue!(writer, SetAttribute(Attribute::Reverse))?;
+    }
+    if style.hidden {
+        queue!(writer, SetAttribute(Attribute::Hidden))?;
+    }
     Ok(())
 }
 
@@ -1471,6 +1507,7 @@ fn write_direct_placement<W: Write>(
         write!(writer, ",p={placement_id}")?;
     }
     write_source_crop(writer, placement)?;
+    write_cell_offsets(writer, placement)?;
     writer.write_all(b";\x1b\\")
 }
 
@@ -1487,6 +1524,21 @@ fn write_source_crop<W: Write>(
             source.width(),
             source.height()
         )?;
+    }
+    Ok(())
+}
+
+/// Emits Kitty's sub-cell `X`/`Y` pixel offsets so the outer terminal restores
+/// a placement at pixel-exact precision rather than the top-left cell corner.
+fn write_cell_offsets<W: Write>(
+    writer: &mut W,
+    placement: &crate::graphics::GraphicsPlacement,
+) -> io::Result<()> {
+    if placement.cell_x_offset() != 0 {
+        write!(writer, ",X={}", placement.cell_x_offset())?;
+    }
+    if placement.cell_y_offset() != 0 {
+        write!(writer, ",Y={}", placement.cell_y_offset())?;
     }
     Ok(())
 }
@@ -1524,9 +1576,14 @@ fn write_direct_upload<W: Write>(
     let placement = submission.placement();
     write!(
         writer,
-        "\x1b_Ga=T,f={},i={},c={},r={},C=1,q=2,m=0",
+        "\x1b_Ga=T,f={},i={}",
         submission.format(),
-        physical_id,
+        physical_id
+    )?;
+    write_pixel_dimensions(writer, submission)?;
+    write!(
+        writer,
+        ",c={},r={},C=1,q=2,m=0",
         placement.width(),
         placement.height()
     )?;
@@ -1537,6 +1594,7 @@ fn write_direct_upload<W: Write>(
         write!(writer, ",p={placement_id}")?;
     }
     write_source_crop(writer, placement)?;
+    write_cell_offsets(writer, placement)?;
     writer.write_all(b";")?;
     writer.write_all(submission.encoded_payload())?;
     writer.write_all(b"\x1b\\")
@@ -1551,9 +1609,14 @@ fn write_placeholder_upload<W: Write>(
     queue!(writer, MoveTo(placement.x(), placement.y()))?;
     write!(
         writer,
-        "\x1b_Ga=T,f={},i={},c={},r={},U=1,C=1,q=2,m=0",
+        "\x1b_Ga=T,f={},i={}",
         submission.format(),
-        physical_id,
+        physical_id
+    )?;
+    write_pixel_dimensions(writer, submission)?;
+    write!(
+        writer,
+        ",c={},r={},U=1,C=1,q=2,m=0",
         placement.width(),
         placement.height()
     )?;
@@ -1564,6 +1627,30 @@ fn write_placeholder_upload<W: Write>(
     writer.write_all(b";")?;
     writer.write_all(submission.encoded_payload())?;
     writer.write_all(b"\x1b\\")
+}
+
+/// Emits Kitty's `s`/`v` pixel dimensions for RGB/RGBA uploads. PNG payloads
+/// carry their own dimensions, so they are left without the redundant keys.
+///
+/// A clipped placement is re-uploaded with its full payload but a smaller
+/// `c`/`r`; without `s`/`v` the terminal would mistake the cell extent for the
+/// image size and could not decode or crop the source region.
+fn write_pixel_dimensions<W: Write>(
+    writer: &mut W,
+    submission: &GraphicsSubmission,
+) -> io::Result<()> {
+    if submission.format() != 100
+        && submission.pixel_width() != 0
+        && submission.pixel_height() != 0
+    {
+        write!(
+            writer,
+            ",s={},v={}",
+            submission.pixel_width(),
+            submission.pixel_height()
+        )?;
+    }
+    Ok(())
 }
 
 fn placeholder_geometry_error(submissions: &[GraphicsSubmission]) -> Option<String> {
@@ -2025,6 +2112,38 @@ mod tests {
     }
 
     #[test]
+    fn style_serialization_emits_text_attributes() {
+        let mut output = Vec::new();
+        let style = CellStyle::new(Color::rgb(1, 2, 3), Color::rgb(4, 5, 6))
+            .italic()
+            .underline_style(Underline::Curly)
+            .underline_color(Color::rgb(9, 8, 7))
+            .strikeout()
+            .reverse()
+            .hidden();
+        write_style(&mut output, style).unwrap();
+        let rendered = String::from_utf8_lossy(&output);
+        assert!(rendered.contains("\x1b[3m"), "italic missing: {rendered:?}");
+        assert!(
+            rendered.contains("\x1b[4:3m"),
+            "curly missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\x1b[9m"),
+            "strikeout missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\x1b[7m"),
+            "reverse missing: {rendered:?}"
+        );
+        assert!(rendered.contains("\x1b[8m"), "hidden missing: {rendered:?}");
+        assert!(
+            rendered.contains("58;"),
+            "underline color missing: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn kitty_graphics_are_replayed_only_when_the_backend_supports_them() {
         let mut store = SessionGraphicsStore::new(SessionId::new(7));
         store.apply_kitty_command(b"a=T,f=24,i=1", b"AQID").unwrap();
@@ -2053,6 +2172,137 @@ mod tests {
         assert!(output.windows(3).any(|window| window == b"C=1"));
         assert!(output.windows(4).any(|window| window == b"a=p,"));
         assert!(output.windows(3).any(|window| window == b"AQI"));
+    }
+
+    #[test]
+    fn sub_cell_offsets_are_serialized_for_the_outer_terminal() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(44));
+        store
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,i=44,c=2,r=1,X=4,Y=7,q=2",
+                b"AQID",
+                (0, 0),
+                (10, 20),
+            )
+            .unwrap();
+        let graphics = store.visible_submissions(Rect::new(0, 0, 4, 2));
+        let capabilities = BackendCapabilities {
+            truecolor: true,
+            mouse: true,
+            bracketed_paste: true,
+            kitty_graphics: true,
+            kitty_unicode_placeholders: false,
+            graphics_source: GraphicsCapabilitySource::EnvironmentHint,
+            graphics_confidence: GraphicsCapabilityConfidence::Inferred,
+            kitty_passthrough: false,
+            kitty_text_fallback: false,
+            sixel: false,
+        };
+        let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
+        backend.submit_graphics(&graphics, &graphics, &[]).unwrap();
+
+        let output = backend.writer();
+        assert!(output.windows(3).any(|window| window == b"X=4"));
+        assert!(output.windows(3).any(|window| window == b"Y=7"));
+    }
+
+    #[test]
+    fn clipped_placements_serialize_a_source_crop_instead_of_rescaling() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(45));
+        store
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,i=45,s=100,v=100,c=10,r=10,q=2",
+                b"AQID",
+                (0, 0),
+                (10, 10),
+            )
+            .unwrap();
+        let submission = store
+            .visible_submissions(Rect::new(0, 0, 20, 20))
+            .into_iter()
+            .next()
+            .unwrap();
+        let clipped = submission.clipped_to(Rect::new(5, 0, 5, 10)).unwrap();
+
+        let capabilities = BackendCapabilities {
+            truecolor: true,
+            mouse: true,
+            bracketed_paste: true,
+            kitty_graphics: true,
+            kitty_unicode_placeholders: false,
+            graphics_source: GraphicsCapabilitySource::EnvironmentHint,
+            graphics_confidence: GraphicsCapabilityConfidence::Inferred,
+            kitty_passthrough: false,
+            kitty_text_fallback: false,
+            sixel: false,
+        };
+        let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
+        backend
+            .submit_graphics(
+                std::slice::from_ref(&clipped),
+                std::slice::from_ref(&clipped),
+                &[],
+            )
+            .unwrap();
+
+        let output = backend.writer();
+        // The destination is the clipped 5x10 extent, not the original 10x10.
+        assert!(output.windows(8).any(|window| window == b"c=5,r=10"));
+        // The visible right half of the image is selected as a source crop.
+        assert!(
+            output
+                .windows(19)
+                .any(|window| window == b"x=50,y=0,w=50,h=100")
+        );
+    }
+
+    #[test]
+    fn sub_cell_offset_clips_serialize_a_pixel_shifted_crop() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(46));
+        store
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,i=46,s=30,v=10,X=6,q=2",
+                b"AQID",
+                (0, 0),
+                (10, 10),
+            )
+            .unwrap();
+        let submission = store
+            .visible_submissions(Rect::new(0, 0, 20, 20))
+            .into_iter()
+            .next()
+            .unwrap();
+        let clipped = submission.clipped_to(Rect::new(1, 0, 3, 1)).unwrap();
+
+        let capabilities = BackendCapabilities {
+            truecolor: true,
+            mouse: true,
+            bracketed_paste: true,
+            kitty_graphics: true,
+            kitty_unicode_placeholders: false,
+            graphics_source: GraphicsCapabilitySource::EnvironmentHint,
+            graphics_confidence: GraphicsCapabilityConfidence::Inferred,
+            kitty_passthrough: false,
+            kitty_text_fallback: false,
+            sixel: false,
+        };
+        let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
+        backend
+            .submit_graphics(
+                std::slice::from_ref(&clipped),
+                std::slice::from_ref(&clipped),
+                &[],
+            )
+            .unwrap();
+
+        let output = backend.writer();
+        // The six-pixel X offset shifts the visible crop to source pixels
+        // 4..30 rather than the whole-cell fraction 30 / 4 == 7.
+        let crop = b"x=4,y=0,w=26,h=10";
+        assert!(output.windows(crop.len()).any(|window| window == crop));
+        // The clipped placement re-anchors at a whole cell, so the original
+        // offset is not re-emitted.
+        assert!(!output.windows(3).any(|window| window == b"X=6"));
     }
 
     #[test]

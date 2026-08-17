@@ -1,10 +1,11 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crossterm::event::{KeyEvent, MouseEvent};
+use alacritty_terminal::grid::Scroll;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::layout::Rect;
 
 #[cfg(feature = "sixel")]
@@ -202,6 +203,65 @@ impl CursorBlinkSettings {
     }
 }
 
+/// Optional scrollback affordances drawn in a terminal widget's chrome.
+///
+/// Both are theme-aware and only appear while scrollback exists; the
+/// percentage indicator additionally requires the view to be scrolled away
+/// from the live screen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScrollbackChrome {
+    scrollbar: bool,
+    indicator: bool,
+}
+
+impl Default for ScrollbackChrome {
+    fn default() -> Self {
+        Self {
+            scrollbar: true,
+            indicator: true,
+        }
+    }
+}
+
+impl ScrollbackChrome {
+    pub fn from_settings(settings: &BTreeMap<String, String>) -> Result<Self, WidgetError> {
+        let scrollbar = settings
+            .get("scrollbar")
+            .map(|value| {
+                value.parse::<bool>().map_err(|_| {
+                    WidgetError::InvalidConfiguration(format!(
+                        "terminal scrollbar must be true or false, got {value:?}"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(true);
+        let indicator = settings
+            .get("scroll_indicator")
+            .map(|value| {
+                value.parse::<bool>().map_err(|_| {
+                    WidgetError::InvalidConfiguration(format!(
+                        "terminal scroll_indicator must be true or false, got {value:?}"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(true);
+        Ok(Self {
+            scrollbar,
+            indicator,
+        })
+    }
+
+    pub const fn scrollbar(self) -> bool {
+        self.scrollbar
+    }
+
+    pub const fn indicator(self) -> bool {
+        self.indicator
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BorderGlyphs {
     horizontal: char,
@@ -342,6 +402,13 @@ pub trait Widget: Send {
 
     fn graphics(&self, _area: Rect) -> Vec<GraphicsSubmission> {
         Vec::new()
+    }
+
+    /// Advances any terminal-driven Kitty animation this widget owns to `now`
+    /// and returns the delay until its next frame deadline (`None` when the
+    /// widget plays no animation).
+    fn advance_graphics_animation(&mut self, _now: Instant) -> Option<Duration> {
+        None
     }
 
     #[cfg(feature = "sixel")]
@@ -698,6 +765,22 @@ impl WidgetRuntime {
             parts.push(format!("{failed} failed"));
         }
         parts.join(", ")
+    }
+
+    /// Advances every widget's terminal-driven Kitty animation to `now` and
+    /// returns the earliest delay until a frame deadline (`None` when no widget
+    /// plays an animation).
+    pub fn advance_graphics_animations(&mut self, now: Instant) -> Option<Duration> {
+        let mut next: Option<Duration> = None;
+        for entry in self.instances.values_mut() {
+            if let Some(delay) = entry.widget.advance_graphics_animation(now) {
+                next = Some(match next {
+                    Some(earliest) => earliest.min(delay),
+                    None => delay,
+                });
+            }
+        }
+        next
     }
 
     pub fn update(&mut self, now: SystemTime) -> WidgetUpdateReport {
@@ -1116,6 +1199,7 @@ struct TerminalWidget {
     appearance: WidgetAppearance,
     theme: Theme,
     cursor_blink: CursorBlinkSettings,
+    scrollback_chrome: ScrollbackChrome,
 }
 
 /// Returns the content rectangle inside a one-cell widget outline.
@@ -1129,6 +1213,25 @@ pub fn widget_content_area(area: Rect) -> Rect {
         area.width.saturating_sub(2),
         area.height.saturating_sub(2),
     )
+}
+
+/// Maps a shifted navigation key to a scrollback view command, mirroring the
+/// scrollback keybindings of a full-featured terminal (`Shift+PageUp` for a
+/// page, `Shift+Up`/`Shift+Down` for lines, `Shift+Home`/`Shift+End` for the
+/// ends of the buffer). Unshifted keys are forwarded to the child PTY.
+fn scrollback_scroll(key: KeyEvent) -> Option<Scroll> {
+    if !key.modifiers.contains(KeyModifiers::SHIFT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::PageUp => Some(Scroll::PageUp),
+        KeyCode::PageDown => Some(Scroll::PageDown),
+        KeyCode::Up => Some(Scroll::Delta(1)),
+        KeyCode::Down => Some(Scroll::Delta(-1)),
+        KeyCode::Home => Some(Scroll::Top),
+        KeyCode::End => Some(Scroll::Bottom),
+        _ => None,
+    }
 }
 
 impl Widget for TerminalWidget {
@@ -1160,6 +1263,10 @@ impl Widget for TerminalWidget {
             .map_err(|error| error.to_string())
     }
 
+    fn advance_graphics_animation(&mut self, now: Instant) -> Option<Duration> {
+        self.session.advance_graphics_animations(now)
+    }
+
     fn health(&self) -> WidgetHealth {
         if let Some(error) = self.session.failure() {
             WidgetHealth::Failed(error.to_owned())
@@ -1189,13 +1296,15 @@ impl Widget for TerminalWidget {
             if self.label { &self.title } else { "" },
             CellStyle::new(color, background),
         );
+        let content_area = self.appearance.content_area(area);
         let content = self.session.render_with_theme_and_cursor(
-            self.appearance.content_area(area),
+            content_area,
             focused,
             self.theme,
             cursor_visible,
         );
         scene.blit(&content, area);
+        self.render_scrollback_chrome(&mut scene, area, content_area, focused);
         scene
     }
 
@@ -1217,6 +1326,14 @@ impl Widget for TerminalWidget {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<WidgetUpdate, String> {
+        if let Some(scroll) = scrollback_scroll(key) {
+            let changed = self.session.scroll_display(scroll);
+            return Ok(if changed {
+                WidgetUpdate::Redraw
+            } else {
+                WidgetUpdate::Unchanged
+            });
+        }
         self.session
             .write_key(key)
             .map(|_| WidgetUpdate::Unchanged)
@@ -1245,6 +1362,24 @@ impl Widget for TerminalWidget {
         mouse: MouseEvent,
         origin: (u16, u16),
     ) -> Result<WidgetUpdate, String> {
+        // When the child application has not captured the wheel, a scroll
+        // event navigates the terminal's own scrollback instead of reaching
+        // the PTY.
+        if !self.session.captures_mouse_scroll() {
+            let scroll = match mouse.kind {
+                crossterm::event::MouseEventKind::ScrollUp => Some(Scroll::Delta(3)),
+                crossterm::event::MouseEventKind::ScrollDown => Some(Scroll::Delta(-3)),
+                _ => None,
+            };
+            if let Some(scroll) = scroll {
+                let changed = self.session.scroll_display(scroll);
+                return Ok(if changed {
+                    WidgetUpdate::Redraw
+                } else {
+                    WidgetUpdate::Unchanged
+                });
+            }
+        }
         let position = (
             mouse.column.saturating_sub(origin.0),
             mouse.row.saturating_sub(origin.1),
@@ -1265,12 +1400,101 @@ impl Widget for TerminalWidget {
     }
 }
 
+impl TerminalWidget {
+    /// Draws the optional scrollbar and percentage indicator for a terminal
+    /// that has scrolled-back history.
+    fn render_scrollback_chrome(
+        &self,
+        scene: &mut Scene,
+        area: Rect,
+        content_area: Rect,
+        focused: bool,
+    ) {
+        let history = self.session.scrollback_lines();
+        if history == 0 || content_area.width == 0 || content_area.height == 0 {
+            return;
+        }
+        let offset = self.session.scrollback_offset();
+        let track_height = usize::from(content_area.height);
+        let background = self.theme.background();
+
+        if self.scrollback_chrome.scrollbar() {
+            let x = content_area
+                .x
+                .saturating_add(content_area.width.saturating_sub(1));
+            let total = history.saturating_add(track_height);
+            let thumb_len = track_height
+                .saturating_mul(track_height)
+                .checked_div(total)
+                .unwrap_or(track_height)
+                .clamp(1, track_height);
+            let max_thumb_top = track_height - thumb_len;
+            let thumb_top =
+                (history.saturating_sub(offset)).saturating_mul(max_thumb_top) / history;
+            let thumb_color = if focused {
+                self.theme.focus()
+            } else {
+                self.theme.border()
+            };
+            let track_color = self.theme.muted();
+            for row in 0..track_height {
+                let y = content_area.y.saturating_add(row as u16);
+                let (glyph, color) = if row >= thumb_top && row < thumb_top + thumb_len {
+                    ('█', thumb_color)
+                } else {
+                    ('│', track_color)
+                };
+                scene.set(x, y, glyph, CellStyle::new(color, background));
+            }
+        }
+
+        if self.scrollback_chrome.indicator() && offset > 0 {
+            let percent = offset.saturating_mul(100) / history;
+            let text = format!("{}%", percent.min(100));
+            let text_len = text.chars().count() as u16;
+            let indicator_color = if focused {
+                self.theme.focus()
+            } else {
+                self.theme.muted()
+            };
+            let style = CellStyle::new(indicator_color, background);
+            let has_border = self.appearance.border() != WidgetBorderStyle::None;
+            if has_border && area.width > text_len.saturating_add(2) {
+                let right = area.x.saturating_add(area.width.saturating_sub(1));
+                scene.text(
+                    right.saturating_sub(text_len.saturating_add(1)),
+                    area.y,
+                    &text,
+                    style,
+                );
+            } else if content_area.width >= text_len {
+                let start = content_area
+                    .x
+                    .saturating_add(content_area.width.saturating_sub(text_len));
+                scene.text(start, content_area.y, &text, style);
+            }
+        }
+    }
+}
+
 fn terminal_widget_factory(
     config: &WidgetInstanceConfig,
     context: &WidgetRuntimeContext,
 ) -> Result<Box<dyn Widget>, WidgetError> {
     let appearance = WidgetAppearance::from_settings(&config.settings)?;
     let cursor_blink = CursorBlinkSettings::from_settings(&config.settings)?;
+    let scrollback_chrome = ScrollbackChrome::from_settings(&config.settings)?;
+    let scrollback_limit = config
+        .settings
+        .get("scrollback")
+        .map(|value| {
+            value.parse::<usize>().map_err(|_| {
+                WidgetError::InvalidConfiguration(format!(
+                    "terminal scrollback must be a non-negative integer, got {value:?}"
+                ))
+            })
+        })
+        .transpose()?;
     let theme = context
         .theme()
         .with_settings(&config.settings)
@@ -1289,6 +1513,9 @@ fn terminal_widget_factory(
         reason: error.to_string(),
     })?;
     session.set_kitty_graphics_support(context.kitty_graphics());
+    if let Some(limit) = scrollback_limit {
+        session.set_scrollback_limit(limit);
+    }
     Ok(Box::new(TerminalWidget {
         title: config
             .title
@@ -1299,6 +1526,7 @@ fn terminal_widget_factory(
         appearance,
         theme,
         cursor_blink,
+        scrollback_chrome,
     }))
 }
 
@@ -2725,6 +2953,177 @@ mod tests {
         let _ = runtime.shutdown();
     }
 
+    fn scrollback_widget() -> TerminalWidget {
+        TerminalWidget {
+            title: " shell ".to_owned(),
+            label: true,
+            session: TerminalSession::spawn_with_args(
+                Some("sh"),
+                &["-c", "yes x | head -n 20; sleep 5"],
+                TerminalSize::new(20, 4),
+            )
+            .unwrap(),
+            appearance: WidgetAppearance::default(),
+            theme: Theme::fallback(),
+            cursor_blink: CursorBlinkSettings::default(),
+            scrollback_chrome: ScrollbackChrome::default(),
+        }
+    }
+
+    fn wait_for_scrollback(widget: &mut TerminalWidget) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            widget.session.poll_output().unwrap();
+            if widget.session.scrollback_lines() > 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("terminal scrollback did not arrive");
+    }
+
+    #[test]
+    fn terminal_widget_scrolls_scrollback_with_shifted_navigation_keys() {
+        let mut widget = scrollback_widget();
+        wait_for_scrollback(&mut widget);
+        assert_eq!(widget.session.scrollback_offset(), 0);
+
+        let update = widget
+            .handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(update, WidgetUpdate::Redraw);
+        assert!(widget.session.scrollback_offset() > 0);
+
+        // A forwarded key returns the viewport to the live screen.
+        widget
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(widget.session.scrollback_offset(), 0);
+
+        widget.session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn terminal_widget_scrolls_scrollback_with_the_mouse_wheel() {
+        let mut widget = scrollback_widget();
+        wait_for_scrollback(&mut widget);
+        assert_eq!(widget.session.scrollback_offset(), 0);
+
+        widget
+            .handle_mouse(
+                MouseEvent {
+                    kind: crossterm::event::MouseEventKind::ScrollUp,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                (0, 0),
+            )
+            .unwrap();
+        assert!(widget.session.scrollback_offset() > 0);
+
+        widget
+            .handle_mouse(
+                MouseEvent {
+                    kind: crossterm::event::MouseEventKind::ScrollDown,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                (0, 0),
+            )
+            .unwrap();
+        assert_eq!(widget.session.scrollback_offset(), 0);
+
+        widget.session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn terminal_scrollbar_settings_parse_and_validate() {
+        let chrome = ScrollbackChrome::from_settings(&BTreeMap::new()).unwrap();
+        assert!(chrome.scrollbar());
+        assert!(chrome.indicator());
+
+        let disabled = ScrollbackChrome::from_settings(&BTreeMap::from([
+            ("scrollbar".to_owned(), "false".to_owned()),
+            ("scroll_indicator".to_owned(), "false".to_owned()),
+        ]))
+        .unwrap();
+        assert!(!disabled.scrollbar());
+        assert!(!disabled.indicator());
+
+        let invalid =
+            ScrollbackChrome::from_settings(&BTreeMap::from([("scrollbar".to_owned(), "yes".to_owned())]));
+        assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn terminal_rejects_invalid_scrollback_settings() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 4
+            type = "terminal"
+            command = "sh"
+
+            [workspace.widgets.settings]
+            scrollback = "lots"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).err(),
+            Some(WidgetError::InvalidConfiguration(
+                "terminal scrollback must be a non-negative integer, got \"lots\"".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn terminal_scrollback_chrome_renders_thumb_track_and_indicator() {
+        let mut widget = scrollback_widget();
+        wait_for_scrollback(&mut widget);
+        let area = Rect::new(0, 0, 22, 6);
+
+        // At the live screen the thumb sits at the bottom of the track and no
+        // percentage is shown.
+        let live = widget.render(area, true);
+        assert_eq!(live.cell_at(20, 4).unwrap().symbol, '█');
+        assert_eq!(live.cell_at(20, 1).unwrap().symbol, '│');
+        let top: String = (0..22).map(|x| live.cell_at(x, 0).unwrap().symbol).collect();
+        assert!(!top.contains('%'));
+
+        // Scrolling to the top moves the thumb up and reveals the indicator.
+        widget.session.scroll_display(Scroll::Top);
+        let scrolled = widget.render(area, true);
+        assert_eq!(scrolled.cell_at(20, 1).unwrap().symbol, '█');
+        assert_eq!(scrolled.cell_at(20, 4).unwrap().symbol, '│');
+        assert_eq!(scrolled.cell_at(19, 0).unwrap().symbol, '%');
+
+        widget.session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn terminal_scrollback_chrome_can_be_disabled() {
+        let mut widget = scrollback_widget();
+        wait_for_scrollback(&mut widget);
+        widget.session.scroll_display(Scroll::Top);
+        widget.scrollback_chrome = ScrollbackChrome {
+            scrollbar: false,
+            indicator: false,
+        };
+
+        let scene = widget.render(Rect::new(0, 0, 22, 6), true);
+        // The rightmost content column keeps its (blank) terminal cell and no
+        // percentage appears in the border.
+        assert_eq!(scene.cell_at(20, 1).unwrap().symbol, ' ');
+        let top: String = (0..22).map(|x| scene.cell_at(x, 0).unwrap().symbol).collect();
+        assert!(!top.contains('%'));
+
+        widget.session.shutdown().unwrap();
+    }
+
     #[test]
     fn terminal_content_is_inset_from_its_widget_border() {
         let mut widget = TerminalWidget {
@@ -2739,6 +3138,7 @@ mod tests {
             appearance: WidgetAppearance::default(),
             theme: Theme::fallback(),
             cursor_blink: CursorBlinkSettings::default(),
+            scrollback_chrome: ScrollbackChrome::default(),
         };
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {

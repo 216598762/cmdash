@@ -418,6 +418,15 @@ The cursor is rendered by cmdash inside the terminal scene. Its optional
 presentation blink and motion settings are documented in
 [ANIMATION.md](ANIMATION.md); terminal emulator cursor modes remain authoritative.
 
+Scrollback is navigated with the mouse wheel, `Shift+PageUp`/`Shift+PageDown`,
+`Shift+Up`/`Shift+Down`, and `Shift+Home`/`Shift+End`. While history exists the
+terminal draws a right-edge scrollbar (muted track, focus-colored thumb) and,
+when scrolled away from the live screen, a percentage indicator in the title
+bar. Both are theme-aware and can be disabled per terminal with
+`settings.scrollbar` and `settings.scroll_indicator` (default `true`). History
+is bounded by `settings.scrollback` (default `10000` lines); graphics that
+scroll past that limit are evicted and their decoded bytes released.
+
 A terminal widget is not a global terminal pane. Splitting it creates another
 terminal widget and another session ID; the new pane inherits the source
 configuration while retaining independent process and emulator state.

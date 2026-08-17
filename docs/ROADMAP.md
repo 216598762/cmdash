@@ -496,6 +496,18 @@ unsupported graphics also makes this failure look like a successful no-op.
   matrices report WezTerm and iTerm2 primarily through inline-image protocols and
   Zellij primarily through Sixel, so capability names must not be treated as a
   universal protocol guarantee.
+- Kitty anchors every image to the cell grid (start row/column), not to absolute
+  pixels. On scroll it shifts each image's start row by the scroll amount
+  (`grman_scroll_images`) and frees images once they scroll past the bounded
+  history limit, so images live inside the scrollback buffer exactly like text.
+  The protocol requires that images "be scrolled along with text" during both
+  screen scrolling and history navigation, that only clear-screen (`ED 2`),
+  terminal reset, and alternate-screen switching erase images, and that the
+  lowercase delete forms release placements while keeping pixel data so a
+  scrolled-away image can be re-displayed without retransmission. Kitty also
+  reflows (rewraps) text on resize while keeping image placements anchored to
+  their cell grid coordinates (`grman_resize` only shifts on-screen images up
+  when a vertical-only shrink pushes content lines into history).
 
 Reference material:
 [Kitty `icat` documentation](https://sw.kovidgoyal.net/kitty/kittens/icat/),
@@ -685,6 +697,20 @@ Reference material:
   collisions.
 - [x] Add PTY fixtures using installed `kitten icat` for detection, image upload,
   `--place`, `--unicode-placeholder`, passthrough, animation, and failure paths.
+- [x] Add an installed-`kitten icat --transfer-mode file` conformance fixture that
+  drives the real file-transfer fast path end to end: kitten writes the decoded
+  pixels to a `kitty-tty-graphics-protocol-*` temp file, the store reads and
+  retains them, the `t=t` marker file is deleted after reading, and the retained
+  pixel payload matches the source (a transparent 1x1 RGBA).
+- [x] Add a conformance fixture that feeds a real animated GIF as a single
+  `f=100` payload through both the store and a PTY session, asserting the store
+  auto-extracts its frames into RGBA animation frames (frame count, `Running`
+  state, `v` loop mapping, and per-frame decoded pixels) rather than treating it
+  as a static image.
+- [x] Add a conformance fixture that drives `a=c` composition on non-raw
+  (PNG) frames through the headless reference model and a PTY session,
+  asserting that a PNG root decodes to RGBA, composes, and converts its wire
+  format to `32` identically on both paths.
 - [x] Add deterministic captured outer-terminal byte-stream fixtures for direct
   upload, placement-only resource reuse, deletion, Unicode placeholders,
   tmux-style passthrough escaping, and textual fallback.
@@ -950,6 +976,347 @@ receives all keys except the configured focus-escape bindings.
 - Raw escape-sequence passthrough as a user-facing configuration format.
 - Mouse, paste, or resize rebinding.
 
+## Phase 16 — Scrollback buffer, history navigation, and terminal feature parity
+
+This phase closes the gap between cmdash's live-viewport terminal and a
+full-featured graphical terminal emulator. Text and graphics must live in a
+single, bounded scrollback buffer, the user must be able to navigate that
+history the way Kitty and Ghostty allow, and the remaining protocol surface
+those terminals support must be planned and prioritized rather than left
+implicit.
+
+### Goals and boundaries
+
+- [ ] Give every terminal session one scrollback buffer that text and graphics
+  move through together, matching how Kitty/Ghostty anchor images to the cell
+  grid instead of to absolute pixels.
+- [ ] Let the user navigate history (mouse wheel, Shift+PageUp/PageDown,
+  touchpad) without disturbing the live child process or leaking state between
+  panes/tabs.
+- [ ] Bound history by a configurable line count and evict image data past that
+  limit, so a long-running session cannot grow the retained store without bound.
+- [ ] Model the protocol's erase/reset semantics for graphics (clear-screen,
+  reset, alternate-screen switch) instead of only tracking scroll displacement.
+- [ ] Keep emulator state (`alacritty_terminal`) the source of truth for text,
+  and keep graphics state an observation/retention layer, as today.
+- [ ] Land the remaining Kitty graphics surface (relative placements, image
+  numbers, usage hints, the full delete-selector set, storage-quota eviction)
+  only with conformance coverage; never claim support without a verified result.
+- [ ] Plan terminal feature parity (hyperlinks, synchronized output, the Kitty
+  keyboard protocol, mouse/focus reports, OSC 52 clipboard, underline styles,
+  bell, and notifications) as explicit, capability-aware workstreams.
+
+### Scrollback and history navigation
+
+The current session renders only the live viewport through
+`grid().display_iter()`, while `ScrollRegionTracker` and the placement anchor's
+captured `scrollback` depth keep images aligned with text as new lines scroll
+in. What is missing is the *view* half of scrollback: the user cannot scroll up
+into history, so graphics that have scrolled out of the viewport are simply
+clipped and cannot be revisited.
+
+Implementation approach (mirrors Kitty's cell-anchored model):
+
+- [x] Add a per-session **view offset** (`display_offset`) that the focused
+  terminal advances on wheel/Shift+PageUp and retreats on Shift+PageDown,
+  clamped to `[0, history_size]`. `alacritty_terminal` already exposes the grid
+  history and `display_offset`; `display_iter()` honors it, so text rendering
+  shows the window `[display_offset, display_offset + rows)`. The live cursor
+  is hidden while scrolled, the view stays pinned when new output arrives
+  (matching Kitty/Ghostty rather than auto-jumping to the bottom), and any
+  forwarded key/paste returns the view to the live screen. Mouse wheel events
+  scroll the terminal's own history unless the app has enabled mouse reporting
+  or the alternate screen is active, in which case they reach the child PTY.
+- [x] Resolve image placements against the same offset. The existing
+  `GraphicsGridAnchor::resolve_row_with_state` already maps a placement to a
+  row relative to the *current* scrollback depth; `visible_submissions_with_scroll_state`
+  now adds the view offset for full-screen primary placements so an image
+  re-anchors to the history window exactly like the text above/below it, and
+  is clipped (with its source crop) when partially outside the window.
+- [x] Re-emit a scrolled-out placement when the view returns to it, reusing the
+  retained resource by generation (no re-upload) rather than re-decoding the
+  payload.
+- [x] Keep alternate-screen and DECSTBM partial-region placements isolated from
+  primary-screen history navigation, as today; only full-screen primary
+  placements participate in the shared scrollback window.
+- [x] Add a scroll indicator (percentage/line offset) in the terminal chrome and
+  a bounded scrollbar, both optional and theme-aware, matching Kitty/Ghostty's
+  visual affordances. The scrollbar draws a muted track with a focus-colored
+  thumb on the right edge whenever history exists, and the percentage indicator
+  appears right-aligned in the title bar while scrolled away from the live
+  screen. Both are toggled per terminal via `scrollbar` and `scroll_indicator`
+  settings (default enabled).
+
+### Graphics scrollback semantics
+
+- [x] Make the session `ScrollRegionTracker` (or a sibling observer) also
+  observe `ED 2` (clear screen), `RIS`/soft reset, and 1049/1047/47
+  alternate-screen transitions, and forward matching
+  clear-visible/clear-all/clear-alternate operations to the graphics store so
+  images are erased in the same scope a real terminal erases text. `ED 2`
+  erases visible placements while preserving history rows; `RIS` clears all
+  placements and resources; and screen switches erase the alternate screen.
+  `ED 0` erases from the cursor row to the bottom of the screen, `ED 1` from
+  the top down to the cursor row (both at row granularity, matching Kitty's
+  `grman_remove_cell_images`), and `ED 3` clears scrollback-only history
+  placements. Erase scopes are resolved against the scrollback depth captured
+  *before* the emulator consumes each chunk, so `ED 2` cannot slide visible
+  images into history nor `ED 3` resurrect a scrolled-out image.
+- [x] On primary-screen scroll, keep shifting placement anchors by the scroll
+  amount; when a placement's resolved row falls past the configured history
+  limit, drop the placement and, once an image has no remaining placements,
+  release its decoded bytes (Kitty's `grman_scroll_images` free-past-limit
+  behavior). The per-terminal `settings.scrollback` count (default 10000, the
+  emulator's default) bounds both `alacritty_terminal`'s history and
+  `SessionGraphicsStore::evict_beyond_scrollback_limit`, which drops full-screen
+  primary placements whose monotonic scroll displacement exceeds
+  `row + limit` and frees images with no remaining placements. A pager-history
+  allowance is not yet modeled.
+- [x] Implement the lowercase/uppercase delete distinction precisely:
+  lowercase `d=` variants release placements but retain pixel data so a
+  scrolled-away image can be re-displayed without retransmission; uppercase
+  variants free data too, unless the image is still referenced by a placement
+  in the scrollback buffer. `d=a`/`d=p` erase placements but keep the decoded
+  resource (and the generation-last image id) so the client can re-place it;
+  `d=A`/`d=P` additionally free every image with no remaining placement, and
+  `d=I` frees the targeted image only once its last placement is gone.
+- [x] Reflow (rewrap) text on resize (handled by `alacritty_terminal`'s primary
+  grid) and re-anchor image placements across the reflow. A column change
+  rewraps text and moves its scrollback depth without scrolling content
+  uniformly, so the store re-captures each full-screen placement's grid row
+  against the new scrollback depth — the placement keeps its grid cell instead
+  of being spuriously shifted by the rewrap, matching how Kitty preserves a
+  placement's `start_row` through a reflow. Row-only resizes stay on the
+  scrollback model, and partial-region/relative placements keep their existing
+  resolution.
+- [x] Evict transient images (protocol `N=1` usage hint) before retained ones
+  under storage pressure, and bound the decoded-byte quota the way Kitty's
+  320MB-per-buffer quota works, with an explicit degraded diagnostic on
+  overflow. On quota pressure the store now evicts in Kitty's order —
+  unreferenced images first, then transient before retained, then oldest
+  first — records an eviction diagnostic, and only rejects the upload if the
+  budget still cannot be met (e.g. a single oversized payload).
+
+### Remaining Kitty graphics protocol surface
+
+These are implemented by Kitty/Ghostty and currently missing or partial in
+cmdash. Each item ships with a conformance test and an `ENOTSUP`/`EINVAL`
+acknowledgement path rather than silent success.
+
+- [x] **Relative placements** (`P`, `Q`, `H`, `V`): anchor a placement to
+  another placement (`P` = parent image id, `Q` = parent placement id) with a
+  signed cell offset (`H`/`V`); track parent lifetime (a child is removed with
+  its parent), reject cycles (`ECYCLE`) and missing parents (`ENOPARENT`) and
+  over-deep chains (`ETOODEEP`, allowing the required depth of 8), never move
+  the cursor, and reject a virtual placement (`U=1`) made relative (`EINVAL`).
+  Relative origins are re-resolved against scrollback/region state at render
+  time so a child follows its parent through scrolling and history navigation.
+- [x] **Virtual placements** (`U=1`): model Kitty's invisible prototype
+  placements. A virtual placement never renders, never moves the cursor, never
+  scrolls, and never re-anchors on resize; it can be a relative placement's
+  parent but cannot itself be relative (`EINVAL`). Delete selectors mirror
+  Kitty's `is_virtual_ref` distinction: only `d=i/I`, `d=n/N`, and `d=r/R`
+  remove virtual placements, while `d=a/A`, `d=c/C`, `d=p/P`, `d=q/Q`,
+  `d=x/X`, `d=y/Y`, and `d=z/Z` (and the screen-erase scopes) leave them alone
+  because they have no physical location. The position a relative child
+  derives from a virtual parent comes from the parent's Unicode-placeholder
+  cells (see the virtual-parent origin item below).
+- [x] **Image numbers** (`I` key): allocate a fresh internal id on every
+  numbered transmit and reply `i=<id>,I=<number>;OK`; resolve `I` references on
+  place/frame/animate/compose commands to the newest surviving image with that
+  number (falling back to the previous one once the newest is freed); reject
+  commands that specify both `i` and `I` (`EINVAL`). The `d=n/N` delete
+  selector that also keys off `I` remains in the full delete-selector item
+  below.
+- [x] **Usage hints** (`N=1` transient): prefer transient images for eviction
+  (parsed from the `N` bitmask on transmit and stored per resource; there is
+  no durable disk cache to skip).
+- [x] **Full delete-selector set** (`d=n/N,c/C,q/Q,r/R,x/X,y/Y,z/Z`): complete
+  the delete matrix beyond the original `a/A,p/P,f/F,i/I` slice. `d=c/C`
+  targets the cursor cell, `d=p/P` and `d=q/Q` a 1-based `x`/`y` cell (with a
+  `z`-index filter for `q/Q`), `d=x/X`/`d=y/Y` a column/row, `d=z/Z` a
+  z-index, `d=n/N` the newest image with the `I` number (optionally narrowed
+  by `p`), and `d=r/R` the inclusive image-id range `[x, y]`. Position-based
+  selectors resolve each placement's current cell against scrollback and are
+  scoped to the active screen; every lowercase variant retains pixel data and
+  every uppercase variant frees it once unreferenced.
+- [x] **Animation completion**: `a=c` now composes a pixel rectangle from one
+  frame onto another (source frame `r`, destination frame `c`, source offset
+  `X`/`Y`, destination offset `x`/`y`, shared size `w`/`h`, and the `C`
+  alpha-blend/overwrite mode) for raw RGB/RGBA frames, rejecting missing
+  frames (`ENOENT`), out-of-bounds rectangles (`EINVAL`), and overlapping
+  same-frame rectangles (`EINVAL`); non-raw PNG/GIF frames are rejected with a
+  diagnostic. The remaining `a=a` animation-control key `v` (loop count) is
+  also stored. Frame *playback* (scheduling the stored frames to the outer
+  terminal) remains a deliberate boundary.
+- [x] **Storage quota and LRU eviction**: evict unreferenced/transient/oldest
+  images on quota pressure (unreferenced first, then transient before
+  retained, then oldest by generation) and surface the eviction as a
+  diagnostic before falling back to rejection on overflow.
+- [x] **Quiet response suppression** (`q` key): `q=1` suppresses success (`OK`)
+  responses while `q>=2` suppresses every response, matching Kitty's
+  `finish_command_response`; a failure is still recorded as a diagnostic
+  regardless of `q`.
+
+### Kitty graphics protocol — next workstream
+
+The following surface is still missing or partial relative to Kitty/Ghostty.
+Each item should ship with a conformance fixture and an explicit
+`ENOTSUP`/`EINVAL` path rather than silent success.
+
+- [x] **Local transfer mediums** (`t=f` file, `t=t` temp file, `t=s` shared
+  memory): the store now reads payloads from the filesystem/shared memory using
+  the `S`/`O` size/offset keys (whole-file read when `S` is absent), bounds the
+  read against the decoded-storage budget, unlinks `t=s` shared-memory names,
+  and deletes a `t=t` file only when it carries the `tty-graphics-protocol`
+  marker (matching Kitty's temp-file convention). Same-user local reads, so no
+  remote/SSH boss permission hook is modeled.
+- [x] **`a=f` frame composition**: compose transmitted frame data onto a
+  background canvas using `c=<frame>` (previous frame), `r=<frame>` (edit an
+  existing frame), `X=1` (replace vs. the default alpha blend), `Y=<RGBA>`
+  background color, and the partial rectangle `x`/`y`/`s`/`v`. New frames are
+  stored as deltas and coalesced on demand; editing an existing frame coalesces
+  it, composes the new rectangle, and stores a full keyframe. `a=c` also
+  coalesces delta sources/destinations before composing.
+- [x] **Terminal-driven animation playback**: the store advances frames on the
+  wall clock at each frame `z` gap (skipping gapless frames), honoring the
+  loop count and animation state (`Loading` plays once; `Running` loops per
+  `v`). The render path serves the coalesced current frame with a bumped
+  generation so the outer terminal re-uploads it, and the scheduler wakes the
+  render loop at each frame deadline.
+- [x] **`d=f` frame deletion**: delete a specific frame via `r=<frame>` with
+  renumbering, gap rebalance, and current-frame index adjustment (deleting the
+  root promotes the first extra frame), plus the `F` free-the-image
+  distinction — `d=f` alone no longer clears every frame unconditionally.
+- [x] **`a=c` composition for non-raw frames**: decode PNG/GIF frames so they
+  compose on pixels rather than being rejected with a diagnostic. A `f=100`
+  PNG/GIF frame is decoded to RGBA8 on coalesce (`png`/`gif` crates), and
+  composing onto a PNG/GIF root converts the resource to raw RGBA (`f=32`).
+  `f=100` PNG payloads now also read their natural dimensions.
+- [x] **Z-order tie-break by image id**: order equal-z overlaps by lower image
+  id first, matching Kitty, instead of insertion order. The store, scene, and
+  headless reference model all sort equal-z placements by ascending image id;
+  the composited scene ties equal-z layers across sessions by the full
+  resource id (session, then image) so a multiplexed scene stays total even
+  when two sessions reuse the same client image id.
+- [x] **Virtual-parent origin**: derive a relative placement's position from
+  its virtual (`U=1`) parent's Unicode-placeholder cells (min x / min y)
+  rather than the creating cursor. The session scans the child's text grid
+  for U+10EEEE placeholder glyphs (decoding the image id from the foreground
+  RGB plus the third combining mark) and feeds the cells to the store, which
+  resolves a virtual parent's origin from the min column / min row of its
+  placeholder cells; a relative child of a virtual parent with no placeholder
+  cells yet is invisible, matching Kitty's `resolve_cell_ref`.
+- [x] **Transient propagation on compose**: mark a composited frame transient
+  when any source frame carries the `N=1` hint (per-frame, not per-image).
+  The `N=1` bit is now stored per frame (the root frame on the resource, each
+  extra frame on its `GraphicsAnimationFrame`); `a=f` deltas inherit their
+  base chain's transient status, frame edits OR the coalesced chain with the
+  transmitted hint, and `a=c` marks the destination transient when either
+  source frame is transient, matching Kitty's `CoalescedFrameData.transient`
+  propagation. Eviction still keys off the root frame's hint, like Kitty.
+- [x] **`a=q` query loading**: a query now loads and validates its payload
+  like a transmit — it requires an `i=` image id (else logs and emits no
+  response), resolves the transfer medium (base64/zlib or file/shared-memory
+  read), checks the format, enforces Kitty's raw `bpp * s * v` data-size
+  match and the 10000-dimension cap, and requires a parseable GIF/PNG header
+  for `f=100`. It replies `OK` only when the image would load and never
+  retains the image.
+- [ ] **Frame `z` gap normalization**: map `z=0` to the default gap and `z<0`
+  to a gapless (0ms) frame instead of storing the raw value.
+- [x] **GIF auto-animation**: extract animated GIF frames from `f=100`
+  payloads instead of treating them as a static image. Animated GIFs are
+  decoded into coalesced full-canvas RGBA frames (root + one animation frame
+  per extra GIF frame, with per-frame delays and the Netscape loop count
+  mapped onto Kitty's `v`), so they play back like a graphical terminal;
+  static GIFs stay `f=100` static images.
+- [ ] **Error acknowledgements for `I`-addressed commands**: emit failure
+  responses when a command is addressed by image *number* (`I`) alone; today
+  only `i`-addressed failures produce a response.
+- [ ] **Deep negative z-index layering**: draw z-indexes below `INT32_MIN/2`
+  under cells with non-default background colors in the compositor.
+
+### Terminal feature parity (Kitty/Ghostty baseline)
+
+Plan and prioritize these as separate, capability-gated workstreams; do not
+imply support from the presence of `alacritty_terminal` alone. Each requires a
+captured-sequence or PTY conformance fixture.
+
+- [ ] **OSC 8 hyperlinks** — parse/emit hyperlink runs so `ls --hyperlink` and
+  shell integration URLs survive composition; bound the number of active
+  links and expose them to copy/notify.
+- [ ] **Synchronized output** (DEC 2026/2027 BSU/ESU) — batch child output
+  bursts into single outer frames to reduce flicker and partial-line tearing.
+- [x] **Kitty keyboard protocol** — extended key encoding (`CSI number ;
+  modifier u`) for disambiguation, negotiated through the kitty
+  progressive-enhancement stack (`CSI >`/`=`/`<` push/set/pop and `CSI ? u`
+  query, answered from the emulator's per-screen mode stack). A child that
+  opts in receives disambiguated modified/ambiguous keys while legacy programs
+  keep the C0/ESC/`CSI ~` encodings. The child's `TERM` must still advertise
+  the protocol before programs will request it (see capability advertisement
+  below).
+- [ ] **Mouse protocols** — SGR mouse (1006), any-event/motion tracking (1002,
+  1003), and focus reporting (1004), routed to the focused child and honored
+  during selection/copy.
+- [ ] **OSC 52 clipboard** — complete the read/write path (selection copy exists
+  today) with bounded payloads and a documented permission policy.
+- [x] **Text presentation attributes** — italic, reverse, strikeout, and hidden
+  (SGR 3/7/9/8) plus underline now flow from the emulator through
+  `CellStyle`/`Scene`/backend serialization instead of being dropped; blink
+  (SGR 5/6) is not stored per cell by the emulator and remains a no-op.
+- [x] **Underline styles** — undercurl/dashed/dotted/double/colored underline
+  from SGR 4:x and DECSET 58 are retained on the cell and emitted as
+  `4:x`/`58` SGR; an outer terminal that lacks the style degrades to its own
+  underline rendering.
+- [ ] **Bell and visual bell** — route BEL to a bounded audible/visual signal
+  without corrupting the scene or waking hidden sessions.
+- [ ] **Notifications and shell integration** — OSC 9/777 and OSC 133/1337
+  progress/prompt markers as bounded, capability-gated metadata, not arbitrary
+  output.
+- [ ] **Capability advertisement** — report a `TERM`/`XTVERSION`/DA surface
+  that matches the implemented feature set so programs actually opt in to
+  hyperlinks, synchronized output, and enhanced keyboard; today children spawn
+  with `TERM=xterm-256color`, which suppresses every feature above even once
+  it is parsed.
+
+### Testing and validation
+
+- [x] Add PTY fixtures that scroll text+images off the top, navigate the view
+  back, and assert both text and images reappear at the correct rows with no
+  re-upload.
+- [x] Add conformance tests for clear-screen/reset/alternate-screen erasure
+  scope, delete lowercase-vs-uppercase retention, and scroll-past-limit
+  eviction under a configured quota.
+- [x] Add reflow tests proving a resized pane re-anchors both text and
+  straddling images without detaching or duplicating them.
+- [x] Add conformance for relative placements (cycles, missing parents, offsets,
+  cursor policy), image numbers, transient hints, and the full delete-selector
+  matrix.
+- [ ] Add captured-sequence fixtures for hyperlinks, synchronized output,
+  keyboard protocol, mouse/focus reports, OSC 52, text presentation
+  attributes, underline styles, bell, and notifications; assert the outer
+  stream and the child acknowledgement sides.
+- [x] Add bounded-pressure tests (long-running sessions, rapid scroll, many
+  images) proving memory stays within the configured history/byte quotas.
+
+**Exit criteria:** a terminal session scrolls text and graphics through one
+bounded history buffer; the user can navigate history and return to live output;
+images are erased/evicted/reflowed exactly like a real graphical terminal; the
+remaining protocol surface is either implemented with conformance or explicitly
+rejected with a diagnostic; and every advertised Kitty/Ghostty-parity feature
+has a captured or interactive verification path.
+
+### Non-goals
+
+- Re-implementing a full text emulator: `alacritty_terminal` remains the grid
+  owner; scrollback view is a rendering/resolution concern, not a new grid.
+- In-scrollback search, pager piping (`kitty +kitten scrollback`), or exporting
+  history to a file in this phase.
+- Guaranteeing images survive a *hard* terminal reset or a session whose
+  history was cleared by the child.
+- Claiming WezTerm/iTerm2/Zellij image protocol support without a conformance
+  result; those remain gated behind verified capability semantics.
+
 ## Decision log starters
 
 | Topic | Provisional direction | Why it matters |
@@ -962,6 +1329,7 @@ receives all keys except the configured focus-escape bindings.
 | Rendering | Retained, backend-neutral scene composed into complete frames | Makes widgets modular and tab restoration deterministic |
 | Widget extensibility | Versioned manifest plus opt-in Wasmtime host | Keeps untrusted widget execution isolated and avoids exposing Rust's unstable ABI or terminal handles |
 | Graphics | Session-owned Kitty adapter with a bounded protocol framer, direct replay, Unicode-placeholder mode, typed active probing, a child/outer response broker, a process-wide raw-input owner, and scroll-aware grid anchors | Keeps child protocol handling isolated, makes outer capability evidence explicit, lets placements follow primary-screen content, and prevents outer acknowledgements from competing with keyboard input |
+| Scrollback model | Session-owned bounded history plus cell-anchored image placements resolved against the current view offset, with placement/data eviction past the history limit | Lets text and graphics move through history together, keeps long-lived sessions bounded, and makes history navigation a pure view/resolution concern over the existing grid |
 | Async model | Coordinator/UI owner plus per-session I/O tasks | Keeps frame submission serialized while PTYs remain responsive |
 | Configuration | TOML with checked-in `config/default.toml` and `docs/CONFIGURATION.md` | Makes the embedded fallback discoverable while keeping schema evolution explicit |
 | Default configuration discovery | Explicit CLI path, user config, example/default file, embedded fallback | Preserves safe startup while giving users an editable starting point |

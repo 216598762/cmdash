@@ -35,25 +35,33 @@ fn write_image_fixture(name: &str, bytes: &[u8]) -> std::path::PathBuf {
 ///
 /// It emits the direct, file, and shared-memory Kitty query commands followed
 /// by DA1, reads the responses from the child PTY, and then emits a quiet
-/// transmit-and-display command. No Kitty terminal is needed: the test exercises
-/// cmdash's terminal-emulator response and retained-placement paths directly.
+/// transmit-and-display command. The file and shared-memory probes point at
+/// real 1x1 RGB payloads created by the fixture, because a query now loads
+/// and validates its payload before replying OK. No Kitty terminal is needed:
+/// the test exercises cmdash's terminal-emulator response and retained-placement
+/// paths directly.
 struct IcatNegotiationFixture {
-    script: &'static str,
+    script: String,
 }
 
 impl IcatNegotiationFixture {
-    const fn new() -> Self {
-        Self {
-            script: r#"
+    fn new() -> Self {
+        let pid = std::process::id();
+        let file_path = std::env::temp_dir().join(format!("cmdash-icat-file-{pid}"));
+        std::fs::write(&file_path, [1, 2, 3]).expect("could not write the icat file fixture");
+        let file_name = encode_base64_for_test(file_path.to_str().expect("fixture path is UTF-8"));
+        let shm_name = create_query_shm(pid);
+        let script = format!(
+            r#"
                 stty raw -echo
-                printf '\033_Ga=q,i=1,t=d,s=1,v=1,f=24;MTIz\033\\\033_Ga=q,i=2,t=f,s=1,v=1,f=24;L3RtcA==\033\\\033_Ga=q,i=3,t=s,s=1,v=1,f=24;aWQ=\033\\\033[c'
+                printf '\033_Ga=q,i=1,t=d,s=1,v=1,f=24;MTIz\033\\\033_Ga=q,i=2,t=f,s=1,v=1,f=24;{file_name}\033\\\033_Ga=q,i=3,t=s,s=1,v=1,f=24;{shm_name}\033\\\033[c'
                 direct=$(dd bs=1 count=11 2>/dev/null)
-                file=$(dd bs=1 count=65 2>/dev/null)
-                memory=$(dd bs=1 count=65 2>/dev/null)
+                file=$(dd bs=1 count=11 2>/dev/null)
+                memory=$(dd bs=1 count=11 2>/dev/null)
                 da=$(dd bs=1 count=7 2>/dev/null)
                 if [ "$direct" = "$(printf '\033_Gi=1;OK\033\\')" ] && \
-                   [ "$file" = "$(printf '\033_Gi=2;ENOTSUP:direct transfer is the only supported Kitty mode\033\\')" ] && \
-                   [ "$memory" = "$(printf '\033_Gi=3;ENOTSUP:direct transfer is the only supported Kitty mode\033\\')" ] && \
+                   [ "$file" = "$(printf '\033_Gi=2;OK\033\\')" ] && \
+                   [ "$memory" = "$(printf '\033_Gi=3;OK\033\\')" ] && \
                    [ "$da" = "$(printf '\033[?1;2c')" ]; then
                     printf 'icat-negotiation-ok'
                     printf '\033_Ga=T,f=24,i=42,s=2,v=1,c=2,r=2,q=2,m=1;AQID\033\\'
@@ -63,19 +71,97 @@ impl IcatNegotiationFixture {
                     printf 'icat-negotiation-failed'
                 fi
                 sleep 5
-            "#,
-        }
+            "#
+        );
+        Self { script }
     }
 
     fn spawn(&self) -> TerminalSession {
         TerminalSession::spawn_with_session_id(
             SessionId::new(200_001),
             Some("sh"),
-            &["-c", self.script],
+            &["-c", self.script.as_str()],
             TerminalSize::new(80, 12),
         )
         .expect("could not spawn the icat negotiation fixture")
     }
+}
+
+/// Creates a POSIX shared-memory object holding a 1x1 RGB payload (3 bytes)
+/// and returns its base64-encoded name for the `t=s` query probe.
+#[cfg(unix)]
+fn create_query_shm(pid: u32) -> String {
+    use std::ffi::CString;
+    let name = format!("/cmdash-icat-shm-{pid}");
+    let cname = CString::new(name.as_str()).unwrap();
+    unsafe {
+        let fd = libc::shm_open(
+            cname.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+            0o600,
+        );
+        assert!(fd >= 0, "shm_open failed for the icat fixture");
+        assert_eq!(libc::ftruncate(fd, 3), 0);
+        let pixels = [1, 2, 3];
+        let written = libc::write(fd, pixels.as_ptr() as *const libc::c_void, pixels.len());
+        assert_eq!(written, pixels.len() as libc::ssize_t);
+        libc::close(fd);
+    }
+    encode_base64_for_test(name)
+}
+
+#[cfg(not(unix))]
+fn create_query_shm(_pid: u32) -> String {
+    String::new()
+}
+
+fn encode_base64_for_test(bytes: impl AsRef<[u8]>) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = bytes.as_ref();
+    let mut output = String::new();
+    for chunk in bytes.chunks(3) {
+        let value = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        output.push(TABLE[((value >> 18) & 63) as usize] as char);
+        output.push(TABLE[((value >> 12) & 63) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            TABLE[((value >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[(value & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
+fn decode_base64_for_test(encoded: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut accumulator = 0u32;
+    let mut bits = 0u8;
+    for byte in encoded.iter().copied().filter(|byte| *byte != b'=') {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue,
+        };
+        accumulator = (accumulator << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((accumulator >> bits) as u8);
+            accumulator &= (1 << bits) - 1;
+        }
+    }
+    output
 }
 
 #[test]
@@ -228,6 +314,120 @@ fn installed_kitten_image_upload_reaches_the_retained_graphics_store() {
 
 #[test]
 #[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
+fn installed_kitten_file_transfer_stream_reaches_the_retained_graphics_store() {
+    // Drive kitten's real file-transfer fast path (`--transfer-mode file`):
+    // kitten writes the decoded pixels to a `kitty-tty-graphics-protocol-*`
+    // temp file and transmits `t=t` with that path. The store must read it,
+    // retain the image, and delete the temp file (marker convention).
+    let path = write_image_fixture("file-transfer", TINY_GIF);
+    if !Command::new("kitten")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipping file-transfer fixture: kitten is not installed");
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    // The store deletes a `t=t` temp file after reading it (marker
+    // convention). Snapshot the shm dir before/after so a parallel test's
+    // leftover files don't make this flaky.
+    let shm_before = shm_temp_files();
+
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(200_009),
+        Some("kitten"),
+        &[
+            "icat",
+            "--use-window-size",
+            "80,12,800,240",
+            "--transfer-mode",
+            "file",
+            "--stdin=no",
+            path.to_str().expect("fixture path is not valid UTF-8"),
+        ],
+        TerminalSize::with_pixels(80, 12, 800, 240),
+    )
+    .expect("could not spawn kitten file-transfer fixture");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut submissions = Vec::new();
+    while Instant::now() < deadline {
+        session
+            .poll_output()
+            .expect("kitten file-transfer PTY failed");
+        submissions = session.graphics(TERMINAL_AREA);
+        if !submissions.is_empty() || session.is_closed() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !submissions.is_empty(),
+        "kitten file transfer uploaded no retained graphics; closed={}, failure={:?}, diagnostics={:?}",
+        session.is_closed(),
+        session.failure(),
+        session.graphics_diagnostics()
+    );
+    // kitten transmits `t=t` (temp-file) for --transfer-mode file, so the
+    // capture must carry the temp-file marker path (base64-encoded in the
+    // payload).
+    let capture = session.graphics_protocol_capture();
+    let uses_file_transfer = capture.windows(3).any(|window| window == b"t=t")
+        && capture
+            .split(|byte| *byte == b';')
+            .nth(1)
+            .is_some_and(|payload| {
+                String::from_utf8_lossy(&decode_base64_for_test(payload))
+                    .contains("tty-graphics-protocol")
+            });
+    assert!(
+        uses_file_transfer,
+        "kitten did not use the file-transfer fast path: capture={:?}",
+        String::from_utf8_lossy(capture)
+    );
+    // The 1x1 GIF decodes to a single RGBA pixel (4 bytes) in the retained
+    // store; the temp file is deleted after reading.
+    let submission = &submissions[0];
+    assert_eq!(submission.pixel_width(), 1);
+    assert_eq!(submission.pixel_height(), 1);
+    // The file-transfer path delivers the *decoded* pixel, not the raw GIF
+    // bytes: TINY_GIF is a 1x1 GIF89a with transparency enabled and
+    // transparent index 0, so kitten ships a single fully-transparent RGBA
+    // pixel (4 bytes, alpha 0) through the temp file.
+    let decoded = decode_base64_for_test(submission.encoded_payload());
+    assert_eq!(decoded, [0, 0, 0, 0]);
+    session
+        .shutdown()
+        .expect("could not shut down kitten file-transfer fixture");
+    // The store removed the temp file it read (no *new* marker files remain).
+    let after = shm_temp_files();
+    assert!(
+        after.len() <= shm_before.len(),
+        "t=t temp file was not deleted after reading: new files={:?}",
+        after.iter().filter(|name| !shm_before.contains(name)).collect::<Vec<_>>()
+    );
+}
+
+/// Lists the `kitty-tty-graphics-protocol-*` temp files currently in the
+/// shared-memory directory (where kitten writes them for `--transfer-mode
+/// file`).
+fn shm_temp_files() -> Vec<String> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/dev/shm") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("kitty-tty-graphics-protocol-") {
+                files.push(name);
+            }
+        }
+    }
+    files
+}
+
+#[test]
+#[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
 fn installed_kitten_place_option_reaches_the_expected_retained_geometry() {
     let path = write_image_fixture("place", TINY_GIF);
     let mut session = TerminalSession::spawn_with_session_id(
@@ -301,21 +501,23 @@ fn installed_kitten_unicode_placeholder_option_reaches_the_pty_session() {
             .render(TERMINAL_AREA, false)
             .cell_at(3, 2)
             .is_some_and(|cell| cell.symbol != ' ');
-        if !submissions.is_empty() && cell_is_placeholder {
+        if cell_is_placeholder {
             break;
         }
         thread::sleep(Duration::from_millis(10));
     }
     let _ = std::fs::remove_file(&path);
 
-    assert_eq!(
-        submissions.len(),
-        1,
-        "kitten emitted no retained placeholder image"
-    );
     assert!(
         cell_is_placeholder,
         "Kitty placeholder did not reach the PTY scene"
+    );
+    // A U=1 virtual placement reserves the cell for the outer terminal's
+    // placeholder layer without rendering as a visible graphics submission.
+    assert_eq!(
+        submissions.len(),
+        0,
+        "a virtual (U=1) placeholder must not produce a visible graphics submission"
     );
     session
         .shutdown()
@@ -401,10 +603,13 @@ fn installed_kitten_tmux_passthrough_reaches_the_session_adapter() {
             .map(|command| String::from_utf8_lossy(command.parameters()).into_owned())
             .collect::<Vec<_>>()
     );
+    // The passthrough carried a U=1 virtual placement, which is invisible in
+    // the visible-submissions view by design (it only reserves the cell for
+    // the outer terminal's placeholder layer).
     assert_eq!(
         session.graphics(TERMINAL_AREA).len(),
-        1,
-        "installed passthrough bytes were captured but not retained: diagnostics={:?}",
+        0,
+        "a virtual (U=1) passthrough placement must not produce a visible graphics submission: diagnostics={:?}",
         session.graphics_diagnostics()
     );
     session

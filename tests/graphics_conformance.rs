@@ -2,11 +2,12 @@
 mod headless_kitty;
 
 use cmdash::{
-    Backend, BackendCapabilities, CrosstermBackend, GraphicsCapabilityConfidence,
-    GraphicsCapabilitySource, GraphicsSubmission, GraphicsSubmissionStatus, SessionGraphicsStore,
-    SessionId, TerminalSession, TerminalSize,
+    Backend, BackendCapabilities, CrosstermBackend, GraphicsAnimationState,
+    GraphicsCapabilityConfidence, GraphicsCapabilitySource, GraphicsSubmission,
+    GraphicsSubmissionStatus, Scene, SessionGraphicsStore, SessionId, TerminalSession,
+    TerminalSize,
 };
-use headless_kitty::HeadlessKittyTerminal;
+use headless_kitty::{HeadlessKittyTerminal, HeadlessPixel};
 use ratatui::layout::Rect;
 use std::{
     io::{self, Write},
@@ -107,6 +108,81 @@ fn encode_test_base64(bytes: &[u8]) -> String {
         } else {
             '='
         });
+    }
+    output
+}
+
+/// A real two-frame 1x1 animated GIF: frame 1 is opaque red, frame 2 is
+/// opaque blue, each with a 100 ms delay, looping forever.
+fn animated_gif_for_conformance() -> Vec<u8> {
+    let palette = [255, 0, 0, 0, 0, 255]; // index 0: red, index 1: blue
+    let mut output = Vec::new();
+    {
+        let mut encoder = gif::Encoder::new(&mut output, 1, 1, &palette).unwrap();
+        encoder.set_repeat(gif::Repeat::Infinite).unwrap();
+        let first = gif::Frame {
+            delay: 10, // 100 ms
+            width: 1,
+            height: 1,
+            buffer: std::borrow::Cow::Owned(vec![0]),
+            ..gif::Frame::default()
+        };
+        encoder.write_frame(&first).unwrap();
+        let second = gif::Frame {
+            delay: 10, // 100 ms
+            width: 1,
+            height: 1,
+            buffer: std::borrow::Cow::Owned(vec![1]),
+            ..gif::Frame::default()
+        };
+        encoder.write_frame(&second).unwrap();
+    }
+    output
+}
+
+/// Encodes an RGBA image as a PNG for the non-raw composition conformance
+/// fixture.
+fn png_fixture(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut output, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(rgba).unwrap();
+        writer.finish().unwrap();
+    }
+    output
+}
+
+/// Decodes base64 produced by [`encode_test_base64`] back into bytes.
+fn decode_test_base64(encoded: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut accumulator = 0_u32;
+    let mut bits = 0_u8;
+    for byte in encoded
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+    {
+        if byte == b'=' {
+            break;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue,
+        } as u32;
+        accumulator = (accumulator << 6) | value;
+        bits = bits.saturating_add(6);
+        if bits >= 8 {
+            bits -= 8;
+            output.push((accumulator >> bits) as u8);
+            accumulator &= (1_u32 << bits).saturating_sub(1);
+        }
     }
     output
 }
@@ -299,6 +375,89 @@ fn headless_framebuffer_renders_rgb_pixels_and_applies_z_order() {
 }
 
 #[test]
+fn headless_model_and_pty_session_agree_on_equal_z_image_id_tie_break() {
+    // Two overlapping placements at the same z-index: the higher image id is
+    // transmitted first, but Kitty draws equal-z overlaps in ascending image
+    // id order, so the lower id is first and the higher id occludes it.
+    let stream = b"\x1b[1;1H\x1b_Ga=T,f=24,i=52,s=1,v=1,c=1,r=1,C=1,z=0,q=2;AP8A\x1b\\\
+        \x1b[1;1H\x1b_Ga=T,f=24,i=51,s=1,v=1,c=1,r=1,C=1,z=0,q=2;/wAA\x1b\\";
+    let model = HeadlessKittyTerminal::replay(stream).unwrap();
+    assert_eq!(model.placement_count(), 2);
+    let order = model
+        .placements_in_z_order()
+        .into_iter()
+        .map(|placement| placement.image_id)
+        .collect::<Vec<_>>();
+    assert_eq!(order, vec![51, 52]);
+
+    // The higher id must occlude the lower id on the deterministic framebuffer.
+    let terminal = HeadlessKittyTerminal::replay_with_framebuffer(stream, 2, 1).unwrap();
+    assert_eq!(
+        terminal.pixel(0, 0),
+        Some(headless_kitty::HeadlessPixel::rgb(0, 255, 0))
+    );
+
+    // The PTY session's visible submissions must be ordered the same way.
+    let script = r"printf '\033[1;1H\033_Ga=T,f=24,i=52,s=1,v=1,c=1,r=1,C=1,z=0,q=2;AP8A\033\\\033[1;1H\033_Ga=T,f=24,i=51,s=1,v=1,c=1,r=1,C=1,z=0,q=2;/wAA\033\\'";
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(52),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(4, 2),
+    )
+    .expect("could not spawn equal-z tie-break fixture");
+    let area = Rect::new(0, 0, 4, 2);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && session.graphics(area).len() < 2 {
+        session
+            .poll_output()
+            .expect("equal-z tie-break fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let ids = session
+        .graphics(area)
+        .iter()
+        .map(|submission| submission.resource().image())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![51, 52]);
+    session
+        .shutdown()
+        .expect("could not shut down equal-z tie-break fixture");
+}
+
+#[test]
+fn composited_scene_tie_breaks_equal_z_across_sessions_by_resource_id() {
+    // Two sessions upload an image with the *same* client id (5) at the same
+    // z-index. A single session breaks the tie by ascending image id; across
+    // sessions the tie-break must stay total, so the full resource id
+    // (session, image) orders the composited scene. The lower session id wins
+    // even though the image id collides.
+    let area = Rect::new(0, 0, 8, 2);
+    let mut first = SessionGraphicsStore::new(SessionId::new(100));
+    first
+        .apply_kitty_command_with_context(b"a=T,f=24,i=5,z=0,c=1,r=1,q=2", b"AQID", (0, 0), (0, 0))
+        .unwrap();
+    let mut second = SessionGraphicsStore::new(SessionId::new(200));
+    second
+        .apply_kitty_command_with_context(b"a=T,f=24,i=5,z=0,c=1,r=1,q=2", b"BAUG", (0, 0), (0, 0))
+        .unwrap();
+
+    // Add the higher-session layer first, so an insertion-order-preserving
+    // sort would leave session 200 on top; the scene must re-sort by
+    // (z, session, image) instead.
+    let mut composed = Scene::new(area);
+    composed.add_image_layer(second.visible_submissions(area).into_iter().next().unwrap());
+    composed.add_image_layer(first.visible_submissions(area).into_iter().next().unwrap());
+
+    let ids = composed
+        .image_layers()
+        .iter()
+        .map(|layer| (layer.resource().session().get(), layer.resource().image()))
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![(100, 5), (200, 5)]);
+}
+
+#[test]
 fn headless_framebuffer_applies_source_crops_and_delete_updates_pixels() {
     let upload = b"\x1b_Ga=t,f=24,i=63,s=2,v=1; /wAA AAD/\x1b\\"
         .iter()
@@ -323,6 +482,95 @@ fn headless_framebuffer_applies_source_crops_and_delete_updates_pixels() {
     assert_eq!(terminal.visible_pixel_count(), 0);
     assert_eq!(terminal.resource_count(), 0);
 }
+
+#[test]
+fn clipped_placements_render_the_visible_sub_image_in_the_outer_terminal() {
+    // A 2x2 pixel image (red, green / blue, white) displayed over 2x2 cells.
+    // Clipping to the right column must render only the green/white pixels,
+    // not a squashed copy of the whole image.
+    let mut store = SessionGraphicsStore::new(SessionId::new(0));
+    store
+        .apply_kitty_command_with_context(
+            b"a=T,f=24,i=511,s=2,v=2,c=2,r=2,q=2",
+            b"/wAAAP8AAAD/////",
+            (0, 0),
+            (0, 0),
+        )
+        .unwrap();
+    let submission = store
+        .visible_submissions(Rect::new(0, 0, 8, 4))
+        .into_iter()
+        .next()
+        .unwrap();
+    let clipped = submission.clipped_to(Rect::new(1, 0, 1, 2)).unwrap();
+
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+    backend
+        .submit_graphics(
+            std::slice::from_ref(&clipped),
+            std::slice::from_ref(&clipped),
+            &[],
+        )
+        .expect("clipped placement should serialize");
+
+    let terminal = HeadlessKittyTerminal::replay_with_framebuffer(backend.writer(), 2, 2)
+        .expect("clipped placement should replay");
+    assert_eq!(
+        terminal.pixel(1, 0),
+        Some(headless_kitty::HeadlessPixel::rgb(0, 255, 0))
+    );    assert_eq!(
+        terminal.pixel(1, 1),
+        Some(headless_kitty::HeadlessPixel::rgb(255, 255, 255))
+    );
+    assert_eq!(terminal.visible_pixel_count(), 2);
+}
+
+#[test]
+fn sub_cell_offset_clips_replay_with_a_pixel_shifted_crop() {
+    // A 30x10 image drawn at its natural size with an X=6 offset in 10x10
+    // cells occupies cells 0..4. Clipping past the first cell must re-emit a
+    // crop starting at source pixel 4 (six pixels into the anchor cell), not
+    // the whole-cell fraction 30 / 4 == 7.
+    let mut store = SessionGraphicsStore::new(SessionId::new(512));
+    store
+        .apply_kitty_command_with_context(
+            b"a=T,f=24,i=512,s=30,v=10,X=6,q=2",
+            b"AQID",
+            (0, 0),
+            (10, 10),
+        )
+        .unwrap();
+    let submission = store
+        .visible_submissions(Rect::new(0, 0, 8, 4))
+        .into_iter()
+        .next()
+        .unwrap();
+    let clipped = submission.clipped_to(Rect::new(1, 0, 3, 1)).unwrap();
+
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+    backend
+        .submit_graphics(
+            std::slice::from_ref(&clipped),
+            std::slice::from_ref(&clipped),
+            &[],
+        )
+        .expect("offset-clipped placement should serialize");
+
+    let terminal =
+        HeadlessKittyTerminal::replay(backend.writer()).expect("offset-clipped placement should replay");
+    let placement = terminal
+        .placements()
+        .first()
+        .expect("the replayed stream should contain one placement");
+    assert_eq!((placement.x, placement.y), (1, 0));
+    assert_eq!((placement.width, placement.height), (3, 1));
+    assert_eq!(placement.source(), Some((4, 0, 26, 10)));
+}
+
+
+
 
 #[test]
 fn headless_framebuffer_renders_unicode_placeholder_cells() {
@@ -485,6 +733,45 @@ fn direct_adapter_matches_captured_upload_stream() {
     assert_eq!(model.resource_count(), 1);
     assert_eq!(model.placement_count(), 1);
     assert_eq!(model.resource_payload(7), Some(&b"AQID"[..]));
+}
+
+#[test]
+fn direct_adapter_preserves_sub_cell_offsets_in_the_outer_stream() {
+    let mut store = SessionGraphicsStore::new(SessionId::new(0));
+    store
+        .apply_kitty_command_with_context(
+            b"a=T,f=24,i=450,c=2,r=1,X=4,Y=6,q=2",
+            b"AQID",
+            (0, 0),
+            (10, 20),
+        )
+        .expect("sub-cell offset fixture should be accepted");
+    let submission = store
+        .visible_submissions(Rect::new(0, 0, 16, 8))
+        .into_iter()
+        .next()
+        .expect("sub-cell offset fixture should create a placement");
+
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+    backend
+        .submit_graphics(
+            std::slice::from_ref(&submission),
+            std::slice::from_ref(&submission),
+            &[],
+        )
+        .expect("sub-cell offset capture should write");
+
+    let output = backend.writer();
+    assert!(
+        output.windows(9).any(|window| window == b",X=4,Y=6;"),
+        "sub-cell offsets were not serialized: {:?}",
+        String::from_utf8_lossy(output)
+    );
+    let model = HeadlessKittyTerminal::replay(output).unwrap();
+    assert_eq!(model.actions(), &["transmit"]);
+    assert_eq!(model.resource_count(), 1);
+    assert_eq!(model.placement_count(), 1);
 }
 
 #[test]
@@ -911,6 +1198,511 @@ fn graphics_lifecycle_preserves_anchors_across_resize_and_clears_on_shutdown() {
         .expect("could not shut down graphics lifecycle fixture");
     assert!(session.is_closed());
     assert!(session.graphics(Rect::new(0, 0, 30, 8)).is_empty());
+}
+
+#[test]
+fn kitty_placements_advance_the_emulator_cursor_like_a_graphics_terminal() {
+    // A default (C=0) placement advances the cursor right by `c` cells and
+    // down by `r` cells, so the trailing `X` lands below the 2x1 image instead
+    // of overwriting its top-left cell.
+    let script = r"printf '\033_Ga=T,f=24,i=401,s=2,v=1,c=2,r=1,q=2;AQID\033\\X'";
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(401),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(20, 4),
+    )
+    .expect("could not spawn cursor-movement fixture");
+    let area = Rect::new(0, 0, 20, 4);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && session.cursor_position() != (3, 1) {
+        session
+            .poll_output()
+            .expect("cursor-movement fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(session.cursor_position(), (3, 1));
+
+    let submissions = session.graphics(area);
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].placement().area(), Rect::new(0, 0, 2, 1));
+
+    let scene = session.render(area, false);
+    assert_eq!(
+        scene
+            .cell_at(2, 1)
+            .map(|cell| cell.symbol),
+        Some('X')
+    );
+    session
+        .shutdown()
+        .expect("could not shut down cursor-movement fixture");
+}
+
+#[test]
+fn headless_model_advances_the_cursor_after_default_placements() {
+    // Two default (C=0) placements stack after each other's cursor movement:
+    // the 2x1 image moves the cursor from (0,0) to (2,1), so the second image
+    // lands below it.
+    let stream = b"\x1b_Ga=T,f=24,i=501,c=2,r=1,q=2;AQID\x1b\\\x1b_Ga=T,f=24,i=502,c=1,r=1,q=2;BAUG\x1b\\";
+    let model = HeadlessKittyTerminal::replay(stream).unwrap();
+
+    assert_eq!(model.placement_count(), 2);
+    assert_eq!((model.placements()[0].x, model.placements()[0].y), (0, 0));
+    assert_eq!(
+        (model.placements()[1].x, model.placements()[1].y),
+        (2, 1)
+    );
+    assert_eq!(model.cursor(), (3, 2));
+}
+
+#[test]
+fn headless_model_respects_static_and_transmit_only_cursor_policy() {
+    // C=1 keeps the cursor fixed, so both images share the top-left cell.
+    let stream = b"\x1b_Ga=T,f=24,i=503,c=2,r=1,C=1,q=2;AQID\x1b\\\x1b_Ga=T,f=24,i=504,c=1,r=1,C=1,q=2;BAUG\x1b\\";
+    let model = HeadlessKittyTerminal::replay(stream).unwrap();
+    assert_eq!(model.placement_count(), 2);
+    assert_eq!((model.placements()[0].x, model.placements()[0].y), (0, 0));
+    assert_eq!((model.placements()[1].x, model.placements()[1].y), (0, 0));
+    assert_eq!(model.cursor(), (0, 0));
+
+    // A lowercase transmit only stores the image; it neither displays nor
+    // moves the cursor, so the later a=T placement starts at (0,0).
+    let stream = b"\x1b_Ga=t,f=24,i=505,s=2,v=1,q=2;AQID\x1b\\\x1b_Ga=T,f=24,i=506,c=1,r=1,q=2;BAUG\x1b\\";
+    let model = HeadlessKittyTerminal::replay(stream).unwrap();
+    assert_eq!(model.placement_count(), 1);
+    assert_eq!((model.placements()[0].x, model.placements()[0].y), (0, 0));
+    assert_eq!(model.cursor(), (1, 1));
+}
+
+#[test]
+fn headless_model_and_pty_session_agree_on_cursor_advancement() {
+    // The same raw child stream must place its image and advance the cursor to
+    // identical positions in both the headless reference terminal and the
+    // cmdash session emulator.
+    let stream = b"\x1b_Ga=T,f=24,i=510,s=2,v=1,c=2,r=1,q=2;AQID\x1b\\X";
+    let model = HeadlessKittyTerminal::replay(stream).unwrap();
+    assert_eq!(model.placement_count(), 1);
+    assert_eq!((model.placements()[0].x, model.placements()[0].y), (0, 0));
+    assert_eq!(
+        (model.placements()[0].width, model.placements()[0].height),
+        (2, 1)
+    );
+    assert_eq!(model.cursor(), (3, 1));
+
+    let script = r"printf '\033_Ga=T,f=24,i=510,s=2,v=1,c=2,r=1,q=2;AQID\033\\X'";
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(510),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(20, 4),
+    )
+    .expect("could not spawn cursor agreement fixture");
+    let area = Rect::new(0, 0, 20, 4);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && session.cursor_position() != (3, 1) {
+        session
+            .poll_output()
+            .expect("cursor agreement fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(session.cursor_position(), (3, 1));
+    let submissions = session.graphics(area);
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].placement().area(), Rect::new(0, 0, 2, 1));
+    assert_eq!(
+        session.render(area, false).cell_at(2, 1).map(|cell| cell.symbol),
+        Some('X')
+    );
+    session
+        .shutdown()
+        .expect("could not shut down cursor agreement fixture");
+}
+
+#[test]
+fn headless_model_and_pty_session_agree_on_relative_placements() {
+    // A parent at (0,0) with a 1x1 extent moves the cursor to (1,1). The child
+    // is relative to it with H=3,V=2, so it lands at (3,2) and must not move
+    // the cursor further.
+    let stream = b"\x1b_Ga=T,f=24,i=602,s=2,v=1,c=1,r=1,p=1,q=2;AQID\x1b\\\x1b_Ga=p,i=602,p=2,P=602,Q=1,H=3,V=2,c=1,r=1,q=2\x1b\\";
+    let model = HeadlessKittyTerminal::replay(stream).unwrap();
+    assert_eq!(model.placement_count(), 2);
+    assert_eq!((model.placements()[0].x, model.placements()[0].y), (0, 0));
+    assert_eq!((model.placements()[1].x, model.placements()[1].y), (3, 2));
+    assert_eq!(model.cursor(), (1, 1));
+
+    let script = r"printf '\033_Ga=T,f=24,i=602,s=2,v=1,c=1,r=1,p=1,q=2;AQID\033\\\033_Ga=p,i=602,p=2,P=602,Q=1,H=3,V=2,c=1,r=1,q=2\033\\'";
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(602),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(20, 4),
+    )
+    .expect("could not spawn relative placement fixture");
+    let area = Rect::new(0, 0, 20, 4);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && session.graphics(area).len() < 2 {
+        session
+            .poll_output()
+            .expect("relative placement fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let submissions = session.graphics(area);
+    assert_eq!(submissions.len(), 2);
+    let areas = submissions
+        .iter()
+        .map(|submission| submission.placement().area())
+        .collect::<Vec<_>>();
+    assert!(areas.contains(&Rect::new(0, 0, 1, 1)));
+    assert!(areas.contains(&Rect::new(3, 2, 1, 1)));
+    session
+        .shutdown()
+        .expect("could not shut down relative placement fixture");
+}
+
+#[test]
+fn headless_model_and_pty_session_agree_on_virtual_parent_origin() {
+    // A virtual parent (U=1) has no physical cell of its own: its origin is
+    // the min x / min y of the Unicode placeholder cells written after it.
+    // Placeholders land at (5,2) and (3,6), so a child with H=1,V=1 resolves
+    // to (3,2)+(1,1) = (4,3) instead of the creating cursor.
+    let stream = "\u{1b}_Ga=T,f=24,i=800,s=2,v=1,c=1,r=1,U=1,p=1,q=2;AQID\u{1b}\u{5c}\u{1b}[3;6H\u{1b}[38;2;0;3;32m\u{10eeee}\u{305}\u{305}\u{305}\u{1b}[7;4H\u{1b}[38;2;0;3;32m\u{10eeee}\u{305}\u{305}\u{305}\u{1b}_Ga=p,i=800,p=2,P=800,Q=1,H=1,V=1,c=1,r=1,q=2\u{1b}\u{5c}";
+    let model = HeadlessKittyTerminal::replay(stream.as_bytes()).unwrap();
+    assert_eq!(model.virtual_placement_count(), 1);
+    assert_eq!(model.placeholder_count(), 2);
+    assert_eq!(model.placement_count(), 1);
+    assert_eq!((model.placements()[0].x, model.placements()[0].y), (4, 3));
+
+    let script = r#"printf '\033_Ga=T,f=24,i=800,s=2,v=1,c=1,r=1,U=1,p=1,q=2;AQID\033\\\033[3;6H\033[38;2;0;3;32m\U0010EEEE\u0305\u0305\u0305\033[7;4H\033[38;2;0;3;32m\U0010EEEE\u0305\u0305\u0305\033_Ga=p,i=800,p=2,P=800,Q=1,H=1,V=1,c=1,r=1,q=2\033\\'"#;
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(800),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(20, 6),
+    )
+    .expect("could not spawn virtual-parent origin fixture");
+    let area = Rect::new(0, 0, 20, 6);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && session.graphics(area).is_empty() {
+        session
+            .poll_output()
+            .expect("virtual-parent origin fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let submissions = session.graphics(area);
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].resource().image(), 800);
+    assert_eq!(submissions[0].placement().area(), Rect::new(4, 3, 1, 1));
+    session
+        .shutdown()
+        .expect("could not shut down virtual-parent origin fixture");
+}
+
+#[test]
+fn headless_model_and_pty_session_agree_on_virtual_placement_selector_immunity() {
+    // A virtual placement (U=1) and a real placement. The virtual one is
+    // invisible and immune to the position/visible delete selectors; only the
+    // id selector removes it.
+    let stream = b"\x1b_Ga=T,f=24,i=701,c=1,r=1,U=1,q=2;AQID\x1b\\\x1b[1;5H\x1b_Ga=T,f=24,i=702,c=1,r=1,q=2;BAUG\x1b\\";
+    let mut model = HeadlessKittyTerminal::replay_with_viewport(stream, Some((8, 4))).unwrap();
+    assert_eq!(model.virtual_placement_count(), 1);
+    assert_eq!(model.placement_count(), 1);
+
+    // d=p targeting the virtual placement's cell (1,1) leaves it alone.
+    model.feed(b"\x1b_Ga=d,d=p,x=1,y=1\x1b\\").unwrap();
+    model.finish().unwrap();
+    assert_eq!(model.virtual_placement_count(), 1);
+    assert_eq!(model.placement_count(), 1);
+
+    // d=a (delete visible) removes the real placement but not the virtual one.
+    model.feed(b"\x1b_Ga=d,d=a\x1b\\").unwrap();
+    model.finish().unwrap();
+    assert_eq!(model.virtual_placement_count(), 1);
+    assert_eq!(model.placement_count(), 0);
+
+    // Only d=i removes the virtual placement.
+    model.feed(b"\x1b_Ga=d,d=i,i=701\x1b\\").unwrap();
+    model.finish().unwrap();
+    assert_eq!(model.virtual_placement_count(), 0);
+
+    let script = r"printf '\033_Ga=T,f=24,i=701,c=1,r=1,U=1,q=2;AQID\033\\\033[1;5H\033_Ga=T,f=24,i=702,c=1,r=1,q=2;BAUG\033\\'";
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(701),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(20, 4),
+    )
+    .expect("could not spawn virtual placement fixture");
+    let area = Rect::new(0, 0, 20, 4);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && session.graphics(area).is_empty() {
+        session
+            .poll_output()
+            .expect("virtual placement fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    // The virtual placement never renders: only the real placement is visible.
+    let submissions = session.graphics(area);
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].resource().image(), 702);
+    session
+        .shutdown()
+        .expect("could not shut down virtual placement fixture");
+}
+
+#[test]
+fn animated_gif_payload_auto_extracts_frames_in_store_and_session() {
+    // A client that uploads an animated GIF as a single `f=100` payload (as a
+    // graphical terminal would treat it, rather than pre-splitting frames into
+    // `a=f` commands like `kitten icat` does) must have its frames extracted
+    // and animated by the store itself.
+    let gif = animated_gif_for_conformance();
+    let encoded = encode_test_base64(&gif);
+
+    // Store path.
+    let mut store = SessionGraphicsStore::new(SessionId::new(720));
+    let parameters = "a=T,f=100,i=720,q=2";
+    store
+        .apply_kitty_command_with_context(
+            parameters.as_bytes(),
+            encoded.as_bytes(),
+            (0, 0),
+            (0, 0),
+        )
+        .expect("animated GIF transmit should be accepted");
+    assert_eq!(store.animation_frame_count(720), Some(1));
+    assert_eq!(
+        store.animation_state(720),
+        Some(GraphicsAnimationState::Running)
+    );
+    // GIF `Repeat::Infinite` maps to Kitty `v=1` (loop forever).
+    assert_eq!(store.animation_loops(720), Some(1));
+    // The root frame is the first GIF frame coalesced to full-canvas RGBA.
+    assert_eq!(store.decoded_bytes(720), Some(&[255, 0, 0, 255][..]));
+    // The extra frame is the second GIF frame's coalesced RGBA.
+    assert_eq!(
+        store.animation_frame_bytes(720, 2),
+        Some(&[0, 0, 255, 255][..])
+    );
+    let submissions = store.visible_submissions(Rect::new(0, 0, 4, 2));
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].format(), 32);
+    assert_eq!(submissions[0].pixel_width(), 1);
+    assert_eq!(submissions[0].pixel_height(), 1);
+
+    // PTY session path: the same command through a real child shell.
+    let script = format!("printf '\\033_Ga=T,f=100,i=720,q=2;{encoded}\\033\\\\'");
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(720),
+        Some("sh"),
+        &["-c", &script],
+        TerminalSize::new(20, 4),
+    )
+    .expect("could not spawn animated GIF fixture");
+    let area = Rect::new(0, 0, 20, 4);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && session.graphics(area).is_empty() {
+        session
+            .poll_output()
+            .expect("animated GIF fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let submissions = session.graphics(area);
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].format(), 32);
+    let image = submissions[0].resource().image();
+    assert_eq!(session.graphics_animation_frame_count(image), Some(1));
+    assert_eq!(
+        session.graphics_animation_state(image),
+        Some(GraphicsAnimationState::Running)
+    );
+    session
+        .shutdown()
+        .expect("could not shut down animated GIF fixture");
+}
+
+#[test]
+fn headless_model_and_pty_session_agree_on_non_raw_frame_composition() {
+    // A non-raw (PNG) root composed with a raw frame must decode to RGBA and
+    // convert to format 32, identically in the headless reference terminal and
+    // the cmdash session emulator.
+    let red = [
+        255, 0, 0, 255, 255, 0, 0, 255,
+        255, 0, 0, 255, 255, 0, 0, 255,
+    ];
+    let green = [
+        0, 255, 0, 255, 0, 255, 0, 255,
+        0, 255, 0, 255, 0, 255, 0, 255,
+    ];
+    let red_pixels = rgba_pixels(&red);
+    let green_pixels = rgba_pixels(&green);
+    let png = png_fixture(2, 2, &red);
+    let png_b64 = encode_test_base64(&png);
+    let green_b64 = encode_test_base64(&green);
+
+    // Composing the green frame onto the PNG root decodes the root to RGBA and
+    // converts its wire format to 32.
+    let onto_root = format!(
+        "\x1b_Ga=T,f=100,i=300,s=2,v=2,q=2;{png_b64}\x1b\\\
+         \x1b_Ga=f,i=300,r=2,s=2,v=2,q=2;{green_b64}\x1b\\\
+         \x1b_Ga=c,i=300,r=2,c=1,X=0,Y=0,x=0,y=0,w=2,h=2,C=1,q=2\x1b\\"
+    );
+    let model = HeadlessKittyTerminal::replay(onto_root.as_bytes()).unwrap();
+    assert_eq!(model.resource_format(300), Some(32));
+    assert_eq!(model.resource_pixels(300), Some(green_pixels.as_slice()));
+
+    // Composing the PNG root (non-raw source) onto the frame decodes it and
+    // overwrites frame 2 with the root's red pixels.
+    let onto_frame = format!(
+        "\x1b_Ga=T,f=100,i=301,s=2,v=2,q=2;{png_b64}\x1b\\\
+         \x1b_Ga=f,i=301,r=2,s=2,v=2,q=2;{green_b64}\x1b\\\
+         \x1b_Ga=c,i=301,r=1,c=2,X=0,Y=0,x=0,y=0,w=2,h=2,C=1,q=2\x1b\\"
+    );
+    let frame_model = HeadlessKittyTerminal::replay(onto_frame.as_bytes()).unwrap();
+    assert_eq!(frame_model.animation_frame_count(301), Some(1));
+    assert_eq!(
+        frame_model.animation_frame_pixels(301, 2),
+        Some(red_pixels.as_slice())
+    );
+
+    // The PTY session must agree with the headless model on the observable
+    // root composition: a single format-32 submission carrying the green
+    // pixels.
+    let script = format!(
+        "printf '\\033_Ga=T,f=100,i=300,s=2,v=2,q=2;{png_b64}\\033\\\\\
+         \\033_Ga=f,i=300,r=2,s=2,v=2,q=2;{green_b64}\\033\\\\\
+         \\033_Ga=c,i=300,r=2,c=1,X=0,Y=0,x=0,y=0,w=2,h=2,C=1,q=2\\033\\\\'"
+    );
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(300),
+        Some("sh"),
+        &["-c", &script],
+        TerminalSize::new(20, 4),
+    )
+    .expect("could not spawn non-raw composition fixture");
+    let area = Rect::new(0, 0, 20, 4);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline
+        && session.graphics(area).first().map(|submission| submission.format()) != Some(32)
+    {
+        session
+            .poll_output()
+            .expect("non-raw composition fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let submissions = session.graphics(area);
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].format(), 32);
+    assert_eq!(
+        decode_test_base64(submissions[0].encoded_payload()),
+        green.to_vec()
+    );
+    session
+        .shutdown()
+        .expect("could not shut down non-raw composition fixture");
+}
+
+/// Converts raw RGBA bytes into the headless model's pixel type.
+fn rgba_pixels(bytes: &[u8]) -> Vec<HeadlessPixel> {
+    bytes
+        .chunks_exact(4)
+        .map(|pixel| HeadlessPixel {
+            red: pixel[0],
+            green: pixel[1],
+            blue: pixel[2],
+            alpha: pixel[3],
+        })
+        .collect()
+}
+
+#[test]
+fn quiet_key_suppresses_success_responses_like_kitty() {
+    // Kitty's `q` rule: `q=0` emits an OK acknowledgement, `q=1` and `q=2`
+    // suppress it. The store's return value is exactly what the session writes
+    // back to the child terminal.
+    let mut store = SessionGraphicsStore::new(SessionId::new(703));
+    let ok = store
+        .apply_kitty_command_with_context(b"a=T,f=24,i=1,q=0", b"AQID", (0, 0), (0, 0))
+        .unwrap()
+        .expect("q=0 must emit an OK response");
+    assert!(String::from_utf8_lossy(&ok).contains("OK"));
+
+    assert!(store
+        .apply_kitty_command_with_context(b"a=T,f=24,i=2,q=1", b"BAUG", (0, 0), (0, 0))
+        .unwrap()
+        .is_none());
+    assert!(store
+        .apply_kitty_command_with_context(b"a=T,f=24,i=3,q=2", b"CAUI", (0, 0), (0, 0))
+        .unwrap()
+        .is_none());
+
+    // Query responses follow the same rule.
+    let query = store
+        .apply_kitty_command_with_context(
+            b"a=q,i=1,t=d,s=1,v=1,f=24,q=0",
+            b"MTIz",
+            (0, 0),
+            (0, 0),
+        )
+        .unwrap()
+        .expect("q=0 query must emit a response");
+    assert!(String::from_utf8_lossy(&query).contains("OK"));
+    assert!(store
+        .apply_kitty_command_with_context(
+            b"a=q,i=1,t=d,s=1,v=1,f=24,q=1",
+            b"MTIz",
+            (0, 0),
+            (0, 0),
+        )
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn headless_model_and_pty_session_agree_queries_do_not_retain_images() {
+    // A query loads and validates its payload but never retains the image
+    // (Kitty's `remove_images` after a query). A subsequent transmit is the
+    // only retained resource in both the headless model and the PTY session.
+    let stream = b"\x1b_Ga=q,i=1,t=d,s=1,v=1,f=24,q=2;MTIz\x1b\\\x1b_Ga=T,f=24,i=2,c=1,r=1,q=2;AQID\x1b\\";
+    let model = HeadlessKittyTerminal::replay(stream).unwrap();
+    assert_eq!(model.resource_count(), 1);
+    assert_eq!(model.placement_count(), 1);
+    assert_eq!(model.actions(), &["query", "transmit"]);
+
+    let script = r"printf '\033_Ga=q,i=1,t=d,s=1,v=1,f=24,q=2;MTIz\033\\\033_Ga=T,f=24,i=2,c=1,r=1,q=2;AQID\033\\'";
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(704),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(20, 4),
+    )
+    .expect("could not spawn query non-retention fixture");
+    let area = Rect::new(0, 0, 20, 4);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && session.graphics(area).is_empty() {
+        session
+            .poll_output()
+            .expect("query non-retention fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Only the transmit is retained and rendered.
+    let submissions = session.graphics(area);
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].resource().image(), 2);
+    session
+        .shutdown()
+        .expect("could not shut down query non-retention fixture");
+}
+
+#[test]
+fn headless_model_allocates_and_resolves_image_numbers() {
+    // Two numbered transmits allocate two distinct ids; the later a=p with
+    // I=7 resolves to the newest (highest id) image.
+    let stream = b"\x1b_Ga=t,f=24,I=7,q=2;AQID\x1b\\\x1b_Ga=t,f=24,I=7,q=2;BAUG\x1b\\\x1b_Ga=p,I=7,c=1,r=1,q=2\x1b\\";
+    let model = HeadlessKittyTerminal::replay(stream).unwrap();
+    assert_eq!(model.resource_count(), 2);
+    assert_eq!(model.placement_count(), 1);
+    assert_eq!(model.placements()[0].image_id, 2);
 }
 
 #[test]

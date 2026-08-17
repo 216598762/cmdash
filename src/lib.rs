@@ -67,7 +67,7 @@ pub use plugin::{
     PluginModule, PluginRegistry, PluginRuntime, PluginWidgetManifest,
 };
 pub use reload::{ConfigReloader, ReloadError};
-pub use scene::{Cell, CellStyle, CellWidth, Color, Scene, SceneCursor};
+pub use scene::{Cell, CellStyle, CellWidth, Color, Scene, SceneCursor, Underline};
 pub use session::{
     SessionError, SessionWakeup, TerminalSession, TerminalSize, UiEvent, kitty_stream_stats,
     ui_event_channel,

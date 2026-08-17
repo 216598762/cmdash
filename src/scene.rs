@@ -26,12 +26,29 @@ impl Color {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Underline {
+    #[default]
+    None,
+    Plain,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CellStyle {
     pub foreground: Color,
     pub background: Color,
     pub bold: bool,
     pub dim: bool,
+    pub italic: bool,
+    pub underline: Underline,
+    pub underline_color: Option<Color>,
+    pub strikeout: bool,
+    pub reverse: bool,
+    pub hidden: bool,
 }
 
 impl CellStyle {
@@ -41,6 +58,12 @@ impl CellStyle {
             background,
             bold: false,
             dim: false,
+            italic: false,
+            underline: Underline::None,
+            underline_color: None,
+            strikeout: false,
+            reverse: false,
+            hidden: false,
         }
     }
 
@@ -51,6 +74,41 @@ impl CellStyle {
 
     pub const fn dim(mut self) -> Self {
         self.dim = true;
+        self
+    }
+
+    pub const fn italic(mut self) -> Self {
+        self.italic = true;
+        self
+    }
+
+    pub const fn underline(mut self) -> Self {
+        self.underline = Underline::Plain;
+        self
+    }
+
+    pub const fn underline_style(mut self, underline: Underline) -> Self {
+        self.underline = underline;
+        self
+    }
+
+    pub const fn underline_color(mut self, color: Color) -> Self {
+        self.underline_color = Some(color);
+        self
+    }
+
+    pub const fn strikeout(mut self) -> Self {
+        self.strikeout = true;
+        self
+    }
+
+    pub const fn reverse(mut self) -> Self {
+        self.reverse = true;
+        self
+    }
+
+    pub const fn hidden(mut self) -> Self {
+        self.hidden = true;
         self
     }
 }
@@ -179,7 +237,7 @@ impl Scene {
         if let Some(submission) = submission.clipped_to(self.area) {
             self.image_layers.push(submission);
             self.image_layers
-                .sort_by_key(|layer| layer.placement().z_index());
+                .sort_by_key(|layer| (layer.placement().z_index(), layer.resource()));
         }
     }
 
@@ -281,7 +339,7 @@ impl Scene {
             }
         }
         self.image_layers
-            .sort_by_key(|layer| layer.placement().z_index());
+            .sort_by_key(|layer| (layer.placement().z_index(), layer.resource()));
         for placeholder in &source.placeholder_layers {
             if let Some(placeholder) = placeholder
                 .clipped_to(clip)
@@ -372,7 +430,7 @@ impl Scene {
                 }
             }
         }
-        visible.sort_by_key(|layer| layer.placement().z_index());
+        visible.sort_by_key(|layer| (layer.placement().z_index(), layer.resource()));
         self.image_layers = visible;
     }
 
@@ -651,6 +709,26 @@ mod tests {
             destination.image_layers()[0].placement().area(),
             Rect::new(3, 1, 2, 1)
         );
+    }
+
+    #[test]
+    fn image_layers_tie_break_equal_z_by_image_id() {
+        let mut store = crate::SessionGraphicsStore::new(crate::SessionId::new(5));
+        store.apply_kitty_command(b"a=T,f=24,i=6,z=0", b"AQID").unwrap();
+        store.apply_kitty_command(b"a=T,f=24,i=5,z=0", b"BAUG").unwrap();
+        let submissions = store.visible_submissions(Rect::new(0, 0, 8, 2));
+        // Add the layers in reverse order to prove the scene re-sorts by
+        // (z, image id) rather than preserving insertion order.
+        let mut scene = Scene::new(Rect::new(0, 0, 8, 2));
+        for submission in submissions.iter().rev() {
+            scene.add_image_layer(submission.clone());
+        }
+        let ids = scene
+            .image_layers()
+            .iter()
+            .map(|layer| layer.resource().image())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![5, 6]);
     }
 
     #[test]

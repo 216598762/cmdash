@@ -252,6 +252,20 @@ A terminal widget owns a `SessionId`. The session contains its own:
 
 Switching tabs changes focus/visibility in the layout. It does not transfer emulator state or graphics resources between sessions.
 
+The emulator also owns the Kitty keyboard protocol negotiation: its
+`kitty_keyboard` config is enabled so `CSI >`/`=`/`<` push/set/pop requests
+update a per-screen mode stack and `CSI ? u` queries are answered through the
+same PTY-response path as DA1. `key_bytes` consults `term.mode()` when
+forwarding input, so a child that opts in receives disambiguated
+`CSI number ; modifier u` encodings for modified and ambiguous keys while
+legacy programs keep the C0/ESC/`CSI ~` encodings. Text presentation
+attributes are first-class scene data too: `CellStyle` carries italic,
+underline style/color, strikeout, reverse, and hidden alongside bold/dim, the
+session render path maps them from the emulator's cell flags, and the backend
+serializes them as SGR (`3`, `4:x`, `58`, `9`, `7`, `8`), leaving degradation
+to the outer terminal's own SGR handling rather than discarding the attribute
+from the scene model.
+
 ### 5.2 Kitty graphics model
 
 Kitty graphics are treated as terminal-session state, not as a global backend cache. `alacritty_terminal` remains the text/parser owner, while cmdash intercepts Kitty APC sequences and retains resources and placements in a session-owned adapter. The current flow is:
@@ -305,6 +319,25 @@ surface clipping. Full-screen primary placements follow scrollback; partial-regi
 placements follow only matching region displacement, while alternate-screen
 placements remain isolated.
 
+A retained placement also emulates a real graphics terminal's cursor movement:
+after an image is placed the child emulator's cursor advances right by the
+placement's `c` cells and down by its `r` cells, unless the client requested
+`C=1`. Because the Kitty APC never reaches `alacritty_terminal`, the session
+feeds the equivalent `CUF`/`CUD` movement back into both the emulator and its
+scroll-region observer, so trailing text and consecutive images follow the
+image instead of stacking on its top-left cell. A lowercase `a=t` transmits the
+image data without displaying it, and the image appears only once a later
+`a=p`/`a=T` placement arrives. When only one of `c`/`r` is given, the missing
+extent is derived from the source image's aspect ratio. Sub-cell `X`/`Y` pixel
+offsets are retained on the placement and re-emitted to the outer terminal in
+direct mode so images land pixel-exactly; Unicode-placeholder mode stays
+cell-granular and cannot express sub-cell offsets. Each placement also records
+the cell pixel size and the on-screen pixel dimensions it is drawn at, so an
+occlusion clip derives its source crop in pixel space rather than as a
+whole-cell fraction of the image: a placement that starts partway into its
+anchor cell is cropped from the correct source pixel, and the clipped placement
+re-anchors with the sub-cell remainder of the original `X`/`Y` offset.
+
 Graphics submission is an explicit outer-rendering contract rather than a
 successful no-op: the backend reports `Rendered`, `Degraded`, `Suppressed`, or
 `Failed` with a placement count and bounded reason. The selected
@@ -343,14 +376,118 @@ scene layers; the compositor clips, orders, diffs, and occludes both before any
 terminal-specific adapter emits bytes. A session-owned VT observer mirrors the
 emulator's private margins and scroll displacement so partial-region linefeeds,
 explicit scrolls, reverse index, origin mode, and resize resets move matching
-graphics anchors without confusing them with primary-screen scrollback.
+graphics anchors without confusing them with primary-screen scrollback. A
+column resize makes the emulator reflow (rewrap) text, which moves its
+scrollback depth without scrolling content uniformly; the store re-anchors
+full-screen placements by re-capturing each one's current grid row against the
+new depth, so an image keeps its grid cell through the reflow the way Kitty
+preserves a placement's `start_row`. Row-only resizes stay on the scrollback
+model, and partial-region/relative placements keep their existing resolution.
+The same observer also forwards screen-scoped erases to the store as
+`GraphicsErase`: `ED 2` removes visible placements while preserving history
+rows, `ED 0`/`ED 1` remove whole image rows from the cursor to the bottom/top
+of the screen (row-granular, matching Kitty's `grman_remove_cell_images`),
+`ED 3` removes scrollback-only placements, `RIS` clears everything, and screen
+switches erase the alternate buffer. Erase scopes resolve against the
+scrollback depth captured before the emulator consumes each chunk, so a clear
+cannot re-anchor visible images into history nor resurrect one that `ED 3`
+just removed; pixel data is retained on all of these except `RIS`, mirroring
+Kitty's re-display cache.
 
-The protocol store accepts zlib-compressed direct payloads, normalizes retained
+The protocol store accepts zlib-compressed direct payloads and the local
+`kitten icat` fast path — `t=f` file, `t=t` temporary-file, and `t=s` POSIX
+shared-memory transfers resolve a base64-encoded path (bounded to 2048 bytes)
+through the `S` size / `O` offset keys, read the range into memory, apply the
+`o=z` zlib step, and enforce the decoded-storage budget. `t=s` unlinks the
+shared-memory name after reading, and `t=t` deletes the file only when its name
+carries the `tty-graphics-protocol` marker (Kitty's own temp-file convention),
+so a program cannot use it to delete an arbitrary path; reads are same-user
+local opens, so no remote/SSH permission hook is modeled. It normalizes
+retained
 payloads for safe replay, preserves source crops and explicit cursor policy,
-tracks bounded animation frames/control state, and implements the supported
-image/placement delete selectors. File, temporary-file, and shared-memory
-transfers are capability-negotiated but intentionally rejected with `ENOTSUP`
-until a sandboxed provider exists. The backend's direct and placeholder adapters
+tracks bounded animation frames/control state — including `a=c` frame
+composition (source rectangle `X`/`Y`, destination rectangle `x`/`y`, shared
+`w`/`h` size, and the `C` alpha-blend/overwrite mode), the `a=f` frame
+composition keys (`c` base frame, `r` frame to write/edit, `X`
+blend/replace, `Y` background canvas, and the `x`/`y`/`s`/`v` partial
+rectangle), and the `v` loop-count control key. A new `a=f` frame is stored
+as a delta (rectangle plus base/canvas metadata) and coalesced on demand;
+editing an existing frame coalesces it, composes the new rectangle on top, and
+stores the result as a full keyframe, mirroring Kitty's
+`get_coalesced_frame_data` chain resolution. `a=c` coalesces both source and
+destination frames before composing so a delta frame contributes its rendered
+pixels. A non-raw (`f=100`) PNG/GIF frame is decoded to RGBA8 on coalesce via
+the `png`/`gif` crates so `a=c` composes it on pixels instead of rejecting it,
+and composing onto a PNG/GIF root converts the resource to raw RGBA (`f=32`)
+since its stored bytes are now decoded pixels. An `f=100` animated GIF is
+decoded on transmit into coalesced
+full-canvas RGBA frames (the root plus one animation frame per extra GIF frame,
+with per-frame delays and the Netscape loop count mapped onto `v`), so a single
+GIF upload animates like a graphical terminal; static GIFs remain static
+`f=100` images.
+
+Animations actually play on screen. The store advances each animatable image on
+the wall clock (`advance_animations`), skipping gapless frames, wrapping the
+root→extra-frame sequence, and honoring Kitty's state/loop semantics — a
+`Loading` animation plays through once and stops at the wrap, while `Running`
+loops per the `v` key (`v`/`v-1`/infinite). The render path serves the
+coalesced current frame's base64 payload with a generation that bumps on every
+frame change, so the outer terminal re-uploads the new pixels rather than
+re-placing the stale root frame. A maintenance-wakeup schedule (derived from
+each widget's `advance_graphics_animation`, threaded through the widget runtime
+and `AppState`) wakes the render loop at the next frame deadline. It implements
+the full
+image/placement delete matrix (`a/A`, `i/I`, `n/N`, `c/C`, `p/P`, `q/Q`, `r/R`,
+`x/X`, `y/Y`, `z/Z`, `f/F`), honoring Kitty's lowercase/uppercase retention rule
+(lowercase releases placements but keeps decoded pixel data for re-display;
+uppercase also frees data once no placement — including scrollback — still
+references it). Position/cell/z-index selectors resolve each placement's
+current cell against the scrollback view and are scoped to the active screen,
+and `d=f` deletes a single frame via `r=<frame>` (0/absent = the root frame),
+renumbering the extras, rebalancing the animation gap schedule, and adjusting
+the current-frame index — deleting the root promotes the first extra frame,
+while deleting the whole frame set frees the image data and resets playback.
+Relative placements (`P`/`Q` parent, `H`/`V` signed cell
+offset) are stored as a parent reference and re-resolved against scroll/region
+state at render time, so they follow their parent through scrolling and are
+removed with it; parent chains are cycle-checked (`ECYCLE`) and depth-bounded
+(`ETOODEEP`, at least 8). Virtual placements (`U=1`) are stored as invisible
+prototypes: they never render, never move the cursor, never scroll or
+re-anchor on resize, and can be a relative placement's parent but cannot
+themselves be relative (`EINVAL`). Their delete-selector scope matches Kitty's
+`is_virtual_ref` — only `i/I`, `n/N`, and `r/R` remove them, while the
+position/z-index/visible selectors and the screen-erase scopes skip them
+because they have no physical location. A relative placement anchored to a
+virtual parent resolves its origin from the min column / min row of the parent's
+U+10EEEE placeholder cells rather than the creating cursor: the session scans
+the child's text grid for placeholder glyphs (decoding the image id from the
+foreground RGB plus the third combining mark) and feeds those cells to the
+store, and a relative child of a virtual parent with no placeholder cells yet
+is invisible, matching Kitty's `resolve_cell_ref`. Image numbers (`I` key) allocate a fresh internal id
+on transmit and resolve to the newest surviving image with that number, so a
+client can pipeline `I`-addressed commands before learning the assigned `i`;
+`i` and `I` are mutually exclusive (`EINVAL`). The `N=1` transient usage hint is
+stored per frame (the root frame on the resource, each extra frame on its
+animation frame): `a=f` deltas inherit their base chain's transient status,
+frame edits OR the coalesced chain with the transmitted hint, and `a=c` marks
+the destination transient when either source frame is transient, while eviction
+still keys off the root frame's hint like Kitty. When an upload would exceed
+the decoded-byte quota the store evicts in Kitty's order — unreferenced images
+first, then transient before retained, then oldest by generation — recording a
+diagnostic before falling back to rejection. File, temporary-file, and shared-memory
+transfers (`t=f` file, `t=t` temp file, `t=s` shared memory) are
+capability-negotiated and supported: the payload decodes to a bounded path
+(2048 bytes), the file is read with `S`/`O` size/offset bounds against the
+decoded-storage budget, `t=s` unlinks the shared-memory name after reading, and
+`t=t` deletes the file only when its name carries the `tty-graphics-protocol`
+marker, mirroring Kitty's conventions for the `kitten icat` fast path. Query
+commands (`a=q`) load and validate their payload exactly like a transmit
+(`handle_add_command` with `is_query=true`): they require an `i=` image id
+(else a diagnostic and no response), resolve the transfer medium, check the
+format, enforce Kitty's raw `bpp * s * v` data-size match and the 10000
+dimension cap, and require a parseable GIF/PNG header for `f=100` — replying
+`OK` only when the image would load and retaining nothing afterwards. The
+backend's direct and placeholder adapters
 serialize only direct payloads, while tmux passthrough wraps the same bytes with
 ESC doubling. Capture fixtures feed those complete streams into a bounded
 headless terminal model and assert both acceptance state and protocol responses.
@@ -481,8 +618,10 @@ The core should be testable without a real terminal:
 - a bounded headless Kitty stream model that semantically parses APC/CSI/SGR,
   tmux unwrapping, chunk reassembly, resources, placements, placement-ID
   replacement, z-order, placeholder references, viewport clipping, z-index
-  occlusion, randomized chunk boundaries, malformed sequences, bounded input
-  rejection, and delete-acknowledgement acceptance;
+  occlusion, animation frames and `a=c` composition (including decoding
+  non-raw PNG/GIF roots to RGBA), virtual-parent origin from Unicode
+  placeholder cells, randomized chunk boundaries, malformed
+  sequences, bounded input rejection, and delete-acknowledgement acceptance;
 - an optional one-pixel-per-cell headless RGB framebuffer that decodes bounded
   RGB/RGBA fixtures, applies crops, alpha blending, clipping, z-order, deletion,
   and placeholder pixels, including a PTY-to-outer-stream acceptance fixture;

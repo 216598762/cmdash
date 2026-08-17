@@ -188,6 +188,13 @@ are `text`, `clock`, `system`, `status`, `key_value`, `gauge`, `list`, `log`,
 - `separator` centers an optional `text` label in a horizontal rule.
 - A terminal widget owns its PTY, emulator, selection, graphics resources, and
   shutdown lifecycle.
+- `settings.scrollbar` and `settings.scroll_indicator` accept `true` or `false`
+  (default `true`) and toggle the terminal's right-edge scrollbar and its
+  title-bar scroll percentage, respectively. Both only appear while scrollback
+  exists and are themed with the `focus`/`muted` roles.
+- `settings.scrollback` is a non-negative line count (default `10000`) bounding
+  the terminal's history. Images that scroll above that limit are evicted and
+  their decoded bytes released.
 
 Appearance is configured through `[appearance]`; see
 [APPEARANCE.md](APPEARANCE.md) for semantic roles, parent-terminal palette
