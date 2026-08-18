@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ratatui::layout::Rect;
 
@@ -218,6 +218,16 @@ pub struct Compositor {
     focus_snapshot: Option<FocusTarget>,
     base_snapshot: Option<Scene>,
     pool: FrameBufferPool,
+    /// Cached z-ordered visible surface/overlay lists, recomputed only when the
+    /// surface/overlay set, visibility, or z-index changes (so a steady frame
+    /// does not re-sort and re-fetch them).
+    surface_order: Vec<(i16, SurfaceId)>,
+    overlay_order: Vec<(i16, OverlayId)>,
+    surface_order_dirty: bool,
+    overlay_order_dirty: bool,
+    surface_order_computed: bool,
+    overlay_order_computed: bool,
+    z_order_recomputations: u64,
 }
 
 /// The regions the current frame must re-composite and re-diff, plus the
@@ -242,6 +252,13 @@ impl Compositor {
             focus_snapshot: None,
             base_snapshot: None,
             pool: FrameBufferPool::default(),
+            surface_order: Vec::new(),
+            overlay_order: Vec::new(),
+            surface_order_dirty: false,
+            overlay_order_dirty: false,
+            surface_order_computed: false,
+            overlay_order_computed: false,
+            z_order_recomputations: 0,
         }
     }
 
@@ -315,6 +332,13 @@ impl Compositor {
     /// proving repeated styles collapse to a single handle.
     pub const fn last_frame_distinct_styles(&self) -> usize {
         self.pool.last_frame_styles
+    }
+
+    /// Number of times the cached z-ordered surface/overlay lists were
+    /// recomputed. Steady-state frames reuse the cache, so this advances only
+    /// when the surface/overlay set, visibility, or z-order changes.
+    pub const fn z_order_recomputations(&self) -> u64 {
+        self.z_order_recomputations
     }
 
     /// Returns the scratch vectors owned by `diff` to the pool so the next
@@ -413,13 +437,16 @@ impl Compositor {
 
     /// Dirties surfaces whose geometry, visibility, widget binding, or z-index
     /// changed since the last frame (moves reveal the base/underlying layers,
-    /// so both the old and new areas are dirtied).
-    fn diff_surface_snapshots(&self, state: &AppState, dirty: &mut Vec<Rect>) {
+    /// so both the old and new areas are dirtied), and marks the cached
+    /// z-ordered surface list dirty so it is recomputed before composition.
+    fn diff_surface_snapshots(&mut self, state: &AppState, dirty: &mut Vec<Rect>) {
         let surfaces = state.workspace().surfaces();
+        let mut changed = false;
         for (&id, surface) in surfaces {
             match self.surface_snapshot.get(&id) {
                 Some(previous) if *previous == *surface => {}
                 _ => {
+                    changed = true;
                     if let Some(previous) = self.surface_snapshot.get(&id) {
                         dirty.push(previous.area());
                     }
@@ -431,18 +458,23 @@ impl Compositor {
         }
         for (&id, previous) in &self.surface_snapshot {
             if !surfaces.contains_key(&id) {
+                changed = true;
                 dirty.push(previous.area());
             }
         }
+        self.surface_order_dirty |= changed;
     }
 
-    /// Dirties overlays that were shown, hidden, moved, or re-rendered.
-    fn diff_overlay_snapshots(&self, state: &AppState, dirty: &mut Vec<Rect>) {
+    /// Dirties overlays that were shown, hidden, moved, or re-rendered, and
+    /// marks the cached z-ordered overlay list dirty for recomputation.
+    fn diff_overlay_snapshots(&mut self, state: &AppState, dirty: &mut Vec<Rect>) {
         let overlays = state.workspace().overlays();
+        let mut changed = false;
         for (&id, overlay) in overlays {
             match self.overlay_snapshot.get(&id) {
                 Some(previous) if *previous == *overlay => {}
                 _ => {
+                    changed = true;
                     if let Some(previous) = self.overlay_snapshot.get(&id) {
                         dirty.push(previous.area());
                     }
@@ -454,9 +486,11 @@ impl Compositor {
         }
         for (&id, previous) in &self.overlay_snapshot {
             if !overlays.contains_key(&id) {
+                changed = true;
                 dirty.push(previous.area());
             }
         }
+        self.overlay_order_dirty |= changed;
     }
 
     /// Dirties both the previously- and newly-focused surface/overlay when
@@ -501,6 +535,23 @@ impl Compositor {
             self.composed = Some(Scene::new(viewport));
             self.composed_reallocations = self.composed_reallocations.saturating_add(1);
         }
+        // Refresh the cached z-ordered surface/overlay lists once per frame.
+        // They change only when the surface/overlay set, visibility, or z-index
+        // changes (flagged by the snapshot diff in `compute_damage`), so a
+        // steady frame reuses them without re-sorting or re-fetching.
+        if !self.surface_order_computed || self.surface_order_dirty {
+            self.surface_order = z_ordered_surfaces(state);
+            self.surface_order_computed = true;
+            self.surface_order_dirty = false;
+            self.z_order_recomputations = self.z_order_recomputations.saturating_add(1);
+        }
+        if !self.overlay_order_computed || self.overlay_order_dirty {
+            self.overlay_order = z_ordered_overlays(state);
+            self.overlay_order_computed = true;
+            self.overlay_order_dirty = false;
+            self.z_order_recomputations = self.z_order_recomputations.saturating_add(1);
+        }
+
         let composed = self
             .composed
             .as_mut()
@@ -517,7 +568,7 @@ impl Compositor {
         // every other cell from the previous frame).
         composed.clear_layers();
         composed.accumulate_layers(base, viewport);
-        for (_, id) in z_ordered_surfaces(state) {
+        for &(_, id) in &self.surface_order {
             let Some(surface) = state.workspace().surfaces().get(&id) else {
                 continue;
             };
@@ -526,7 +577,7 @@ impl Compositor {
             };
             composed.accumulate_layers(scene, surface.area());
         }
-        for (_, id) in z_ordered_overlays(state) {
+        for &(_, id) in &self.overlay_order {
             let Some(overlay) = state.workspace().overlays().get(&id) else {
                 continue;
             };
@@ -538,13 +589,13 @@ impl Compositor {
             // `blit_cells` clips to each source's own area, so a region that
             // does not overlap a surface/overlay is a natural no-op.
             composed.blit_cells(base, *region);
-            for (_, id) in z_ordered_surfaces(state) {
+            for &(_, id) in &self.surface_order {
                 let Some(scene) = surface_scenes.get(&id) else {
                     continue;
                 };
                 composed.blit_cells(scene, *region);
             }
-            for (_, id) in z_ordered_overlays(state) {
+            for &(_, id) in &self.overlay_order {
                 let Some(overlay) = state.workspace().overlays().get(&id) else {
                     continue;
                 };
@@ -822,30 +873,52 @@ fn build_diff(
         graphics.extend_from_slice(current.image_layers());
     }
     visible_graphics.extend_from_slice(current.image_layers());
-    let current_graphics = current
-        .image_layers()
-        .iter()
-        .map(|image| (image.terminal_image_id(), image))
-        .collect::<BTreeMap<_, _>>();
-    removed_graphics.extend(
-        previous_scene
-            .into_iter()
-            .flat_map(|previous| previous.image_layers())
-            .filter(|image| {
-                current_graphics
-                    .get(&image.terminal_image_id())
-                    .is_none_or(|current| *current != *image)
+    // Keyed-set diffs replace the previous linear/quadratic removal scans: map
+    // the current layer set by a stable key (images by resource + placement
+    // key, placeholders by their full identity) so removal detection is
+    // O(visible) and skipped entirely when the layers are unchanged.
+    if graphics_changed {
+        let current_graphics = current
+            .image_layers()
+            .iter()
+            .map(|image| ((image.resource(), image.placement().key()), image))
+            .collect::<BTreeMap<_, _>>();
+        removed_graphics.extend(
+            previous_scene
+                .into_iter()
+                .flat_map(|previous| previous.image_layers())
+                .filter(|image| {
+                    current_graphics
+                        .get(&(image.resource(), image.placement().key()))
+                        .is_none_or(|current| *current != *image)
+                })
+                .cloned(),
+        );
+        let current_placeholders: HashSet<_> = current
+            .placeholder_layers()
+            .iter()
+            .map(|placeholder| {
+                (
+                    placeholder.resource(),
+                    placeholder.area(),
+                    placeholder.z_index(),
+                )
             })
-            .cloned(),
-    );
-    let current_placeholders = current.placeholder_layers();
-    removed_placeholders.extend(
-        previous_scene
-            .into_iter()
-            .flat_map(|previous| previous.placeholder_layers())
-            .filter(|placeholder| !current_placeholders.contains(placeholder))
-            .copied(),
-    );
+            .collect();
+        removed_placeholders.extend(
+            previous_scene
+                .into_iter()
+                .flat_map(|previous| previous.placeholder_layers())
+                .filter(|placeholder| {
+                    !current_placeholders.contains(&(
+                        placeholder.resource(),
+                        placeholder.area(),
+                        placeholder.z_index(),
+                    ))
+                })
+                .copied(),
+        );
+    }
     if graphics_changed {
         placeholders.extend_from_slice(current.placeholder_layers());
     }
@@ -1610,5 +1683,102 @@ mod tests {
         assert_eq!(diff.spans()[1].cells()[0].style, second_style);
     }
 
+    #[test]
+    fn z_ordered_lists_are_recomputed_only_when_structure_changes() {
+        let (mut state, viewport) = two_surface_state();
+        let base = Scene::new(viewport);
+        let mut compositor = Compositor::new();
 
+        let scenes = |left: &str, right: &str| {
+            let mut left_scene = Scene::new(Rect::new(0, 0, 4, 1));
+            left_scene.text(0, 0, left, terminal_style());
+            let mut right_scene = Scene::new(Rect::new(4, 0, 4, 1));
+            right_scene.text(4, 0, right, terminal_style());
+            BTreeMap::from([
+                (SurfaceId::new(1), left_scene),
+                (SurfaceId::new(2), right_scene),
+            ])
+        };
+
+        compositor.compose_and_diff(viewport, &state, &base, &scenes("AAAA", "BBBB"), &[]);
+        let after_first = compositor.z_order_recomputations();
+        assert!(
+            after_first > 0,
+            "the first frame must populate the cached z-ordered lists"
+        );
+
+        for _ in 0..5 {
+            compositor.compose_and_diff(viewport, &state, &base, &scenes("AAAA", "BBBB"), &[]);
+        }
+        assert_eq!(
+            compositor.z_order_recomputations(),
+            after_first,
+            "steady-state frames must reuse the cached z-ordered lists"
+        );
+
+        // Moving a surface changes the layout and forces a recompute.
+        state
+            .dispatch(Command::Surface(SurfaceCommand::SetArea {
+                id: SurfaceId::new(1),
+                area: Rect::new(0, 1, 2, 1),
+            }))
+            .unwrap();
+        let mut moved = Scene::new(Rect::new(0, 1, 2, 1));
+        moved.text(0, 1, "AA", terminal_style());
+        let mut right = Scene::new(Rect::new(4, 0, 4, 1));
+        right.text(4, 0, "BBBB", terminal_style());
+        let scenes = BTreeMap::from([
+            (SurfaceId::new(1), moved),
+            (SurfaceId::new(2), right),
+        ]);
+        compositor.compose_and_diff(viewport, &state, &base, &scenes, &[]);
+        assert!(
+            compositor.z_order_recomputations() > after_first,
+            "a surface geometry change must recompute the cached list"
+        );
+    }
+
+    #[test]
+    fn keyed_graphics_diff_removes_only_the_absent_placement() {
+        let mut store = crate::SessionGraphicsStore::new(crate::SessionId::new(1));
+        store.apply_kitty_command(b"a=T,f=24,i=1", b"AQID").unwrap();
+        store.apply_kitty_command(b"a=p,i=1,x=0,y=0", b"").unwrap();
+        store.apply_kitty_command(b"a=p,i=1,x=2,y=0", b"").unwrap();
+
+        let area = Rect::new(0, 0, 4, 2);
+        let submissions = store.visible_submissions(area);
+        assert!(
+            submissions.len() >= 2,
+            "expected multiple placements of the same image, got {}",
+            submissions.len()
+        );
+
+        let mut first_scene = Scene::new(area);
+        for submission in &submissions {
+            first_scene.add_image_layer(submission.clone());
+        }
+        let mut compositor = Compositor::new();
+        compositor.diff(&first_scene);
+
+        // Keep every placement except the last; the absent one (and only it)
+        // must be reported as removed. The old image-id-only key would collapse
+        // the shared image id and falsely remove the other kept placements.
+        let removed_key = submissions.last().expect("submissions are non-empty").placement().key();
+        let mut second_scene = Scene::new(area);
+        for submission in &submissions[..submissions.len() - 1] {
+            second_scene.add_image_layer(submission.clone());
+        }
+        let diff = compositor.diff(&second_scene);
+
+        let removed_keys: Vec<_> = diff
+            .removed_graphics()
+            .iter()
+            .map(|submission| submission.placement().key())
+            .collect();
+        assert_eq!(
+            removed_keys,
+            vec![removed_key],
+            "exactly the absent placement is removed"
+        );
+    }
 }

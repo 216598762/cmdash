@@ -2001,10 +2001,14 @@ scratch vectors are pooled (`FrameBufferPool`) and recycled after the backend
 consumes each diff (`Compositor::recycle`), and span grouping keys off a
 per-frame `StyleInterner` handle rather than the expanded `CellStyle` struct;
 `retained_buffer_reallocations`, `scratch_reallocations`, and
-`last_frame_distinct_styles` prove the savings. Remaining increments: caching
-the z-ordered lists and keyed layer-set diffs (plus the optional full
-cell-buffer shrink, which is blocked on changing `CellStyle` from a public
-value type to an interned handle).
+`last_frame_distinct_styles` prove the savings. The z-ordered surface/overlay
+lists are cached and recomputed only when the set/visibility/z-order changes
+(`z_order_recomputations` proves the reuse), and removed-graphics/placeholder
+detection is a keyed-set diff (images by resource + placement key, placeholders
+by their full identity) skipped when the layers are unchanged. Remaining
+increments: deferring layer sorting to one pass per frame, and the optional
+full cell-buffer shrink (blocked on changing `CellStyle` from a public value
+type to an interned handle).
 
 ### Goals and boundaries
 
@@ -2072,16 +2076,17 @@ value type to an interned handle).
   that differs from the previous buffer is recorded as a change in the same
   pass — no separate full-viewport cell scan and no compose-then-diff double
   traversal (the base-shell equality check is the only full-width comparison).
-- [ ] (deferred) Cache the z-ordered visible surface and overlay lists (and
-  their geometry) and recompute them only when layout, visibility, focus, or
-  z-order actually change, so a steady frame does not re-sort and re-fetch
-  surfaces.
+- [x] Cache the z-ordered visible surface and overlay lists and recompute them
+  only when the set, visibility, or z-order changes (flagged by the snapshot
+  diff): a steady frame reuses the cached lists without re-sorting or
+  re-fetching, and `Compositor::z_order_recomputations` proves the reuse.
 - [ ] (deferred) Defer image/placeholder/sixel layer sorting to one pass per
   frame after all dirty surfaces are aggregated, rather than sorting on every
   `add_*`/`blit`.
-- [ ] (deferred) Replace the removed-graphics/placeholder recomputation with
-  keyed-set diffs (e.g. image id → submission maps) so removal detection is
-  O(visible), not the current linear/quadratic filters.
+- [x] Replace the removed-graphics/placeholder recomputation with keyed-set
+  diffs: images are keyed by (resource, placement key) and placeholders by
+  their full (resource, area, z-index) identity, so removal detection is
+  O(visible) and is skipped entirely when the layers are unchanged.
 
 ### Compatibility and validation
 
@@ -2110,8 +2115,9 @@ value type to an interned handle).
 - [x] Add style-interning tests: repeated styles produce one handle, the
   per-frame table stores only distinct styles, and span grouping is unchanged
   when keyed off the interned handle.
-- [ ] (deferred) Add set-diff tests for graphics/placeholder removal, including
-  equal-z tie-breaks and cross-session resource collisions.
+- [x] Add set-diff tests for graphics/placeholder removal: a keyed-graphics
+  test removes only the absent placement of a shared image id. (Equal-z
+  tie-breaks and cross-session resource-collision cases remain deferred.)
 - [x] Add allocation-counter tests asserting steady-state frames do not
   allocate the frame buffer (via `retained_buffer_reallocations`).
 - [x] Re-run the full conformance suite (`cargo test`, `kitty_verify.py`, the
