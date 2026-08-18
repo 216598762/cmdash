@@ -1,9 +1,19 @@
 # Widgets
 
 Widgets are cmdash's composable units of behavior and rendering. A workspace is
-made from widget instances placed into a layout tree. A widget may be a passive
-dashboard display, an interactive control, or a terminal session; terminal
-sessions are not required for a dashboard to run.
+made from widget instances placed into a layout tree. Every dashboard item is
+exactly one of two types: a `terminal` (a live PTY session) or a `widget` (a
+shell script whose stdout renders into the surface).
+
+A `widget` is a script run directly by the dashboard, not a compiled plugin:
+the configured `command` is spawned through `/bin/sh -c`, its stdout feeds a
+bounded output ring rendered into the surface, its stderr becomes a bounded
+diagnostic, and its lifecycle (spawn, read, restart, reap, kill) is owned by
+the widget. Script output wakes the same coalescing `SessionWakeup` as terminal
+PTY readers, so widgets coexist with active sessions on one frame loop. The
+former compiled data widgets (`text`, `clock`, `system`, `status`, `key_value`,
+`gauge`, `list`, `log`, `sparkline`, `separator`, `spacer`) have been removed;
+existing configurations migrate them to equivalent `widget` scripts on load.
 
 This page documents the widget contract and runtime behavior. For the complete
 TOML schema and configuration discovery rules, see

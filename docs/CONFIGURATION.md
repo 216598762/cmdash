@@ -162,11 +162,19 @@ padding = "1"
 border = "rounded"
 ```
 
-Every widget needs a unique numeric `id` and a non-empty `type`. Built-in types
-are `text`, `clock`, `system`, `status`, `key_value`, `gauge`, `list`, `log`,
-`sparkline`, `separator`, `spacer`, and `terminal`.
+Every widget needs a unique numeric `id` and a non-empty `type`. There are
+exactly two built-in types: `terminal` and `widget`.
 
-- `title`, `text`, `format`, and `command` are optional type-specific fields.
+- A `terminal` owns a live PTY session (shell, emulator, selection, graphics).
+- A `widget` is a shell script spawned directly; its stdout renders into the
+  surface. `command` is required, and stderr becomes a bounded diagnostic.
+- The former data-widget types (`text`, `clock`, `system`, `status`,
+  `key_value`, `gauge`, `list`, `log`, `sparkline`, `separator`, `spacer`) are
+  removed; on load they migrate to `type = "widget"` with an equivalent
+  command and an actionable warning.
+
+- `title` and `command` are optional type-specific fields (`command` is
+  required for `widget`).
 - `label` accepts `auto`, `always`, or `never`; it controls whether the title is
   drawn in the widget border.
 - `settings` is a stable string-to-string map reserved for widget options.
@@ -175,17 +183,24 @@ are `text`, `clock`, `system`, `status`, `key_value`, `gauge`, `list`, `log`,
   `none`; `border_style` is an alias.
 - `settings.border_color` and semantic role names such as `foreground`,
   `background`, `focus`, and `muted` accept `inherit`, `ansi:N`, or `#RRGGBB`.
-- `clock.format` accepts `HH:MM` or `HH:MM:SS`.
-- `status.state` accepts `success`, `warning`, `error`, or `neutral` (plus
-  aliases such as `ok`, `warn`, `err`, and `critical`).
-- `key_value` uses `settings.key` (or the widget `title`) for the label and
-  `text` for the value.
-- `gauge.value` accepts an integer between `0` and `100`.
-- `list` and `log` split `text` on newlines into rows; `log` honors an optional
-  `[error]`/`[warning]`/`[success]`/`[info]` prefix for per-line severity.
-- `sparkline` takes `settings.values` (or `text`) as comma-separated integers;
-  `settings.max_points` (default `64`) bounds the series.
-- `separator` centers an optional `text` label in a horizontal rule.
+- Widget `settings` (all string-valued):
+  - `mode`: `stream` (default) runs once and keeps reading stdout; `interval`
+    runs to EOF and re-runs every `interval_ms`.
+  - `interval_ms`: re-run cadence for `interval` mode (default `1000`, bounded
+    `100..=60000`).
+  - `render`: `text` (default); `parse_tags` (`true`/`false`) styles each line
+    by its `[error]`/`[warning]`/`[success]`/`[info]` prefix.
+  - `max_lines` (default `1024`) and `max_bytes` (default `65536`) bound the
+    output ring; overflow drops the oldest lines and records a diagnostic.
+  - `restart` (`true` default) restarts an exited script with bounded
+    exponential backoff; repeated immediate exits escalate to `Failed` health.
+  - `handles_input` (`false` default) forwards focused keys to the script's
+    stdin.
+  - `session_env` (`true` default) exposes `CMDASH_WIDGET_ID`,
+    `CMDASH_WIDGET_TITLE`, `CMDASH_SURFACE_COLUMNS`, and `CMDASH_SURFACE_ROWS`
+    at spawn.
+  - `session_events`: `off` (default), `text`, or `json` (parsed/validated;
+    fd-3 delivery is a follow-up increment).
 - A terminal widget owns its PTY, emulator, selection, graphics resources, and
   shutdown lifecycle.
 - `settings.scrollbar` and `settings.scroll_indicator` accept `true` or `false`

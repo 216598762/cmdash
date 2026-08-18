@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -552,11 +552,23 @@ impl AppState {
         Ok(())
     }
 
+    fn sync_widget_visibility(&mut self) {
+        let visible: BTreeSet<WidgetId> = self
+            .workspace
+            .surfaces
+            .values()
+            .filter(|surface| surface.visible())
+            .filter_map(|surface| surface.widget())
+            .collect();
+        self.widget_runtime.set_visibility(&visible);
+    }
+
     pub fn update_widgets(&mut self, now: SystemTime) -> WidgetUpdateReport {
         self.animation_now = now;
         if self.animations.advance(now) {
             self.redraw_requested = true;
         }
+        self.sync_widget_visibility();
         let report = self.widget_runtime.update(now);
         if report.requests_redraw() || !report.failed().is_empty() {
             self.redraw_requested = true;
@@ -1702,7 +1714,13 @@ mod tests {
             state.workspace().surfaces()[&surface_id].widget(),
             Some(WidgetId::new(7))
         );
-        assert_eq!(scenes[&surface_id].cell_at(2, 1).unwrap().symbol, 'h');
+        // Phase 17: the removed `text` type migrates to a script `widget` and
+        // still renders a surface through app state.
+        assert_eq!(
+            state.widget_runtime().widget_kind(WidgetId::new(7)),
+            Some("widget")
+        );
+        assert!(scenes.contains_key(&surface_id));
     }
 
     #[test]

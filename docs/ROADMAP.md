@@ -1569,34 +1569,46 @@ active terminal session: widget output wakes the same coordinator loop as PTY
 output, hidden widgets behave like hidden terminals, and scripts may opt into
 bounded session context and events.
 
+### Implementation status (core landed)
+
+The two-type model, the script process runtime, the wakeup integration, the
+configuration migration, and the data-widget removal are implemented and
+tested (`src/script.rs`, `src/config.rs`, `src/widget.rs`, `src/state.rs`).
+The one intentionally deferred piece is the coordinator-owned session-event
+bus and its fd-3 delivery (`session_events`): the setting is parsed and
+validated, but the pipe and the focus/title/line/exit publisher are the next
+increment. `session_env` currently exposes widget identity and surface size;
+the session-context snapshot is the same increment.
+
 ### Goals and boundaries
 
-- [ ] Collapse the dashboard item model to exactly two types: `terminal` and
+- [x] Collapse the dashboard item model to exactly two types: `terminal` and
   `widget`. `terminal` keeps its current session/PTY/emulator/graphics
   contract unchanged.
-- [ ] Make the `widget` type a first-class script runner: the configured
+- [x] Make the `widget` type a first-class script runner: the configured
   `command` is spawned as a child process, stdout renders into the surface,
   stderr feeds bounded diagnostics, and the process lifecycle (spawn, read,
   restart, reap, kill) is owned by the widget.
-- [ ] Keep the widget runtime on the shared event/wakeup path: script output
+- [x] Keep the widget runtime on the shared event/wakeup path: script output
   notifies the same coalescing `SessionWakeup` used by terminal PTY readers,
   so widgets never require their own polling timers and never block or starve
   the frame loop while terminals stream.
 - [ ] Give scripts bounded, opt-in session integration: read-only session
   context as environment variables at spawn, and an event pipe (fd 3)
   delivering bounded terminal-session events (line output, focus changes,
-  title changes, exit).
-- [ ] Remove the internal data-widget implementations and migrate existing
+  title changes, exit). (`session_env` identity/surface vars are in; the
+  context snapshot and fd-3 pipe are the deferred increment.)
+- [x] Remove the internal data-widget implementations and migrate existing
   configurations: every removed type rewrites to `type = "widget"` with an
   equivalent shell command, preserving titles, labels, and appearance
   settings where possible.
-- [ ] Ship the widget catalog as example scripts (`config/widgets/*.sh` and
+- [x] Ship the widget catalog as example scripts (`config/widgets/*.sh` and
   `examples/widgets/`) instead of compiled code, so the old catalog remains
   reachable as editable, documented scripts.
-- [ ] Supersede the plugin/WASM widget path: dashboard items are scripts or
+- [x] Supersede the plugin/WASM widget path: dashboard items are scripts or
   terminals; the Wasmtime host stays compile-gated and dormant, reserved for
   future host-function ABI work and no longer advertised as a widget path.
-- [ ] Keep every execution bounded: output ring size, line count, event queue
+- [x] Keep every execution bounded: output ring size, line count, event queue
   depth, restart count/backoff, and process lifetime all have explicit limits
   with visible diagnostics on violation.
 

@@ -1185,7 +1185,7 @@ mod tests {
         let snapshot = ApiSnapshot::from_state(&state, &scene, OutputMetrics::default(), 7, false);
         assert_eq!(snapshot.generation, 7);
         assert_eq!(snapshot.frame.cells.len(), 2);
-        assert_eq!(snapshot.widgets[0].kind, "text");
+        assert_eq!(snapshot.widgets[0].kind, "widget");
         assert!(snapshot.frame.graphics.is_empty());
     }
 

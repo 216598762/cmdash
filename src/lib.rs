@@ -15,6 +15,7 @@ pub mod notification;
 pub mod plugin;
 pub mod reload;
 pub mod scene;
+pub mod script;
 pub mod session;
 #[cfg(feature = "sixel")]
 pub mod sixel;

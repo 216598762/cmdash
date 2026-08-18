@@ -150,7 +150,7 @@ pub struct SessionWakeup {
 }
 
 impl SessionWakeup {
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         if !self.pending.swap(true, Ordering::AcqRel) {
             let _ = self.sender.send(UiEvent::PtyOutput);
         }

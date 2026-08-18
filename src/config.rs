@@ -178,6 +178,7 @@ pub struct LoadedConfig {
 pub enum ConfigMigration {
     AddedVersion,
     LegacyVersion { from: u32, to: u32 },
+    WidgetTypeRewritten { kind: String, id: u64 },
 }
 
 impl ConfigMigration {
@@ -187,8 +188,160 @@ impl ConfigMigration {
             Self::LegacyVersion { from, to } => {
                 format!("configuration version {from} migrated to version {to}")
             }
+            Self::WidgetTypeRewritten { kind, id } => {
+                format!("widget {id} type {kind:?} migrated to \"widget\" (shell script)")
+            }
         }
     }
+}
+
+/// The dashboard item types that were removed in Phase 17 and now migrate to
+/// script-driven `widget` items.
+pub const REMOVED_WIDGET_KINDS: &[&str] = &[
+    "text", "clock", "system", "status", "key_value", "gauge", "list", "log", "sparkline",
+    "separator", "spacer",
+];
+
+/// Single-quote escapes `value` so it can be embedded in a shell command.
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Rewrites a removed data-widget type into an equivalent script-driven
+/// `widget` in place, returning the migration record when a rewrite happened.
+fn migrate_widget_config(widget: &mut WidgetInstanceConfig) -> Option<ConfigMigration> {
+    if !REMOVED_WIDGET_KINDS.contains(&widget.kind.as_str()) {
+        return None;
+    }
+    let old_kind = widget.kind.clone();
+    let text = widget.text.as_deref().unwrap_or_default();
+    let (command, mode, parse_tags) = match old_kind.as_str() {
+        "text" => (format!("printf {}", sh_quote(text)), None, false),
+        "clock" => {
+            let spec = match widget.format.as_deref() {
+                Some("HH:MM") => "+%H:%M",
+                _ => "+%H:%M:%S",
+            };
+            (format!("date {}", sh_quote(spec)), Some("interval"), false)
+        }
+        "system" => ("uname -sm".to_owned(), Some("interval"), false),
+        "status" => {
+            let tag = match widget.settings.get("state").map(String::as_str) {
+                Some("success" | "ok" | "healthy" | "up" | "green" | "passing") => "[ok]",
+                Some("warning" | "warn" | "degraded" | "yellow") => "[warn]",
+                Some("error" | "err" | "failed" | "failure" | "down" | "red" | "critical") => "[err]",
+                _ => "",
+            };
+            (format!("printf {}", sh_quote(&format!("{tag}{text}"))), None, true)
+        }
+        "key_value" => {
+            let key = widget.settings.get("key").cloned().unwrap_or_default();
+            (format!("printf {}", sh_quote(&format!("{key}: {text}"))), None, false)
+        }
+        "gauge" => {
+            let value = widget
+                .settings
+                .get("value")
+                .cloned()
+                .unwrap_or_else(|| "0".to_owned());
+            (format!("printf {}", sh_quote(&format!("{value}%"))), None, false)
+        }
+        "list" => (format!("printf {}", sh_quote(&format!("{text}\n"))), None, false),
+        "log" => (format!("printf {}", sh_quote(&format!("{text}\n"))), None, true),
+        "sparkline" => {
+            let values = widget
+                .settings
+                .get("values")
+                .cloned()
+                .unwrap_or_else(|| text.to_owned());
+            (format!("printf {}", sh_quote(&values)), None, false)
+        }
+        "separator" => ("printf '────────'".to_owned(), None, false),
+        "spacer" => ("printf ''".to_owned(), None, false),
+        _ => return None,
+    };
+    widget.kind = "widget".to_owned();
+    widget.command = Some(command);
+    widget.text = None;
+    widget.format = None;
+    if let Some(mode) = mode {
+        widget
+            .settings
+            .entry("mode".to_owned())
+            .or_insert_with(|| mode.to_owned());
+        widget
+            .settings
+            .entry("interval_ms".to_owned())
+            .or_insert_with(|| "1000".to_owned());
+    }
+    if parse_tags {
+        widget
+            .settings
+            .insert("parse_tags".to_owned(), "true".to_owned());
+    }
+    Some(ConfigMigration::WidgetTypeRewritten {
+        kind: old_kind,
+        id: widget.id,
+    })
+}
+
+/// Rewrites a removed data-widget table in the raw TOML source so that
+/// `--migrate-config` persists the same change the typed migration applies.
+fn migrate_widget_value(widget: &mut toml::Table) {
+    let Some(kind) = widget.get("type").and_then(|v| v.as_str()).map(str::to_owned) else {
+        return;
+    };
+    if !REMOVED_WIDGET_KINDS.contains(&kind.as_str()) {
+        return;
+    }
+    let text = widget
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let format = widget
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let settings: BTreeMap<String, String> = widget
+        .get("settings")
+        .and_then(|v| v.as_table())
+        .map(|table| {
+            table
+                .iter()
+                .filter_map(|(key, value)| value.as_str().map(|s| (key.clone(), s.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut migrated = WidgetInstanceConfig {
+        id: widget.get("id").and_then(|v| v.as_integer()).unwrap_or(0) as u64,
+        kind,
+        title: widget.get("title").and_then(|v| v.as_str()).map(str::to_owned),
+        label: LabelPolicy::Auto,
+        text: (!text.is_empty()).then_some(text),
+        format: (!format.is_empty()).then_some(format),
+        command: widget.get("command").and_then(|v| v.as_str()).map(str::to_owned),
+        settings,
+    };
+    if migrate_widget_config(&mut migrated).is_none() {
+        return;
+    }
+    widget.insert("type".to_owned(), toml::Value::String(migrated.kind));
+    widget.insert(
+        "command".to_owned(),
+        toml::Value::String(migrated.command.unwrap_or_default()),
+    );
+    widget.remove("text");
+    widget.remove("format");
+    let mut settings_table = toml::Table::new();
+    for (key, value) in &migrated.settings {
+        settings_table.insert(key.clone(), toml::Value::String(value.clone()));
+    }
+    widget.insert(
+        "settings".to_owned(),
+        toml::Value::Table(settings_table),
+    );
 }
 
 impl AppConfig {
@@ -217,7 +370,7 @@ impl AppConfig {
             keybindings: BTreeMap<String, String>,
         }
 
-        let raw: RawAppConfig =
+        let mut raw: RawAppConfig =
             toml::from_str(source).map_err(|error| ConfigError::Parse(error.to_string()))?;
         let (source_version, migration) = match raw.version {
             None => (CURRENT_CONFIG_VERSION, Some(ConfigMigration::AddedVersion)),
@@ -233,6 +386,12 @@ impl AppConfig {
         if source_version != CURRENT_CONFIG_VERSION {
             return Err(ConfigError::UnsupportedVersion(source_version));
         }
+        let mut migrations: Vec<ConfigMigration> = migration.into_iter().collect();
+        for widget in &mut raw.workspace.widgets {
+            if let Some(rewritten) = migrate_widget_config(widget) {
+                migrations.push(rewritten);
+            }
+        }
         let config = Self {
             version: CURRENT_CONFIG_VERSION,
             workspace: raw.workspace,
@@ -243,7 +402,7 @@ impl AppConfig {
             keybindings: raw.keybindings,
         };
         config.validate()?;
-        Ok((config, migration.into_iter().collect()))
+        Ok((config, migrations))
     }
 
     pub fn load_file(path: impl AsRef<Path>) -> Result<Self, ConfigFileError> {
@@ -275,6 +434,15 @@ impl AppConfig {
                 "version".to_owned(),
                 toml::Value::Integer(i64::from(CURRENT_CONFIG_VERSION)),
             );
+            if let Some(workspace) = table.get_mut("workspace").and_then(|w| w.as_table_mut())
+                && let Some(widgets) = workspace.get_mut("widgets").and_then(|w| w.as_array_mut())
+            {
+                for entry in widgets {
+                    if let Some(widget) = entry.as_table_mut() {
+                        migrate_widget_value(widget);
+                    }
+                }
+            }
         }
         Ok((value.to_string(), migrations))
     }
@@ -338,6 +506,14 @@ impl AppConfig {
             let id = WidgetId::new(widget.id);
             if !ids.insert(id) {
                 return Err(ConfigError::DuplicateWidgetId(id));
+            }
+            if widget.kind == "widget"
+                && widget
+                    .command
+                    .as_deref()
+                    .is_none_or(|command| command.trim().is_empty())
+            {
+                return Err(ConfigError::WidgetRequiresCommand(id));
             }
         }
 
@@ -585,6 +761,8 @@ pub enum ConfigError {
     EmptyWorkspaceName,
     #[error("widget type cannot be empty")]
     EmptyWidgetType,
+    #[error("widget {} requires a command (the shell script to run)", .0.get())]
+    WidgetRequiresCommand(WidgetId),
     #[error("duplicate widget id {}", .0.get())]
     DuplicateWidgetId(WidgetId),
     #[error("duplicate overlay id {}", .0.get())]
@@ -639,7 +817,12 @@ mod tests {
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
         assert_eq!(config.workspace.name, "monitor");
         assert_eq!(config.workspace.widgets[0].id, 7);
-        assert_eq!(config.workspace.widgets[0].kind, "text");
+        // Phase 17: the removed `text` type migrates to a script `widget`.
+        assert_eq!(config.workspace.widgets[0].kind, "widget");
+        assert_eq!(
+            config.workspace.widgets[0].command.as_deref(),
+            Some("printf 'world'")
+        );
         assert_eq!(config.workspace.widgets[0].label, LabelPolicy::Never);
     }
 
@@ -800,6 +983,70 @@ mod tests {
         let (_, legacy) = AppConfig::parse_with_migrations("version = 0\n").unwrap();
         assert_eq!(legacy, [ConfigMigration::LegacyVersion { from: 0, to: 1 }]);
         assert!(missing[0].warning().contains("assumed"));
+    }
+
+    #[test]
+    fn removed_widget_types_migrate_to_script_widgets() {
+        let (config, migrations) = AppConfig::parse_with_migrations(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "text"
+            text = "hello"
+            [[workspace.widgets]]
+            id = 2
+            type = "clock"
+            format = "HH:MM"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.workspace.widgets[0].kind, "widget");
+        assert_eq!(
+            config.workspace.widgets[0].command.as_deref(),
+            Some("printf 'hello'")
+        );
+        assert_eq!(config.workspace.widgets[1].kind, "widget");
+        assert_eq!(
+            config.workspace.widgets[1].command.as_deref(),
+            Some("date '+%H:%M'")
+        );
+        assert_eq!(
+            config.workspace.widgets[1].settings.get("mode").map(String::as_str),
+            Some("interval")
+        );
+        assert_eq!(migrations.len(), 2);
+        assert!(migrations[0].warning().contains("migrated"));
+    }
+
+    #[test]
+    fn widget_type_requires_a_command() {
+        let error = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "widget"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigError::WidgetRequiresCommand(_)));
+    }
+
+    #[test]
+    fn migrate_source_rewrites_widget_types_in_the_toml() {
+        let source = r#"
+version = 1
+[[workspace.widgets]]
+id = 3
+type = "text"
+text = "world"
+"#;
+        let (rewritten, migrations) = AppConfig::migrate_source(source).unwrap();
+        assert_eq!(migrations.len(), 1);
+        assert!(rewritten.contains("type = \"widget\""));
+        assert!(rewritten.contains("command = \"printf 'world'\""));
+        assert!(!rewritten.contains("type = \"text\""));
     }
 
     #[test]

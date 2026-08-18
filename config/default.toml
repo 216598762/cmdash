@@ -1,5 +1,9 @@
 # cmdash default configuration (schema version 1)
 # Copy this file to ~/.config/cmdash/config.toml and customize it.
+#
+# Every dashboard item is one of two types:
+#   terminal - a live PTY session (as before)
+#   widget   - a shell script whose stdout renders into the surface
 version = 1
 
 [workspace]
@@ -16,22 +20,33 @@ enabled = false
 [api]
 enabled = false
 
+# A widget is a shell script run directly by the dashboard. `command` is
+# required; stdout renders into the surface and stderr becomes a diagnostic.
 [[workspace.widgets]]
 id = 1
-type = "text"
-title = " workspace "
-text = "Dashboard widgets are configuration-driven."
+type = "widget"
+title = " clock "
+command = "date +%H:%M:%S"
+
+[workspace.widgets.settings]
+mode = "interval"
+interval_ms = "1000"
 
 [[workspace.widgets]]
 id = 2
-type = "clock"
-title = " clock "
-format = "HH:MM:SS"
+type = "widget"
+title = " system "
+command = "uname -sm"
+
+[workspace.widgets.settings]
+mode = "interval"
+interval_ms = "60000"
 
 [[workspace.widgets]]
 id = 3
-type = "system"
-title = " system "
+type = "terminal"
+title = " shell "
+command = "/bin/sh"
 
 [[workspace.overlays]]
 id = 9
@@ -41,7 +56,7 @@ width = 30
 height = 4
 z_index = 10
 title = " notice "
-text = "Phase 2 widget host"
+text = "Script-driven widgets"
 
 [workspace.layout]
 type = "stack"
