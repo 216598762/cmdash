@@ -744,7 +744,9 @@ protocols whose capability semantics have not yet been verified.
 
 ### Workstream 8 — Virtualized image buffer and mutation-driven emission
 
-**Status:** planned. Today images are an *observation layer* over the emulator
+**Status:** in progress — increment 1 (object model, identity registry,
+command vocabulary, scroll mutation) landed; not yet wired into
+`SessionGraphicsStore`/backends. Today images are an *observation layer* over the emulator
 grid: each placement carries a `GraphicsGridAnchor` (column, row, captured
 scrollback depth, screen, scroll region, region scroll) and is re-resolved
 against current scrollback/view state at render time, then the backend diffs
@@ -757,6 +759,30 @@ that owns text rows *and* image objects together, and emits an explicit,
 ordered, coalesced command stream (move / delete / upload) as the buffer
 mutates — the same mutation-driven model a real graphical terminal uses for
 its own `grman`.
+
+**Increment 2 (landed):** the object model and command vocabulary are complete
+without yet touching the graphics store. `VirtualBuffer` owns ordered
+`VirtualRow`s + attached `ImageObject`s; `ImagePlacement` carries the child
+`p=` placement id, the stable outer `p=`, cell offsets, and relative/virtual
+parent links; `GraphicsCommand` is `Upload`/`Place`/`Delete` (scoped or
+whole-object). `ImageIdentityRegistry` resolves client `i=`, `I=` numbers
+(newest-surviving wins), and `P`/`Q` parent references (`object_for_parent`).
+Mutations: `add_object`/`attach_placement` (create), `register_upload`
+(transmit-only), `delete_object`/`delete_placement` (whole vs scoped delete),
+`scroll` (up), `insert_lines` (down), `evict_beyond` (limit eviction), and
+`drain_commands` (idempotent coalescing — delete supersedes place/upload,
+multiple places collapse to the last, uploads preserved). Twelve unit tests
+cover attachment, scroll move/delete, past-limit eviction, identity/parent
+resolution, scoped vs object deletes, insert-lines, re-upload, and burst
+coalescing. The ratatui-image decision is documented below.
+
+**Remaining increments:** wire `VirtualBuffer` into `SessionGraphicsStore`
+(replace the flat `placements` map + `GraphicsGridAnchor` re-resolution — the
+anchor model must first be generalized to an absolute, growable row space so
+history rows and DECSTBM regions map cleanly), map insert/delete-line, erase
+scopes, reflow, and alternate-screen mutations to commands, and feed the
+drained command stream through the existing direct/placeholder/passthrough
+adapters.
 
 ### Goals and boundaries
 
@@ -791,17 +817,19 @@ its own `grman`.
 
 ### Virtual buffer object model
 
-- [ ] Define `VirtualRow` as the union of a text line (borrowed from the
+- [x] Define `VirtualRow` as the union of a text line (borrowed from the
   emulator grid) and attached image objects; define `ImageObject` as a
   resource (decoded payload, format, generation) plus its placements (each
   with a stable outer `p=` id, source crop, z-index, cell offsets, and
   relative/virtual parent links).
-- [ ] Own the mapping from child image id / number / parent to
+- [x] Own the mapping from child image id / number / parent to
   `ImageObject` in the identity registry, and the mapping from object to
   outer-terminal resource id + generation in the adapter boundary, so a
   single identity is unambiguous across child, virtual buffer, and outer
-  terminal.
-- [ ] Attach every placement to an owning `VirtualRow`; a placement that
+  terminal. *(The `ImageIdentityRegistry` now resolves client `i=`, `I=`
+  numbers, and `P`/`Q` parent references — `object_for_parent` — and
+  `ImageResource` carries the outer resource id + generation.)*
+- [x] Attach every placement to an owning `VirtualRow`; a placement that
   spans multiple rows attaches to its start row and records its cell size,
   exactly like Kitty's `start_row`-anchored `grman` placements.
 
@@ -834,10 +862,12 @@ Define an explicit table from each buffer mutation to its command stream:
 
 ### Command coalescing and adapter integration
 
-- [ ] Add a per-session command queue that coalesces mutation bursts into one
+- [x] Add a per-session command queue that coalesces mutation bursts into one
   frame's command set: each affected `ImageObject` emits at most one
-  move/delete/upload, ordered by row, deduplicated, and idempotent, and the
-  queue is drained by the backend in submission order.
+  move/delete/upload, ordered by first appearance, deduplicated, and
+  idempotent, and the queue is drained by the backend in submission order.
+  *(Row-ordering, rather than first-seen ordering, is deferred to the
+  adapter-integration increment.)*
 - [ ] Replace the render-time `submit_graphics(changed, visible, removed)`
   diff with the mutation-produced command queue as the source of truth for
   the outer terminal, while keeping the frame diff for *visibility* (which
@@ -850,7 +880,7 @@ Define an explicit table from each buffer mutation to its command stream:
 
 ### ratatui-image evaluation (documented decision)
 
-- [ ] Record in the roadmap/architecture why `ratatui-image` is **not**
+- [x] Record in the roadmap/architecture why `ratatui-image` is **not**
   adopted for the core re-emission path: it is a *client-side* renderer for
   ratatui apps — it queries the terminal for protocol support and font size,
   transforms image data into protocol payloads (Sixel/Kitty/iTerm2), and
@@ -859,13 +889,13 @@ Define an explicit table from each buffer mutation to its command stream:
   as a middleman re-emitting a child's images to an outer terminal; the data
   direction is inverted for a multiplexer, so adopting it would mean
   re-architecting around a role it does not play.
-- [ ] Note that the stateful patterns ratatui-image encapsulates — upload-
+- [x] Note that the stateful patterns ratatui-image encapsulates — upload-
   once/re-place with a cache, stable placement ids, delete-on-remove,
   Unicode-placeholder cells — are already implemented in cmdash's
   `SessionGraphicsStore` + backend adapters (generations, `outer_placement_ids`,
   ack-gated GC, placeholder adapter), so the crate adds no missing capability
   for child-derived images.
-- [ ] Keep ratatui-image (or its patterns) as a candidate only for a future
+- [x] Keep ratatui-image (or its patterns) as a candidate only for a future
   *dashboard-owned* image path (cmdash rendering its own images to the outer
   terminal, e.g. a script-widget image output), where the client-side
   direction is correct; even there the existing adapters already cover the
@@ -881,7 +911,7 @@ Define an explicit table from each buffer mutation to its command stream:
   lines, `ED 2`, `ED 3`, RIS, alternate-screen switch, reflow), asserting
   exactly-one move per affected object, correct ordering, idempotency, and
   no ghost deletes.
-- [ ] Add coalescing tests: a burst of mutations collapses to one frame's
+- [x] Add coalescing tests: a burst of mutations collapses to one frame's
   command set with no duplicate or conflicting commands.
 - [ ] Extend `tests/kitty_verify.py` to replay the mutation-produced command
   stream against real Kitty and assert placement positions/deletion through

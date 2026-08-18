@@ -365,6 +365,31 @@ surface clipping. Full-screen primary placements follow scrollback; partial-regi
 placements follow only matching region displacement, while alternate-screen
 placements remain isolated.
 
+### 5.3 Virtualized image buffer (Workstream 8)
+
+`src/virtual_buffer.rs` models images as first-class citizens of a per-session
+**virtual buffer** that owns text rows and image objects together. `VirtualBuffer`
+holds ordered `VirtualRow`s (each with the set of attached image objects),
+`ImageObject` (a resource plus its placements), and an `ImageIdentityRegistry`
+that owns the child's `i=`/`I=`/`P`/`Q` identities. Buffer mutations — create,
+delete, scroll, insert-lines, and limit eviction — produce a coalesced
+`GraphicsCommand` stream (`Upload`/`Place`/`Delete`) that backend adapters
+serialize, so the outer terminal's placement state is *mutation-driven* rather
+than render-diff-driven. As of this increment the model and command vocabulary
+are complete and unit-tested; wiring it into `SessionGraphicsStore` (which still
+uses the anchor + render-diff model) is the remaining integration step.
+
+**ratatui-image decision:** `ratatui-image` is *not* adopted for the
+re-emission path. It is a client-side renderer — it queries the terminal,
+transforms image data into protocol payloads, and manages stateful Kitty
+placement/caching for images the *app itself* draws to its own terminal. It
+cannot parse a child process's APC stream or act as a middleman re-emitting a
+child's images to an outer terminal; the data direction is inverted for a
+multiplexer. Its stateful patterns (upload-once/re-place, stable placement ids,
+delete-on-remove, Unicode-placeholder cells) are already implemented in
+`SessionGraphicsStore` + the backend adapters. It remains a candidate only for a
+future *dashboard-owned* image path.
+
 A retained placement also emulates a real graphics terminal's cursor movement:
 after an image is placed the child emulator's cursor advances right by the
 placement's `c` cells and down by its `r` cells, unless the client requested

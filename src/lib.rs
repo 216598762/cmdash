@@ -21,6 +21,7 @@ pub mod session_events;
 #[cfg(feature = "sixel")]
 pub mod sixel;
 pub mod state;
+pub mod virtual_buffer;
 #[cfg(feature = "wasm-plugins")]
 pub mod wasm_plugin;
 pub mod widget;
@@ -83,6 +84,10 @@ pub use sixel::{SixelError, SixelImage, SixelSubmission, encode_rgb};
 pub use state::{
     AppState, AppStateConfigError, CommandError, FocusState, FocusTarget, Overlay, OverlayId,
     OverlayPrimitive, SessionId, Surface, SurfaceId, WidgetId, WorkspaceId, WorkspaceState,
+};
+pub use virtual_buffer::{
+    GraphicsCommand, ImageIdentityRegistry, ImageObject, ImageObjectId, ImagePlacement,
+    ImageResource, VirtualBuffer, VirtualRow,
 };
 #[cfg(feature = "wasm-plugins")]
 pub use wasm_plugin::{WasmLimits, WasmPluginError, WasmPluginHost, WasmPluginInstance};
