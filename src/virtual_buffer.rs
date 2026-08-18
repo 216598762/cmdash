@@ -40,13 +40,18 @@ pub struct ImageResource {
     pub transient: bool,
 }
 
-/// One placement of an image object, attached to an absolute virtual-buffer
-/// row. `start_row` is the attachment point (like Kitty's `start_row`-anchored
-/// placements); the placement spans `rows` cells downward from there.
+/// One placement of an image object, attached to a virtual-buffer row.
+///
+/// `start_row` is a **signed, screen-relative** row: row `0` is the top of the
+/// visible screen, positive rows go down the screen, and negative rows are
+/// scrolled into history (|row| lines above the top). This mirrors the store's
+/// anchor resolution, so history placements survive scrolls instead of being
+/// deleted on underflow — eviction past the scrollback limit is the only thing
+/// that drops them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImagePlacement {
     pub column: u16,
-    pub start_row: usize,
+    pub start_row: i32,
     pub rows: u16,
     pub columns: u16,
     pub z_index: i32,
@@ -66,8 +71,8 @@ pub struct ImagePlacement {
 
 impl ImagePlacement {
     /// The last row (exclusive) this placement occupies.
-    pub const fn end_row(self) -> usize {
-        self.start_row + self.rows as usize
+    pub const fn end_row(self) -> i32 {
+        self.start_row + self.rows as i32
     }
 }
 
@@ -185,6 +190,10 @@ impl ImageIdentityRegistry {
 /// to them, and the coalesced command stream produced by buffer mutations.
 #[derive(Clone, Debug, Default)]
 pub struct VirtualBuffer {
+    /// `rows[i]` represents screen-relative row `first_row + i`; `first_row`
+    /// is the lowest tracked row (negative when history rows are present), so
+    /// history rows map to the start of the vector.
+    first_row: i32,
     rows: Vec<VirtualRow>,
     objects: BTreeMap<ImageObjectId, ImageObject>,
     identity: ImageIdentityRegistry,
@@ -202,6 +211,17 @@ impl VirtualBuffer {
 
     pub fn rows(&self) -> &[VirtualRow] {
         &self.rows
+    }
+
+    /// Returns the row at a signed screen-relative row, or `None` when that
+    /// row has never had an object attached (the buffer only allocates rows it
+    /// needs, so gaps are absent rather than empty).
+    pub fn row_at(&self, row: i32) -> Option<&VirtualRow> {
+        self.rows.get(self.row_index(row))
+    }
+
+    fn row_index(&self, row: i32) -> usize {
+        (row - self.first_row) as usize
     }
 
     pub fn object(&self, id: ImageObjectId) -> Option<&ImageObject> {
@@ -284,19 +304,34 @@ impl VirtualBuffer {
         object
     }
 
-    /// Attaches an additional placement to an existing object (a second `a=p`
-    /// of an already-displayed image), emitting a place command.
+    /// Upserts a placement onto an object (by outer-terminal `p=`), emitting a
+    /// place command. Re-placing the same placement (a move) updates its cell
+    /// position in place rather than stacking a duplicate, while a placement
+    /// with a new id is appended.
     pub fn attach_placement(&mut self, object: ImageObjectId, placement: ImagePlacement) {
-        self.attach(object, placement);
-        let client_id = self
+        let Some(client_id) = self
             .objects
             .get(&object)
-            .map(|object| object.resource.resource.image())
-            .unwrap_or(0);
+            .map(|entry| entry.resource.resource.image())
+        else {
+            return;
+        };
         self.identity
             .register_placement(client_id, placement.placement_id, object);
+        if let Some(entry) = self.objects.get_mut(&object) {
+            if let Some(existing) = entry
+                .placements
+                .iter_mut()
+                .find(|existing| existing.outer_placement_id == placement.outer_placement_id)
+            {
+                *existing = placement;
+            } else {
+                entry.placements.push(placement);
+            }
+        }
         self.pending_commands
             .push(GraphicsCommand::Place { object, placement });
+        self.rebuild_attachments();
     }
 
     /// Records an upload (`a=t`, transmit-only) without attaching a placement,
@@ -347,57 +382,53 @@ impl VirtualBuffer {
     }
 
     /// Scrolls the buffer up by `rows` (a linefeed burst): every attached
-    /// object moves up, emitting one move per surviving object; objects whose
-    /// start row underflows the retained buffer are deleted. This is the
-    /// mutation-driven equivalent of the current render-time re-resolution.
+    /// non-virtual object moves up, emitting one move per object. Placements
+    /// that move above the top of the screen take on negative history rows but
+    /// are **not** deleted — only [`Self::evict_beyond`] drops a placement
+    /// once it scrolls past the configured history limit.
     pub fn scroll(&mut self, rows: usize) {
         if rows == 0 {
             return;
         }
-        let mut removed: BTreeSet<ImageObjectId> = BTreeSet::new();
+        let delta = i32::try_from(rows).unwrap_or(i32::MAX);
         for (&id, object) in self.objects.iter_mut() {
             for placement in &mut object.placements {
-                match placement.start_row.checked_sub(rows) {
-                    Some(row) => {
-                        placement.start_row = row;
-                        self.pending_commands.push(GraphicsCommand::Place {
-                            object: id,
-                            placement: *placement,
-                        });
-                    }
-                    None => {
-                        removed.insert(id);
-                    }
+                if placement.virtual_placement {
+                    continue;
                 }
+                placement.start_row = placement.start_row.saturating_sub(delta);
+                self.pending_commands.push(GraphicsCommand::Place {
+                    object: id,
+                    placement: *placement,
+                });
             }
-        }
-        for object in removed {
-            self.remove_object(object);
-            self.pending_commands.push(GraphicsCommand::Delete {
-                object,
-                placement_id: None,
-                all: true,
-            });
         }
         self.rebuild_attachments();
     }
 
-    /// Deletes every object attached at or beyond `limit` rows — the
-    /// scrollback-limit eviction the store currently performs by walking
-    /// per-placement anchors.
+    /// Deletes every placement scrolled more than `limit` history lines above
+    /// the top of the screen (start row `< -limit`). Objects left with no
+    /// placements are removed and their identities forgotten.
     pub fn evict_beyond(&mut self, limit: usize) {
-        let removed: BTreeSet<ImageObjectId> = self
+        let limit = i32::try_from(limit).unwrap_or(i32::MAX);
+        let to_evict: Vec<(ImageObjectId, u32)> = self
             .objects
             .iter()
-            .filter(|(_, object)| {
-                object
-                    .placements
-                    .iter()
-                    .any(|placement| placement.start_row >= limit)
+            .flat_map(|(id, object)| {
+                object.placements.iter().filter_map(move |placement| {
+                    (placement.start_row < -limit).then_some((*id, placement.outer_placement_id))
+                })
             })
-            .map(|(id, _)| *id)
             .collect();
-        for object in removed {
+        for (object, placement_id) in to_evict {
+            self.delete_placement(object, placement_id);
+        }
+    }
+
+    /// Deletes every object, emitting a whole-object delete for each.
+    pub fn clear(&mut self) {
+        let objects: Vec<ImageObjectId> = self.objects.keys().copied().collect();
+        for object in objects {
             self.remove_object(object);
             self.pending_commands.push(GraphicsCommand::Delete {
                 object,
@@ -455,12 +486,13 @@ impl VirtualBuffer {
         if rows == 0 {
             return;
         }
+        let delta = i32::try_from(rows).unwrap_or(i32::MAX);
         for (&id, object) in self.objects.iter_mut() {
             for placement in &mut object.placements {
                 if placement.virtual_placement {
                     continue;
                 }
-                placement.start_row = placement.start_row.saturating_add(rows);
+                placement.start_row = placement.start_row.saturating_add(delta);
                 self.pending_commands.push(GraphicsCommand::Place {
                     object: id,
                     placement: *placement,
@@ -485,13 +517,12 @@ impl VirtualBuffer {
     }
 
     fn attach(&mut self, object: ImageObjectId, placement: ImagePlacement) {
-        self.grow_rows(placement.end_row());
-        self.rows[placement.start_row].attached.insert(object);
         self.objects
             .get_mut(&object)
             .expect("object exists")
             .placements
             .push(placement);
+        self.rebuild_attachments();
     }
 
     fn remove_object(&mut self, object: ImageObjectId) {
@@ -499,80 +530,115 @@ impl VirtualBuffer {
         self.identity.forget(object);
     }
 
-    fn grow_rows(&mut self, min_rows: usize) {
-        if self.rows.len() < min_rows {
-            self.rows.resize_with(min_rows, VirtualRow::default);
-        }
-    }
-
     /// Rebuilds the row→object attachment index from the authoritative
-    /// placements. Cheap and total, so the invariant can never drift.
+    /// placements. Cheap and total, so the invariant can never drift. `rows`
+    /// is sized to exactly the span of occupied rows, and `row_offset` maps
+    /// signed (screen-relative) rows onto the non-negative vector indices.
     fn rebuild_attachments(&mut self) {
-        for row in &mut self.rows {
-            row.attached.clear();
+        let mut min_row: Option<i32> = None;
+        let mut max_row: Option<i32> = None;
+        for object in self.objects.values() {
+            for placement in &object.placements {
+                min_row = Some(min_row.map_or(placement.start_row, |m| m.min(placement.start_row)));
+                max_row = Some(max_row.map_or(placement.end_row(), |m| m.max(placement.end_row())));
+            }
         }
-        let attachments: Vec<(usize, ImageObjectId)> = self
-            .objects
-            .iter()
-            .flat_map(|(id, object)| {
-                object
-                    .placements
-                    .iter()
-                    .map(move |placement| (placement.start_row, *id))
-            })
-            .collect();
-        if let Some(max_row) = attachments.iter().map(|(row, _)| *row).max() {
-            self.grow_rows(max_row + 1);
-        }
-        for (row, id) in attachments {
-            self.rows[row].attached.insert(id);
+        let (Some(min_row), Some(max_row)) = (min_row, max_row) else {
+            self.first_row = 0;
+            self.rows.clear();
+            return;
+        };
+        self.first_row = min_row;
+        let total = usize::try_from(max_row.saturating_sub(min_row)).unwrap_or(usize::MAX) + 1;
+        self.rows.clear();
+        self.rows.resize_with(total, VirtualRow::default);
+        for (id, object) in &self.objects {
+            for placement in &object.placements {
+                let index = self.row_index(placement.start_row);
+                self.rows[index].attached.insert(*id);
+            }
         }
     }
 }
 
 /// Coalesces a burst into an idempotent, ordered command set:
-/// - a `Delete` supersedes any upload/place for the same object;
-/// - an `Upload` is preserved (the outer terminal must receive the payload);
-/// - multiple `Place`s collapse to the last one (the final position).
+/// - a whole-object `Delete` (`all: true`) supersedes every other command for
+///   that object;
+/// - a scoped `Delete` (`all: false`) removes only that one placement, leaving
+///   places for the object's other placements intact;
+/// - an `Upload` is preserved (the outer terminal must receive the payload) and
+///   deduplicated per object;
+/// - multiple `Place`s for the same placement (by outer `p=`) collapse to the
+///   last position, while places for distinct placements are all kept.
 ///
-/// Output order follows first appearance, so an upload always precedes its
-/// object's place.
+/// Output order follows first appearance.
 fn coalesce_commands(commands: Vec<GraphicsCommand>) -> Vec<GraphicsCommand> {
-    let mut order: Vec<ImageObjectId> = Vec::new();
-    let mut seen: BTreeSet<ImageObjectId> = BTreeSet::new();
-    let mut uploads: BTreeMap<ImageObjectId, GraphicsCommand> = BTreeMap::new();
-    let mut places: BTreeMap<ImageObjectId, GraphicsCommand> = BTreeMap::new();
-    let mut deletes: BTreeMap<ImageObjectId, GraphicsCommand> = BTreeMap::new();
-
-    for command in commands {
-        let object = command.object();
-        if seen.insert(object) {
-            order.push(object);
-        }
-        match command {
-            GraphicsCommand::Upload { .. } => {
-                uploads.entry(object).or_insert(command);
-            }
-            GraphicsCommand::Place { .. } => {
-                places.insert(object, command);
-            }
-            GraphicsCommand::Delete { .. } => {
-                deletes.insert(object, command);
-            }
-        }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+    enum Key {
+        Upload(ImageObjectId),
+        Place(ImageObjectId, u32),
+        WholeDelete(ImageObjectId),
+        ScopedDelete(ImageObjectId, u32),
     }
 
+    let mut order: Vec<Key> = Vec::new();
+    let mut finals: BTreeMap<Key, GraphicsCommand> = BTreeMap::new();
+    for command in commands {
+        let object = command.object();
+        let key = match &command {
+            GraphicsCommand::Upload { .. } => Key::Upload(object),
+            GraphicsCommand::Place { placement, .. } => {
+                Key::Place(object, placement.outer_placement_id)
+            }
+            GraphicsCommand::Delete { all: true, .. } => Key::WholeDelete(object),
+            GraphicsCommand::Delete {
+                placement_id: Some(placement_id),
+                ..
+            } => Key::ScopedDelete(object, *placement_id),
+            // `all: false` without a placement id never occurs; drop it.
+            GraphicsCommand::Delete { .. } => continue,
+        };
+        if !finals.contains_key(&key) {
+            order.push(key);
+        }
+        finals.insert(key, command);
+    }
+
+    let whole_deleted: BTreeSet<ImageObjectId> = order
+        .iter()
+        .filter_map(|key| match key {
+            Key::WholeDelete(object) => Some(*object),
+            _ => None,
+        })
+        .collect();
+    let scoped_deleted: BTreeSet<(ImageObjectId, u32)> = order
+        .iter()
+        .filter_map(|key| match key {
+            Key::ScopedDelete(object, placement_id) => Some((*object, *placement_id)),
+            _ => None,
+        })
+        .collect();
+
     let mut coalesced = Vec::with_capacity(order.len());
-    for object in order {
-        if let Some(delete) = deletes.remove(&object) {
-            coalesced.push(delete);
-        } else {
-            if let Some(upload) = uploads.remove(&object) {
-                coalesced.push(upload);
+    for key in order {
+        let command = finals.remove(&key).expect("final command present");
+        let object = command.object();
+        match key {
+            Key::WholeDelete(_) => coalesced.push(command),
+            Key::Upload(_) if !whole_deleted.contains(&object) => coalesced.push(command),
+            Key::Place(_, placement_id) => {
+                if !whole_deleted.contains(&object)
+                    && !scoped_deleted.contains(&(object, placement_id))
+                {
+                    coalesced.push(command);
+                }
             }
-            if let Some(place) = places.remove(&object) {
-                coalesced.push(place);
+            Key::ScopedDelete(_, _) => {
+                if !whole_deleted.contains(&object) {
+                    coalesced.push(command);
+                }
             }
+            Key::Upload(_) => {}
         }
     }
     coalesced
@@ -586,7 +652,7 @@ mod tests {
         GraphicsResourceId::new(crate::state::SessionId::new(1), client_id)
     }
 
-    fn placement(start_row: usize, outer_id: u32) -> ImagePlacement {
+    fn placement(start_row: i32, outer_id: u32) -> ImagePlacement {
         ImagePlacement {
             column: 0,
             start_row,
@@ -602,7 +668,7 @@ mod tests {
         }
     }
 
-    fn add(buffer: &mut VirtualBuffer, client_id: u32, start_row: usize) -> ImageObjectId {
+    fn add(buffer: &mut VirtualBuffer, client_id: u32, start_row: i32) -> ImageObjectId {
         buffer.add_object(
             client_id,
             0,
@@ -622,8 +688,11 @@ mod tests {
         let id = add(&mut buffer, 7, 3);
 
         assert_eq!(buffer.identity().object_for_client(7), Some(id));
-        assert!(buffer.rows()[3].attached.contains(&id));
-        assert!(!buffer.rows()[0].attached.contains(&id));
+        assert!(buffer.row_at(3).unwrap().attached.contains(&id));
+        assert!(
+            buffer.row_at(0).is_none(),
+            "sparse rows are absent, not empty"
+        );
 
         let commands = buffer.drain_commands();
         assert_eq!(commands.len(), 2);
@@ -646,8 +715,8 @@ mod tests {
 
         assert_eq!(buffer.object(low).unwrap().placements[0].start_row, 3);
         assert_eq!(buffer.object(high).unwrap().placements[0].start_row, 6);
-        assert!(buffer.rows()[3].attached.contains(&low));
-        assert!(buffer.rows()[6].attached.contains(&high));
+        assert!(buffer.row_at(3).unwrap().attached.contains(&low));
+        assert!(buffer.row_at(6).unwrap().attached.contains(&high));
 
         let commands = buffer.drain_commands();
         assert_eq!(commands.len(), 2);
@@ -659,39 +728,48 @@ mod tests {
     }
 
     #[test]
-    fn scroll_past_the_top_deletes_the_object() {
+    fn scroll_past_the_top_moves_the_object_into_history() {
         let mut buffer = VirtualBuffer::new();
         let id = add(&mut buffer, 1, 1);
         buffer.drain_commands();
 
         buffer.scroll(2);
 
-        assert!(buffer.object(id).is_none());
-        assert_eq!(buffer.identity().object_for_client(1), None);
-
+        // The placement survives the scroll, now one row into history.
+        assert_eq!(buffer.object(id).unwrap().placements[0].start_row, -1);
+        assert!(buffer.row_at(-1).unwrap().attached.contains(&id));
         let commands = buffer.drain_commands();
         assert_eq!(commands.len(), 1);
         assert!(
-            matches!(commands[0], GraphicsCommand::Delete { object, all: true, .. } if object == id)
+            matches!(commands[0], GraphicsCommand::Place { object, placement } if object == id && placement.start_row == -1)
         );
     }
 
     #[test]
-    fn evict_beyond_deletes_objects_past_the_limit() {
+    fn evict_beyond_deletes_placements_scrolled_past_the_limit() {
         let mut buffer = VirtualBuffer::new();
-        let kept = add(&mut buffer, 1, 1);
-        let evicted = add(&mut buffer, 2, 5);
+        let kept = add(&mut buffer, 1, 3);
+        let evicted = add(&mut buffer, 2, 1);
         buffer.drain_commands();
 
-        buffer.evict_beyond(4);
+        // Scroll both up by 4: `kept` lands at -1 (retained), `evicted` at -3.
+        buffer.scroll(4);
+        buffer.evict_beyond(2);
 
-        assert!(buffer.object(kept).is_some());
+        assert_eq!(buffer.object(kept).unwrap().placements[0].start_row, -1);
         assert!(buffer.object(evicted).is_none());
         let commands = buffer.drain_commands();
-        assert_eq!(commands.len(), 1);
-        assert!(
-            matches!(commands[0], GraphicsCommand::Delete { object, all: true, .. } if object == evicted)
+        assert_eq!(
+            commands.len(),
+            2,
+            "the retained move and the eviction delete"
         );
+        assert!(commands.iter().any(
+            |command| matches!(command, GraphicsCommand::Place { object, placement } if *object == kept && placement.start_row == -1)
+        ));
+        assert!(commands.iter().any(
+            |command| matches!(command, GraphicsCommand::Delete { object, all: true, .. } if *object == evicted)
+        ));
     }
 
     #[test]
@@ -743,6 +821,69 @@ mod tests {
         assert!(
             matches!(commands[0], GraphicsCommand::Place { object, placement } if object == id && placement.start_row == 0)
         );
+    }
+
+    #[test]
+    fn coalescing_keeps_a_scoped_delete_beside_a_place_for_a_different_placement() {
+        let commands = vec![
+            GraphicsCommand::Upload {
+                object: 1,
+                generation: 2,
+            },
+            GraphicsCommand::Delete {
+                object: 1,
+                placement_id: Some(1),
+                all: false,
+            },
+            GraphicsCommand::Place {
+                object: 1,
+                placement: placement(3, 2),
+            },
+        ];
+        let coalesced = coalesce_commands(commands);
+        assert_eq!(
+            coalesced.len(),
+            3,
+            "a re-transmit keeps upload, scoped delete, and the new place"
+        );
+        assert!(matches!(coalesced[0], GraphicsCommand::Upload { .. }));
+        assert!(matches!(
+            &coalesced[1],
+            GraphicsCommand::Delete {
+                placement_id: Some(1),
+                all: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &coalesced[2],
+            GraphicsCommand::Place { placement, .. } if placement.outer_placement_id == 2
+        ));
+    }
+
+    #[test]
+    fn coalescing_whole_object_delete_supersedes_upload_and_places() {
+        let commands = vec![
+            GraphicsCommand::Upload {
+                object: 1,
+                generation: 1,
+            },
+            GraphicsCommand::Place {
+                object: 1,
+                placement: placement(0, 1),
+            },
+            GraphicsCommand::Delete {
+                object: 1,
+                placement_id: None,
+                all: true,
+            },
+        ];
+        let coalesced = coalesce_commands(commands);
+        assert_eq!(coalesced.len(), 1);
+        assert!(matches!(
+            &coalesced[0],
+            GraphicsCommand::Delete { all: true, .. }
+        ));
     }
 
     #[test]

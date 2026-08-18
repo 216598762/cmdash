@@ -10,6 +10,7 @@ use flate2::read::ZlibDecoder;
 use ratatui::layout::Rect;
 
 use crate::state::SessionId;
+use crate::virtual_buffer::{GraphicsCommand, ImagePlacement, VirtualBuffer};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GraphicsResourceId {
@@ -216,7 +217,12 @@ pub struct GraphicsPlacementParent {
 }
 
 impl GraphicsPlacementParent {
-    pub const fn new(image: u32, placement_id: u32, cell_offset_x: i32, cell_offset_y: i32) -> Self {
+    pub const fn new(
+        image: u32,
+        placement_id: u32,
+        cell_offset_x: i32,
+        cell_offset_y: i32,
+    ) -> Self {
         Self {
             image,
             placement_id,
@@ -1170,7 +1176,12 @@ fn clip_placement(
             + (u64::from(offset_y) + u64::from(clip_height)) * u64::from(source_height)
                 / u64::from(full_height.max(1));
         return finish_placement_clip(
-            (left, top, right.saturating_sub(left), bottom.saturating_sub(top)),
+            (
+                left,
+                top,
+                right.saturating_sub(left),
+                bottom.saturating_sub(top),
+            ),
             (
                 if offset_x == 0 {
                     placement.cell_x_offset()
@@ -1229,8 +1240,8 @@ fn clip_placement(
     // zero once the clip moves past the placement's first cell.
     let cell_x_offset =
         (x_off.saturating_sub(offset_x.saturating_mul(cell_width))).min(u32::from(u16::MAX)) as u16;
-    let cell_y_offset =
-        (y_off.saturating_sub(offset_y.saturating_mul(cell_height))).min(u32::from(u16::MAX)) as u16;
+    let cell_y_offset = (y_off.saturating_sub(offset_y.saturating_mul(cell_height)))
+        .min(u32::from(u16::MAX)) as u16;
     finish_placement_clip(
         (
             u64::from(left),
@@ -1404,10 +1415,7 @@ fn normalized_gap_ms(gap: Option<i32>, default_ms: u32) -> u32 {
 fn animation_duration_ms(resource: &GraphicsResource) -> u32 {
     let mut total = normalized_gap_ms(resource.animation_root_gap_ms, 0);
     for frame in resource.animation_frames.values() {
-        total = total.saturating_add(normalized_gap_ms(
-            frame.gap_ms,
-            DEFAULT_ANIMATION_GAP_MS,
-        ));
+        total = total.saturating_add(normalized_gap_ms(frame.gap_ms, DEFAULT_ANIMATION_GAP_MS));
     }
     total
 }
@@ -1515,6 +1523,11 @@ pub struct SessionGraphicsStore {
     session: SessionId,
     resources: BTreeMap<u32, GraphicsResource>,
     placements: BTreeMap<u64, GraphicsPlacement>,
+    /// The mutation-driven virtual buffer that mirrors placements as row-
+    /// attached objects and emits the coalesced outer-terminal command stream
+    /// (Workstream 8). It is currently additive: the anchor + render-diff path
+    /// remains authoritative for the backend until the adapter swap lands.
+    buffer: VirtualBuffer,
     limits: GraphicsLimits,
     decoded_bytes: usize,
     pending_upload: Option<PendingUpload>,
@@ -1555,6 +1568,7 @@ impl SessionGraphicsStore {
             session,
             resources: BTreeMap::new(),
             placements: BTreeMap::new(),
+            buffer: VirtualBuffer::new(),
             limits,
             decoded_bytes: 0,
             pending_upload: None,
@@ -1593,10 +1607,7 @@ impl SessionGraphicsStore {
     /// a fresh scan of the child's text grid. The session calls this after
     /// feeding plain output so a relative placement anchored to a virtual
     /// (`U=1`) parent resolves against the placeholder glyphs' current cells.
-    pub fn set_placeholder_cells(
-        &mut self,
-        cells: BTreeMap<u32, Vec<GraphicsPlaceholderCell>>,
-    ) {
+    pub fn set_placeholder_cells(&mut self, cells: BTreeMap<u32, Vec<GraphicsPlaceholderCell>>) {
         self.placeholder_cells = cells;
     }
 
@@ -1637,7 +1648,10 @@ impl SessionGraphicsStore {
         if frame == 1 {
             Some(resource.transient)
         } else {
-            resource.animation_frames.get(&frame).map(|frame| frame.transient)
+            resource
+                .animation_frames
+                .get(&frame)
+                .map(|frame| frame.transient)
         }
     }
 
@@ -1651,7 +1665,9 @@ impl SessionGraphicsStore {
     }
 
     pub fn animation_loops(&self, image: u32) -> Option<u32> {
-        self.resources.get(&image).map(|resource| resource.animation_loops)
+        self.resources
+            .get(&image)
+            .map(|resource| resource.animation_loops)
     }
 
     pub fn animation_current_frame(&self, image: u32) -> Option<u32> {
@@ -1685,6 +1701,116 @@ impl SessionGraphicsStore {
         self.decoded_bytes = 0;
         self.last_image_id = None;
         self.placeholder_cells.clear();
+        self.buffer.clear();
+    }
+
+    /// Drains the virtual buffer's coalesced mutation command stream (Workstream
+    /// 8). The backend adapters serialize these into outer-terminal bytes; until
+    /// the adapter swap lands, the render-diff path remains authoritative and
+    /// this stream is used for golden/parity validation.
+    pub fn take_graphics_commands(&mut self) -> Vec<GraphicsCommand> {
+        self.buffer.drain_commands()
+    }
+
+    /// Records a full-screen scroll of `delta` rows (positive = scrolled up, so
+    /// placements move toward history). Mirrors the scroll into the virtual
+    /// buffer as a mutation so it emits one move per affected object.
+    pub fn record_scroll(&mut self, delta: i64) {
+        match delta {
+            0 => {}
+            n if n > 0 => self.buffer.scroll(n as usize),
+            n => self.buffer.insert_lines(n.unsigned_abs() as usize),
+        }
+    }
+
+    /// Mirrors a freshly-inserted placement into the virtual buffer: resolves
+    /// (or lazily creates) the object via the identity registry and upserts the
+    /// placement at its resolved cell origin.
+    fn record_buffer_placement(&mut self, image: u32, placement: &GraphicsPlacement) {
+        let object = match self.buffer.identity().object_for_client(image) {
+            Some(object) => object,
+            None => {
+                let Some(resource) = self.resources.get(&image) else {
+                    return;
+                };
+                let generation = resource.generation;
+                let image_number = resource.image_number;
+                let format = resource.format;
+                let pixel_width = resource.pixel_width;
+                let pixel_height = resource.pixel_height;
+                let transient = resource.transient;
+                self.buffer.register_upload(
+                    image,
+                    image_number,
+                    GraphicsResourceId::new(self.session, image),
+                    format,
+                    generation,
+                    pixel_width,
+                    pixel_height,
+                    transient,
+                )
+            }
+        };
+        self.buffer
+            .attach_placement(object, self.to_buffer_placement(placement));
+    }
+
+    /// Mirrors a resource transmit into the virtual buffer as an upload. Every
+    /// transmit bumps the generation, so the outer terminal re-uploads the new
+    /// payload.
+    fn record_buffer_upload(&mut self, image: u32) {
+        let Some(resource) = self.resources.get(&image) else {
+            return;
+        };
+        let generation = resource.generation;
+        let image_number = resource.image_number;
+        let format = resource.format;
+        let pixel_width = resource.pixel_width;
+        let pixel_height = resource.pixel_height;
+        let transient = resource.transient;
+        self.buffer.register_upload(
+            image,
+            image_number,
+            GraphicsResourceId::new(self.session, image),
+            format,
+            generation,
+            pixel_width,
+            pixel_height,
+            transient,
+        );
+    }
+
+    /// Mirrors a removed placement into the virtual buffer as a scoped (or
+    /// whole-object, when last) delete.
+    fn record_buffer_remove(&mut self, placement: &GraphicsPlacement) {
+        let image = placement.resource().image();
+        let Some(object) = self.buffer.identity().object_for_client(image) else {
+            return;
+        };
+        self.buffer
+            .delete_placement(object, placement.outer_placement_id());
+    }
+
+    fn to_buffer_placement(&self, placement: &GraphicsPlacement) -> ImagePlacement {
+        ImagePlacement {
+            column: placement.x(),
+            start_row: i32::from(placement.y()),
+            rows: placement.height(),
+            columns: placement.width(),
+            z_index: placement.z_index(),
+            cell_x_offset: placement.cell_x_offset(),
+            cell_y_offset: placement.cell_y_offset(),
+            placement_id: placement.placement_id().unwrap_or(0),
+            outer_placement_id: placement.outer_placement_id(),
+            parent: placement.parent().map(|parent| {
+                (
+                    u64::from(parent.image()),
+                    parent.cell_offset_x(),
+                    parent.cell_offset_y(),
+                )
+            }),
+            virtual_placement: placement.is_virtual(),
+        }
     }
 
     /// Evicts full-screen primary placements that have scrolled above the top
@@ -2190,7 +2316,10 @@ impl SessionGraphicsStore {
             let supported = matches!(transfer, "d" | "f" | "s" | "t");
             if !supported || !self.outer_kitty_graphics {
                 let (message, is_ok) = if supported {
-                    ("ENOTSUP:outer terminal does not support Kitty graphics", false)
+                    (
+                        "ENOTSUP:outer terminal does not support Kitty graphics",
+                        false,
+                    )
                 } else {
                     ("ENOTSUP:unsupported Kitty transfer mode", false)
                 };
@@ -2319,25 +2448,26 @@ impl SessionGraphicsStore {
                 // an image (and its auto-extracted frames) transient so it is
                 // evicted before retained ones.
                 let transient = parameter_u32(&values, "N", 0)? & 1 != 0;
-                let (pixel_width, pixel_height, total_storage_bytes) = if let Some(gif) = &decoded_gif {
-                    (
-                        gif.width,
-                        gif.height,
-                        gif.root_rgba.len().saturating_add(
-                            gif.extra_frames
-                                .iter()
-                                .map(|frame| frame.rgba.len())
-                                .sum::<usize>(),
-                        ),
-                    )
-                } else {
-                    let natural = natural_dimensions(&decoded_payload, format);
-                    (
-                        parameter_u32(&values, "s", natural.map_or(0, |size| size.0))?,
-                        parameter_u32(&values, "v", natural.map_or(0, |size| size.1))?,
-                        decoded_payload.len(),
-                    )
-                };
+                let (pixel_width, pixel_height, total_storage_bytes) =
+                    if let Some(gif) = &decoded_gif {
+                        (
+                            gif.width,
+                            gif.height,
+                            gif.root_rgba.len().saturating_add(
+                                gif.extra_frames
+                                    .iter()
+                                    .map(|frame| frame.rgba.len())
+                                    .sum::<usize>(),
+                            ),
+                        )
+                    } else {
+                        let natural = natural_dimensions(&decoded_payload, format);
+                        (
+                            parameter_u32(&values, "s", natural.map_or(0, |size| size.0))?,
+                            parameter_u32(&values, "v", natural.map_or(0, |size| size.1))?,
+                            decoded_payload.len(),
+                        )
+                    };
                 let (animation_frames, animation_state, animation_loops, animation_root_gap_ms) =
                     if let Some(gif) = &decoded_gif {
                         let frames: BTreeMap<u32, GraphicsAnimationFrame> = gif
@@ -2464,6 +2594,7 @@ impl SessionGraphicsStore {
                     },
                 );
                 self.last_image_id = Some(image);
+                self.record_buffer_upload(image);
                 // Re-transmission replaces the image and all of its old
                 // placements, as required by the Kitty protocol.
                 self.remove_image_placements(image);
@@ -2546,17 +2677,15 @@ impl SessionGraphicsStore {
                 // `r=0` appends the next frame number (Kitty allocates the
                 // next slot after the newest existing frame).
                 let frame = if requested_frame == 0 {
-                    self.resources
-                        .get(&image)
-                        .map_or(2, |resource| {
-                            resource
-                                .animation_frames
-                                .keys()
-                                .next_back()
-                                .copied()
-                                .unwrap_or(1)
-                                .saturating_add(1)
-                        })
+                    self.resources.get(&image).map_or(2, |resource| {
+                        resource
+                            .animation_frames
+                            .keys()
+                            .next_back()
+                            .copied()
+                            .unwrap_or(1)
+                            .saturating_add(1)
+                    })
                 } else {
                     requested_frame
                 };
@@ -2669,74 +2798,82 @@ impl SessionGraphicsStore {
                 // coalescing until it is rendered or itself edited. Non-raw
                 // (PNG/GIF) payloads cannot be composed byte-for-byte, so an
                 // edit of one replaces the stored frame verbatim instead.
-                let (new_payload, new_width, new_height, new_x, new_y, new_base, new_mode, new_bgcolor, new_transient) =
-                    if edits_existing && bytes_per_pixel != 0 {
-                        let mut under = self.coalesce_frame_metadata(image, frame)?;
-                        // Editing an existing frame keeps its coalesced
-                        // transient status and ORs in the transmitted hint
-                        // (Kitty's `frame->transient = cfd.transient ||
-                        // transmitted_frame.transient`).
-                        let transient = under.transient || transmitted_transient;
-                        compose_rect_onto(
-                            &mut under.payload,
-                            &decoded,
-                            RectCompose {
-                                under_width: pixel_width,
-                                bytes_per_pixel,
-                                over_x: offset_x,
-                                over_y: offset_y,
-                                over_width: rect_width,
-                                over_height: rect_height,
-                                compose_mode,
-                            },
-                        );
-                        (
-                            under.payload,
-                            pixel_width,
-                            pixel_height,
-                            0u32,
-                            0u32,
-                            0u32,
-                            0u32,
-                            None,
-                            transient,
-                        )
-                    } else if edits_existing {
-                        // A non-raw frame cannot be coalesced byte-for-byte, so
-                        // the replacement keeps the existing chain's transient
-                        // status OR'd with the transmitted hint.
-                        (
-                            decoded,
-                            rect_width,
-                            rect_height,
-                            offset_x,
-                            offset_y,
-                            0u32,
-                            0u32,
-                            None,
-                            self.frame_chain_transient(image, frame) || transmitted_transient,
-                        )
-                    } else {
-                        // A new delta inherits its base frame's chain transient
-                        // (Kitty's `transmitted_frame.transient ||=
-                        // frame_chain_is_transient(img, other_frame)`).
-                        (
-                            decoded,
-                            rect_width,
-                            rect_height,
-                            offset_x,
-                            offset_y,
-                            base_frame,
+                let (
+                    new_payload,
+                    new_width,
+                    new_height,
+                    new_x,
+                    new_y,
+                    new_base,
+                    new_mode,
+                    new_bgcolor,
+                    new_transient,
+                ) = if edits_existing && bytes_per_pixel != 0 {
+                    let mut under = self.coalesce_frame_metadata(image, frame)?;
+                    // Editing an existing frame keeps its coalesced
+                    // transient status and ORs in the transmitted hint
+                    // (Kitty's `frame->transient = cfd.transient ||
+                    // transmitted_frame.transient`).
+                    let transient = under.transient || transmitted_transient;
+                    compose_rect_onto(
+                        &mut under.payload,
+                        &decoded,
+                        RectCompose {
+                            under_width: pixel_width,
+                            bytes_per_pixel,
+                            over_x: offset_x,
+                            over_y: offset_y,
+                            over_width: rect_width,
+                            over_height: rect_height,
                             compose_mode,
-                            bgcolor,
-                            if base_frame != 0 {
-                                transmitted_transient
-                                    || self.frame_chain_transient(image, base_frame)
-                            } else {
-                                transmitted_transient
-                            },
-                        )
-                    };
+                        },
+                    );
+                    (
+                        under.payload,
+                        pixel_width,
+                        pixel_height,
+                        0u32,
+                        0u32,
+                        0u32,
+                        0u32,
+                        None,
+                        transient,
+                    )
+                } else if edits_existing {
+                    // A non-raw frame cannot be coalesced byte-for-byte, so
+                    // the replacement keeps the existing chain's transient
+                    // status OR'd with the transmitted hint.
+                    (
+                        decoded,
+                        rect_width,
+                        rect_height,
+                        offset_x,
+                        offset_y,
+                        0u32,
+                        0u32,
+                        None,
+                        self.frame_chain_transient(image, frame) || transmitted_transient,
+                    )
+                } else {
+                    // A new delta inherits its base frame's chain transient
+                    // (Kitty's `transmitted_frame.transient ||=
+                    // frame_chain_is_transient(img, other_frame)`).
+                    (
+                        decoded,
+                        rect_width,
+                        rect_height,
+                        offset_x,
+                        offset_y,
+                        base_frame,
+                        compose_mode,
+                        bgcolor,
+                        if base_frame != 0 {
+                            transmitted_transient || self.frame_chain_transient(image, base_frame)
+                        } else {
+                            transmitted_transient
+                        },
+                    )
+                };
 
                 let previous_frame_bytes = if frame == 1 {
                     self.resources
@@ -2852,9 +2989,10 @@ impl SessionGraphicsStore {
                     if frame == 1 {
                         resource.animation_root_gap_ms = Some(gap_ms);
                     } else {
-                        let target = resource.animation_frames.get_mut(&frame).ok_or_else(|| {
-                            GraphicsError::InvalidParameter("animation frame".to_owned())
-                        })?;
+                        let target =
+                            resource.animation_frames.get_mut(&frame).ok_or_else(|| {
+                                GraphicsError::InvalidParameter("animation frame".to_owned())
+                            })?;
                         target.gap_ms = Some(gap_ms);
                     }
                 }
@@ -3211,7 +3349,11 @@ impl SessionGraphicsStore {
     /// left untouched: the triggering operation (lowercase vs. uppercase
     /// delete, erase, or eviction) decides whether resources are reclaimed.
     fn prune_orphaned_relatives(&mut self) -> bool {
-        if !self.placements.values().any(|placement| placement.parent().is_some()) {
+        if !self
+            .placements
+            .values()
+            .any(|placement| placement.parent().is_some())
+        {
             return false;
         }
         // Compute, to a fixpoint, which placements still have a resolvable
@@ -3319,14 +3461,11 @@ impl SessionGraphicsStore {
         current_region_scroll: i64,
         view_offset: i32,
     ) -> Option<(i32, i32)> {
-        let cells = self
-            .placeholder_cells
-            .get(&placement.resource().image())?;
+        let cells = self.placeholder_cells.get(&placement.resource().image())?;
         let mut min_column: Option<i32> = None;
         let mut min_row: Option<i32> = None;
         for cell in cells {
-            let anchor =
-                GraphicsGridAnchor::new(cell.column, cell.row, cell.scrollback);
+            let anchor = GraphicsGridAnchor::new(cell.column, cell.row, cell.scrollback);
             let mut row = anchor.resolve_row_with_state(
                 current_scrollback,
                 current_region,
@@ -3493,7 +3632,7 @@ impl SessionGraphicsStore {
             _ => {
                 return Err(GraphicsError::InvalidParameter(
                     "animation frame composition".to_owned(),
-                ))
+                ));
             }
         };
         let (image_width, image_height) = (resource.pixel_width, resource.pixel_height);
@@ -3503,10 +3642,8 @@ impl SessionGraphicsStore {
                 let (pixels, width, height) =
                     decode_raster_image(&resource.decoded_payload, self.limits.max_decoded_bytes)
                         .ok_or_else(|| {
-                            GraphicsError::InvalidParameter(
-                                "animation frame composition".to_owned(),
-                            )
-                        })?;
+                        GraphicsError::InvalidParameter("animation frame composition".to_owned())
+                    })?;
                 if width != resource.pixel_width || height != resource.pixel_height {
                     return Err(GraphicsError::InvalidParameter(
                         "animation frame composition".to_owned(),
@@ -3525,9 +3662,7 @@ impl SessionGraphicsStore {
         let animation_frame = resource
             .animation_frames
             .get(&frame)
-            .ok_or_else(|| {
-                GraphicsError::InvalidParameter("animation frame".to_owned())
-            })?;
+            .ok_or_else(|| GraphicsError::InvalidParameter("animation frame".to_owned()))?;
         if animation_frame.is_full_keyframe(image_width, image_height) {
             return Ok(CoalescedFrame {
                 payload: animation_frame.payload.clone(),
@@ -3700,12 +3835,16 @@ impl SessionGraphicsStore {
     /// current animation frame when one is selected, otherwise the root frame.
     fn served_graphics_payload(&self, image: u32, resource: &GraphicsResource) -> (Vec<u8>, u64) {
         if resource.animation_current_frame != 1
-            && resource.animation_frames.contains_key(&resource.animation_current_frame)
+            && resource
+                .animation_frames
+                .contains_key(&resource.animation_current_frame)
         {
             match self.coalesce_frame(image, resource.animation_current_frame) {
                 Ok(bytes) => (
                     encode_base64_payload(&bytes),
-                    resource.generation.wrapping_add(resource.animation_revision),
+                    resource
+                        .generation
+                        .wrapping_add(resource.animation_revision),
                 ),
                 Err(_) => (resource.encoded_payload.clone(), resource.generation),
             }
@@ -3773,8 +3912,10 @@ impl SessionGraphicsStore {
                 }
                 resource.animation_frames = renumbered;
             } else {
-                let removed =
-                    resource.animation_frames.remove(&removed_frame).expect("clamped frame");
+                let removed = resource
+                    .animation_frames
+                    .remove(&removed_frame)
+                    .expect("clamped frame");
                 removed_bytes = removed.payload.len();
                 let mut renumbered = BTreeMap::new();
                 for (key, animation_frame) in resource.animation_frames.iter() {
@@ -3893,8 +4034,7 @@ impl SessionGraphicsStore {
         for row in 0..height {
             let start = (u64::from(source_y) + u64::from(row))
                 .saturating_mul(u64::from(pixel_width))
-                .saturating_add(u64::from(source_x))
-                as usize;
+                .saturating_add(u64::from(source_x)) as usize;
             let start = start.saturating_mul(bytes_per_pixel);
             let end = start.saturating_add(row_bytes);
             source_rect.extend_from_slice(source_full.payload.get(start..end).unwrap_or(&[]));
@@ -3907,8 +4047,7 @@ impl SessionGraphicsStore {
                 .saturating_add(u64::from(destination_x))
                 as usize;
             for column in 0..width {
-                let destination_index =
-                    (destination_row + column as usize) * bytes_per_pixel;
+                let destination_index = (destination_row + column as usize) * bytes_per_pixel;
                 let source_index = ((row * width + column) as usize) * bytes_per_pixel;
                 if blends {
                     alpha_blend_onto(
@@ -3916,7 +4055,8 @@ impl SessionGraphicsStore {
                         &source_rect[source_index..source_index + 4],
                     );
                 } else {
-                    destination_full.payload[destination_index..destination_index + bytes_per_pixel]
+                    destination_full.payload
+                        [destination_index..destination_index + bytes_per_pixel]
                         .copy_from_slice(
                             &source_rect[source_index..source_index + bytes_per_pixel],
                         );
@@ -4039,8 +4179,12 @@ impl SessionGraphicsStore {
         // top-left corner, so the image can be placed below cell granularity.
         let cell_x_offset = parameter_u16(values, "X", 0)?;
         let cell_y_offset = parameter_u16(values, "Y", 0)?;
-        let (width, height) =
-            placement_dimensions(values, pixel_size, cell_size, (cell_x_offset, cell_y_offset))?;
+        let (width, height) = placement_dimensions(
+            values,
+            pixel_size,
+            cell_size,
+            (cell_x_offset, cell_y_offset),
+        )?;
         let source = source_rect(values, pixel_size)?;
         let (drawn_width, drawn_height) = drawn_dimensions(
             width,
@@ -4083,23 +4227,19 @@ impl SessionGraphicsStore {
         let cursor_static = values.get("C").is_some_and(|value| value == "1");
         // A relative placement lives in its parent's group, so it inherits the
         // parent's screen and scrolling region and resolves against them.
-        let (anchor_screen, anchor_region, anchor_region_scroll) = parent.map_or(
-            (screen, scroll_region, region_scroll),
-            |parent| {
-                let parent_anchor =
-                    self.placements[&relative_parent_key(parent)].anchor();
+        let (anchor_screen, anchor_region, anchor_region_scroll) =
+            parent.map_or((screen, scroll_region, region_scroll), |parent| {
+                let parent_anchor = self.placements[&relative_parent_key(parent)].anchor();
                 (
                     parent_anchor.screen(),
                     parent_anchor.scroll_region(),
                     parent_anchor.region_scroll(),
                 )
-            },
-        );
+            });
         // Record the resolved cell origin for diagnostics/consumers that read
         // `x`/`y` without re-resolving relative parents.
-        let (logical_x, logical_y) = parent.map_or(
-            (i32::from(cursor.0), i32::from(cursor.1)),
-            |parent| {
+        let (logical_x, logical_y) =
+            parent.map_or((i32::from(cursor.0), i32::from(cursor.1)), |parent| {
                 let origin = self
                     .resolve_origin(
                         &self.placements[&relative_parent_key(parent)],
@@ -4114,8 +4254,7 @@ impl SessionGraphicsStore {
                     origin.0.saturating_add(parent.cell_offset_x()),
                     origin.1.saturating_add(parent.cell_offset_y()),
                 )
-            },
-        );
+            });
         let placement = GraphicsPlacement {
             resource: GraphicsResourceId::new(self.session, image),
             placement_id: requested_placement_id,
@@ -4147,6 +4286,7 @@ impl SessionGraphicsStore {
         } else {
             Some((width, height))
         };
+        self.record_buffer_placement(image, &placement);
         self.placements.insert(key, placement);
         Ok(())
     }
@@ -4216,26 +4356,30 @@ impl SessionGraphicsStore {
     /// recur, so their ids are released.
     fn remove_placement_key(&mut self, key: u64) -> Option<GraphicsPlacement> {
         let removed = self.placements.remove(&key);
+        if let Some(placement) = &removed {
+            self.record_buffer_remove(placement);
+        }
         if removed.is_some() && key < (1u64 << 32) {
             self.outer_placement_ids.remove(&key);
         }
         removed
     }
 
-    /// Removes every placement whose key satisfies `keep`, returning the
-    /// pruned keys via `remove_placement_key` after iteration ends (the
-    /// retain closure cannot otherwise reach other store fields).
+    /// Removes every placement whose key satisfies `keep`. Pruned placements
+    /// are captured so the virtual buffer can mirror their removal, then the
+    /// outer-placement-id bookkeeping is released per key.
     fn retain_placements(&mut self, mut keep: impl FnMut(u64, &GraphicsPlacement) -> bool) {
-        let mut pruned = Vec::new();
+        let mut pruned: Vec<(u64, GraphicsPlacement)> = Vec::new();
         self.placements.retain(|key, placement| {
             if keep(*key, placement) {
                 true
             } else {
-                pruned.push(*key);
+                pruned.push((*key, placement.clone()));
                 false
             }
         });
-        for key in pruned {
+        for (key, placement) in pruned {
+            self.record_buffer_remove(&placement);
             self.remove_placement_key(key);
         }
     }
@@ -4308,8 +4452,10 @@ impl SessionGraphicsStore {
                     placement.height,
                 );
                 let clipped_area = intersect_signed(placement_area, surface)?;
-                let offset_x = u32::try_from(i32::from(clipped_area.x) - placement_area.0).unwrap_or(0);
-                let offset_y = u32::try_from(i32::from(clipped_area.y) - placement_area.1).unwrap_or(0);
+                let offset_x =
+                    u32::try_from(i32::from(clipped_area.x) - placement_area.0).unwrap_or(0);
+                let offset_y =
+                    u32::try_from(i32::from(clipped_area.y) - placement_area.1).unwrap_or(0);
                 let clipped = clip_placement(
                     placement,
                     offset_x,
@@ -4570,22 +4716,17 @@ fn placement_dimensions(
             }
             let width_pixels =
                 u128::from(columns) * u128::from(cell_width) + u128::from(cell_x_offset);
-            let height_pixels =
-                width_pixels * u128::from(pixel_height) / u128::from(pixel_width);
+            let height_pixels = width_pixels * u128::from(pixel_height) / u128::from(pixel_width);
             let rows = ceil_extent(height_pixels, cell_height);
             Ok((columns, rows))
         }
         (None, Some(rows)) => {
             if pixel_width == 0 || pixel_height == 0 || cell_width == 0 || cell_height == 0 {
-                return Ok((
-                    natural_extent(pixel_width, cell_width, cell_x_offset),
-                    rows,
-                ));
+                return Ok((natural_extent(pixel_width, cell_width, cell_x_offset), rows));
             }
             let height_pixels =
                 u128::from(rows) * u128::from(cell_height) + u128::from(cell_y_offset);
-            let width_pixels =
-                height_pixels * u128::from(pixel_width) / u128::from(pixel_height);
+            let width_pixels = height_pixels * u128::from(pixel_width) / u128::from(pixel_height);
             let columns = ceil_extent(width_pixels, cell_width);
             Ok((columns, rows))
         }
@@ -4687,8 +4828,7 @@ fn aspect_scale(pixels: u32, num: u32, den: u32) -> u32 {
     if num == 0 || den == 0 {
         return pixels;
     }
-    (u128::from(pixels) * u128::from(num) / u128::from(den))
-        .min(u128::from(u32::MAX)) as u32
+    (u128::from(pixels) * u128::from(num) / u128::from(den)).min(u128::from(u32::MAX)) as u32
 }
 
 fn placement_id(values: &BTreeMap<String, String>) -> Option<u32> {
@@ -4957,8 +5097,8 @@ fn decode_gif_animation(payload: &[u8], max_decoded_bytes: usize) -> Option<Deco
         match frame.dispose {
             gif::DisposalMethod::Background => {
                 for row in top..top + frame_height {
-                    canvas
-                        [(row * canvas_width + left) * 4..(row * canvas_width + left + frame_width) * 4]
+                    canvas[(row * canvas_width + left) * 4
+                        ..(row * canvas_width + left + frame_width) * 4]
                         .fill(0);
                 }
             }
@@ -5008,10 +5148,7 @@ fn gif_repeat_to_animation_loops(repeat: gif::Repeat) -> u32 {
 /// non-raw (`f=100`) frame can be composed on pixels like a raw one. Returns
 /// `None` for payloads that are not a recognized image or that cannot be
 /// decoded within the storage budget.
-fn decode_raster_image(
-    payload: &[u8],
-    max_decoded_bytes: usize,
-) -> Option<(Vec<u8>, u32, u32)> {
+fn decode_raster_image(payload: &[u8], max_decoded_bytes: usize) -> Option<(Vec<u8>, u32, u32)> {
     if payload.starts_with(b"\x89PNG\r\n\x1a\n") {
         decode_png_rgba(payload, max_decoded_bytes)
     } else if payload.starts_with(b"GIF") {
@@ -5030,9 +5167,7 @@ fn decode_png_rgba(payload: &[u8], max_decoded_bytes: usize) -> Option<(Vec<u8>,
         },
     );
     decoder.set_transformations(
-        png::Transformations::EXPAND
-            | png::Transformations::STRIP_16
-            | png::Transformations::ALPHA,
+        png::Transformations::EXPAND | png::Transformations::STRIP_16 | png::Transformations::ALPHA,
     );
     let mut reader = decoder.read_info().ok()?;
     let (width, height) = reader.info().size();
@@ -5113,10 +5248,7 @@ fn encode_base64_payload(bytes: &[u8]) -> Vec<u8> {
 
 /// Inflates a zlib stream, bounding the decompressed size so a malicious
 /// payload cannot exhaust memory.
-fn decompress_zlib(
-    encoded: &[u8],
-    max_decoded_bytes: usize,
-) -> Result<Vec<u8>, GraphicsError> {
+fn decompress_zlib(encoded: &[u8], max_decoded_bytes: usize) -> Result<Vec<u8>, GraphicsError> {
     let mut decoder = ZlibDecoder::new(encoded);
     let mut decoded = Vec::new();
     decoder
@@ -5298,7 +5430,9 @@ pub(crate) fn decode_base64(payload: &[u8]) -> Option<Vec<u8>> {
     if filtered.len() % 4 != 0 {
         filtered.resize(filtered.len() + (4 - filtered.len() % 4), b'=');
     }
-    base64::engine::general_purpose::STANDARD.decode(filtered).ok()
+    base64::engine::general_purpose::STANDARD
+        .decode(filtered)
+        .ok()
 }
 
 fn intersect(first: Rect, second: Rect) -> Option<Rect> {
@@ -5464,9 +5598,7 @@ mod tests {
         // Deleting a client-identified placement and re-placing the same
         // `(i, p)` reuses its outer id: the outer terminal treats it as the
         // same placement (Kitty matches by `(i, p)`).
-        store
-            .apply_kitty_command(b"a=d,d=i,i=1,p=1", b"")
-            .unwrap();
+        store.apply_kitty_command(b"a=d,d=i,i=1,p=1", b"").unwrap();
         store
             .apply_kitty_command(b"a=p,i=1,p=1,c=1,r=1,C=1,q=2", b"")
             .unwrap();
@@ -5476,6 +5608,71 @@ mod tests {
             .find(|submission| submission.resource().image() == 1)
             .expect("image 1 should be re-placed");
         assert_eq!(image_one.placement().outer_placement_id(), 1);
+    }
+
+    #[test]
+    fn virtual_buffer_mirrors_create_scroll_delete_and_clear_as_commands() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(90));
+        store
+            .apply_kitty_command(b"a=T,f=24,i=7,c=2,r=1,C=1,q=2", b"AQID")
+            .unwrap();
+
+        let commands = store.take_graphics_commands();
+        assert_eq!(
+            commands.len(),
+            2,
+            "a transmit + place emits upload then place"
+        );
+        assert!(matches!(
+            commands[0],
+            GraphicsCommand::Upload { generation, .. } if generation == 1
+        ));
+        assert!(matches!(
+            &commands[1],
+            GraphicsCommand::Place { placement, .. }
+                if placement.outer_placement_id == 1
+                    && placement.start_row == 0
+                    && placement.rows == 1
+                    && placement.columns == 2
+        ));
+
+        // A full-screen scroll moves the placement one row into history.
+        store.record_scroll(1);
+        let commands = store.take_graphics_commands();
+        assert_eq!(commands.len(), 1);
+        assert!(
+            matches!(&commands[0], GraphicsCommand::Place { placement, .. } if placement.start_row == -1)
+        );
+
+        // Deleting the image emits a whole-object delete.
+        store.apply_kitty_command(b"a=d,d=i,i=7", b"").unwrap();
+        let commands = store.take_graphics_commands();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            &commands[0],
+            GraphicsCommand::Delete { all: true, .. }
+        ));
+    }
+
+    #[test]
+    fn virtual_buffer_clear_emits_one_delete_per_object() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(91));
+        store
+            .apply_kitty_command(b"a=T,f=24,i=1,c=1,r=1,C=1,q=2", b"AQID")
+            .unwrap();
+        store
+            .apply_kitty_command(b"a=T,f=24,i=2,c=1,r=1,C=1,q=2", b"BAUG")
+            .unwrap();
+        store.take_graphics_commands();
+
+        store.clear();
+        let commands = store.take_graphics_commands();
+        assert_eq!(commands.len(), 2, "one whole-object delete per image");
+        assert!(
+            commands
+                .iter()
+                .all(|command| matches!(command, GraphicsCommand::Delete { all: true, .. }))
+        );
     }
 
     #[test]
@@ -6343,8 +6540,7 @@ mod tests {
                 );
                 assert!(fd >= 0, "shm_open failed");
                 assert_eq!(libc::ftruncate(fd, pixels.len() as libc::off_t), 0);
-                let written =
-                    libc::write(fd, pixels.as_ptr() as *const libc::c_void, pixels.len());
+                let written = libc::write(fd, pixels.as_ptr() as *const libc::c_void, pixels.len());
                 assert_eq!(written, pixels.len() as libc::ssize_t);
                 libc::close(fd);
             }
@@ -6369,14 +6565,23 @@ mod tests {
         let mut store = SessionGraphicsStore::new(SessionId::new(8));
         // Kitty logs "Query graphics command without image id" and emits no
         // response at all when a query lacks the `i=` key.
-        assert!(store
-            .apply_kitty_command_with_context(b"a=q,t=d,s=1,v=1,f=24", b"MTIz", (0, 0), (0, 0))
-            .unwrap()
-            .is_none());
-        assert!(store
-            .apply_kitty_command_with_context(b"a=q,i=0,t=d,s=1,v=1,f=24", b"MTIz", (0, 0), (0, 0))
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .apply_kitty_command_with_context(b"a=q,t=d,s=1,v=1,f=24", b"MTIz", (0, 0), (0, 0))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .apply_kitty_command_with_context(
+                    b"a=q,i=0,t=d,s=1,v=1,f=24",
+                    b"MTIz",
+                    (0, 0),
+                    (0, 0)
+                )
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(store.resource_count(), 0);
     }
 
@@ -6384,29 +6589,57 @@ mod tests {
     fn query_validates_the_payload_before_replying_ok() {
         let mut store = SessionGraphicsStore::new(SessionId::new(9));
         // A valid 1x1 RGB payload loads and replies OK.
-        assert!(store
-            .apply_kitty_command_with_context(b"a=q,i=9,t=d,s=1,v=1,f=24", b"MTIz", (0, 0), (0, 0))
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .apply_kitty_command_with_context(
+                    b"a=q,i=9,t=d,s=1,v=1,f=24",
+                    b"MTIz",
+                    (0, 0),
+                    (0, 0)
+                )
+                .unwrap()
+                .is_some()
+        );
         // Data size must match bpp * s * v: 2 bytes for a 1x1 RGB is invalid.
         assert_eq!(
             store
-                .apply_kitty_command_with_context(b"a=q,i=10,t=d,s=1,v=1,f=24", b"MTI=", (0, 0), (0, 0))
+                .apply_kitty_command_with_context(
+                    b"a=q,i=10,t=d,s=1,v=1,f=24",
+                    b"MTI=",
+                    (0, 0),
+                    (0, 0)
+                )
                 .unwrap_err(),
             GraphicsError::InvalidPayload
         );
         // Raw query payloads require explicit s/v dimensions.
-        assert!(store
-            .apply_kitty_command_with_context(b"a=q,i=11,t=d,f=24", b"MTIz", (0, 0), (0, 0))
-            .is_err());
+        assert!(
+            store
+                .apply_kitty_command_with_context(b"a=q,i=11,t=d,f=24", b"MTIz", (0, 0), (0, 0))
+                .is_err()
+        );
         // Unsupported formats are rejected.
-        assert!(store
-            .apply_kitty_command_with_context(b"a=q,i=12,t=d,s=1,v=1,f=7", b"MTIz", (0, 0), (0, 0))
-            .is_err());
+        assert!(
+            store
+                .apply_kitty_command_with_context(
+                    b"a=q,i=12,t=d,s=1,v=1,f=7",
+                    b"MTIz",
+                    (0, 0),
+                    (0, 0)
+                )
+                .is_err()
+        );
         // f=100 payloads must carry a parseable GIF/PNG header.
-        assert!(store
-            .apply_kitty_command_with_context(b"a=q,i=13,t=d,f=100", b"bm90IGEgaW1hZ2U=", (0, 0), (0, 0))
-            .is_err());
+        assert!(
+            store
+                .apply_kitty_command_with_context(
+                    b"a=q,i=13,t=d,f=100",
+                    b"bm90IGEgaW1hZ2U=",
+                    (0, 0),
+                    (0, 0)
+                )
+                .is_err()
+        );
         // Nothing was retained by any of the queries.
         assert_eq!(store.resource_count(), 0);
     }
@@ -6417,9 +6650,16 @@ mod tests {
         // A file query pointing at a missing path fails to load and returns
         // the transfer error instead of OK.
         let missing = encode_base64_for_test(b"/no/such/cmdash-query-file");
-        assert!(store
-            .apply_kitty_command_with_context(b"a=q,i=10,t=f,s=1,v=1,f=24", &missing, (0, 0), (0, 0))
-            .is_err());
+        assert!(
+            store
+                .apply_kitty_command_with_context(
+                    b"a=q,i=10,t=f,s=1,v=1,f=24",
+                    &missing,
+                    (0, 0),
+                    (0, 0)
+                )
+                .is_err()
+        );
         assert_eq!(store.resource_count(), 0);
     }
 
@@ -6831,7 +7071,10 @@ mod tests {
         // hand-rolled `Display` strings exactly, so downstream error responses
         // and diagnostics never change.
         let catalogue = [
-            (GraphicsError::MissingAction.to_string(), "Kitty graphics command has no action"),
+            (
+                GraphicsError::MissingAction.to_string(),
+                "Kitty graphics command has no action",
+            ),
             (
                 GraphicsError::InvalidParameter("a=b".to_string()).to_string(),
                 "invalid Kitty graphics parameter \"a=b\"",
@@ -6910,14 +7153,18 @@ mod tests {
         assert!(String::from_utf8_lossy(&response).contains("OK"));
 
         // q=1 and q=2 both suppress the success response.
-        assert!(store
-            .apply_kitty_command_with_context(b"a=T,f=24,i=2,q=1", b"BAUG", (0, 0), (0, 0))
-            .unwrap()
-            .is_none());
-        assert!(store
-            .apply_kitty_command_with_context(b"a=T,f=24,i=3,q=2", b"CAUI", (0, 0), (0, 0))
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .apply_kitty_command_with_context(b"a=T,f=24,i=2,q=1", b"BAUG", (0, 0), (0, 0))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .apply_kitty_command_with_context(b"a=T,f=24,i=3,q=2", b"CAUI", (0, 0), (0, 0))
+                .unwrap()
+                .is_none()
+        );
 
         // Query responses follow the same rule.
         let query_ok = store
@@ -6930,24 +7177,28 @@ mod tests {
             .unwrap()
             .expect("q=0 query must emit a response");
         assert!(String::from_utf8_lossy(&query_ok).contains("OK"));
-        assert!(store
-            .apply_kitty_command_with_context(
-                b"a=q,i=1,t=d,s=1,v=1,f=24,q=1",
-                b"MTIz",
-                (0, 0),
-                (0, 0),
-            )
-            .unwrap()
-            .is_none());
-        assert!(store
-            .apply_kitty_command_with_context(
-                b"a=q,i=1,t=d,s=1,v=1,f=24,q=2",
-                b"MTIz",
-                (0, 0),
-                (0, 0),
-            )
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .apply_kitty_command_with_context(
+                    b"a=q,i=1,t=d,s=1,v=1,f=24,q=1",
+                    b"MTIz",
+                    (0, 0),
+                    (0, 0),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .apply_kitty_command_with_context(
+                    b"a=q,i=1,t=d,s=1,v=1,f=24,q=2",
+                    b"MTIz",
+                    (0, 0),
+                    (0, 0),
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -7010,7 +7261,12 @@ mod tests {
             .apply_kitty_command_with_context(b"a=T,f=24,i=1,c=1,r=1,q=2", b"AQID", (0, 0), (0, 0))
             .unwrap();
         store
-            .apply_kitty_command_with_context(b"a=T,f=24,i=2,N=1,c=1,r=1,q=2", b"BAUG", (1, 0), (0, 0))
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,i=2,N=1,c=1,r=1,q=2",
+                b"BAUG",
+                (1, 0),
+                (0, 0),
+            )
             .unwrap();
         assert_eq!(store.resource_count(), 2);
         assert_eq!(store.decoded_bytes(2), Some(&[4u8, 5, 6][..]));
@@ -7024,10 +7280,12 @@ mod tests {
         assert_eq!(store.decoded_bytes(1), Some(&[1u8, 2, 3][..]));
         assert_eq!(store.decoded_bytes(2), None);
         assert!(store.decoded_bytes(3).is_some());
-        assert!(store
-            .diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.message().contains("evicted")));
+        assert!(
+            store
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message().contains("evicted"))
+        );
     }
 
     #[test]
@@ -7124,7 +7382,9 @@ mod tests {
         };
         let mut store = SessionGraphicsStore::with_limits(SessionId::new(71), limits);
         // An unreferenced retained image (transmit-only) and a referenced one.
-        store.apply_kitty_command(b"a=t,f=24,i=1,q=2", b"AQID").unwrap();
+        store
+            .apply_kitty_command(b"a=t,f=24,i=1,q=2", b"AQID")
+            .unwrap();
         store
             .apply_kitty_command_with_context(b"a=T,f=24,i=2,c=1,r=1,q=2", b"BAUG", (0, 0), (0, 0))
             .unwrap();
@@ -7207,10 +7467,7 @@ mod tests {
     fn compose_overwrites_a_source_rectangle_into_the_destination_frame() {
         let mut store = SessionGraphicsStore::new(SessionId::new(60));
         // A 2x2 RGBA root frame.
-        let root = [
-            1, 1, 1, 255, 2, 2, 2, 255,
-            3, 3, 3, 255, 4, 4, 4, 255,
-        ];
+        let root = [1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255, 4, 4, 4, 255];
         store
             .apply_kitty_command_with_context(
                 b"a=T,f=32,i=60,s=2,v=2,q=2",
@@ -7220,10 +7477,7 @@ mod tests {
             )
             .unwrap();
         // Frame 2 has distinct pixels.
-        let frame2 = [
-            9, 9, 9, 255, 8, 8, 8, 255,
-            7, 7, 7, 255, 6, 6, 6, 255,
-        ];
+        let frame2 = [9, 9, 9, 255, 8, 8, 8, 255, 7, 7, 7, 255, 6, 6, 6, 255];
         store
             .apply_kitty_command_with_context(
                 b"a=f,i=60,r=2,q=2",
@@ -7280,10 +7534,7 @@ mod tests {
     #[test]
     fn compose_into_a_non_root_frame_updates_only_that_frame() {
         let mut store = SessionGraphicsStore::new(SessionId::new(64));
-        let root = [
-            1, 1, 1, 255, 2, 2, 2, 255,
-            3, 3, 3, 255, 4, 4, 4, 255,
-        ];
+        let root = [1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255, 4, 4, 4, 255];
         store
             .apply_kitty_command_with_context(
                 b"a=T,f=32,i=64,s=2,v=2,q=2",
@@ -7292,10 +7543,7 @@ mod tests {
                 (10, 10),
             )
             .unwrap();
-        let frame2 = [
-            9, 9, 9, 255, 8, 8, 8, 255,
-            7, 7, 7, 255, 6, 6, 6, 255,
-        ];
+        let frame2 = [9, 9, 9, 255, 8, 8, 8, 255, 7, 7, 7, 255, 6, 6, 6, 255];
         store
             .apply_kitty_command_with_context(
                 b"a=f,i=64,r=2,q=2",
@@ -7321,10 +7569,7 @@ mod tests {
     #[test]
     fn compose_rejects_missing_frames_out_of_bounds_and_overlapping_rectangles() {
         let mut store = SessionGraphicsStore::new(SessionId::new(62));
-        let root = [
-            1, 1, 1, 255, 2, 2, 2, 255,
-            3, 3, 3, 255, 4, 4, 4, 255,
-        ];
+        let root = [1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255, 4, 4, 4, 255];
         store
             .apply_kitty_command_with_context(
                 b"a=T,f=32,i=62,s=2,v=2,q=2",
@@ -7370,8 +7615,7 @@ mod tests {
     fn frame_composition_composes_a_delta_onto_its_base_frame() {
         let mut store = SessionGraphicsStore::new(SessionId::new(70));
         let red = [
-            255, 0, 0, 255, 255, 0, 0, 255,
-            255, 0, 0, 255, 255, 0, 0, 255,
+            255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
         ];
         store
             .apply_kitty_command_with_context(
@@ -7382,8 +7626,7 @@ mod tests {
             )
             .unwrap();
         let green = [
-            0, 255, 0, 255, 0, 255, 0, 255,
-            0, 255, 0, 255, 0, 255, 0, 255,
+            0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255,
         ];
         store
             .apply_kitty_command_with_context(
@@ -7406,8 +7649,7 @@ mod tests {
         assert_eq!(
             store.coalesced_frame_bytes(70, 3).unwrap(),
             vec![
-                0, 255, 0, 255, 0, 255, 0, 255,
-                0, 255, 0, 255, 0, 0, 255, 255,
+                0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255,
             ]
         );
         // The stored delta keeps only the 1-pixel rectangle, not the whole
@@ -7444,8 +7686,7 @@ mod tests {
         assert_eq!(
             store.coalesced_frame_bytes(71, 2).unwrap(),
             vec![
-                0x11, 0x22, 0x33, 0x44, 255, 255, 255, 255,
-                0x11, 0x22, 0x33, 0x44, 0, 0, 0, 255,
+                0x11, 0x22, 0x33, 0x44, 255, 255, 255, 255, 0x11, 0x22, 0x33, 0x44, 0, 0, 0, 255,
             ]
         );
     }
@@ -7454,8 +7695,7 @@ mod tests {
     fn frame_edit_coalesces_the_existing_frame_into_a_keyframe() {
         let mut store = SessionGraphicsStore::new(SessionId::new(72));
         let red = [
-            255, 0, 0, 255, 255, 0, 0, 255,
-            255, 0, 0, 255, 255, 0, 0, 255,
+            255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
         ];
         store
             .apply_kitty_command_with_context(
@@ -7466,8 +7706,7 @@ mod tests {
             )
             .unwrap();
         let green = [
-            0, 255, 0, 255, 0, 255, 0, 255,
-            0, 255, 0, 255, 0, 255, 0, 255,
+            0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255,
         ];
         store
             .apply_kitty_command_with_context(
@@ -7489,8 +7728,7 @@ mod tests {
             )
             .unwrap();
         let expected = vec![
-            0, 0, 255, 255, 0, 255, 0, 255,
-            0, 255, 0, 255, 0, 255, 0, 255,
+            0, 0, 255, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255,
         ];
         assert_eq!(store.coalesced_frame_bytes(72, 2).unwrap(), expected);
         // The edit collapsed the delta into a full keyframe.
@@ -7498,8 +7736,7 @@ mod tests {
             store.animation_frame_bytes(72, 2),
             Some(
                 &[
-                    0, 0, 255, 255, 0, 255, 0, 255,
-                    0, 255, 0, 255, 0, 255, 0, 255,
+                    0, 0, 255, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255,
                 ][..]
             )
         );
@@ -7571,10 +7808,7 @@ mod tests {
         // `a=c` copies frame 2's rendered (1,1) pixel into the root's (0,0),
         // so the delta source must be coalesced before reading.
         store
-            .apply_kitty_command(
-                b"a=c,i=74,r=2,c=1,X=1,Y=1,x=0,y=0,w=1,h=1,C=1,q=2",
-                b"",
-            )
+            .apply_kitty_command(b"a=c,i=74,r=2,c=1,X=1,Y=1,x=0,y=0,w=1,h=1,C=1,q=2", b"")
             .unwrap();
         let decoded = store.decoded_bytes(74).unwrap();
         assert_eq!(&decoded[0..4], &[0, 0, 255, 255]);
@@ -7614,8 +7848,7 @@ mod tests {
     fn compose_decodes_a_png_root_frame_into_the_destination() {
         let mut store = SessionGraphicsStore::new(SessionId::new(76));
         let red = [
-            255, 0, 0, 255, 255, 0, 0, 255,
-            255, 0, 0, 255, 255, 0, 0, 255,
+            255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
         ];
         let png = png_fixture(2, 2, &red);
         store
@@ -7627,8 +7860,7 @@ mod tests {
             )
             .unwrap();
         let green = [
-            0, 255, 0, 255, 0, 255, 0, 255,
-            0, 255, 0, 255, 0, 255, 0, 255,
+            0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255,
         ];
         store
             .apply_kitty_command_with_context(
@@ -7642,10 +7874,7 @@ mod tests {
         // Compose the PNG root over frame 2 (overwriting it); the root must be
         // decoded to RGBA before composing.
         store
-            .apply_kitty_command(
-                b"a=c,i=76,r=1,c=2,X=0,Y=0,x=0,y=0,w=2,h=2,C=1,q=2",
-                b"",
-            )
+            .apply_kitty_command(b"a=c,i=76,r=1,c=2,X=0,Y=0,x=0,y=0,w=2,h=2,C=1,q=2", b"")
             .unwrap();
 
         assert_eq!(store.animation_frame_bytes(76, 2), Some(&red[..]));
@@ -7655,8 +7884,7 @@ mod tests {
     fn compose_into_a_png_root_decodes_it_and_converts_to_rgba() {
         let mut store = SessionGraphicsStore::new(SessionId::new(77));
         let red = [
-            255, 0, 0, 255, 255, 0, 0, 255,
-            255, 0, 0, 255, 255, 0, 0, 255,
+            255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
         ];
         let png = png_fixture(2, 2, &red);
         store
@@ -7668,8 +7896,7 @@ mod tests {
             )
             .unwrap();
         let green = [
-            0, 255, 0, 255, 0, 255, 0, 255,
-            0, 255, 0, 255, 0, 255, 0, 255,
+            0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255,
         ];
         store
             .apply_kitty_command_with_context(
@@ -7683,10 +7910,7 @@ mod tests {
         // Compose frame 2 over the PNG root; the root is decoded to RGBA and
         // the resource's wire format becomes 32.
         store
-            .apply_kitty_command(
-                b"a=c,i=77,r=2,c=1,X=0,Y=0,x=0,y=0,w=2,h=2,C=1,q=2",
-                b"",
-            )
+            .apply_kitty_command(b"a=c,i=77,r=2,c=1,X=0,Y=0,x=0,y=0,w=2,h=2,C=1,q=2", b"")
             .unwrap();
 
         assert_eq!(store.decoded_bytes(77).unwrap(), &green[..]);
@@ -7718,10 +7942,7 @@ mod tests {
 
         // Compose the GIF root over frame 2, decoding it to RGBA.
         store
-            .apply_kitty_command(
-                b"a=c,i=78,r=1,c=2,X=0,Y=0,x=0,y=0,w=1,h=1,C=1,q=2",
-                b"",
-            )
+            .apply_kitty_command(b"a=c,i=78,r=1,c=2,X=0,Y=0,x=0,y=0,w=1,h=1,C=1,q=2", b"")
             .unwrap();
 
         assert_eq!(
@@ -7808,7 +8029,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.animation_frame_count(90), Some(1));
-        assert_eq!(store.animation_state(90), Some(GraphicsAnimationState::Running));
+        assert_eq!(
+            store.animation_state(90),
+            Some(GraphicsAnimationState::Running)
+        );
         // GIF `Finite(3)` -> `v = 5` (`max_loops = 4`).
         assert_eq!(store.animation_loops(90), Some(5));
 
@@ -7882,10 +8106,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.animation_frame_count(92), Some(0));
-        assert_eq!(store.animation_state(92), Some(GraphicsAnimationState::Stopped));
+        assert_eq!(
+            store.animation_state(92),
+            Some(GraphicsAnimationState::Stopped)
+        );
         let submissions = store.visible_submissions(Rect::new(0, 0, 2, 1));
         assert_eq!(submissions[0].format(), 100);
-        assert_eq!(submissions[0].encoded_payload(), encode_base64_for_test(&output));
+        assert_eq!(
+            submissions[0].encoded_payload(),
+            encode_base64_for_test(&output)
+        );
     }
 
     #[test]
@@ -7980,7 +8210,9 @@ mod tests {
             )
             .unwrap();
         // `v=2` means `max_loops = 1`: play through once, then stop.
-        store.apply_kitty_command(b"a=a,i=81,s=3,v=2,q=2", b"").unwrap();
+        store
+            .apply_kitty_command(b"a=a,i=81,s=3,v=2,q=2", b"")
+            .unwrap();
 
         let t0 = Instant::now();
         store.advance_animations(t0);
@@ -8138,7 +8370,9 @@ mod tests {
     #[test]
     fn delete_frame_removes_an_extra_frame_and_renumbers() {
         let (mut store, red, _green, blue) = frame_delete_fixture(95);
-        store.apply_kitty_command(b"a=d,d=f,i=95,r=3,q=2", b"").unwrap();
+        store
+            .apply_kitty_command(b"a=d,d=f,i=95,r=3,q=2", b"")
+            .unwrap();
         assert_eq!(store.animation_frame_count(95), Some(2));
         // Frames after the removed one renumber down by one.
         assert_eq!(store.animation_frame_bytes(95, 2), Some(&red[..]));
@@ -8151,12 +8385,17 @@ mod tests {
     #[test]
     fn delete_frame_promotes_the_first_extra_frame_to_the_root() {
         let (mut store, red, green, _blue) = frame_delete_fixture(96);
-        store.apply_kitty_command(b"a=d,d=f,i=96,r=1,q=2", b"").unwrap();
+        store
+            .apply_kitty_command(b"a=d,d=f,i=96,r=1,q=2", b"")
+            .unwrap();
         // The first extra frame becomes the new root and the rest renumber.
         assert_eq!(store.decoded_bytes(96), Some(&red[..]));
         assert_eq!(store.animation_frame_count(96), Some(2));
         assert_eq!(store.animation_frame_bytes(96, 2), Some(&green[..]));
-        assert_eq!(store.animation_frame_bytes(96, 3), Some(&[0, 0, 255, 255][..]));
+        assert_eq!(
+            store.animation_frame_bytes(96, 3),
+            Some(&[0, 0, 255, 255][..])
+        );
     }
 
     #[test]
@@ -8164,21 +8403,27 @@ mod tests {
         let (mut store, _red, green, blue) = frame_delete_fixture(97);
         // Removing a frame before the current one shifts it down.
         store.apply_kitty_command(b"a=a,i=97,c=3,q=2", b"").unwrap();
-        store.apply_kitty_command(b"a=d,d=f,i=97,r=2,q=2", b"").unwrap();
+        store
+            .apply_kitty_command(b"a=d,d=f,i=97,r=2,q=2", b"")
+            .unwrap();
         assert_eq!(store.animation_current_frame(97), Some(2));
         assert_eq!(store.animation_frame_bytes(97, 2), Some(&green[..]));
 
         // Removing the current frame keeps the slot, which now holds the next
         // frame.
         store.apply_kitty_command(b"a=a,i=97,c=2,q=2", b"").unwrap();
-        store.apply_kitty_command(b"a=d,d=f,i=97,r=2,q=2", b"").unwrap();
+        store
+            .apply_kitty_command(b"a=d,d=f,i=97,r=2,q=2", b"")
+            .unwrap();
         assert_eq!(store.animation_current_frame(97), Some(2));
         assert_eq!(store.animation_frame_bytes(97, 2), Some(&blue[..]));
 
         // Removing the last frame clamps the current frame to the new last
         // slot (the root once nothing remains).
         store.apply_kitty_command(b"a=a,i=97,c=2,q=2", b"").unwrap();
-        store.apply_kitty_command(b"a=d,d=f,i=97,r=2,q=2", b"").unwrap();
+        store
+            .apply_kitty_command(b"a=d,d=f,i=97,r=2,q=2", b"")
+            .unwrap();
         assert_eq!(store.animation_current_frame(97), Some(1));
         assert_eq!(store.animation_frame_count(97), Some(0));
     }
@@ -8214,7 +8459,9 @@ mod tests {
         assert_eq!(store.animation_current_frame(99), Some(2));
         // Delete frame 3 (20 ms gap): playback now cycles the 10 ms and the
         // renumbered 30 ms frame.
-        store.apply_kitty_command(b"a=d,d=f,i=99,r=3,q=2", b"").unwrap();
+        store
+            .apply_kitty_command(b"a=d,d=f,i=99,r=3,q=2", b"")
+            .unwrap();
         assert_eq!(store.animation_frame_count(99), Some(2));
         // The clock re-anchored, so the next deadline is 10 ms out again.
         assert_eq!(
@@ -8407,8 +8654,11 @@ mod tests {
         let cname = CString::new(name.as_str()).unwrap();
         let pixels = [9, 8, 7, 255];
         unsafe {
-            let fd =
-                libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR | libc::O_EXCL, 0o600);
+            let fd = libc::shm_open(
+                cname.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+                0o600,
+            );
             assert!(fd >= 0, "shm_open failed");
             assert_eq!(libc::ftruncate(fd, pixels.len() as libc::off_t), 0);
             let written = libc::write(fd, pixels.as_ptr() as *const libc::c_void, pixels.len());
@@ -8504,15 +8754,12 @@ mod tests {
     #[test]
     fn relative_placement_resolves_to_parent_offset_and_leaves_cursor_unmoved() {
         let mut store = SessionGraphicsStore::new(SessionId::new(40));
-        store.apply_kitty_command(b"a=t,f=24,i=40", b"AQID").unwrap();
+        store
+            .apply_kitty_command(b"a=t,f=24,i=40", b"AQID")
+            .unwrap();
         // Parent placement at cell (2, 3) with placement id 1.
         store
-            .apply_kitty_command_with_context(
-                b"a=p,i=40,p=1,c=1,r=1,q=2",
-                b"",
-                (2, 3),
-                (10, 20),
-            )
+            .apply_kitty_command_with_context(b"a=p,i=40,p=1,c=1,r=1,q=2", b"", (2, 3), (10, 20))
             .unwrap();
         assert_eq!(store.take_last_cursor_advance(), Some((1, 1)));
         // Child relative to the parent with H=4,V=2. The cursor position must
@@ -8543,12 +8790,7 @@ mod tests {
             .apply_kitty_command_with_context(b"a=p,i=41,p=1,q=2", b"", (1, 0), (0, 0))
             .unwrap();
         store
-            .apply_kitty_command_with_context(
-                b"a=p,i=41,p=2,P=41,Q=1,q=2",
-                b"",
-                (0, 0),
-                (0, 0),
-            )
+            .apply_kitty_command_with_context(b"a=p,i=41,p=2,P=41,Q=1,q=2", b"", (0, 0), (0, 0))
             .unwrap();
         assert_eq!(store.placement_count(), 3);
 
@@ -8561,40 +8803,35 @@ mod tests {
     #[test]
     fn relative_placement_errors_map_to_protocol_codes() {
         let mut store = SessionGraphicsStore::new(SessionId::new(42));
-        store.apply_kitty_command(b"a=t,f=24,i=42", b"AQID").unwrap();
+        store
+            .apply_kitty_command(b"a=t,f=24,i=42", b"AQID")
+            .unwrap();
 
         // Missing parent maps to ENOPARENT.
         let error = store
             .apply_kitty_command(b"a=p,i=42,p=1,P=99,Q=1", b"")
             .unwrap_err();
         assert_eq!(error, GraphicsError::ParentNotFound(99));
-        assert!(String::from_utf8_lossy(&kitty_error_response(
-            b"a=p,i=42,p=1,P=99,Q=1",
-            &error
-        ))
-        .contains("ENOPARENT"));
+        assert!(
+            String::from_utf8_lossy(&kitty_error_response(b"a=p,i=42,p=1,P=99,Q=1", &error))
+                .contains("ENOPARENT")
+        );
 
         // A cycle through existing placements maps to ECYCLE.
         store
             .apply_kitty_command_with_context(b"a=p,i=42,p=1,q=2", b"", (1, 0), (0, 0))
             .unwrap();
         store
-            .apply_kitty_command_with_context(
-                b"a=p,i=42,p=2,P=42,Q=1,q=2",
-                b"",
-                (0, 0),
-                (0, 0),
-            )
+            .apply_kitty_command_with_context(b"a=p,i=42,p=2,P=42,Q=1,q=2", b"", (0, 0), (0, 0))
             .unwrap();
         let error = store
             .apply_kitty_command(b"a=p,i=42,p=1,P=42,Q=2", b"")
             .unwrap_err();
         assert_eq!(error, GraphicsError::RelativeCycle);
-        assert!(String::from_utf8_lossy(&kitty_error_response(
-            b"a=p,i=42,p=1,P=42,Q=2",
-            &error
-        ))
-        .contains("ECYCLE"));
+        assert!(
+            String::from_utf8_lossy(&kitty_error_response(b"a=p,i=42,p=1,P=42,Q=2", &error))
+                .contains("ECYCLE")
+        );
 
         // A virtual placement cannot be relative (EINVAL).
         let error = store
@@ -8606,14 +8843,18 @@ mod tests {
     #[test]
     fn relative_placement_chains_are_bounded_and_report_etoodeep() {
         let mut store = SessionGraphicsStore::new(SessionId::new(43));
-        store.apply_kitty_command(b"a=t,f=24,i=43", b"AQID").unwrap();
+        store
+            .apply_kitty_command(b"a=t,f=24,i=43", b"AQID")
+            .unwrap();
         store
             .apply_kitty_command_with_context(b"a=p,i=43,p=1,q=2", b"", (0, 0), (0, 0))
             .unwrap();
         // p=2..=9 are relative placements at depths 1..8, all allowed.
         for id in 2..=9 {
             let parameters = format!("a=p,i=43,p={id},P=43,Q={},q=2", id - 1);
-            store.apply_kitty_command(parameters.as_bytes(), b"").unwrap();
+            store
+                .apply_kitty_command(parameters.as_bytes(), b"")
+                .unwrap();
         }
         assert_eq!(store.placement_count(), 9);
 
@@ -8622,11 +8863,10 @@ mod tests {
             .apply_kitty_command(b"a=p,i=43,p=10,P=43,Q=9", b"")
             .unwrap_err();
         assert_eq!(error, GraphicsError::RelativeDepthExceeded);
-        assert!(String::from_utf8_lossy(&kitty_error_response(
-            b"a=p,i=43,p=10,P=43,Q=9",
-            &error
-        ))
-        .contains("ETOODEEP"));
+        assert!(
+            String::from_utf8_lossy(&kitty_error_response(b"a=p,i=43,p=10,P=43,Q=9", &error))
+                .contains("ETOODEEP")
+        );
     }
 
     #[test]
@@ -8739,10 +8979,20 @@ mod tests {
             .apply_kitty_command_with_context(b"a=T,f=24,i=1,c=1,r=1,q=2", b"AQID", (3, 4), (0, 0))
             .unwrap();
         store
-            .apply_kitty_command_with_context(b"a=T,f=24,i=2,c=1,r=1,z=-1,q=2", b"BAUG", (3, 4), (0, 0))
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,i=2,c=1,r=1,z=-1,q=2",
+                b"BAUG",
+                (3, 4),
+                (0, 0),
+            )
             .unwrap();
         store
-            .apply_kitty_command_with_context(b"a=T,f=24,i=3,c=1,r=1,z=-1,q=2", b"CAUI", (7, 7), (0, 0))
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,i=3,c=1,r=1,z=-1,q=2",
+                b"CAUI",
+                (7, 7),
+                (0, 0),
+            )
             .unwrap();
         assert_eq!(store.placement_count(), 3);
 
@@ -8761,10 +9011,20 @@ mod tests {
     fn cell_and_z_index_delete_selector_filters_by_both() {
         let mut store = SessionGraphicsStore::new(SessionId::new(64));
         store
-            .apply_kitty_command_with_context(b"a=T,f=24,i=1,c=1,r=1,z=-1,q=2", b"AQID", (3, 4), (0, 0))
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,i=1,c=1,r=1,z=-1,q=2",
+                b"AQID",
+                (3, 4),
+                (0, 0),
+            )
             .unwrap();
         store
-            .apply_kitty_command_with_context(b"a=T,f=24,i=2,c=1,r=1,z=-1,q=2", b"BAUG", (7, 7), (0, 0))
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,i=2,c=1,r=1,z=-1,q=2",
+                b"BAUG",
+                (7, 7),
+                (0, 0),
+            )
             .unwrap();
         store
             .apply_kitty_command_with_context(b"a=T,f=24,i=3,c=1,r=1,q=2", b"CAUI", (3, 4), (0, 0))
@@ -8772,7 +9032,9 @@ mod tests {
         assert_eq!(store.placement_count(), 3);
 
         // d=q targets cell (4,5) [1-based -> (3,4)] with z=-1: only image 1.
-        store.apply_kitty_command(b"a=d,d=q,x=4,y=5,z=-1", b"").unwrap();
+        store
+            .apply_kitty_command(b"a=d,d=q,x=4,y=5,z=-1", b"")
+            .unwrap();
         assert_eq!(store.placement_count(), 2);
         let images = store
             .visible_submissions(Rect::new(0, 0, 12, 12))
@@ -8810,7 +9072,10 @@ mod tests {
             .iter()
             .map(|submission| submission.placement().z_index())
             .collect();
-        assert_eq!(zs, vec![i32::MIN, -1_073_741_825, -1_073_741_823, 0, i32::MAX]);
+        assert_eq!(
+            zs,
+            vec![i32::MIN, -1_073_741_825, -1_073_741_823, 0, i32::MAX]
+        );
         // A value beyond the 32-bit range is rejected.
         let error = store.apply_kitty_command(b"a=T,f=24,i=6,c=1,r=1,z=2147483648,q=2", b"AQID");
         assert!(error.is_err());
@@ -8861,10 +9126,20 @@ mod tests {
     fn virtual_placements_are_deleted_by_id_number_and_range_selectors() {
         let mut store = SessionGraphicsStore::new(SessionId::new(71));
         store
-            .apply_kitty_command_with_context(b"a=T,f=24,i=10,c=1,r=1,U=1,q=2", b"AQID", (0, 0), (0, 0))
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,i=10,c=1,r=1,U=1,q=2",
+                b"AQID",
+                (0, 0),
+                (0, 0),
+            )
             .unwrap();
         store
-            .apply_kitty_command_with_context(b"a=T,f=24,i=20,c=1,r=1,U=1,q=2", b"BAUG", (2, 0), (0, 0))
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,i=20,c=1,r=1,U=1,q=2",
+                b"BAUG",
+                (2, 0),
+                (0, 0),
+            )
             .unwrap();
         store
             .apply_kitty_command_with_context(b"a=T,f=24,i=30,c=1,r=1,q=2", b"CAUI", (4, 0), (0, 0))
@@ -8873,7 +9148,9 @@ mod tests {
 
         // d=r removes the two virtual placements in the id range, retaining the
         // real placement outside it.
-        store.apply_kitty_command(b"a=d,d=r,x=10,y=20", b"").unwrap();
+        store
+            .apply_kitty_command(b"a=d,d=r,x=10,y=20", b"")
+            .unwrap();
         assert_eq!(store.placement_count(), 1);
         let submissions = store.visible_submissions(Rect::new(0, 0, 8, 4));
         assert_eq!(submissions.len(), 1);
@@ -8881,7 +9158,12 @@ mod tests {
 
         // A numbered (I) virtual placement is likewise deleted by d=n.
         store
-            .apply_kitty_command_with_context(b"a=T,f=24,I=7,c=1,r=1,U=1,q=2", b"BAUG", (0, 0), (0, 0))
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,I=7,c=1,r=1,U=1,q=2",
+                b"BAUG",
+                (0, 0),
+                (0, 0),
+            )
             .unwrap();
         assert_eq!(store.placement_count(), 2);
         store.apply_kitty_command(b"a=d,d=n,I=7", b"").unwrap();
@@ -8917,15 +9199,10 @@ mod tests {
 
         // The client then writes placeholder cells at (5,2) and (3,6); the
         // virtual parent's origin is the independent min x / min y = (3,2).
-        let cells = [
-            (5, 2, 0),
-            (3, 6, 0),
-        ]
-        .into_iter()
-        .map(|(column, row, scrollback)| {
-            GraphicsPlaceholderCell::new(column, row, scrollback)
-        })
-        .collect();
+        let cells = [(5, 2, 0), (3, 6, 0)]
+            .into_iter()
+            .map(|(column, row, scrollback)| GraphicsPlaceholderCell::new(column, row, scrollback))
+            .collect();
         store.set_placeholder_cells([(1, cells)].into_iter().collect());
         assert_eq!(store.placeholder_cell_count(), 2);
 
@@ -8967,19 +9244,29 @@ mod tests {
     #[test]
     fn delete_range_removes_images_in_the_id_range() {
         let mut store = SessionGraphicsStore::new(SessionId::new(66));
-        store.apply_kitty_command(b"a=T,f=24,i=10,q=2", b"AQID").unwrap();
-        store.apply_kitty_command(b"a=T,f=24,i=20,q=2", b"BAUG").unwrap();
-        store.apply_kitty_command(b"a=T,f=24,i=30,q=2", b"CAUI").unwrap();
+        store
+            .apply_kitty_command(b"a=T,f=24,i=10,q=2", b"AQID")
+            .unwrap();
+        store
+            .apply_kitty_command(b"a=T,f=24,i=20,q=2", b"BAUG")
+            .unwrap();
+        store
+            .apply_kitty_command(b"a=T,f=24,i=30,q=2", b"CAUI")
+            .unwrap();
         assert_eq!(store.resource_count(), 3);
         assert_eq!(store.placement_count(), 3);
 
         // Lowercase d=r removes placements of images 10..20 but retains data.
-        store.apply_kitty_command(b"a=d,d=r,x=10,y=20", b"").unwrap();
+        store
+            .apply_kitty_command(b"a=d,d=r,x=10,y=20", b"")
+            .unwrap();
         assert_eq!(store.placement_count(), 1);
         assert_eq!(store.resource_count(), 3);
 
         // Uppercase d=R frees data for images in the range.
-        store.apply_kitty_command(b"a=d,d=R,x=10,y=20", b"").unwrap();
+        store
+            .apply_kitty_command(b"a=d,d=R,x=10,y=20", b"")
+            .unwrap();
         assert_eq!(store.resource_count(), 1);
         assert!(store.decoded_bytes(30).is_some());
     }

@@ -65,16 +65,11 @@ pub enum SelectionDirection {
 
 /// Moves a grid `Point` one step in `direction`, clamped to the grid bounds
 /// (history top through the bottommost visible line, and columns `0..=last`).
-fn move_grid_point(
-    point: Point,
-    direction: SelectionDirection,
-    grid: &impl Dimensions,
-) -> Point {
+fn move_grid_point(point: Point, direction: SelectionDirection, grid: &impl Dimensions) -> Point {
     match direction {
-        SelectionDirection::Left => Point::new(
-            point.line,
-            Column(point.column.0.saturating_sub(1)),
-        ),
+        SelectionDirection::Left => {
+            Point::new(point.line, Column(point.column.0.saturating_sub(1)))
+        }
         SelectionDirection::Right => Point::new(
             point.line,
             Column((point.column.0 + 1).min(grid.last_column().0)),
@@ -968,9 +963,7 @@ impl TerminalSession {
         let now = Instant::now();
         let click_count = self.advance_click_count(position, now);
 
-        if shift
-            && let Some(anchor) = self.selection_anchor
-        {
+        if shift && let Some(anchor) = self.selection_anchor {
             // Extend the existing selection to the new point, preserving the
             // anchor and mode while recomputing both endpoints' sides.
             let ty = self
@@ -1327,9 +1320,24 @@ impl TerminalSession {
                         // (visible images would slide into history, and a
                         // scrolled-out image would resurrect on `ED 3`).
                         let scrollback_before = self.scrollback_lines();
+                        // Mirror full-screen scrolls into the virtual buffer so
+                        // its mutation-driven command stream moves images with
+                        // the text (Workstream 8). Partial-region (DECSTBM)
+                        // scrolls are deferred to the region-aware increment.
+                        let region_scroll_before = self.scroll_tracker.current_region_scroll();
+                        let region_before = self.scroll_tracker.current_region();
                         self.processor.advance(&mut self.term, &plain);
                         self.scroll_processor
                             .advance(&mut self.scroll_tracker, &plain);
+                        if region_before.is_full_screen() {
+                            let delta = self
+                                .scroll_tracker
+                                .current_region_scroll()
+                                .saturating_sub(region_scroll_before);
+                            if delta != 0 {
+                                self.graphics.record_scroll(delta);
+                            }
+                        }
                         // The emulator does not answer XTVERSION (`CSI > q`),
                         // so reply here with a cmdash identity before flushing
                         // queued child responses.
@@ -1355,7 +1363,10 @@ impl TerminalSession {
                             let region_scroll = self.scroll_tracker.current_region_scroll();
                             for erase in erases {
                                 self.graphics.apply_erase(
-                                    erase, scrollback_before, region, region_scroll,
+                                    erase,
+                                    scrollback_before,
+                                    region,
+                                    region_scroll,
                                 );
                             }
                         }
@@ -1365,7 +1376,8 @@ impl TerminalSession {
                         // (`U=1`) parent resolves against these cells, so they
                         // must be current before any following command event
                         // is processed.
-                        self.graphics.set_placeholder_cells(self.scan_placeholder_cells());
+                        self.graphics
+                            .set_placeholder_cells(self.scan_placeholder_cells());
                         changed = true;
                     }
                 }
@@ -1418,7 +1430,8 @@ impl TerminalSession {
                         let advance = graphics_cursor_advance_bytes(columns, rows);
                         if !advance.is_empty() {
                             self.processor.advance(&mut self.term, &advance);
-                            self.scroll_processor.advance(&mut self.scroll_tracker, &advance);
+                            self.scroll_processor
+                                .advance(&mut self.scroll_tracker, &advance);
                         }
                     }
                     changed = true;
@@ -1480,11 +1493,14 @@ impl TerminalSession {
                 | (u32::from(rgb.r) << 16)
                 | (u32::from(rgb.g) << 8)
                 | u32::from(rgb.b);
-            cells.entry(image).or_default().push(GraphicsPlaceholderCell::new(
-                indexed.point.column.0 as u16,
-                indexed.point.line.0 as u16,
-                scrollback,
-            ));
+            cells
+                .entry(image)
+                .or_default()
+                .push(GraphicsPlaceholderCell::new(
+                    indexed.point.column.0 as u16,
+                    indexed.point.line.0 as u16,
+                    scrollback,
+                ));
         }
         cells
     }
@@ -2823,7 +2839,9 @@ mod tests {
             .consume_output(b"\x1b_Ga=T,f=24,i=33,c=1,r=1,C=1,q=2;AQID\x1b\\")
             .unwrap();
         assert_eq!(
-            session.graphics(Rect::new(0, 0, 20, 6))[0].placement().area(),
+            session.graphics(Rect::new(0, 0, 20, 6))[0]
+                .placement()
+                .area(),
             Rect::new(5, 1, 1, 1)
         );
         assert_eq!(session.scrollback_lines(), 0);
@@ -2839,7 +2857,9 @@ mod tests {
         assert_eq!(scene.cell_at(0, 0).unwrap().symbol, 'k');
         assert_eq!(scene.cell_at(0, 1).unwrap().symbol, 'A');
         assert_eq!(
-            session.graphics(Rect::new(0, 0, 10, 6))[0].placement().area(),
+            session.graphics(Rect::new(0, 0, 10, 6))[0]
+                .placement()
+                .area(),
             Rect::new(5, 1, 1, 1)
         );
         session.shutdown().unwrap();
@@ -3049,9 +3069,7 @@ mod tests {
     #[test]
     fn flowed_copy_joins_wrapped_lines_without_a_spurious_newline() {
         let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(5, 3)).unwrap();
-        session
-            .processor
-            .advance(&mut session.term, b"abcdefghij");
+        session.processor.advance(&mut session.term, b"abcdefghij");
         session.begin_selection((0, 0), false);
         session.update_selection((4, 1));
         assert_eq!(
@@ -3064,9 +3082,7 @@ mod tests {
     #[test]
     fn backward_drag_selects_the_full_reversed_range() {
         let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
-        session
-            .processor
-            .advance(&mut session.term, b"abcdef");
+        session.processor.advance(&mut session.term, b"abcdef");
         session.begin_selection((5, 0), false);
         session.update_selection((0, 0));
         assert_eq!(
@@ -3079,9 +3095,7 @@ mod tests {
     #[test]
     fn shift_click_extends_an_existing_selection() {
         let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
-        session
-            .processor
-            .advance(&mut session.term, b"abcdefgh");
+        session.processor.advance(&mut session.term, b"abcdefgh");
         session.begin_selection((0, 0), false);
         session.update_selection((2, 0));
         assert_eq!(
@@ -3189,9 +3203,7 @@ mod tests {
     #[test]
     fn selection_highlight_uses_the_theme_selection_role() {
         let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
-        session
-            .processor
-            .advance(&mut session.term, b"abc");
+        session.processor.advance(&mut session.term, b"abc");
         session.begin_selection((0, 0), false);
         session.update_selection((2, 0));
         let scene = session.render(Rect::new(0, 0, 20, 4), false);

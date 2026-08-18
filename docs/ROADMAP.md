@@ -744,9 +744,9 @@ protocols whose capability semantics have not yet been verified.
 
 ### Workstream 8 — Virtualized image buffer and mutation-driven emission
 
-**Status:** in progress — increment 1 (object model, identity registry,
-command vocabulary, scroll mutation) landed; not yet wired into
-`SessionGraphicsStore`/backends. Today images are an *observation layer* over the emulator
+**Status:** in progress — increments 1–3 landed (object model, identity
+registry, signed row space, store mirror); the render-diff path is still
+authoritative until the adapter swap. Today images are an *observation layer* over the emulator
 grid: each placement carries a `GraphicsGridAnchor` (column, row, captured
 scrollback depth, screen, scroll region, region scroll) and is re-resolved
 against current scrollback/view state at render time, then the backend diffs
@@ -760,29 +760,31 @@ ordered, coalesced command stream (move / delete / upload) as the buffer
 mutates — the same mutation-driven model a real graphical terminal uses for
 its own `grman`.
 
-**Increment 2 (landed):** the object model and command vocabulary are complete
-without yet touching the graphics store. `VirtualBuffer` owns ordered
-`VirtualRow`s + attached `ImageObject`s; `ImagePlacement` carries the child
-`p=` placement id, the stable outer `p=`, cell offsets, and relative/virtual
-parent links; `GraphicsCommand` is `Upload`/`Place`/`Delete` (scoped or
-whole-object). `ImageIdentityRegistry` resolves client `i=`, `I=` numbers
-(newest-surviving wins), and `P`/`Q` parent references (`object_for_parent`).
-Mutations: `add_object`/`attach_placement` (create), `register_upload`
-(transmit-only), `delete_object`/`delete_placement` (whole vs scoped delete),
-`scroll` (up), `insert_lines` (down), `evict_beyond` (limit eviction), and
-`drain_commands` (idempotent coalescing — delete supersedes place/upload,
-multiple places collapse to the last, uploads preserved). Twelve unit tests
-cover attachment, scroll move/delete, past-limit eviction, identity/parent
-resolution, scoped vs object deletes, insert-lines, re-upload, and burst
-coalescing. The ratatui-image decision is documented below.
+**Increments 2–3 (landed):** the object model, identity registry, command
+vocabulary, signed/growable row space, and store mirror are complete.
+`ImagePlacement.start_row` is now a **signed, screen-relative** row (negative =
+history), so placements survive scrolls and only `evict_beyond` drops them past
+the limit; the row attachment index maps negative rows through a `first_row`
+offset. `ImageIdentityRegistry` resolves client `i=`, `I=` numbers, and `P`/`Q`
+parent references. `SessionGraphicsStore` now owns a `VirtualBuffer` and mirrors
+every mutation into it: transmits → `register_upload`, placements →
+`attach_placement` (upsert by outer `p=`), removals → `delete_placement`
+(captured in `retain_placements` so the placement is still available), `clear`
+→ whole-object deletes, and a new `record_scroll(delta)` drives `scroll`/
+`insert_lines`; the session calls `record_scroll` on full-screen scrolls.
+`take_graphics_commands()` drains the coalesced stream (a whole-object delete
+supersedes everything for its object; a scoped delete removes only that
+placement; multiple places collapse per placement). Sixteen unit tests plus two
+store golden tests cover the model and the create/scroll/delete/clear mirror.
+The mirror is currently **additive**: the anchor + render-diff path stays
+authoritative for the backend.
 
-**Remaining increments:** wire `VirtualBuffer` into `SessionGraphicsStore`
-(replace the flat `placements` map + `GraphicsGridAnchor` re-resolution — the
-anchor model must first be generalized to an absolute, growable row space so
-history rows and DECSTBM regions map cleanly), map insert/delete-line, erase
-scopes, reflow, and alternate-screen mutations to commands, and feed the
-drained command stream through the existing direct/placeholder/passthrough
-adapters.
+**Remaining increments:** replace the render-time
+`submit_graphics(changed, visible, removed)` diff with the drained command
+stream as the outer terminal's source of truth (keeping the frame diff for
+*visibility*), feed the commands through the direct/placeholder/passthrough
+adapters, add region-scoped scroll/insert/delete-line mutation mapping, and
+extend `kitty_verify.py` to replay the command stream against real Kitty.
 
 ### Goals and boundaries
 
