@@ -15,7 +15,7 @@ use crate::{
         SurfaceCommand, TabCommand,
     },
     config::{AppConfig, ConfigError},
-    graphics::GraphicsSubmission,
+    graphics::{GraphicsDeltas, GraphicsSubmission},
     keymap::{KeyAction, Keymap},
     layout::{LayoutError, LayoutTree},
     scene::{CellStyle, Scene},
@@ -592,7 +592,9 @@ impl AppState {
         }
         // Terminal-driven Kitty animations advance on wall-clock time; capture
         // the next frame deadline so the scheduler can wake the render loop.
-        self.graphics_animation_next = self.widget_runtime.advance_graphics_animations(Instant::now());
+        self.graphics_animation_next = self
+            .widget_runtime
+            .advance_graphics_animations(Instant::now());
         let active_terminal = self.active_terminal_widget();
         if active_terminal.is_some_and(|id| report.changed().contains(&id)) {
             self.reset_cursor_blink();
@@ -611,12 +613,14 @@ impl AppState {
             .count();
         let focused = self.active_terminal_widget().and_then(|id| {
             let session_id = self.widget_runtime.session_id(id)?;
-            let title = self.session_event_bus.title_of(session_id).or_else(|| {
-                self.widget_runtime.session_title(id)
-            })?;
+            let title = self
+                .session_event_bus
+                .title_of(session_id)
+                .or_else(|| self.widget_runtime.session_title(id))?;
             Some((session_id, title))
         });
-        self.session_event_bus.update_context(count, focused.clone());
+        self.session_event_bus
+            .update_context(count, focused.clone());
         if focused != self.last_focused_session {
             self.last_focused_session = focused.clone();
             if let Some((session_id, title)) = focused {
@@ -631,10 +635,8 @@ impl AppState {
     /// Publishes a terminal-session title change to the event bus (called when
     /// the frontend observes a `UiEvent::SessionTitle`).
     pub fn publish_session_title(&mut self, id: SessionId, title: String) {
-        self.session_event_bus.publish(SessionEvent::new(
-            id,
-            SessionEventKind::Title { title },
-        ));
+        self.session_event_bus
+            .publish(SessionEvent::new(id, SessionEventKind::Title { title }));
     }
 
     /// Returns the delay until the focused visible terminal should blink again.
@@ -1079,6 +1081,20 @@ impl AppState {
             .filter_map(|surface| surface.widget().map(|widget| (widget, surface.area())))
             .collect();
         self.widget_runtime.graphics(&areas)
+    }
+
+    /// Drains every visible terminal widget's mutation-driven graphics deltas
+    /// (Workstream 8) so the backend adapters can submit them instead of a
+    /// frame-to-frame render diff.
+    pub fn drain_graphics_deltas(&mut self) -> GraphicsDeltas {
+        let areas: BTreeMap<_, _> = self
+            .workspace
+            .surfaces
+            .values()
+            .filter(|surface| surface.visible())
+            .filter_map(|surface| surface.widget().map(|widget| (widget, surface.area())))
+            .collect();
+        self.widget_runtime.drain_graphics_deltas(&areas)
     }
 
     pub fn take_surface_invalidations(&mut self) -> Vec<Rect> {

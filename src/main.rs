@@ -279,16 +279,20 @@ where
         let diff =
             compositor.compose_and_diff(area, state, &base, &surface_scenes, widget_report.changed());
         backend.submit_diff(&diff)?;
+        // Workstream 8 adapter swap: the mutation-driven command stream is the
+        // source of truth for which placements need upload/place/delete; the
+        // render diff still supplies the visible set and placeholder regions.
+        let graphics_deltas = state.drain_graphics_deltas();
         let graphics_status = backend.submit_graphics_frame(
-            diff.graphics(),
+            &graphics_deltas.changed,
             diff.visible_graphics(),
-            diff.removed_graphics(),
+            &graphics_deltas.removed,
             diff.visible_placeholders(),
             diff.removed_placeholders(),
         )?;
         if !graphics_status.is_successful()
             && graphics_status.placements() > 0
-            && (!diff.graphics().is_empty() || !diff.removed_graphics().is_empty())
+            && (!graphics_deltas.changed.is_empty() || !graphics_deltas.removed.is_empty())
         {
             let outcome = match &graphics_status {
                 GraphicsSubmissionStatus::Suppressed { .. } => "suppressed",

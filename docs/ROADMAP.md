@@ -744,9 +744,10 @@ protocols whose capability semantics have not yet been verified.
 
 ### Workstream 8 — Virtualized image buffer and mutation-driven emission
 
-**Status:** in progress — increments 1–3 landed (object model, identity
-registry, signed row space, store mirror); the render-diff path is still
-authoritative until the adapter swap. Today images are an *observation layer* over the emulator
+**Status:** in progress — increments 1–4 landed (object model, identity
+registry, signed row space, store mirror, and the adapter swap); the
+mutation-driven command stream is now the source of truth for the outer
+terminal's `changed`/`removed` sets. Today images are an *observation layer* over the emulator
 grid: each placement carries a `GraphicsGridAnchor` (column, row, captured
 scrollback depth, screen, scroll region, region scroll) and is re-resolved
 against current scrollback/view state at render time, then the backend diffs
@@ -776,15 +777,24 @@ every mutation into it: transmits → `register_upload`, placements →
 supersedes everything for its object; a scoped delete removes only that
 placement; multiple places collapse per placement). Sixteen unit tests plus two
 store golden tests cover the model and the create/scroll/delete/clear mirror.
-The mirror is currently **additive**: the anchor + render-diff path stays
-authoritative for the backend.
 
-**Remaining increments:** replace the render-time
-`submit_graphics(changed, visible, removed)` diff with the drained command
-stream as the outer terminal's source of truth (keeping the frame diff for
-*visibility*), feed the commands through the direct/placeholder/passthrough
-adapters, add region-scoped scroll/insert/delete-line mutation mapping, and
-extend `kitty_verify.py` to replay the command stream against real Kitty.
+**Increment 4 (landed): the adapter swap.** `SessionGraphicsStore` now logs
+removed placements at mutation time (`record_buffer_remove`/`clear`) and
+`drain_graphics_deltas(surface, …)` converts the coalesced command stream into
+full surface-projected `changed`/`removed` submissions, reusing the exact
+projection helper of the render path so a `Place` move, an upload, and a delete
+serialize byte-identically to the frame diff. `main.rs` feeds
+`submit_graphics_frame(&deltas.changed, visible, &deltas.removed, …)` — the
+render diff now supplies only *visibility* and placeholder regions. A frame
+advance is mirrored as a `Place` serve mutation so animations keep re-uploading
+their next frame without a render diff noticing the revision bump. Three
+parity tests prove the drained deltas equal `visible_submissions` for
+create/delete/scroll/clear.
+
+**Remaining increments:** region-scoped scroll/insert/delete-line and the
+ED/RIS/alternate-screen erase scopes are not yet wired to emit commands (only
+full-screen scroll is), reflow re-attachment is pending, and `kitty_verify.py`
+should replay the command stream against real Kitty.
 
 ### Goals and boundaries
 
@@ -870,12 +880,12 @@ Define an explicit table from each buffer mutation to its command stream:
   idempotent, and the queue is drained by the backend in submission order.
   *(Row-ordering, rather than first-seen ordering, is deferred to the
   adapter-integration increment.)*
-- [ ] Replace the render-time `submit_graphics(changed, visible, removed)`
+- [x] Replace the render-time `submit_graphics(changed, visible, removed)`
   diff with the mutation-produced command queue as the source of truth for
   the outer terminal, while keeping the frame diff for *visibility* (which
   placements are in the rendered window after view navigation) and the
   ack-gated resource GC.
-- [ ] Feed the command stream through the existing direct / Unicode-
+- [x] Feed the command stream through the existing direct / Unicode-
   placeholder / passthrough adapters unchanged (they already serialize
   `a=p` moves, `d=i,i=X,p=P` scoped deletes, and placeholder-cell clears);
   the virtual buffer supplies the commands, the adapters keep the bytes.

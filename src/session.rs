@@ -91,9 +91,9 @@ use crate::{
     appearance::Theme,
     backend::kitty_diacritic_index,
     graphics::{
-        GraphicsErase, GraphicsPlaceholderCell, GraphicsProtocolAdapter, GraphicsProtocolBroker,
-        GraphicsProtocolEvent, GraphicsScreen, GraphicsScrollRegion, GraphicsSubmission,
-        SessionGraphicsStore, kitty_error_response, should_emit_response,
+        GraphicsDeltas, GraphicsErase, GraphicsPlaceholderCell, GraphicsProtocolAdapter,
+        GraphicsProtocolBroker, GraphicsProtocolEvent, GraphicsScreen, GraphicsScrollRegion,
+        GraphicsSubmission, SessionGraphicsStore, kitty_error_response, should_emit_response,
     },
     scene::{CellStyle, Color, Scene, Underline},
     session_events::{SessionEvent, SessionEventBus, SessionEventKind},
@@ -907,6 +907,20 @@ impl TerminalSession {
 
     pub fn graphics(&self, surface: Rect) -> Vec<GraphicsSubmission> {
         self.graphics.visible_submissions_with_scroll_state(
+            surface,
+            self.scrollback_lines(),
+            self.scroll_tracker.active_screen(),
+            self.scroll_tracker.current_region(),
+            self.scroll_tracker.current_region_scroll(),
+            self.scrollback_offset(),
+        )
+    }
+
+    /// Drains this session's mutation-driven graphics deltas (Workstream 8),
+    /// projecting them onto `surface` with the same scroll state the render
+    /// path uses so the backend adapters receive identical geometry.
+    pub fn drain_graphics_deltas(&mut self, surface: Rect) -> GraphicsDeltas {
+        self.graphics.drain_graphics_deltas(
             surface,
             self.scrollback_lines(),
             self.scroll_tracker.active_screen(),

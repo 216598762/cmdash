@@ -1090,6 +1090,18 @@ impl GraphicsSubmission {
     }
 }
 
+/// The mutation-driven graphics deltas for one frame: which placements need
+/// (re-)upload/placement and which need deletion, derived from the virtual
+/// buffer's command stream rather than a frame-to-frame render diff.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphicsDeltas {
+    /// Placements that must be uploaded and/or placed at the outer terminal
+    /// (a `Place` command), reconstructed to full surface-projected geometry.
+    pub changed: Vec<GraphicsSubmission>,
+    /// Placements whose outer-terminal representation must be deleted.
+    pub removed: Vec<GraphicsSubmission>,
+}
+
 /// The pixel-accurate result of clipping a placement to a cell-aligned region:
 /// the visible source crop plus the sub-cell geometry the clipped placement
 /// must re-anchor at so a subsequent clip stays exact.
@@ -1528,6 +1540,10 @@ pub struct SessionGraphicsStore {
     /// (Workstream 8). It is currently additive: the anchor + render-diff path
     /// remains authoritative for the backend until the adapter swap lands.
     buffer: VirtualBuffer,
+    /// Removed placements captured at mutation time so the drained command
+    /// stream can reconstruct full `removed` submissions even after the
+    /// placement (and, for uppercase deletes, its resource) is gone.
+    removed_submissions: Vec<GraphicsSubmission>,
     limits: GraphicsLimits,
     decoded_bytes: usize,
     pending_upload: Option<PendingUpload>,
@@ -1569,6 +1585,7 @@ impl SessionGraphicsStore {
             resources: BTreeMap::new(),
             placements: BTreeMap::new(),
             buffer: VirtualBuffer::new(),
+            removed_submissions: Vec::new(),
             limits,
             decoded_bytes: 0,
             pending_upload: None,
@@ -1695,6 +1712,10 @@ impl SessionGraphicsStore {
     }
 
     pub fn clear(&mut self) {
+        for placement in self.placements.values() {
+            self.removed_submissions
+                .push(self.removed_submission(placement));
+        }
         self.resources.clear();
         self.placements.clear();
         self.pending_upload = None;
@@ -1710,6 +1731,95 @@ impl SessionGraphicsStore {
     /// this stream is used for golden/parity validation.
     pub fn take_graphics_commands(&mut self) -> Vec<GraphicsCommand> {
         self.buffer.drain_commands()
+    }
+
+    /// Drains the virtual buffer's command stream and converts it into full
+    /// surface-projected `changed`/`removed` submissions for the backend
+    /// adapters (Workstream 8 adapter swap).
+    ///
+    /// `changed` is one submission per surviving `Place` command (a move or a
+    /// re-upload), reconstructed from the store's authoritative placement and
+    /// resource and projected with the exact geometry of the render path. A
+    /// transmit-only `Upload` has no placement, so it produces no `changed`
+    /// entry — its bumped generation is reflected in the resource and picked
+    /// up by the next `Place` of that object, matching the render path which
+    /// only ever emits visible placements.
+    ///
+    /// `removed` is the mutation-time removal log projected through the same
+    /// helper; when projection fails (a removed relative placement whose
+    /// parent is already gone, or a placement scrolled fully off-surface), the
+    /// raw geometry is kept so the outer deletion is still emitted.
+    pub fn drain_graphics_deltas(
+        &mut self,
+        surface: Rect,
+        current_scrollback: usize,
+        current_screen: GraphicsScreen,
+        current_region: GraphicsScrollRegion,
+        current_region_scroll: i64,
+        view_offset: usize,
+    ) -> GraphicsDeltas {
+        let view_offset = i32::try_from(view_offset).unwrap_or(i32::MAX);
+        let commands = self.buffer.drain_commands();
+
+        let logged_removals = std::mem::take(&mut self.removed_submissions);
+        let mut removed = Vec::with_capacity(logged_removals.len());
+        for mut submission in logged_removals {
+            match self.submission_for_placement(
+                &submission.placement,
+                surface,
+                current_scrollback,
+                current_screen,
+                current_region,
+                current_region_scroll,
+                view_offset,
+            ) {
+                Some(projected) => removed.push(projected),
+                None => {
+                    submission.placement.x = surface.x.saturating_add(submission.placement.x());
+                    submission.placement.y = surface.y.saturating_add(submission.placement.y());
+                    removed.push(submission);
+                }
+            }
+        }
+
+        let mut changed = Vec::new();
+        let mut seen = BTreeSet::new();
+        for command in commands {
+            let GraphicsCommand::Place { object, placement } = command else {
+                continue;
+            };
+            let Some(image) = self
+                .buffer
+                .object(object)
+                .map(|entry| entry.resource.resource.image())
+            else {
+                continue;
+            };
+            let Some(store_placement) = self.placements.values().find(|candidate| {
+                candidate.resource().image() == image
+                    && candidate.outer_placement_id() == placement.outer_placement_id
+            }) else {
+                continue;
+            };
+            if !seen.insert((image, placement.outer_placement_id)) {
+                continue;
+            }
+            if let Some(submission) = self.submission_for_placement(
+                store_placement,
+                surface,
+                current_scrollback,
+                current_screen,
+                current_region,
+                current_region_scroll,
+                view_offset,
+            ) {
+                changed.push(submission);
+            }
+        }
+
+        sort_submissions(&mut changed);
+        sort_submissions(&mut removed);
+        GraphicsDeltas { changed, removed }
     }
 
     /// Records a full-screen scroll of `delta` rows (positive = scrolled up, so
@@ -1781,14 +1891,34 @@ impl SessionGraphicsStore {
     }
 
     /// Mirrors a removed placement into the virtual buffer as a scoped (or
-    /// whole-object, when last) delete.
+    /// whole-object, when last) delete, and captures the full submission so the
+    /// drained command stream can reconstruct the `removed` set after the
+    /// placement (and possibly its resource) is gone.
     fn record_buffer_remove(&mut self, placement: &GraphicsPlacement) {
+        self.removed_submissions
+            .push(self.removed_submission(placement));
         let image = placement.resource().image();
         let Some(object) = self.buffer.identity().object_for_client(image) else {
             return;
         };
         self.buffer
             .delete_placement(object, placement.outer_placement_id());
+    }
+
+    /// Builds a full `GraphicsSubmission` for a placement being removed. The
+    /// pixel payload is deliberately omitted: removal only serializes the
+    /// delete selector (`a=d`), never the image data.
+    fn removed_submission(&self, placement: &GraphicsPlacement) -> GraphicsSubmission {
+        let resource = self.resources.get(&placement.resource().image());
+        GraphicsSubmission {
+            resource: placement.resource(),
+            format: resource.map_or(0, |resource| resource.format),
+            generation: resource.map_or(0, |resource| resource.generation),
+            encoded_payload: Vec::new(),
+            pixel_width: resource.map_or(0, |resource| resource.pixel_width),
+            pixel_height: resource.map_or(0, |resource| resource.pixel_height),
+            placement: placement.clone(),
+        }
     }
 
     fn to_buffer_placement(&self, placement: &GraphicsPlacement) -> ImagePlacement {
@@ -3827,8 +3957,33 @@ impl SessionGraphicsStore {
                 resource.animation_revision = resource.animation_revision.wrapping_add(1).max(1);
             }
         }
+        if changed {
+            // A frame advance changes what the outer terminal must display, so
+            // mirror it as a serve mutation (a `Place` for each placement) so
+            // the drained command stream re-uploads the new frame with a bumped
+            // generation instead of relying on a render diff to notice it.
+            self.record_animation_serve(image);
+        }
         let gap = frame_gap_ms(self.resources.get(&image)?, frame);
         Some(anchor + Duration::from_millis(u64::from(gap)))
+    }
+
+    /// Emits a `Place` command for every placement of `image` so a frame
+    /// advance is replayed to the outer terminal as a re-place of the same
+    /// placement (the drain serves the bumped animation generation).
+    fn record_animation_serve(&mut self, image: u32) {
+        let Some(object) = self.buffer.identity().object_for_client(image) else {
+            return;
+        };
+        let placements: Vec<ImagePlacement> = self
+            .placements
+            .values()
+            .filter(|placement| placement.resource().image() == image)
+            .map(|placement| self.to_buffer_placement(placement))
+            .collect();
+        for placement in placements {
+            self.buffer.attach_placement(object, placement);
+        }
     }
 
     /// The pixel payload and generation a resource should serve: the coalesced
@@ -4428,67 +4583,15 @@ impl SessionGraphicsStore {
             .placements
             .values()
             .filter_map(|placement| {
-                if placement.anchor.screen() != current_screen {
-                    return None;
-                }
-                // Virtual placements (U=1) are invisible prototypes; they never
-                // produce a rendered submission.
-                if placement.is_virtual() {
-                    return None;
-                }
-                let resource = self.resources.get(&placement.resource.image())?;
-                let (column, resolved_y) = self.resolve_origin(
+                self.submission_for_placement(
                     placement,
+                    surface,
                     current_scrollback,
+                    current_screen,
                     current_region,
                     current_region_scroll,
                     view_offset,
-                    0,
-                )?;
-                let placement_area = (
-                    i32::from(surface.x) + column,
-                    i32::from(surface.y) + resolved_y,
-                    placement.width,
-                    placement.height,
-                );
-                let clipped_area = intersect_signed(placement_area, surface)?;
-                let offset_x =
-                    u32::try_from(i32::from(clipped_area.x) - placement_area.0).unwrap_or(0);
-                let offset_y =
-                    u32::try_from(i32::from(clipped_area.y) - placement_area.1).unwrap_or(0);
-                let clipped = clip_placement(
-                    placement,
-                    offset_x,
-                    offset_y,
-                    clipped_area.width,
-                    clipped_area.height,
-                    (resource.pixel_width, resource.pixel_height),
-                )?;
-                // An animation serves the coalesced current frame (with a
-                // bumped generation so the outer terminal re-uploads it) rather
-                // than the static root frame.
-                let (served_payload, served_generation) =
-                    self.served_graphics_payload(placement.resource.image(), resource);
-                Some(GraphicsSubmission {
-                    resource: placement.resource,
-                    format: resource.format,
-                    generation: served_generation,
-                    encoded_payload: served_payload,
-                    pixel_width: resource.pixel_width,
-                    pixel_height: resource.pixel_height,
-                    placement: GraphicsPlacement {
-                        x: clipped_area.x,
-                        y: clipped_area.y,
-                        width: clipped_area.width,
-                        height: clipped_area.height,
-                        source: clipped.source,
-                        cell_x_offset: clipped.cell_x_offset,
-                        cell_y_offset: clipped.cell_y_offset,
-                        drawn_width: clipped.drawn_width,
-                        drawn_height: clipped.drawn_height,
-                        ..*placement
-                    },
-                })
+                )
             })
             .collect::<Vec<_>>();
         // Kitty draws equal-z placements in ascending image-id order (lower
@@ -4501,6 +4604,83 @@ impl SessionGraphicsStore {
             )
         });
         submissions
+    }
+
+    /// Projects one placement into a full surface-projected `GraphicsSubmission`
+    /// (resolving anchors against the current scroll state and clipping to the
+    /// surface), or `None` when it is on another screen, virtual, unresolvable,
+    /// or entirely outside the surface. Shared by the render path and the
+    /// mutation-driven delta drain so both produce identical geometry.
+    #[allow(clippy::too_many_arguments)]
+    fn submission_for_placement(
+        &self,
+        placement: &GraphicsPlacement,
+        surface: Rect,
+        current_scrollback: usize,
+        current_screen: GraphicsScreen,
+        current_region: GraphicsScrollRegion,
+        current_region_scroll: i64,
+        view_offset: i32,
+    ) -> Option<GraphicsSubmission> {
+        if placement.anchor.screen() != current_screen {
+            return None;
+        }
+        // Virtual placements (U=1) are invisible prototypes; they never
+        // produce a rendered submission.
+        if placement.is_virtual() {
+            return None;
+        }
+        let resource = self.resources.get(&placement.resource.image())?;
+        let (column, resolved_y) = self.resolve_origin(
+            placement,
+            current_scrollback,
+            current_region,
+            current_region_scroll,
+            view_offset,
+            0,
+        )?;
+        let placement_area = (
+            i32::from(surface.x) + column,
+            i32::from(surface.y) + resolved_y,
+            placement.width,
+            placement.height,
+        );
+        let clipped_area = intersect_signed(placement_area, surface)?;
+        let offset_x = u32::try_from(i32::from(clipped_area.x) - placement_area.0).unwrap_or(0);
+        let offset_y = u32::try_from(i32::from(clipped_area.y) - placement_area.1).unwrap_or(0);
+        let clipped = clip_placement(
+            placement,
+            offset_x,
+            offset_y,
+            clipped_area.width,
+            clipped_area.height,
+            (resource.pixel_width, resource.pixel_height),
+        )?;
+        // An animation serves the coalesced current frame (with a bumped
+        // generation so the outer terminal re-uploads it) rather than the
+        // static root frame.
+        let (served_payload, served_generation) =
+            self.served_graphics_payload(placement.resource.image(), resource);
+        Some(GraphicsSubmission {
+            resource: placement.resource,
+            format: resource.format,
+            generation: served_generation,
+            encoded_payload: served_payload,
+            pixel_width: resource.pixel_width,
+            pixel_height: resource.pixel_height,
+            placement: GraphicsPlacement {
+                x: clipped_area.x,
+                y: clipped_area.y,
+                width: clipped_area.width,
+                height: clipped_area.height,
+                source: clipped.source,
+                cell_x_offset: clipped.cell_x_offset,
+                cell_y_offset: clipped.cell_y_offset,
+                drawn_width: clipped.drawn_width,
+                drawn_height: clipped.drawn_height,
+                ..*placement
+            },
+        })
     }
 }
 
@@ -4540,6 +4720,20 @@ fn resource_storage_bytes(resource: &GraphicsResource) -> usize {
             .map(|frame| frame.payload.len())
             .sum::<usize>(),
     )
+}
+
+/// Orders submissions by z-index, then image id, then outer placement id, so
+/// both the render path and the drained-delta path serialize in a stable,
+/// byte-comparable order (Kitty draws equal-z placements by ascending image
+/// id).
+fn sort_submissions(submissions: &mut [GraphicsSubmission]) {
+    submissions.sort_by_key(|submission| {
+        (
+            submission.placement.z_index(),
+            submission.placement.resource.image(),
+            submission.placement.outer_placement_id(),
+        )
+    });
 }
 
 /// Whether two same-size rectangles at `a` and `b` overlap on either axis.
@@ -5673,6 +5867,125 @@ mod tests {
                 .iter()
                 .all(|command| matches!(command, GraphicsCommand::Delete { all: true, .. }))
         );
+    }
+
+    #[test]
+    fn drain_graphics_deltas_match_the_render_path_for_static_mutations() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(92));
+        let surface = Rect::new(0, 0, 8, 4);
+        store
+            .apply_kitty_command(b"a=T,f=24,i=7,c=2,r=1,C=1,q=2", b"AQID")
+            .unwrap();
+
+        // Create: one changed submission, byte-identical to the render path's
+        // visible projection.
+        let deltas = store.drain_graphics_deltas(
+            surface,
+            0,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::unbounded(),
+            0,
+            0,
+        );
+        assert_eq!(deltas.removed.len(), 0);
+        assert_eq!(deltas.changed.len(), 1);
+        let rendered = store.visible_submissions(surface);
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(deltas.changed[0], rendered[0]);
+
+        // Delete: one removed submission carrying the identity the delete
+        // selector needs, and no changed entry.
+        store.apply_kitty_command(b"a=d,d=i,i=7", b"").unwrap();
+        let deltas = store.drain_graphics_deltas(
+            surface,
+            0,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::unbounded(),
+            0,
+            0,
+        );
+        assert_eq!(deltas.changed.len(), 0);
+        assert_eq!(deltas.removed.len(), 1);
+        assert_eq!(deltas.removed[0].resource().image(), 7);
+        assert_eq!(deltas.removed[0].placement().outer_placement_id(), 1);
+    }
+
+    #[test]
+    fn drain_graphics_deltas_track_scroll_moves_like_the_render_path() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(93));
+        let surface = Rect::new(0, 0, 8, 6);
+        store
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,i=7,c=2,r=1,C=1,q=2",
+                b"AQID",
+                (0, 2),
+                (10, 20),
+            )
+            .unwrap();
+        store.drain_graphics_deltas(
+            surface,
+            0,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::unbounded(),
+            0,
+            0,
+        );
+
+        store.record_scroll(1);
+        let deltas = store.drain_graphics_deltas(
+            surface,
+            1,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::unbounded(),
+            0,
+            0,
+        );
+        assert_eq!(deltas.changed.len(), 1, "the scroll emits one move");
+        assert_eq!(deltas.removed.len(), 0);
+        let rendered = store.visible_submissions_at(surface, 1);
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(
+            deltas.changed[0], rendered[0],
+            "the drained move projects to the same surface geometry"
+        );
+    }
+
+    #[test]
+    fn drain_graphics_deltas_clear_logs_every_removed_placement() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(94));
+        let surface = Rect::new(0, 0, 8, 4);
+        store
+            .apply_kitty_command(b"a=T,f=24,i=1,c=1,r=1,C=1,q=2", b"AQID")
+            .unwrap();
+        store
+            .apply_kitty_command(b"a=T,f=24,i=2,c=1,r=1,C=1,q=2", b"BAUG")
+            .unwrap();
+        store.drain_graphics_deltas(
+            surface,
+            0,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::unbounded(),
+            0,
+            0,
+        );
+
+        store.clear();
+        let deltas = store.drain_graphics_deltas(
+            surface,
+            0,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::unbounded(),
+            0,
+            0,
+        );
+        assert_eq!(deltas.changed.len(), 0);
+        assert_eq!(deltas.removed.len(), 2, "one removed submission per image");
+        let images = deltas
+            .removed
+            .iter()
+            .map(|submission| submission.resource().image())
+            .collect::<Vec<_>>();
+        assert_eq!(images, vec![1, 2]);
     }
 
     #[test]

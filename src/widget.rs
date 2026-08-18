@@ -14,7 +14,7 @@ use crate::{
     animation::{AnimationFrame, AnimationSettings},
     appearance::Theme,
     config::{AppConfig, LabelPolicy, WidgetInstanceConfig},
-    graphics::{GraphicsPlaceholderLayer, GraphicsSubmission},
+    graphics::{GraphicsDeltas, GraphicsPlaceholderLayer, GraphicsSubmission},
     plugin::PluginRegistry,
     scene::{CellStyle, Color, Scene},
     session::{SelectionDirection, SessionWakeup, TerminalSession, TerminalSize},
@@ -514,6 +514,12 @@ pub trait Widget: Send {
         Vec::new()
     }
 
+    /// Drains this widget's mutation-driven graphics deltas (Workstream 8).
+    /// Non-terminal widgets have none.
+    fn drain_graphics_deltas(&mut self, _area: Rect) -> GraphicsDeltas {
+        GraphicsDeltas::default()
+    }
+
     /// Advances any terminal-driven Kitty animation this widget owns to `now`
     /// and returns the delay until its next frame deadline (`None` when the
     /// widget plays no animation).
@@ -862,11 +868,15 @@ impl WidgetRuntime {
     }
 
     pub fn session_id(&self, id: WidgetId) -> Option<SessionId> {
-        self.instances.get(&id).and_then(|entry| entry.widget.session_id())
+        self.instances
+            .get(&id)
+            .and_then(|entry| entry.widget.session_id())
     }
 
     pub fn session_title(&self, id: WidgetId) -> Option<String> {
-        self.instances.get(&id).and_then(|entry| entry.widget.session_title())
+        self.instances
+            .get(&id)
+            .and_then(|entry| entry.widget.session_title())
     }
 
     pub fn statuses(&self) -> impl Iterator<Item = WidgetStatus> + '_ {
@@ -1091,6 +1101,22 @@ impl WidgetRuntime {
             .collect()
     }
 
+    /// Drains every terminal widget's mutation-driven graphics deltas for the
+    /// frame (Workstream 8), aggregating `changed`/`removed` across widgets in
+    /// stable widget order.
+    pub fn drain_graphics_deltas(&mut self, areas: &BTreeMap<WidgetId, Rect>) -> GraphicsDeltas {
+        let mut changed = Vec::new();
+        let mut removed = Vec::new();
+        for (&id, &area) in areas {
+            if let Some(entry) = self.instances.get_mut(&id) {
+                let deltas = entry.widget.drain_graphics_deltas(area);
+                changed.extend(deltas.changed);
+                removed.extend(deltas.removed);
+            }
+        }
+        GraphicsDeltas { changed, removed }
+    }
+
     #[cfg(feature = "sixel")]
     pub fn sixel(&self, areas: &BTreeMap<WidgetId, Rect>) -> Vec<SixelSubmission> {
         areas
@@ -1301,6 +1327,11 @@ impl Widget for TerminalWidget {
 
     fn graphics(&self, area: Rect) -> Vec<GraphicsSubmission> {
         self.session.graphics(self.appearance.content_area(area))
+    }
+
+    fn drain_graphics_deltas(&mut self, area: Rect) -> GraphicsDeltas {
+        self.session
+            .drain_graphics_deltas(self.appearance.content_area(area))
     }
 
     fn copy_selection(&self, area: Rect) -> Option<String> {
@@ -1667,7 +1698,6 @@ pub(crate) fn parse_log_line(line: &str) -> (StatusLevel, String) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1985,8 +2015,10 @@ mod tests {
         assert!(!disabled.scrollbar());
         assert!(!disabled.indicator());
 
-        let invalid =
-            ScrollbackChrome::from_settings(&BTreeMap::from([("scrollbar".to_owned(), "yes".to_owned())]));
+        let invalid = ScrollbackChrome::from_settings(&BTreeMap::from([(
+            "scrollbar".to_owned(),
+            "yes".to_owned(),
+        )]));
         assert!(invalid.is_err());
     }
 
@@ -2007,7 +2039,10 @@ mod tests {
             ("copy_on_release".to_owned(), "true".to_owned()),
         ]))
         .unwrap();
-        assert_eq!(configured.double_click_timeout(), Duration::from_millis(250));
+        assert_eq!(
+            configured.double_click_timeout(),
+            Duration::from_millis(250)
+        );
         assert_eq!(configured.semantic_escape_chars(), Some("-_"));
         assert!(!configured.selection_auto_scroll());
         assert!(configured.copy_on_select());
@@ -2149,7 +2184,9 @@ mod tests {
         let live = widget.render(area, true);
         assert_eq!(live.cell_at(20, 4).unwrap().symbol, '█');
         assert_eq!(live.cell_at(20, 1).unwrap().symbol, '│');
-        let top: String = (0..22).map(|x| live.cell_at(x, 0).unwrap().symbol).collect();
+        let top: String = (0..22)
+            .map(|x| live.cell_at(x, 0).unwrap().symbol)
+            .collect();
         assert!(!top.contains('%'));
 
         // Scrolling to the top moves the thumb up and reveals the indicator.
@@ -2176,7 +2213,9 @@ mod tests {
         // The rightmost content column keeps its (blank) terminal cell and no
         // percentage appears in the border.
         assert_eq!(scene.cell_at(20, 1).unwrap().symbol, ' ');
-        let top: String = (0..22).map(|x| scene.cell_at(x, 0).unwrap().symbol).collect();
+        let top: String = (0..22)
+            .map(|x| scene.cell_at(x, 0).unwrap().symbol)
+            .collect();
         assert!(!top.contains('%'));
 
         widget.session.shutdown().unwrap();

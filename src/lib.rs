@@ -53,7 +53,7 @@ pub use config::{
 };
 pub use crash::CrashReport;
 pub use graphics::{
-    GraphicsAnimationState, GraphicsDiagnostic, GraphicsError, GraphicsGridAnchor,
+    GraphicsAnimationState, GraphicsDeltas, GraphicsDiagnostic, GraphicsError, GraphicsGridAnchor,
     GraphicsInputDemultiplexer, GraphicsLimits, GraphicsPlaceholderLayer, GraphicsPlacement,
     GraphicsProtocolAdapter, GraphicsProtocolBroker, GraphicsProtocolCommand,
     GraphicsProtocolError, GraphicsProtocolEvent, GraphicsResourceId, GraphicsResponse,
