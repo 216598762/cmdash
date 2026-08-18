@@ -252,7 +252,7 @@ where
                 Err(error) => state.record_diagnostic(format!("config reload failed: {error}")),
             }
         }
-        state.update_widgets(SystemTime::now());
+        let widget_report = state.update_widgets(SystemTime::now());
         if let Some(text) = state.take_clipboard() {
             backend.submit_clipboard(&text)?;
         }
@@ -276,7 +276,8 @@ where
         } else {
             state.widget_surface_scenes()
         };
-        let diff = compositor.compose_and_diff(area, state, &base, &surface_scenes);
+        let diff =
+            compositor.compose_and_diff(area, state, &base, &surface_scenes, widget_report.changed());
         backend.submit_diff(&diff)?;
         let graphics_status = backend.submit_graphics_frame(
             diff.graphics(),
@@ -303,6 +304,7 @@ where
         }
         #[cfg(feature = "sixel")]
         backend.submit_sixel(diff.sixel())?;
+        compositor.recycle(diff);
         frame_generation = frame_generation.wrapping_add(1);
         if let Some(api) = context.api.as_deref_mut() {
             api.publish_snapshot(cmdash::ApiSnapshot::from_state(

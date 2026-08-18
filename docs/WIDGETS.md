@@ -432,14 +432,16 @@ The cursor is rendered by cmdash inside the terminal scene. Its optional
 presentation blink and motion settings are documented in
 [ANIMATION.md](ANIMATION.md); terminal emulator cursor modes remain authoritative.
 
-Scrollback is navigated with the mouse wheel, `Shift+PageUp`/`Shift+PageDown`,
-`Shift+Up`/`Shift+Down`, and `Shift+Home`/`Shift+End`. While history exists the
-terminal draws a right-edge scrollbar (muted track, focus-colored thumb) and,
-when scrolled away from the live screen, a percentage indicator in the title
-bar. Both are theme-aware and can be disabled per terminal with
-`settings.scrollbar` and `settings.scroll_indicator` (default `true`). History
-is bounded by `settings.scrollback` (default `10000` lines); graphics that
-scroll past that limit are evicted and their decoded bytes released.
+Scrollback is navigated with the mouse wheel and `Shift+PageUp`/`Shift+PageDown`.
+`Shift+Up`/`Shift+Down` and `Shift+Home`/`Shift+End` scroll history while no
+selection is active and extend an existing selection once one exists (see
+"Terminal selection and copy"). While history exists the terminal draws a
+right-edge scrollbar (muted track, focus-colored thumb) and, when scrolled away
+from the live screen, a percentage indicator in the title bar. Both are
+theme-aware and can be disabled per terminal with `settings.scrollbar` and
+`settings.scroll_indicator` (default `true`). History is bounded by
+`settings.scrollback` (default `10000` lines); graphics that scroll past that
+limit are evicted and their decoded bytes released.
 
 A terminal widget is not a global terminal pane. Splitting it creates another
 terminal widget and another session ID; the new pane inherits the source
@@ -644,11 +646,21 @@ semantics. The highlight follows the flowed selection range with the theme
 selection colors. When the child has enabled mouse reporting (or the alternate
 screen is active), the events reach the child and no local selection is made.
 
+Keyboard selection is available without a mouse: `Shift`+Left/Right extend the
+tail one cell and `Shift`+Up/Down one line, while `Shift`+Home/End jump to the
+line start/end, anchoring at the grid cursor when no selection exists. To avoid
+breaking scrollback, `Shift`+Left/Right always select, `Shift`+Up/Down/Home/End
+select while a selection is active and otherwise scroll history, and
+`Shift`+PageUp/PageDown always scroll. The double-click window, semantic
+word-break characters, and auto-scroll/copy behavior are configurable per
+typical terminal via `settings` (see [CONFIGURATION.md](CONFIGURATION.md)).
+
 For a focused terminal widget, key events are encoded for the PTY and paste is
 sent through the session's bracketed-paste-aware path. `Ctrl+Shift+C` copies the
-current selection through the backend's OSC 52 clipboard submission path. The
-copy notification is kept in cmdash diagnostics/status state rather than sent
-to the shell.
+current selection through the backend's OSC 52 clipboard submission path; a
+terminal with `copy_on_select` or `copy_on_release` enabled auto-copies its
+finalized selection when the mouse button lifts instead. The copy notification
+is kept in cmdash diagnostics/status state rather than sent to the shell.
 
 Pane and application commands are handled before widget input when their key
 bindings match:

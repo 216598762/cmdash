@@ -218,6 +218,20 @@ exactly two built-in types: `terminal` and `widget`.
   another capability-rich entry whose terminfo is installed) to make programs
   opt in to the negotiated Kitty keyboard protocol and graphics; the value must
   be a non-empty name of at most 64 bytes.
+- Terminal selection is configurable per widget through the same `settings`
+  namespace:
+  - `double_click_timeout_ms`: the multi-click window in milliseconds (default
+    `500`, bounded `100..=10000`).
+  - `semantic_escape_chars`: the word-break characters used by double-click
+    (semantic) word selection (default the emulator's built-in set; a
+    non-empty string of at most 64 bytes with no NUL).
+  - `selection_auto_scroll`: `true` (default) or `false`, gating the
+    drag-past-the-edge auto-scroll as it lands.
+  - `copy_on_select` / `copy_on_release`: `false` (default) or `true`; when
+    enabled, the finalized selection is auto-copied to the clipboard via OSC 52
+    when the mouse button lifts, instead of requiring `Ctrl+Shift+C`.
+- Keyboard selection (`Shift`+arrows, `Shift`+Home/End) needs no configuration;
+  see [WIDGETS.md](WIDGETS.md) for the interaction with scrollback navigation.
 
 Appearance is configured through `[appearance]`; see
 [APPEARANCE.md](APPEARANCE.md) for semantic roles, parent-terminal palette

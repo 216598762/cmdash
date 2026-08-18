@@ -5,7 +5,7 @@ use crate::graphics::{GraphicsPlaceholderLayer, GraphicsSubmission};
 #[cfg(feature = "sixel")]
 use crate::sixel::SixelSubmission;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Color {
     Rgb { red: u8, green: u8, blue: u8 },
     Ansi(u8),
@@ -26,7 +26,7 @@ impl Color {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum Underline {
     #[default]
     None,
@@ -37,7 +37,7 @@ pub enum Underline {
     Dashed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CellStyle {
     pub foreground: Color,
     pub background: Color,
@@ -262,6 +262,16 @@ impl Scene {
         &self.placeholder_layers
     }
 
+    /// Clears all image/placeholder/sixel layers in place, keeping the cell
+    /// buffer and cursor intact. The compositor uses this to rebuild layer
+    /// state in one pass before re-compositing only the dirty cell regions.
+    pub fn clear_layers(&mut self) {
+        self.image_layers.clear();
+        self.placeholder_layers.clear();
+        #[cfg(feature = "sixel")]
+        self.sixel_layers.clear();
+    }
+
     /// Applies the bounded transition appearance used by the animation layer.
     ///
     /// Terminal scenes remain ordinary retained cells; animation never emits
@@ -344,33 +354,15 @@ impl Scene {
     }
 
     pub fn blit(&mut self, source: &Scene, clip: Rect) {
-        let x_start = source.area.x.max(self.area.x).max(clip.x);
-        let y_start = source.area.y.max(self.area.y).max(clip.y);
-        let x_end = (source.area.x as u32 + source.area.width as u32)
-            .min(self.area.x as u32 + self.area.width as u32)
-            .min(clip.x as u32 + clip.width as u32) as u16;
-        let y_end = (source.area.y as u32 + source.area.height as u32)
-            .min(self.area.y as u32 + self.area.height as u32)
-            .min(clip.y as u32 + clip.height as u32) as u16;
+        self.accumulate_layers(source, clip);
+        self.blit_cells(source, clip);
+    }
 
-        let cursor_in_clip = self
-            .cursor
-            .is_some_and(|cursor| contains(clip, cursor.x, cursor.y));
-        if cursor_in_clip && source.cursor.is_none() {
-            self.cursor = None;
-        }
-        if let Some(cursor) = source.cursor
-            && contains(clip, cursor.x, cursor.y)
-            && self.index(cursor.x, cursor.y).is_some()
-        {
-            self.cursor = Some(cursor);
-        }
-
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                self.clear_cell_occupancy(x, y);
-            }
-        }
+    /// Accumulates `source`'s image/placeholder/sixel layers into this scene,
+    /// clipping and occluding them against `clip`, without copying any cells.
+    /// Kept separate from `blit_cells` so the compositor can rebuild layer
+    /// state in one pass while only re-compositing dirty cell regions.
+    pub fn accumulate_layers(&mut self, source: &Scene, clip: Rect) {
         self.occlude_images(clip);
         self.occlude_placeholder_layers(clip);
         for image in &source.image_layers {
@@ -399,6 +391,38 @@ impl Scene {
                 .and_then(|image| image.clipped_to(self.area))
             {
                 self.sixel_layers.push(image);
+            }
+        }
+    }
+
+    /// Copies `source`'s cell content (and cursor) into this scene, clipped to
+    /// `clip`, without touching image/placeholder/sixel layers.
+    pub fn blit_cells(&mut self, source: &Scene, clip: Rect) {
+        let x_start = source.area.x.max(self.area.x).max(clip.x);
+        let y_start = source.area.y.max(self.area.y).max(clip.y);
+        let x_end = (source.area.x as u32 + source.area.width as u32)
+            .min(self.area.x as u32 + self.area.width as u32)
+            .min(clip.x as u32 + clip.width as u32) as u16;
+        let y_end = (source.area.y as u32 + source.area.height as u32)
+            .min(self.area.y as u32 + self.area.height as u32)
+            .min(clip.y as u32 + clip.height as u32) as u16;
+
+        let cursor_in_clip = self
+            .cursor
+            .is_some_and(|cursor| contains(clip, cursor.x, cursor.y));
+        if cursor_in_clip && source.cursor.is_none() {
+            self.cursor = None;
+        }
+        if let Some(cursor) = source.cursor
+            && contains(clip, cursor.x, cursor.y)
+            && self.index(cursor.x, cursor.y).is_some()
+        {
+            self.cursor = Some(cursor);
+        }
+
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                self.clear_cell_occupancy(x, y);
             }
         }
         for y in y_start..y_end {

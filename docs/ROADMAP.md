@@ -1820,18 +1820,23 @@ terminal does: flowed (not boxed) ranges, double-click word selection,
 triple-click line selection, grid-anchored points that survive scrollback, and
 copy text with correct wrap/newline semantics.
 
-### Implementation status (core landed)
+### Implementation status (core + keyboard + settings landed)
 
-The delegation core is implemented and tested: the hand-rolled viewport tuple
-is gone and the emulator-owned `Term::selection` is the single source of truth
-(`SelectionType` modes, `Side` endpoints, grid `Point`s). Mouse tracking with a
-bounded click-count window drives `Simple`/`Semantic`/`Lines`, `Shift`+click
-extends, drag direction sets each endpoint's `Side`, copy uses
-`selection_to_string()`, and the highlight follows the flowed `SelectionRange`
-with theme selection colors. Remaining increments: keyboard selection
-(`Shift`+arrows), drag auto-scroll, and the configurable selection settings
+The delegation core, keyboard selection, and the configurable settings are
+implemented and tested: the hand-rolled viewport tuple is gone and the
+emulator-owned `Term::selection` is the single source of truth (`SelectionType`
+modes, `Side` endpoints, grid `Point`s). Mouse tracking with a bounded
+click-count window drives `Simple`/`Semantic`/`Lines`, `Shift`+click extends,
+drag direction sets each endpoint's `Side`, copy uses `selection_to_string()`,
+and the highlight follows the flowed `SelectionRange` with theme selection
+colors. `Shift`+arrows (and `Shift`+Home/End) extend or begin a keyboard
+selection anchored at the grid cursor, and the five settings
 (`double_click_timeout_ms`, `semantic_escape_chars`, `selection_auto_scroll`,
-`copy_on_select`/`copy_on_release`).
+`copy_on_select`, `copy_on_release`) are validated per terminal and wired into
+the session (`copy_on_select`/`copy_on_release` auto-copy on mouse release).
+Remaining increments: drag auto-scroll (gated by the now-parsed
+`selection_auto_scroll`), deterministic clear-on-bare-click/focus-loss, and the
+mouse-reporting handoff tests.
 
 ### Goals and boundaries
 
@@ -1905,18 +1910,20 @@ with theme selection colors. Remaining increments: keyboard selection
 
 ### Keyboard selection and configuration
 
-- [ ] (deferred) Add optional keyboard selection: `Shift`+arrows extend the
-  selection tail by one cell/line (and `Shift`+Home/End to line ends) through
-  the existing keymap path, so selection is reachable without a mouse. Vi-mode
-  selection (`toggle_vi_mode`/`vi_motion`) is explicitly out of scope for
-  this phase.
-- [ ] (deferred) Add validated settings: `semantic_escape_chars` (word-break
-  characters passed to the emulator's semantic search), `double_click_timeout_ms`,
-  `selection_auto_scroll` (default `true`), and `copy_on_select`/`copy_on
-  release` (default off, Kitty-style copy-on-release as an option), with
-  theme-aware selection colors using the existing selection role.
-- [ ] (deferred) Keep selection config reload-safe and per-terminal, applying
-  the same `settings` namespace as `scrollbar`/`scroll_indicator` today.
+- [x] Add optional keyboard selection: `Shift`+arrows extend the selection tail
+  by one cell/line (and `Shift`+Home/End to line ends), so selection is
+  reachable without a mouse. `Shift`+Left/Right always select; `Shift`+Up/Down/
+  Home/End extend an existing selection and otherwise keep scrolling history
+  (`Shift`+PageUp/PageDown always scroll). Vi-mode selection
+  (`toggle_vi_mode`/`vi_motion`) is explicitly out of scope for this phase.
+- [x] Add validated settings: `semantic_escape_chars` (word-break characters
+  passed to the emulator's semantic search), `double_click_timeout_ms`,
+  `selection_auto_scroll` (default `true`, parsed now and gating the deferred
+  drag auto-scroll), and `copy_on_select`/`copy_on_release` (default off,
+  auto-copying the finalized selection on mouse release), with theme-aware
+  selection colors using the existing selection role.
+- [x] Keep selection config reload-safe and per-terminal, applying the same
+  `settings` namespace as `scrollbar`/`scroll_indicator` today.
 
 ### Documentation updates
 
@@ -1926,8 +1933,9 @@ with theme selection colors. Remaining increments: keyboard selection
 - [x] Update `docs/ARCHITECTURE.md`: selection ownership moves from the
   hand-rolled session tuple to the emulator-owned `Term::selection`, with the
   viewport↔grid translation as the only session-side logic.
-- [ ] (deferred) Update the keymap documentation for the new `Shift`+arrow
-  selection bindings and any copy binding changes.
+- [x] Document the new `Shift`+arrow selection bindings and copy-on-release
+  behavior in `docs/WIDGETS.md`; the bindings are terminal-widget-local (like
+  scrollback navigation) and are not part of the `[keybindings]` map.
 
 ### Testing and validation
 
@@ -1948,8 +1956,10 @@ with theme selection colors. Remaining increments: keyboard selection
 - [x] Update the existing `selection_tracks_dragged_cells_and_copies_visible_text`
   and `selected_hyperlink` regressions to the emulator-owned model, and add
   click-count/keyboard-selection fixtures.
-- [ ] Add configuration tests for `semantic_escape_chars`,
-  `double_click_timeout_ms`, `selection_auto_scroll`, and `copy_on_select`.
+- [x] Add configuration tests for `semantic_escape_chars`,
+  `double_click_timeout_ms`, `selection_auto_scroll`, `copy_on_select`, and
+  `copy_on_release`, including defaults, valid values, and invalid-value
+  rejection (`selection_settings_parse_and_validate`).
 
 **Exit criteria:** a focused terminal selects text with flowed semantics,
 word/line modes via double/triple-click, and Shift-click extension; selection
@@ -1974,18 +1984,27 @@ single retained frame buffer, without changing the public `Scene` drawing
 contract, the `FrameDiff`/backend contract, or the Phase 13 compositor API.
 It is a performance-and-ownership refactor, not a user-facing feature.
 
-### Implementation status (core landed)
+### Implementation status (retained buffer + damage + pooling landed)
 
-The retained frame buffer is implemented and tested. `Compositor` now owns two
+The retained frame buffer, damage-driven aggregation, scratch-vector pooling,
+and `CellStyle` interning are implemented and tested. `Compositor` owns two
 reused buffers (`composed` and `previous`); the main loop calls
-`compose_and_diff`, which resets the composed buffer in place (`Scene::reset`)
-and replaces the previous generation with a memcpy (`Scene::replace_with`),
-so steady-state frames no longer clone the full frame or allocate a fresh
-composed scene. The composed buffer is exposed via `Compositor::frame()` for the
-API snapshot. Allocation counters (`retained_buffer_reallocations`) prove reuse
-across frames and reallocation only on first frame/resize. Remaining increments:
-per-surface damage regions and single-pass aggregation, a bounded scratch-vector
-pool, and `CellStyle` interning.
+`compose_and_diff(.., changed_widgets)`, which computes per-surface damage from
+widget redraws, surface/overlay geometry-visibility-z changes, focus moves,
+base-shell diffs, and explicit invalidations (plus a full redraw on first
+frame/resize/active animation). Only the dirty regions are re-composited
+(`Scene::blit_cells`) and re-diffed, so a steady frame touches no unchanged
+cells; image/placeholder/sixel layers are rebuilt once per frame via
+`Scene::accumulate_layers`. The composed buffer is exposed via
+`Compositor::frame()` for the API snapshot. The per-frame change/span/layer
+scratch vectors are pooled (`FrameBufferPool`) and recycled after the backend
+consumes each diff (`Compositor::recycle`), and span grouping keys off a
+per-frame `StyleInterner` handle rather than the expanded `CellStyle` struct;
+`retained_buffer_reallocations`, `scratch_reallocations`, and
+`last_frame_distinct_styles` prove the savings. Remaining increments: caching
+the z-ordered lists and keyed layer-set diffs (plus the optional full
+cell-buffer shrink, which is blocked on changing `CellStyle` from a public
+value type to an interned handle).
 
 ### Goals and boundaries
 
@@ -1996,14 +2015,13 @@ pool, and `CellStyle` interning.
   plus a fresh composed `Scene` from `compose`). The refactor eliminates the
   clone and the per-frame composed-scene allocation.
 - [x] Pool the per-frame allocations behind the frame buffer: cell vectors
-  are recycled across frames, so steady-state rendering performs no cell-buffer
-  allocation (first frame and resize still allocate, then reuse).
-  (change/span/layer scratch vectors and a bounded arena are the remaining
-  pooling increment.)
-- [ ] (deferred) Aggregate surfaces directly into the retained buffer in
-  z-order with last-write-wins, instead of the current two-pass
-  `compose` (blit-merge into a fresh scene) then `diff` (full-viewport linear
-  scan). Composition and change detection become one pass over dirty regions.
+  and the change/span/layer scratch vectors are recycled across frames, so
+  steady-state rendering performs no cell-buffer or scratch allocation (first
+  frame and resize still allocate, then reuse).
+- [x] Aggregate surfaces directly into the retained buffer in z-order with
+  last-write-wins, instead of the two-pass `compose` (blit-merge into a fresh
+  scene) then `diff` (full-viewport linear scan). Composition and change
+  detection now run one pass over dirty regions.
 - [x] Keep the `FrameDiff` struct and the backend `submit_diff`/`submit_graphics`
   contract byte-compatible, so direct / Unicode-placeholder / passthrough
   adapters and the API snapshot path are untouched.
@@ -2028,27 +2046,32 @@ pool, and `CellStyle` interning.
 - [x] Introduce a retained composed buffer plus a retained previous-generation
   buffer. The compositor resets the composed buffer and replaces the previous
   buffer in place; it never clones the full frame.
-- [ ] (deferred) Add a `FrameBufferPool` (bounded by a fixed per-frame ceiling,
-  e.g. `viewport_cells` + a small slack) that reuses the change/span/layer
-  scratch vectors, and returns the arena at shutdown/on viewport shrink to
-  avoid unbounded growth.
-- [ ] (deferred) Intern `CellStyle` into a compact style handle (id into a
-  per-frame style table) so cells compare as small integers, identical styles
-  are stored once, and span grouping keys off the handle rather than the
-  expanded 9-field struct. Public `Cell`/`CellStyle` APIs remain unchanged;
-  packing is internal.
+- [x] Add a `FrameBufferPool` that reuses the change/span/layer scratch
+  vectors: `build_diff` takes them out each frame and the main loop returns
+  them via `Compositor::recycle`, so steady-state frames perform no scratch
+  allocation (a vector only reallocates when its capacity grows while filling;
+  `Compositor::scratch_reallocations` exposes the count).
+- [x] Intern `CellStyle` into a compact style handle (id into a per-frame style
+  table) so identical styles are stored once and span grouping keys off the
+  handle rather than the expanded 9-field struct (`CellSpan` carries the
+  `StyleId`; `Compositor::last_frame_distinct_styles` proves dedup). The public
+  `Cell`/`CellStyle` APIs are unchanged: interning keys the diff/span path only.
+  (Shrinking the cell buffer itself to store handles remains deferred — it
+  requires turning `CellStyle` into a handle-backed type, an API change this
+  phase deliberately avoids.)
 
 ### Damage tracking and single-pass aggregation
 
-- [ ] (deferred) Track per-surface dirty regions: a surface contributes a dirty
-  rect when its widget returns `Redraw`, when it is resized/moved/revealed, when
-  focus changes its chrome, or when the compositor is explicitly invalidated.
-  The base, z-order changes, and full viewport changes dirty the whole frame.
-- [ ] (deferred) Aggregate only dirty regions each frame: surfaces blit their
-  dirty region into the retained buffer in z-order (last-write-wins), and each
-  written cell that differs from the previous buffer is recorded as a change
-  in the same pass — no separate full-viewport scan and no
-  compose-then-diff double traversal.
+- [x] Track per-surface dirty regions: a surface contributes a dirty rect when
+  its widget returns `Redraw`, when it is resized/moved/revealed, when focus
+  changes its chrome, or when the compositor is explicitly invalidated. The
+  base shell is diffed against a cached copy, and the first frame/resize/active
+  animation dirty the whole frame.
+- [x] Aggregate only dirty regions each frame: surfaces blit their dirty region
+  into the retained buffer in z-order (last-write-wins), and each written cell
+  that differs from the previous buffer is recorded as a change in the same
+  pass — no separate full-viewport cell scan and no compose-then-diff double
+  traversal (the base-shell equality check is the only full-width comparison).
 - [ ] (deferred) Cache the z-ordered visible surface and overlay lists (and
   their geometry) and recompute them only when layout, visibility, focus, or
   z-order actually change, so a steady frame does not re-sort and re-fetch
@@ -2077,14 +2100,16 @@ pool, and `CellStyle` interning.
 
 - [x] Add unit tests for the retained buffers: reuse across frames, resize
   reallocation, and no unbounded growth under churn.
-- [ ] (deferred) Add damage-tracking tests: a single surface redraw dirties only
-  its region and produces changes limited to that region; focus-chrome, resize,
-  move, reveal, and explicit invalidation each dirty exactly the expected rect.
+- [x] Add damage-tracking tests: a single surface redraw dirties only its
+  region and produces changes limited to that region; focus-chrome and surface
+  moves each dirty both the old and new rects, and an incremental frame is
+  byte-identical to a fresh full recompose.
 - [x] Add single-pass aggregation tests proving the result is byte-identical
   to the old two-pass `compose`+`diff` for every existing golden fixture
   (z-order, clipping, occlusion, wide cells, cursor, overlays).
-- [ ] (deferred) Add style-interning tests: repeated styles produce one handle,
-  cell equality becomes handle equality, and span grouping is unchanged.
+- [x] Add style-interning tests: repeated styles produce one handle, the
+  per-frame table stores only distinct styles, and span grouping is unchanged
+  when keyed off the interned handle.
 - [ ] (deferred) Add set-diff tests for graphics/placeholder removal, including
   equal-z tie-breaks and cross-session resource collisions.
 - [x] Add allocation-counter tests asserting steady-state frames do not

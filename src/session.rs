@@ -43,12 +43,54 @@ const MAX_LINE_EVENT_BYTES: usize = 8 * 1024;
 /// clipboard-read query before falling back to the session's cached copy.
 const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Window in which a second/third click counts as a double/triple click.
-const DOUBLE_CLICK_TIMEOUT: Duration = Duration::from_millis(500);
+/// Default window in which a second/third click counts as a double/triple
+/// click. Overridable per terminal via the `double_click_timeout_ms` setting.
+const DEFAULT_DOUBLE_CLICK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Maximum cell distance between successive clicks for them to count as a
 /// multi-click (a drag between presses resets the click count).
 const CLICK_MOVEMENT_THRESHOLD: u16 = 2;
+
+/// A keyboard-selection motion: move the tail one cell/line or jump to a line
+/// end. These are the `Shift`+arrow / `Shift`+Home / `Shift`+End bindings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectionDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+}
+
+/// Moves a grid `Point` one step in `direction`, clamped to the grid bounds
+/// (history top through the bottommost visible line, and columns `0..=last`).
+fn move_grid_point(
+    point: Point,
+    direction: SelectionDirection,
+    grid: &impl Dimensions,
+) -> Point {
+    match direction {
+        SelectionDirection::Left => Point::new(
+            point.line,
+            Column(point.column.0.saturating_sub(1)),
+        ),
+        SelectionDirection::Right => Point::new(
+            point.line,
+            Column((point.column.0 + 1).min(grid.last_column().0)),
+        ),
+        SelectionDirection::Up => Point::new(
+            Line((point.line.0 - 1).max(grid.topmost_line().0)),
+            point.column,
+        ),
+        SelectionDirection::Down => Point::new(
+            Line((point.line.0 + 1).min(grid.bottommost_line().0)),
+            point.column,
+        ),
+        SelectionDirection::LineStart => Point::new(point.line, Column(0)),
+        SelectionDirection::LineEnd => Point::new(point.line, grid.last_column()),
+    }
+}
 
 use crate::{
     appearance::Theme,
@@ -693,9 +735,14 @@ pub struct TerminalSession {
     line_buffer: Vec<u8>,
     last_exit_code: Option<i32>,
     selection_anchor: Option<Point>,
+    selection_tail: Option<Point>,
     selection_click_count: u8,
     last_click_time: Option<Instant>,
     last_click_position: Option<(u16, u16)>,
+    double_click_timeout: Duration,
+    selection_auto_scroll: bool,
+    copy_on_select: bool,
+    copy_on_release: bool,
 }
 
 impl TerminalSession {
@@ -725,9 +772,14 @@ impl TerminalSession {
             None,
             "xterm-256color",
             Arc::new(Mutex::new(None)),
+            None,
         )
     }
 
+    // This entry point consolidates the PTY/emulator/session setup options
+    // (wakeup, term, clipboard, word-break characters); a builder is deferred
+    // until the option set stabilizes.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_session_id_and_wakeup(
         session_id: SessionId,
         command: Option<&str>,
@@ -736,6 +788,7 @@ impl TerminalSession {
         wakeup: Option<SessionWakeup>,
         term_env: &str,
         clipboard: Arc<Mutex<Option<String>>>,
+        semantic_escape_chars: Option<&str>,
     ) -> Result<Self, SessionError> {
         let size = size.validate()?;
         let pty_system = native_pty_system();
@@ -778,11 +831,17 @@ impl TerminalSession {
         // `term.mode()` when forwarding keys. OSC 52 store/load are forwarded
         // to the session's clipboard cache and the frontend; a load is deferred
         // until the outer terminal's system clipboard answers the read query.
-        let config = Config {
+        let mut config = Config {
             kitty_keyboard: true,
             osc52: Osc52::CopyPaste,
             ..Config::default()
         };
+        // Override the word-break character set used by double-click
+        // (semantic) selection when the terminal's settings request it; an
+        // absent value keeps the emulator's default.
+        if let Some(chars) = semantic_escape_chars {
+            config.semantic_escape_chars = chars.to_owned();
+        }
         let pending_clipboard = Arc::new(Mutex::new(PendingClipboardLoad::default()));
         let term = Term::new(
             config,
@@ -824,9 +883,14 @@ impl TerminalSession {
             line_buffer: Vec::new(),
             last_exit_code: None,
             selection_anchor: None,
+            selection_tail: None,
             selection_click_count: 0,
             last_click_time: None,
             last_click_position: None,
+            double_click_timeout: DEFAULT_DOUBLE_CLICK_TIMEOUT,
+            selection_auto_scroll: true,
+            copy_on_select: false,
+            copy_on_release: false,
         })
     }
 
@@ -914,6 +978,7 @@ impl TerminalSession {
                 .selection
                 .as_ref()
                 .map_or(SelectionType::Simple, |selection| selection.ty);
+            self.selection_tail = Some(point);
             self.rebuild_selection(ty, anchor, point);
             return;
         }
@@ -924,6 +989,7 @@ impl TerminalSession {
             _ => SelectionType::Lines,
         };
         self.selection_anchor = Some(point);
+        self.selection_tail = Some(point);
         self.rebuild_selection(ty, point, point);
     }
 
@@ -938,12 +1004,73 @@ impl TerminalSession {
         };
         let ty = selection.ty;
         let point = self.viewport_to_point(position);
+        self.selection_tail = Some(point);
         self.rebuild_selection(ty, anchor, point);
     }
 
     pub fn clear_selection(&mut self) {
         self.term.selection = None;
         self.selection_anchor = None;
+        self.selection_tail = None;
+    }
+
+    /// Whether a non-empty selection is currently active.
+    pub fn has_selection(&self) -> bool {
+        self.term
+            .selection
+            .as_ref()
+            .is_some_and(|selection| !selection.is_empty())
+    }
+
+    /// Extends (or begins) a keyboard-driven selection by moving the tail one
+    /// cell/line in `direction`. Without an existing selection the anchor is
+    /// the grid cursor, so the first motion selects the cell/line adjacent to
+    /// the cursor exactly like a mouse drag would.
+    pub fn extend_keyboard_selection(&mut self, direction: SelectionDirection) {
+        let cursor = self.term.grid().cursor.point;
+        let ty = self
+            .term
+            .selection
+            .as_ref()
+            .map_or(SelectionType::Simple, |selection| selection.ty);
+        let (anchor, tail) = match (self.selection_anchor, self.selection_tail) {
+            (Some(anchor), Some(tail)) => (anchor, tail),
+            _ => {
+                self.selection_anchor = Some(cursor);
+                self.selection_tail = Some(cursor);
+                (cursor, cursor)
+            }
+        };
+        let tail = move_grid_point(tail, direction, self.term.grid());
+        self.selection_tail = Some(tail);
+        self.rebuild_selection(ty, anchor, tail);
+    }
+
+    /// Applies the per-terminal selection settings that arrive after spawn
+    /// (the word-break characters are fixed at emulator construction).
+    pub fn set_selection_settings(
+        &mut self,
+        double_click_timeout: Duration,
+        selection_auto_scroll: bool,
+        copy_on_select: bool,
+        copy_on_release: bool,
+    ) {
+        self.double_click_timeout = double_click_timeout;
+        self.selection_auto_scroll = selection_auto_scroll;
+        self.copy_on_select = copy_on_select;
+        self.copy_on_release = copy_on_release;
+    }
+
+    pub const fn selection_auto_scroll(&self) -> bool {
+        self.selection_auto_scroll
+    }
+
+    pub const fn copy_on_select(&self) -> bool {
+        self.copy_on_select
+    }
+
+    pub const fn copy_on_release(&self) -> bool {
+        self.copy_on_release
     }
 
     /// Builds (or rebuilds) the emulator-owned selection from a grid anchor and
@@ -966,7 +1093,7 @@ impl TerminalSession {
     fn advance_click_count(&mut self, position: (u16, u16), now: Instant) -> u8 {
         let within_window = self
             .last_click_time
-            .is_some_and(|previous| now.duration_since(previous) <= DOUBLE_CLICK_TIMEOUT);
+            .is_some_and(|previous| now.duration_since(previous) <= self.double_click_timeout);
         let near_previous = self.last_click_position.is_some_and(|(column, row)| {
             column.abs_diff(position.0) <= CLICK_MOVEMENT_THRESHOLD
                 && row.abs_diff(position.1) <= CLICK_MOVEMENT_THRESHOLD
@@ -2969,6 +3096,96 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_selection_extends_from_the_grid_cursor() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        session.processor.advance(&mut session.term, b"abcd");
+        // The cursor rests just past the text at column 4.
+        assert_eq!(session.cursor_position(), (4, 0));
+        assert!(!session.has_selection());
+
+        // The first Shift+Left anchors at the cursor and selects the cell to
+        // its left.
+        session.extend_keyboard_selection(SelectionDirection::Left);
+        assert!(session.has_selection());
+        assert_eq!(
+            session.selected_text(Rect::new(0, 0, 20, 4)).as_deref(),
+            Some("d")
+        );
+
+        // Shift+Home extends the tail to the line start, keeping the anchor.
+        session.extend_keyboard_selection(SelectionDirection::LineStart);
+        assert_eq!(
+            session.selected_text(Rect::new(0, 0, 20, 4)).as_deref(),
+            Some("abcd")
+        );
+
+        session.clear_selection();
+        assert!(!session.has_selection());
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn double_click_timeout_setting_controls_click_counting() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        // The default 500 ms window counts two rapid presses as a double click.
+        session.begin_selection((0, 0), false);
+        session.begin_selection((0, 0), false);
+        assert_eq!(
+            session.term.selection.as_ref().unwrap().ty,
+            SelectionType::Semantic
+        );
+
+        // A zero-length window can never contain a second press, so every
+        // press restarts a single-click selection.
+        session.set_selection_settings(Duration::ZERO, true, false, false);
+        session.clear_selection();
+        session.begin_selection((0, 0), false);
+        session.begin_selection((0, 0), false);
+        assert_eq!(
+            session.term.selection.as_ref().unwrap().ty,
+            SelectionType::Simple
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn semantic_escape_chars_setting_changes_word_boundaries() {
+        // With the default word-break set, `-` is not a boundary, so a
+        // double-click inside `foo-bar` selects the whole token.
+        let mut default = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        default.processor.advance(&mut default.term, b"foo-bar baz");
+        default.begin_selection((1, 0), false);
+        default.begin_selection((1, 0), false);
+        assert_eq!(
+            default.selected_text(Rect::new(0, 0, 20, 4)).as_deref(),
+            Some("foo-bar")
+        );
+        default.shutdown().unwrap();
+
+        // Treating `-` as a word-break character splits the token, so the same
+        // double-click selects only `foo`.
+        let mut custom = TerminalSession::spawn_with_session_id_and_wakeup(
+            SessionId::new(90_998),
+            Some("sh"),
+            &["-c", "sleep 5"],
+            TerminalSize::new(20, 4),
+            None,
+            "xterm-256color",
+            Arc::new(Mutex::new(None)),
+            Some("-"),
+        )
+        .unwrap();
+        custom.processor.advance(&mut custom.term, b"foo-bar baz");
+        custom.begin_selection((1, 0), false);
+        custom.begin_selection((1, 0), false);
+        assert_eq!(
+            custom.selected_text(Rect::new(0, 0, 20, 4)).as_deref(),
+            Some("foo")
+        );
+        custom.shutdown().unwrap();
+    }
+
+    #[test]
     fn selection_highlight_uses_the_theme_selection_role() {
         let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
         session
@@ -3213,6 +3430,7 @@ mod tests {
             Some(wakeup),
             "xterm-256color",
             Arc::clone(&clipboard),
+            None,
         )
         .unwrap();
         session
@@ -3237,6 +3455,7 @@ mod tests {
             None,
             "xterm-256color",
             Arc::clone(&clipboard),
+            None,
         )
         .unwrap();
         session
@@ -3271,6 +3490,7 @@ mod tests {
             Some(wakeup),
             "xterm-256color",
             Arc::clone(&clipboard),
+            None,
         )
         .unwrap();
         session
@@ -3302,6 +3522,7 @@ mod tests {
             Some(wakeup),
             "xterm-256color",
             Arc::clone(&clipboard),
+            None,
         )
         .unwrap();
         session
@@ -3333,6 +3554,7 @@ mod tests {
             Some(wakeup),
             "xterm-256color",
             Arc::clone(&clipboard),
+            None,
         )
         .unwrap();
         session
@@ -3372,6 +3594,7 @@ mod tests {
             Some(wakeup),
             "xterm-256color",
             Arc::new(Mutex::new(None)),
+            None,
         )
         .unwrap();
         session
@@ -3396,6 +3619,7 @@ mod tests {
             None,
             "xterm-256color",
             Arc::new(Mutex::new(None)),
+            None,
         )
         .unwrap();
         session.set_session_event_bus(bus);
@@ -3426,6 +3650,7 @@ mod tests {
             None,
             "xterm-256color",
             Arc::new(Mutex::new(None)),
+            None,
         )
         .unwrap();
         session.set_session_event_bus(bus);
@@ -3455,6 +3680,7 @@ mod tests {
             Some(wakeup),
             "xterm-256color",
             Arc::new(Mutex::new(None)),
+            None,
         )
         .unwrap();
         session.processor.advance(&mut session.term, b"\x07");
@@ -3491,6 +3717,7 @@ mod tests {
             Some(wakeup),
             "xterm-256color",
             Arc::new(Mutex::new(None)),
+            None,
         )
         .unwrap();
         session

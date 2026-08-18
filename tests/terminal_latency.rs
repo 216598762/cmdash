@@ -32,6 +32,7 @@ fn terminal_key_to_echo_latency_benchmark() {
         Some(wakeup.clone()),
         "xterm-256color",
         Arc::new(Mutex::new(None)),
+        None,
     )
     .expect("could not spawn the latency benchmark PTY");
 

@@ -17,7 +17,7 @@ use crate::{
     graphics::{GraphicsPlaceholderLayer, GraphicsSubmission},
     plugin::PluginRegistry,
     scene::{CellStyle, Color, Scene},
-    session::{SessionWakeup, TerminalSession, TerminalSize},
+    session::{SelectionDirection, SessionWakeup, TerminalSession, TerminalSize},
     session_events::SessionEventBus,
     state::{SessionId, WidgetId},
 };
@@ -263,6 +263,115 @@ impl ScrollbackChrome {
     }
 }
 
+/// Per-terminal selection behavior: click timing, semantic word-break
+/// characters, drag auto-scroll, and auto-copy on select/release.
+///
+/// All values are validated from the terminal's `settings` map so a bad value
+/// rejects a reload instead of silently degrading selection behavior.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectionSettings {
+    double_click_timeout: Duration,
+    semantic_escape_chars: Option<String>,
+    selection_auto_scroll: bool,
+    copy_on_select: bool,
+    copy_on_release: bool,
+}
+
+impl Default for SelectionSettings {
+    fn default() -> Self {
+        Self {
+            double_click_timeout: Duration::from_millis(500),
+            semantic_escape_chars: None,
+            selection_auto_scroll: true,
+            copy_on_select: false,
+            copy_on_release: false,
+        }
+    }
+}
+
+impl SelectionSettings {
+    pub fn from_settings(settings: &BTreeMap<String, String>) -> Result<Self, WidgetError> {
+        let double_click_timeout_ms = settings
+            .get("double_click_timeout_ms")
+            .map(|value| {
+                value.parse::<u64>().map_err(|_| {
+                    WidgetError::InvalidConfiguration(format!(
+                        "terminal double_click_timeout_ms must be an integer, got {value:?}"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(500);
+        if !(100..=10_000).contains(&double_click_timeout_ms) {
+            return Err(WidgetError::InvalidConfiguration(format!(
+                "terminal double_click_timeout_ms must be between 100 and 10000, got {double_click_timeout_ms}"
+            )));
+        }
+        let semantic_escape_chars = settings
+            .get("semantic_escape_chars")
+            .map(|value| {
+                let value = value.as_str();
+                if value.is_empty() || value.len() > 64 || value.contains('\0') {
+                    return Err(WidgetError::InvalidConfiguration(format!(
+                        "terminal semantic_escape_chars must be 1..=64 bytes without NUL, got {value:?}"
+                    )));
+                }
+                Ok(value.to_owned())
+            })
+            .transpose()?;
+        let selection_auto_scroll = parse_terminal_bool(settings, "selection_auto_scroll", true)?;
+        let copy_on_select = parse_terminal_bool(settings, "copy_on_select", false)?;
+        let copy_on_release = parse_terminal_bool(settings, "copy_on_release", false)?;
+        Ok(Self {
+            double_click_timeout: Duration::from_millis(double_click_timeout_ms),
+            semantic_escape_chars,
+            selection_auto_scroll,
+            copy_on_select,
+            copy_on_release,
+        })
+    }
+
+    pub const fn double_click_timeout(&self) -> Duration {
+        self.double_click_timeout
+    }
+
+    pub fn semantic_escape_chars(&self) -> Option<&str> {
+        self.semantic_escape_chars.as_deref()
+    }
+
+    pub const fn selection_auto_scroll(&self) -> bool {
+        self.selection_auto_scroll
+    }
+
+    pub const fn copy_on_select(&self) -> bool {
+        self.copy_on_select
+    }
+
+    pub const fn copy_on_release(&self) -> bool {
+        self.copy_on_release
+    }
+}
+
+/// Parses a boolean-valued terminal setting with a stable default and a
+/// shared error shape.
+fn parse_terminal_bool(
+    settings: &BTreeMap<String, String>,
+    key: &str,
+    default: bool,
+) -> Result<bool, WidgetError> {
+    settings
+        .get(key)
+        .map(|value| {
+            value.parse::<bool>().map_err(|_| {
+                WidgetError::InvalidConfiguration(format!(
+                    "terminal {key} must be true or false, got {value:?}"
+                ))
+            })
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
+}
+
 #[derive(Clone, Copy)]
 struct BorderGlyphs {
     horizontal: char,
@@ -459,6 +568,17 @@ pub trait Widget: Send {
     /// The title of this widget's terminal session, if it is a terminal.
     fn session_title(&self) -> Option<String> {
         None
+    }
+
+    /// Whether the widget currently holds a non-empty text selection.
+    fn has_selection(&self) -> bool {
+        false
+    }
+
+    /// Whether a finalized selection should be auto-copied to the clipboard
+    /// (the terminal's `copy_on_select`/`copy_on_release` settings).
+    fn auto_copy_selection(&self) -> bool {
+        false
     }
 
     fn handle_mouse(
@@ -891,6 +1011,18 @@ impl WidgetRuntime {
             .and_then(|entry| entry.widget.selected_hyperlink(area))
     }
 
+    pub fn has_selection(&self, id: WidgetId) -> bool {
+        self.instances
+            .get(&id)
+            .is_some_and(|entry| entry.widget.has_selection())
+    }
+
+    pub fn auto_copy_selection(&self, id: WidgetId) -> bool {
+        self.instances
+            .get(&id)
+            .is_some_and(|entry| entry.widget.auto_copy_selection())
+    }
+
     pub fn handle_mouse(
         &mut self,
         id: WidgetId,
@@ -1041,6 +1173,7 @@ struct TerminalWidget {
     theme: Theme,
     cursor_blink: CursorBlinkSettings,
     scrollback_chrome: ScrollbackChrome,
+    selection: SelectionSettings,
 }
 
 /// Returns the content rectangle inside a one-cell widget outline.
@@ -1067,6 +1200,23 @@ fn scrollback_scroll(key: KeyEvent) -> Option<Scroll> {
         KeyCode::Down => Some(Scroll::Delta(-1)),
         KeyCode::Home => Some(Scroll::Top),
         KeyCode::End => Some(Scroll::Bottom),
+        _ => None,
+    }
+}
+
+/// Maps `Shift`+arrow / `Shift`+Home / `Shift`+End to a keyboard-selection
+/// motion. `Shift`+PageUp/PageDown are scrollback navigation, not selection.
+fn keyboard_selection_direction(key: KeyEvent) -> Option<SelectionDirection> {
+    if !key.modifiers.contains(KeyModifiers::SHIFT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Left => Some(SelectionDirection::Left),
+        KeyCode::Right => Some(SelectionDirection::Right),
+        KeyCode::Up => Some(SelectionDirection::Up),
+        KeyCode::Down => Some(SelectionDirection::Down),
+        KeyCode::Home => Some(SelectionDirection::LineStart),
+        KeyCode::End => Some(SelectionDirection::LineEnd),
         _ => None,
     }
 }
@@ -1170,11 +1320,33 @@ impl Widget for TerminalWidget {
         Some(self.title.clone())
     }
 
+    fn has_selection(&self) -> bool {
+        self.session.has_selection()
+    }
+
+    fn auto_copy_selection(&self) -> bool {
+        self.selection.copy_on_select() || self.selection.copy_on_release()
+    }
+
     fn handles_input(&self) -> bool {
         true
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<WidgetUpdate, String> {
+        if let Some(direction) = keyboard_selection_direction(key) {
+            // Horizontal motions always select; vertical/line motions select
+            // only once a selection exists, otherwise they keep scrolling
+            // history (`scrollback_scroll` below).
+            let selects = self.session.has_selection()
+                || matches!(
+                    direction,
+                    SelectionDirection::Left | SelectionDirection::Right
+                );
+            if selects {
+                self.session.extend_keyboard_selection(direction);
+                return Ok(WidgetUpdate::Redraw);
+            }
+        }
         if let Some(scroll) = scrollback_scroll(key) {
             let changed = self.session.scroll_display(scroll);
             return Ok(if changed {
@@ -1355,6 +1527,7 @@ fn terminal_widget_factory(
     let appearance = WidgetAppearance::from_settings(&config.settings)?;
     let cursor_blink = CursorBlinkSettings::from_settings(&config.settings)?;
     let scrollback_chrome = ScrollbackChrome::from_settings(&config.settings)?;
+    let selection = SelectionSettings::from_settings(&config.settings)?;
     let scrollback_limit = config
         .settings
         .get("scrollback")
@@ -1397,12 +1570,19 @@ fn terminal_widget_factory(
         context.session_wakeup().cloned(),
         &term_env,
         context.clipboard(),
+        selection.semantic_escape_chars(),
     )
     .map_err(|error| WidgetError::InitializationFailed {
         kind: "terminal".to_owned(),
         reason: error.to_string(),
     })?;
     session.set_kitty_graphics_support(context.kitty_graphics());
+    session.set_selection_settings(
+        selection.double_click_timeout(),
+        selection.selection_auto_scroll(),
+        selection.copy_on_select(),
+        selection.copy_on_release(),
+    );
     if let Some(bus) = context.session_event_bus() {
         session.set_session_event_bus(bus.clone());
     }
@@ -1420,6 +1600,7 @@ fn terminal_widget_factory(
         theme,
         cursor_blink,
         scrollback_chrome,
+        selection,
     }))
 }
 
@@ -1718,6 +1899,7 @@ mod tests {
             theme: Theme::fallback(),
             cursor_blink: CursorBlinkSettings::default(),
             scrollback_chrome: ScrollbackChrome::default(),
+            selection: SelectionSettings::default(),
         }
     }
 
@@ -1809,6 +1991,131 @@ mod tests {
     }
 
     #[test]
+    fn selection_settings_parse_and_validate() {
+        let defaults = SelectionSettings::from_settings(&BTreeMap::new()).unwrap();
+        assert_eq!(defaults.double_click_timeout(), Duration::from_millis(500));
+        assert_eq!(defaults.semantic_escape_chars(), None);
+        assert!(defaults.selection_auto_scroll());
+        assert!(!defaults.copy_on_select());
+        assert!(!defaults.copy_on_release());
+
+        let configured = SelectionSettings::from_settings(&BTreeMap::from([
+            ("double_click_timeout_ms".to_owned(), "250".to_owned()),
+            ("semantic_escape_chars".to_owned(), "-_".to_owned()),
+            ("selection_auto_scroll".to_owned(), "false".to_owned()),
+            ("copy_on_select".to_owned(), "true".to_owned()),
+            ("copy_on_release".to_owned(), "true".to_owned()),
+        ]))
+        .unwrap();
+        assert_eq!(configured.double_click_timeout(), Duration::from_millis(250));
+        assert_eq!(configured.semantic_escape_chars(), Some("-_"));
+        assert!(!configured.selection_auto_scroll());
+        assert!(configured.copy_on_select());
+        assert!(configured.copy_on_release());
+
+        for (key, value) in [
+            ("double_click_timeout_ms", "fast"),
+            ("double_click_timeout_ms", "0"),
+            ("semantic_escape_chars", ""),
+            ("selection_auto_scroll", "maybe"),
+            ("copy_on_select", "1"),
+            ("copy_on_release", "yes"),
+        ] {
+            assert!(
+                SelectionSettings::from_settings(&BTreeMap::from([(
+                    key.to_owned(),
+                    value.to_owned()
+                )]))
+                .is_err(),
+                "{key}={value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_widget_extends_keyboard_selection_with_shift_arrows() {
+        let mut widget = TerminalWidget {
+            title: " shell ".to_owned(),
+            label: true,
+            session: TerminalSession::spawn_with_args(
+                Some("sh"),
+                &["-c", "printf 'abcdefgh'; sleep 5"],
+                TerminalSize::new(20, 4),
+            )
+            .unwrap(),
+            appearance: WidgetAppearance::default(),
+            theme: Theme::fallback(),
+            cursor_blink: CursorBlinkSettings::default(),
+            scrollback_chrome: ScrollbackChrome::default(),
+            selection: SelectionSettings::default(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && widget.session.cursor_position() != (8, 0) {
+            widget.session.poll_output().unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(widget.session.cursor_position(), (8, 0));
+
+        // Shift+Left starts a selection anchored at the cursor (column 8).
+        let update = widget
+            .handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(update, WidgetUpdate::Redraw);
+        assert!(widget.session.has_selection());
+        assert_eq!(
+            widget
+                .session
+                .selected_text(Rect::new(0, 0, 20, 4))
+                .as_deref(),
+            Some("h")
+        );
+
+        // Shift+Home extends to the line start while the selection is active.
+        widget
+            .handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(
+            widget
+                .session
+                .selected_text(Rect::new(0, 0, 20, 4))
+                .as_deref(),
+            Some("abcdefgh")
+        );
+        widget.session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn terminal_auto_copy_selection_reflects_copy_settings() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "terminal"
+            command = "sh"
+            [workspace.widgets.settings]
+            copy_on_select = "true"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        assert!(runtime.auto_copy_selection(WidgetId::new(1)));
+
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 2
+            type = "terminal"
+            command = "sh"
+            "#,
+        )
+        .unwrap();
+        let runtime = WidgetRuntime::from_config(&WidgetRegistry::builtins(), &config).unwrap();
+        assert!(!runtime.auto_copy_selection(WidgetId::new(2)));
+    }
+
+    #[test]
     fn terminal_rejects_invalid_scrollback_settings() {
         let config = AppConfig::parse(
             r#"
@@ -1890,6 +2197,7 @@ mod tests {
             theme: Theme::fallback(),
             cursor_blink: CursorBlinkSettings::default(),
             scrollback_chrome: ScrollbackChrome::default(),
+            selection: SelectionSettings::default(),
         };
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {

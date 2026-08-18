@@ -229,7 +229,13 @@ impl Overlay {
         if !self.visible {
             return;
         }
+        scene.blit(&self.scene(), scene.area());
+    }
 
+    /// Renders this overlay's primitives into a fresh, overlay-area-sized
+    /// scene. The compositor reuses this to blit overlay cells into only the
+    /// dirty regions of a partially-damaged frame.
+    pub(crate) fn scene(&self) -> Scene {
         let mut overlay_scene = Scene::new(self.area);
         for primitive in &self.primitives {
             match primitive {
@@ -242,7 +248,7 @@ impl Overlay {
                 }
             }
         }
-        scene.blit(&overlay_scene, scene.area());
+        overlay_scene
     }
 }
 
@@ -966,6 +972,14 @@ impl AppState {
         }
         self.widget_runtime
             .handle_mouse(widget_id, mouse, (input_area.x, input_area.y))?;
+        // A terminal that opts into copy-on-select/release auto-copies its
+        // finalized selection to the clipboard when the mouse button lifts.
+        if matches!(mouse.kind, MouseEventKind::Up(_))
+            && self.widget_runtime.auto_copy_selection(widget_id)
+            && self.widget_runtime.has_selection(widget_id)
+        {
+            self.copy_focused_selection();
+        }
         self.reset_cursor_blink();
         Ok(true)
     }
@@ -1947,6 +1961,66 @@ mod tests {
                 .as_deref(),
             Some("copy me")
         );
+    }
+
+    #[test]
+    fn copy_on_release_auto_copies_the_finalized_selection() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "terminal"
+            command = "sh"
+            [workspace.widgets.settings]
+            copy_on_release = "true"
+            "#,
+        )
+        .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        let surface = SurfaceId::new(1);
+        state
+            .dispatch(Command::Surface(SurfaceCommand::SetArea {
+                id: surface,
+                area: Rect::new(0, 0, 20, 8),
+            }))
+            .unwrap();
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(surface)))
+            .unwrap();
+
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        state
+            .handle_mouse(mouse(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                2,
+                2,
+            ))
+            .unwrap();
+        state
+            .handle_mouse(mouse(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                6,
+                2,
+            ))
+            .unwrap();
+        assert!(state.widget_runtime.has_selection(WidgetId::new(1)));
+
+        state
+            .handle_mouse(mouse(
+                MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                6,
+                2,
+            ))
+            .unwrap();
+        assert!(state.take_clipboard().is_some());
+        state.shutdown_widgets();
     }
 
     #[test]
