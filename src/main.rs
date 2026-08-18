@@ -14,8 +14,9 @@ use std::{
 
 use cmdash::{
     ApiServer, AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend,
-    GraphicsInputDemultiplexer, GraphicsSubmissionStatus, OuterInputEvent, SessionWakeup, Surface,
-    SurfaceCommand, SurfaceId, TerminalWindowSize, UiEvent, WidgetRegistry, WidgetRuntimeContext,
+    GraphicsInputDemultiplexer, GraphicsSubmissionStatus, OuterInputEvent, SessionEventBus,
+    SessionWakeup, Surface, SurfaceCommand, SurfaceId, TerminalWindowSize, UiEvent, WidgetRegistry,
+    WidgetRuntimeContext,
     dashboard::{
         render_static_dashboard_shell_with_theme,
         render_static_dashboard_surface_scenes_with_theme, static_dashboard_surface_areas,
@@ -146,9 +147,11 @@ fn main() -> io::Result<()> {
     backend.enter()?;
     probe_outer_terminal(&mut backend)?;
     let (event_sender, event_receiver, pty_wakeup) = ui_event_channel();
+    let session_event_bus = SessionEventBus::new();
     let mut api_server = ApiServer::start(&config.api, event_sender.clone())?;
     let registry = WidgetRegistry::builtins_with_context(
         WidgetRuntimeContext::with_session_wakeup(pty_wakeup.clone())
+            .with_session_event_bus(session_event_bus)
             .with_initial_terminal_size(initial_window_size.terminal_size())
             .with_kitty_graphics(backend.capabilities().kitty_graphics),
     );
@@ -273,8 +276,7 @@ where
         } else {
             state.widget_surface_scenes()
         };
-        let scene = compositor.compose(area, state, &base, &surface_scenes);
-        let diff = compositor.diff(&scene);
+        let diff = compositor.compose_and_diff(area, state, &base, &surface_scenes);
         backend.submit_diff(&diff)?;
         let graphics_status = backend.submit_graphics_frame(
             diff.graphics(),
@@ -305,7 +307,7 @@ where
         if let Some(api) = context.api.as_deref_mut() {
             api.publish_snapshot(cmdash::ApiSnapshot::from_state(
                 state,
-                &scene,
+                compositor.frame(),
                 backend.metrics(),
                 frame_generation,
                 api.expose_graphics(),
@@ -792,6 +794,7 @@ fn collect_ui_event<B: Backend<Error = io::Error>>(
         }
         UiEvent::Bell(_) => state.record_bell(),
         UiEvent::Notification(_, message) => state.record_diagnostic(message),
+        UiEvent::SessionTitle(id, title) => state.publish_session_title(id, title),
         UiEvent::Tick => {}
         UiEvent::ApiWakeup => {}
         UiEvent::AnimationFrame => {

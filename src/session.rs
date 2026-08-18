@@ -13,6 +13,8 @@ use std::{
 use alacritty_terminal::{
     event::{Event, EventListener, WindowSize as EmulatorWindowSize},
     grid::{Dimensions, Scroll},
+    index::{Column, Line, Point, Side},
+    selection::{Selection, SelectionType},
     term::{Config, Osc52, Term, TermMode, cell::Flags},
     vte::ansi::{ClearMode, Color as AnsiColor, Handler, Mode, NamedColor, PrivateMode, Processor},
 };
@@ -33,9 +35,20 @@ const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 /// Upper bound on a single extracted shell-integration notification.
 const MAX_NOTIFICATION_BYTES: usize = 256;
 
+/// Upper bound on a single extracted line-output event before it is truncated
+/// and the buffered remainder dropped.
+const MAX_LINE_EVENT_BYTES: usize = 8 * 1024;
+
 /// How long a session waits for the outer terminal to answer an OSC 52
 /// clipboard-read query before falling back to the session's cached copy.
 const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Window in which a second/third click counts as a double/triple click.
+const DOUBLE_CLICK_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Maximum cell distance between successive clicks for them to count as a
+/// multi-click (a drag between presses resets the click count).
+const CLICK_MOVEMENT_THRESHOLD: u16 = 2;
 
 use crate::{
     appearance::Theme,
@@ -46,6 +59,7 @@ use crate::{
         SessionGraphicsStore, kitty_error_response, should_emit_response,
     },
     scene::{CellStyle, Color, Scene, Underline},
+    session_events::{SessionEvent, SessionEventBus, SessionEventKind},
     state::SessionId,
 };
 
@@ -135,6 +149,8 @@ pub enum UiEvent {
     Bell(SessionId),
     /// Bounded shell-integration metadata (OSC 9/777 notify) from a session.
     Notification(SessionId, String),
+    /// A session's (OSC 0/2) window title changed.
+    SessionTitle(SessionId, String),
     Tick,
     AnimationFrame,
     ApiWakeup,
@@ -269,6 +285,16 @@ impl EventListener for SessionEventListener {
             Event::Bell => {
                 if let Some(ui) = &self.ui {
                     let _ = ui.send(UiEvent::Bell(self.session_id));
+                }
+            }
+            Event::Title(title) => {
+                if let Some(ui) = &self.ui {
+                    let _ = ui.send(UiEvent::SessionTitle(self.session_id, title));
+                }
+            }
+            Event::ResetTitle => {
+                if let Some(ui) = &self.ui {
+                    let _ = ui.send(UiEvent::SessionTitle(self.session_id, String::new()));
                 }
             }
             _ => {}
@@ -640,12 +666,6 @@ impl Handler for ScrollRegionTracker {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Selection {
-    anchor: (u16, u16),
-    active: (u16, u16),
-}
-
 pub struct TerminalSession {
     term: Term<SessionEventListener>,
     processor: Processor,
@@ -664,12 +684,18 @@ pub struct TerminalSession {
     graphics_broker: GraphicsProtocolBroker,
     graphics_protocol: GraphicsProtocolAdapter,
     graphics_protocol_capture: Vec<u8>,
-    selection: Option<Selection>,
     scrollback_limit: usize,
     ui: Option<Sender<UiEvent>>,
     clipboard: Arc<Mutex<Option<String>>>,
     pending_clipboard: Arc<Mutex<PendingClipboardLoad>>,
     session_id: SessionId,
+    session_events: Option<SessionEventBus>,
+    line_buffer: Vec<u8>,
+    last_exit_code: Option<i32>,
+    selection_anchor: Option<Point>,
+    selection_click_count: u8,
+    last_click_time: Option<Instant>,
+    last_click_position: Option<(u16, u16)>,
 }
 
 impl TerminalSession {
@@ -789,12 +815,18 @@ impl TerminalSession {
             graphics_broker: GraphicsProtocolBroker::default(),
             graphics_protocol: GraphicsProtocolAdapter::default(),
             graphics_protocol_capture: Vec::new(),
-            selection: None,
             scrollback_limit: 10_000,
             ui,
             clipboard,
             pending_clipboard,
             session_id,
+            session_events: None,
+            line_buffer: Vec::new(),
+            last_exit_code: None,
+            selection_anchor: None,
+            selection_click_count: 0,
+            last_click_time: None,
+            last_click_position: None,
         })
     }
 
@@ -857,65 +889,132 @@ impl TerminalSession {
         self.graphics.set_outer_kitty_graphics(supported);
     }
 
-    pub fn begin_selection(&mut self, position: (u16, u16)) {
-        self.selection = Some(Selection {
-            anchor: position,
-            active: position,
-        });
+    /// Attaches the coordinator-owned session-event bus so this session can
+    /// publish title, line-output, and exit events to subscribing widgets.
+    pub fn set_session_event_bus(&mut self, bus: SessionEventBus) {
+        self.session_events = Some(bus);
     }
 
-    pub fn update_selection(&mut self, position: (u16, u16)) {
-        if let Some(selection) = &mut self.selection {
-            selection.active = position;
+    /// Begins (or extends) a text selection at the given content-area-relative
+    /// cell. A `Shift`+click extends an existing selection instead of
+    /// replacing it; otherwise the click count (single/double/triple) selects
+    /// the matching `SelectionType` (`Simple`/`Semantic`/`Lines`).
+    pub fn begin_selection(&mut self, position: (u16, u16), shift: bool) {
+        let point = self.viewport_to_point(position);
+        let now = Instant::now();
+        let click_count = self.advance_click_count(position, now);
+
+        if shift
+            && let Some(anchor) = self.selection_anchor
+        {
+            // Extend the existing selection to the new point, preserving the
+            // anchor and mode while recomputing both endpoints' sides.
+            let ty = self
+                .term
+                .selection
+                .as_ref()
+                .map_or(SelectionType::Simple, |selection| selection.ty);
+            self.rebuild_selection(ty, anchor, point);
+            return;
         }
+
+        let ty = match click_count {
+            1 => SelectionType::Simple,
+            2 => SelectionType::Semantic,
+            _ => SelectionType::Lines,
+        };
+        self.selection_anchor = Some(point);
+        self.rebuild_selection(ty, point, point);
+    }
+
+    /// Updates the tail of the current selection to the given cell, computing
+    /// both endpoints' `Side` from the drag direction relative to the anchor.
+    pub fn update_selection(&mut self, position: (u16, u16)) {
+        let Some(anchor) = self.selection_anchor else {
+            return;
+        };
+        let Some(selection) = self.term.selection.as_ref() else {
+            return;
+        };
+        let ty = selection.ty;
+        let point = self.viewport_to_point(position);
+        self.rebuild_selection(ty, anchor, point);
     }
 
     pub fn clear_selection(&mut self) {
-        self.selection = None;
+        self.term.selection = None;
+        self.selection_anchor = None;
     }
 
-    pub fn selected_text(&self, area: Rect) -> Option<String> {
-        let selection = self.selection?;
-        if selection.anchor == selection.active {
-            return None;
-        }
-        let scene = self.render(area, false);
-        let left = selection.anchor.0.min(selection.active.0);
-        let right = selection.anchor.0.max(selection.active.0);
-        let top = selection.anchor.1.min(selection.active.1);
-        let bottom = selection.anchor.1.max(selection.active.1);
-        let mut lines = Vec::new();
-        for row in top..=bottom {
-            let mut line = String::new();
-            for column in left..=right {
-                let x = area.x.saturating_add(column);
-                let y = area.y.saturating_add(row);
-                if let Some(cell) = scene.cell_at(x, y)
-                    && cell.width != crate::scene::CellWidth::Continuation
-                {
-                    line.push(cell.symbol);
-                }
-            }
-            lines.push(line.trim_end().to_owned());
-        }
-        Some(lines.join("\n"))
+    /// Builds (or rebuilds) the emulator-owned selection from a grid anchor and
+    /// tail, deriving each endpoint's `Side` so that a backward drag removes
+    /// exactly the first/last cells instead of over-selecting by one column.
+    fn rebuild_selection(&mut self, ty: SelectionType, anchor: Point, tail: Point) {
+        let (anchor_side, tail_side) = if tail < anchor {
+            (Side::Right, Side::Left)
+        } else {
+            (Side::Left, Side::Right)
+        };
+        let mut selection = Selection::new(ty, anchor, anchor_side);
+        selection.update(tail, tail_side);
+        self.term.selection = Some(selection);
+    }
+
+    /// Advances the click counter using a bounded double-click window and a
+    /// movement threshold, mapping repeated presses to `1 → 2 → 3` and resetting
+    /// to `1` on timeout or a moved press.
+    fn advance_click_count(&mut self, position: (u16, u16), now: Instant) -> u8 {
+        let within_window = self
+            .last_click_time
+            .is_some_and(|previous| now.duration_since(previous) <= DOUBLE_CLICK_TIMEOUT);
+        let near_previous = self.last_click_position.is_some_and(|(column, row)| {
+            column.abs_diff(position.0) <= CLICK_MOVEMENT_THRESHOLD
+                && row.abs_diff(position.1) <= CLICK_MOVEMENT_THRESHOLD
+        });
+        self.selection_click_count = if within_window && near_previous {
+            self.selection_click_count % 3 + 1
+        } else {
+            1
+        };
+        self.last_click_time = Some(now);
+        self.last_click_position = Some(position);
+        self.selection_click_count
+    }
+
+    /// Translates a content-area-relative viewport cell into a grid `Point`
+    /// (absolute line), applying the current scrollback display offset so
+    /// selection and hyperlink lookup never drift by one row in history.
+    fn viewport_to_point(&self, position: (u16, u16)) -> Point {
+        let display_offset = self.term.grid().display_offset() as i32;
+        Point::new(
+            Line(position.1 as i32 - display_offset),
+            Column(position.0 as usize),
+        )
+    }
+
+    /// Inverse of `viewport_to_point`, used to map a grid anchor back to viewport
+    /// coordinates for hyperlink lookup.
+    fn point_to_viewport(&self, point: Point) -> (u16, u16) {
+        let display_offset = self.term.grid().display_offset() as i32;
+        (
+            point.column.0 as u16,
+            (point.line.0 + display_offset) as u16,
+        )
+    }
+
+    /// Copies the current selection using the emulator's own flowed semantics
+    /// (wrapped lines copy without a spurious `\n`, hard breaks with one).
+    pub fn selected_text(&self, _area: Rect) -> Option<String> {
+        self.term.selection_to_string()
     }
 
     /// Returns the URI of the OSC 8 hyperlink covering the given grid cell,
     /// if any. The position is in content-area-relative cell coordinates
     /// (column, row), matching the selection and render mapping.
     pub fn hyperlink_at(&self, position: (u16, u16)) -> Option<String> {
-        // Positions are viewport-relative, but `display_iter` yields absolute
-        // grid lines (negative when scrolled back into history), so the same
-        // offset translation as the render path applies here.
-        let display_offset = self.term.grid().display_offset() as i32;
+        let target = self.viewport_to_point(position);
         for indexed in self.term.grid().display_iter() {
-            let point = indexed.point;
-            let viewport_row = point.line.0 + display_offset;
-            if viewport_row < 0 {
-                continue;
-            }
-            if point.column.0 as u16 == position.0 && viewport_row as u16 == position.1 {
+            if indexed.point == target {
                 return indexed.cell.hyperlink().map(|link| link.uri().to_owned());
             }
         }
@@ -925,11 +1024,12 @@ impl TerminalSession {
     /// Returns the URI of the hyperlink under the current selection's anchor,
     /// if the selection is non-empty and that cell carries an OSC 8 link.
     pub fn selected_hyperlink(&self) -> Option<String> {
-        let selection = self.selection?;
-        if selection.anchor == selection.active {
+        let selection = self.term.selection.as_ref()?;
+        if selection.is_empty() {
             return None;
         }
-        self.hyperlink_at(selection.anchor)
+        let anchor = self.selection_anchor?;
+        self.hyperlink_at(self.point_to_viewport(anchor))
     }
 
     pub fn poll_output(&mut self) -> Result<bool, SessionError> {
@@ -958,12 +1058,23 @@ impl TerminalSession {
         // Reap the child when it exits. The session is only considered closed
         // once the reader has also drained the PTY to EOF, so the child-exit
         // observation cannot race ahead of the final output.
-        let child_exited = self
+        let child_status = self
             .child
             .try_wait()
-            .map_err(|error| SessionError::Io(error.to_string()))?
-            .is_some();
-        if reader_finished && child_exited {
+            .map_err(|error| SessionError::Io(error.to_string()))?;
+        if let Some(status) = child_status.as_ref() {
+            self.last_exit_code = if status.signal().is_some() {
+                None
+            } else {
+                Some(status.exit_code() as i32)
+            };
+        }
+        if reader_finished && child_status.is_some() && !self.closed {
+            self.publish_session_event(SessionEventKind::Exit {
+                code: self.last_exit_code,
+            });
+            self.closed = true;
+        } else if reader_finished && child_status.is_some() {
             self.closed = true;
         }
         // A child that opens a synchronized-output burst (`?2026h`) without
@@ -1021,6 +1132,46 @@ impl TerminalSession {
         true
     }
 
+    /// Publishes a session event to the attached event bus, if any.
+    fn publish_session_event(&self, kind: SessionEventKind) {
+        if let Some(bus) = &self.session_events {
+            bus.publish(SessionEvent::new(self.session_id, kind));
+        }
+    }
+
+    /// Splits plain terminal output into newline-delimited line events and
+    /// publishes each completed line. Only runs when a subscriber is attached,
+    /// so the per-chunk line splitting never costs sessions without listeners.
+    fn split_and_publish_lines(&mut self, bytes: &[u8]) {
+        let Some(bus) = &self.session_events else {
+            return;
+        };
+        if !bus.has_subscribers() {
+            return;
+        }
+        self.line_buffer.extend_from_slice(bytes);
+        while let Some(newline) = self.line_buffer.iter().position(|byte| *byte == b'\n') {
+            let rest = self.line_buffer.split_off(newline + 1);
+            let mut line = std::mem::replace(&mut self.line_buffer, rest);
+            line.pop(); // drop the trailing newline
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            bus.publish(SessionEvent::new(
+                self.session_id,
+                SessionEventKind::Line {
+                    text: String::from_utf8_lossy(&line).into_owned(),
+                },
+            ));
+        }
+        // Bound the unterminated tail so a stream that never emits a newline
+        // cannot grow the accumulator without limit.
+        if self.line_buffer.len() > MAX_LINE_EVENT_BYTES {
+            let excess = self.line_buffer.len() - MAX_LINE_EVENT_BYTES;
+            self.line_buffer.drain(..excess);
+        }
+    }
+
     fn consume_output(&mut self, bytes: &[u8]) -> Result<bool, SessionError> {
         let remaining = MAX_GRAPHICS_PROTOCOL_CAPTURE_BYTES
             .saturating_sub(self.graphics_protocol_capture.len());
@@ -1041,6 +1192,7 @@ impl TerminalSession {
             match event {
                 GraphicsProtocolEvent::Plain(plain) => {
                     if !plain.is_empty() {
+                        self.split_and_publish_lines(&plain);
                         // Capture the scrollback depth *before* the emulator
                         // consumes this chunk: `ED 2` pushes the viewport into
                         // history and `ED 3` clears it, so resolving an erase
@@ -1435,6 +1587,14 @@ impl TerminalSession {
         // would wrap history rows ~to 65535 and silently drop them, tearing
         // scrolled text away from its images.
         let display_offset = self.term.grid().display_offset() as i32;
+        // Resolve the flowed selection range once per frame so the highlight
+        // follows the text across wrapped lines and never over-paints
+        // continuation cells.
+        let selection_range = self
+            .term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&self.term));
         for indexed in self.term.grid().display_iter() {
             let point = indexed.point;
             let cell = indexed.cell;
@@ -1479,6 +1639,9 @@ impl TerminalSession {
             if cell.flags.contains(Flags::HIDDEN) {
                 style = style.hidden();
             }
+            if selection_range.is_some_and(|range| range.contains(point)) {
+                style = CellStyle::new(theme.selection_foreground(), theme.selection_background());
+            }
             scene.set(x, y, cell.c, style);
         }
         if focused {
@@ -1496,23 +1659,6 @@ impl TerminalSession {
                 {
                     let cursor_style = CellStyle::new(cell.style.background, cell.style.foreground);
                     scene.set(cursor_cell.0, cursor_cell.1, cell.symbol, cursor_style);
-                }
-            }
-        }
-        if let Some(selection) = self.selection {
-            let left = selection.anchor.0.min(selection.active.0);
-            let right = selection.anchor.0.max(selection.active.0);
-            let top = selection.anchor.1.min(selection.active.1);
-            let bottom = selection.anchor.1.max(selection.active.1);
-            for row in top..=bottom {
-                for column in left..=right {
-                    let x = area.x.saturating_add(column);
-                    let y = area.y.saturating_add(row);
-                    if let Some(cell) = scene.cell_at(x, y).copied() {
-                        let selected_style =
-                            CellStyle::new(cell.style.background, cell.style.foreground);
-                        scene.set(x, y, cell.symbol, selected_style);
-                    }
                 }
             }
         }
@@ -2712,12 +2858,129 @@ mod tests {
         .unwrap();
         wait_for_output(&mut session);
         let area = Rect::new(0, 0, 20, 4);
-        session.begin_selection((0, 0));
+        session.begin_selection((0, 0), false);
         session.update_selection((6, 0));
 
         assert_eq!(session.selected_text(area).as_deref(), Some("copy me"));
         session.clear_selection();
         assert_eq!(session.selected_text(area), None);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn click_count_maps_to_simple_semantic_and_lines_modes() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        session.begin_selection((0, 0), false);
+        assert_eq!(
+            session.term.selection.as_ref().unwrap().ty,
+            SelectionType::Simple
+        );
+        session.begin_selection((0, 0), false);
+        assert_eq!(
+            session.term.selection.as_ref().unwrap().ty,
+            SelectionType::Semantic
+        );
+        session.begin_selection((0, 0), false);
+        assert_eq!(
+            session.term.selection.as_ref().unwrap().ty,
+            SelectionType::Lines
+        );
+        session.begin_selection((0, 0), false);
+        assert_eq!(
+            session.term.selection.as_ref().unwrap().ty,
+            SelectionType::Simple
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn double_click_selects_a_word_and_lines_an_entire_row() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        session
+            .processor
+            .advance(&mut session.term, b"one two three");
+
+        // Double-click inside `two` expands to the word's semantic boundaries.
+        session.begin_selection((5, 0), false);
+        session.begin_selection((5, 0), false);
+        assert_eq!(
+            session.selected_text(Rect::new(0, 0, 20, 4)).as_deref(),
+            Some("two")
+        );
+
+        // Triple-click expands to the full line (line mode always terminates
+        // with a newline, matching alacritty's `selection_to_string`).
+        session.begin_selection((5, 0), false);
+        assert_eq!(
+            session.selected_text(Rect::new(0, 0, 20, 4)).as_deref(),
+            Some("one two three\n")
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn flowed_copy_joins_wrapped_lines_without_a_spurious_newline() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(5, 3)).unwrap();
+        session
+            .processor
+            .advance(&mut session.term, b"abcdefghij");
+        session.begin_selection((0, 0), false);
+        session.update_selection((4, 1));
+        assert_eq!(
+            session.selected_text(Rect::new(0, 0, 5, 3)).as_deref(),
+            Some("abcdefghij")
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn backward_drag_selects_the_full_reversed_range() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        session
+            .processor
+            .advance(&mut session.term, b"abcdef");
+        session.begin_selection((5, 0), false);
+        session.update_selection((0, 0));
+        assert_eq!(
+            session.selected_text(Rect::new(0, 0, 20, 4)).as_deref(),
+            Some("abcdef")
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shift_click_extends_an_existing_selection() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        session
+            .processor
+            .advance(&mut session.term, b"abcdefgh");
+        session.begin_selection((0, 0), false);
+        session.update_selection((2, 0));
+        assert_eq!(
+            session.selected_text(Rect::new(0, 0, 20, 4)).as_deref(),
+            Some("abc")
+        );
+        session.begin_selection((7, 0), true);
+        assert_eq!(
+            session.selected_text(Rect::new(0, 0, 20, 4)).as_deref(),
+            Some("abcdefgh")
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn selection_highlight_uses_the_theme_selection_role() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        session
+            .processor
+            .advance(&mut session.term, b"abc");
+        session.begin_selection((0, 0), false);
+        session.update_selection((2, 0));
+        let scene = session.render(Rect::new(0, 0, 20, 4), false);
+        let selected = scene.cell_at(1, 0).unwrap();
+        let theme = crate::appearance::Theme::fallback();
+        assert_eq!(selected.style.foreground, theme.selection_foreground());
+        assert_eq!(selected.style.background, theme.selection_background());
         session.shutdown().unwrap();
     }
 
@@ -2891,7 +3154,7 @@ mod tests {
             "the link closed at cell 4"
         );
 
-        session.begin_selection((0, 0));
+        session.begin_selection((0, 0), false);
         session.update_selection((3, 0));
         assert_eq!(
             session.selected_hyperlink().as_deref(),
@@ -3095,6 +3358,89 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(stored.as_deref(), Some("roundtrip"));
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn title_changes_are_reported_to_the_frontend() {
+        let (_, receiver, wakeup) = ui_event_channel();
+        let mut session = TerminalSession::spawn_with_session_id_and_wakeup(
+            SessionId::new(21),
+            Some("sh"),
+            &["-c", "sleep 5"],
+            TerminalSize::new(20, 4),
+            Some(wakeup),
+            "xterm-256color",
+            Arc::new(Mutex::new(None)),
+        )
+        .unwrap();
+        session
+            .processor
+            .advance(&mut session.term, b"\x1b]0;my title\x07");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(UiEvent::SessionTitle(id, title)) if id.get() == 21 && title == "my title"
+        ));
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn line_output_events_are_published_to_the_bus() {
+        let bus = SessionEventBus::new();
+        let events = bus.subscribe(16);
+        let mut session = TerminalSession::spawn_with_session_id_and_wakeup(
+            SessionId::new(22),
+            Some("sh"),
+            &["-c", "printf 'hello\\nworld\\n'; sleep 1"],
+            TerminalSize::new(20, 4),
+            None,
+            "xterm-256color",
+            Arc::new(Mutex::new(None)),
+        )
+        .unwrap();
+        session.set_session_event_bus(bus);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut lines = Vec::new();
+        while Instant::now() < deadline && lines.len() < 2 {
+            let _ = session.poll_output();
+            for event in events.drain() {
+                if let SessionEventKind::Line { text } = event.kind {
+                    lines.push(text);
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(lines, vec!["hello".to_owned(), "world".to_owned()]);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn exit_events_are_published_to_the_bus_with_the_exit_code() {
+        let bus = SessionEventBus::new();
+        let events = bus.subscribe(16);
+        let mut session = TerminalSession::spawn_with_session_id_and_wakeup(
+            SessionId::new(23),
+            Some("sh"),
+            &["-c", "exit 3"],
+            TerminalSize::new(20, 4),
+            None,
+            "xterm-256color",
+            Arc::new(Mutex::new(None)),
+        )
+        .unwrap();
+        session.set_session_event_bus(bus);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut exited = None;
+        while Instant::now() < deadline && !session.is_closed() {
+            let _ = session.poll_output();
+            for event in events.drain() {
+                if let SessionEventKind::Exit { code } = event.kind {
+                    exited = Some(code);
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(exited, Some(Some(3)));
         session.shutdown().unwrap();
     }
 

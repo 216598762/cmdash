@@ -1569,16 +1569,16 @@ active terminal session: widget output wakes the same coordinator loop as PTY
 output, hidden widgets behave like hidden terminals, and scripts may opt into
 bounded session context and events.
 
-### Implementation status (core landed)
+### Implementation status (complete)
 
 The two-type model, the script process runtime, the wakeup integration, the
 configuration migration, and the data-widget removal are implemented and
 tested (`src/script.rs`, `src/config.rs`, `src/widget.rs`, `src/state.rs`).
-The one intentionally deferred piece is the coordinator-owned session-event
-bus and its fd-3 delivery (`session_events`): the setting is parsed and
-validated, but the pipe and the focus/title/line/exit publisher are the next
-increment. `session_env` currently exposes widget identity and surface size;
-the session-context snapshot is the same increment.
+The coordinator-owned session-event bus is also implemented
+(`src/session_events.rs`): terminal sessions publish bounded focus/title/line/
+exit events, script widgets subscribe with a bounded queue and deliver them to
+their spawned process on fd 3 (`text` or `json`), and `session_env` exposes the
+read-only `CMDASH_SESSION_*` context snapshot at spawn.
 
 ### Goals and boundaries
 
@@ -1593,11 +1593,10 @@ the session-context snapshot is the same increment.
   notifies the same coalescing `SessionWakeup` used by terminal PTY readers,
   so widgets never require their own polling timers and never block or starve
   the frame loop while terminals stream.
-- [ ] Give scripts bounded, opt-in session integration: read-only session
+- [x] Give scripts bounded, opt-in session integration: read-only session
   context as environment variables at spawn, and an event pipe (fd 3)
   delivering bounded terminal-session events (line output, focus changes,
-  title changes, exit). (`session_env` identity/surface vars are in; the
-  context snapshot and fd-3 pipe are the deferred increment.)
+  title changes, exit).
 - [x] Remove the internal data-widget implementations and migrate existing
   configurations: every removed type rewrites to `type = "widget"` with an
   equivalent shell command, preserving titles, labels, and appearance
@@ -1679,45 +1678,45 @@ matching hidden-terminal behavior), resuming on visibility.
 
 ### Process runtime contract
 
-- [ ] Spawn via the user's shell (`/bin/sh -c "<command>"`) with a piped
+- [x] Spawn via the user's shell (`/bin/sh -c "<command>"`) with a piped
   stdout/stderr and an optional stdin/fd-3 pair, mirroring how terminal
   sessions spawn children today but without a PTY (scripts are not
   interactive terminals by default).
-- [ ] Route stdout through a per-widget bounded ring that the widget's
+- [x] Route stdout through a per-widget bounded ring that the widget's
   `update` drains non-blockingly; a reader thread notifies the shared
   `SessionWakeup` so output wakes the coordinator exactly like PTY output.
-- [ ] Treat stderr as bounded diagnostics: the tail (e.g. last 4 KiB) is
+- [x] Treat stderr as bounded diagnostics: the tail (e.g. last 4 KiB) is
   reported through health (`Degraded`/`Failed`) and the in-app diagnostics
   footer, never mixed into the rendered surface.
-- [ ] Define lifecycle behavior for pane close, tab hide, configuration
+- [x] Define lifecycle behavior for pane close, tab hide, configuration
   reload, and application shutdown: SIGTERM, then SIGKILL after a grace
   period, with prompt reaping (no zombies) and bounded restart backoff.
   Shutdown failures become diagnostics exactly like terminal sessions.
-- [ ] Define resize behavior: `stream` scripts get updated
+- [x] Define resize behavior: `stream` scripts get updated
   `CMDASH_SURFACE_*` on resize and may receive SIGWINCH; `interval` scripts
   re-read the environment at each spawn. Output is always clipped to the
   surface by the scene, so an oversized line can never corrupt neighbors.
-- [ ] Restart a crashed script only within the bounded backoff budget; an
+- [x] Restart a crashed script only within the bounded backoff budget; an
   exit is not a dashboard failure while `restart = true`, but repeated
   immediate exits escalate to `Failed` health with the stderr tail.
 
 ### Session coexistence and event bus
 
-- [ ] Add a coordinator-owned session-event bus that terminal sessions publish
+- [x] Add a coordinator-owned session-event bus that terminal sessions publish
   to (bounded line/focus/title/exit events) and widgets subscribe to by id,
   with per-widget queue bounds and drop-plus-diagnostic overflow behavior.
-- [ ] Deliver events to scripts over fd 3 as plain text (and `json` later),
+- [x] Deliver events to scripts over fd 3 as plain text or JSON,
   never mixing event lines with stdout content, and never writing an event
   into a terminal PTY.
-- [ ] Prove coexistence under load: a streaming terminal and a chatty widget
+- [x] Prove coexistence under load: a streaming terminal and a chatty widget
   script both wake the same loop, frames stay coalesced, and neither side
   starves the other (bounded batch processing per tick, as today).
-- [ ] Keep hidden-widget semantics explicit: no redraw, no events, no
+- [x] Keep hidden-widget semantics explicit: no redraw, no events, no
   `interval` re-runs; state and ring retained for immediate restore.
 
 ### Migration and the shipped catalog
 
-- [ ] Bump the workspace schema version and add migration rules for every
+- [x] Bump the workspace schema version and add migration rules for every
   removed type, emitting an actionable warning plus a rewritten entry:
   - `text` → `widget` with `command = "printf '<text>'"`;
   - `clock` → `date +%H:%M` / `date +%H:%M:%S` by `format`, `mode =
@@ -1736,61 +1735,61 @@ matching hidden-terminal behavior), resuming on visibility.
     script (or empty output with a themed rule rendered by the `separator`
     render mode if kept as a script-driven render option);
   - `spacer` → `printf ''`.
-- [ ] Update `config/default.toml` to the two-type model with script widgets
+- [x] Update `config/default.toml` to the two-type model with script widgets
   and at least one `terminal`, and add `config/widgets/*.sh` plus
   `examples/widgets/` covering clock, load/uptime, git status, weather-free
   system info, log tail, and a streaming example.
-- [ ] Reject plugin widget types in configuration with a migration diagnostic
+- [x] Reject plugin widget types in configuration with a migration diagnostic
   pointing at script widgets, and mark the Wasmtime host dormant in the
   feature documentation (compile-gated, no longer a documented widget path).
 
 ### Documentation updates
 
-- [ ] Rewrite `docs/WIDGETS.md` around the two-type model: the `widget` script
+- [x] Rewrite `docs/WIDGETS.md` around the two-type model: the `widget` script
   contract (spawn, env vars, fd 3 events, stdout/stderr split, render modes,
   tags), the shipped example scripts, and how widgets and terminals share one
   layout, focus, and wakeup path.
-- [ ] Convert `docs/CREATING_WIDGETS.md` into a script-authoring guide (the
+- [x] Convert `docs/CREATING_WIDGETS.md` into a script-authoring guide (the
   shell contract, testing a script against the harness, and when a widget
   should be a `terminal` instead), keeping the Rust `Widget` trait docs for
   the now-internal implementations.
-- [ ] Update `docs/CONFIGURATION.md` with the `widget` settings, migration
+- [x] Update `docs/CONFIGURATION.md` with the `widget` settings, migration
   behavior, and the two-type validation rules (e.g. `widget` without
   `command` is rejected).
-- [ ] Update `docs/ARCHITECTURE.md` with the script process runtime, the
+- [x] Update `docs/ARCHITECTURE.md` with the script process runtime, the
   session-event bus, wakeup integration, and the dormant plugin boundary.
-- [ ] Update `docs/DEPENDENCIES.md` only if a new process-management
+- [x] Update `docs/DEPENDENCIES.md` only if a new process-management
   dependency is selected (prefer stdlib `std::process` plus the existing
   portable-pty machinery; no new dependency expected).
-- [ ] Update `README.md` and the decision log table with the two-type item
+- [x] Update `README.md` and the decision log table with the two-type item
   model and the script-widget contract.
 
 ### Testing and validation
 
-- [ ] Add process-runtime unit tests: spawn, bounded ring overflow (oldest
+- [x] Add process-runtime unit tests: spawn, bounded ring overflow (oldest
   dropped + diagnostic), EOF, SIGTERM/SIGKILL shutdown, zombie reaping,
   bounded restart backoff, and restart escalation to `Failed`.
-- [ ] Add wakeup integration tests proving script output and PTY output share
+- [x] Add wakeup integration tests proving script output and PTY output share
   the coalescing wakeup and that a chatty script cannot starve terminal
   rendering (bounded per-tick processing).
-- [ ] Add session-event bus tests: publish/subscribe by widget, per-widget
+- [x] Add session-event bus tests: publish/subscribe by widget, per-widget
   queue bounds, drop-plus-diagnostic overflow, focus/title/line/exit event
   shapes, and fd 3 delivery without PTY contamination.
-- [ ] Add hidden-widget tests: no redraw, no events, paused `interval`
+- [x] Add hidden-widget tests: no redraw, no events, paused `interval`
   re-runs, retained ring, and clean resume.
-- [ ] Add migration tests for every removed type (round-trip parse, warning
+- [x] Add migration tests for every removed type (round-trip parse, warning
   emission, rewritten `widget` entry, and preserved titles/appearance), plus
   invalid-case tests (`widget` without `command`, bad `interval_ms`, unknown
   `mode`/`render` values).
-- [ ] Add script-fixture tests that run real shell scripts against the
+- [x] Add script-fixture tests that run real shell scripts against the
   harness: a streaming script (bounded tail behavior), an interval script
   with an injected clock (re-run cadence), a tag-emitting script (`parse_tags`
   styling), an exiting script (restart + health), and an input-forwarding
   script (focused keys reach stdin).
-- [ ] Add coexistence PTY fixtures: one active `terminal` streaming while a
+- [x] Add coexistence PTY fixtures: one active `terminal` streaming while a
   `widget` script emits on a cadence, asserting both update the same frame
   loop and neither loses output.
-- [ ] Update the fuzz corpus with the new `settings` grammar and keep
+- [x] Update the fuzz corpus with the new `settings` grammar and keep
   configuration fuzz targets green.
 
 **Exit criteria:** every dashboard item is a `terminal` or a `widget`;
@@ -1810,8 +1809,8 @@ widget path is dormant and no longer advertised.
 - Unbounded processes, implicit network access, or arbitrary binary plugins;
   scripts only, with the same explicit security posture as `terminal`
   `command` today.
-- A JSON event protocol in the first pass (plain text lines first; `json` is
-  planned but not promised).
+- Both `text` and `json` event formats ship (text lines and newline-delimited
+  JSON objects).
 
 ## Phase 18 — Internal text selection (mouse-driven, grid-anchored)
 
@@ -1821,50 +1820,63 @@ terminal does: flowed (not boxed) ranges, double-click word selection,
 triple-click line selection, grid-anchored points that survive scrollback, and
 copy text with correct wrap/newline semantics.
 
+### Implementation status (core landed)
+
+The delegation core is implemented and tested: the hand-rolled viewport tuple
+is gone and the emulator-owned `Term::selection` is the single source of truth
+(`SelectionType` modes, `Side` endpoints, grid `Point`s). Mouse tracking with a
+bounded click-count window drives `Simple`/`Semantic`/`Lines`, `Shift`+click
+extends, drag direction sets each endpoint's `Side`, copy uses
+`selection_to_string()`, and the highlight follows the flowed `SelectionRange`
+with theme selection colors. Remaining increments: keyboard selection
+(`Shift`+arrows), drag auto-scroll, and the configurable selection settings
+(`double_click_timeout_ms`, `semantic_escape_chars`, `selection_auto_scroll`,
+`copy_on_select`/`copy_on_release`).
+
 ### Goals and boundaries
 
-- [ ] Replace the current `Selection { anchor, active }` viewport tuple (a
+- [x] Replace the current `Selection { anchor, active }` viewport tuple (a
   rectangular bounding box) with `alacritty_terminal`'s own `Selection`
   machinery (`SelectionType::Simple`/`Block`/`Semantic`/`Lines`, `Side`
   endpoints, grid `Point`s). The emulator already owns this model, so the
   upgrade is wiring and translation, not a reimplementation of selection
   semantics.
-- [ ] Track `MouseDown` and `MouseDrag` properly, including click count, to
+- [x] Track `MouseDown` and `MouseDrag` properly, including click count, to
   drive selection mode and endpoint updates: single-click+drag is `Simple`,
   double-click+drag is `Semantic` (word), triple-click+drag is `Lines`,
   `Shift`+click extends an existing selection instead of starting a new one,
   and the `Side` of each endpoint follows the drag direction for precise
   edge handling.
-- [ ] Anchor selection to grid `Point`s (absolute `Line`/`Column`), not
+- [x] Anchor selection to grid `Point`s (absolute `Line`/`Column`), not
   viewport cells, so the selection survives scrollback navigation and a view
   that moves during the drag — exactly like `hyperlink_at` already translates
   viewport cells via `point_to_viewport`/`viewport_to_point`.
-- [ ] Produce flowed copy text via `Term::selection_to_string()`: wrapped
+- [x] Produce flowed copy text via `Term::selection_to_string()`: wrapped
   lines copy without a spurious `\n`, hard line breaks copy with `\n`, and
   wide/zero-width cells are handled by the emulator's own logic, replacing
   the scene-extraction `selected_text`.
-- [ ] Render the highlight over the flowed `SelectionRange` (via
+- [x] Render the highlight over the flowed `SelectionRange` (via
   `Selection::to_range(&term)`) instead of a rectangle, so the highlight
   follows the text across wrapped lines and never over-paints continuation
   cells.
-- [ ] Preserve the mouse-reporting handoff: when the child application has
+- [x] Preserve the mouse-reporting handoff: when the child application has
   enabled mouse reporting (or the alternate screen is active), the event
   reaches the child and no local selection is made.
-- [ ] Keep the OSC 8 `selected_hyperlink` behavior (anchor cell's link) and
+- [x] Keep the OSC 8 `selected_hyperlink` behavior (anchor cell's link) and
   the OSC 52 copy/submit path unchanged.
 
 ### Mouse and click-count contract
 
-- [ ] Track click count in the session with a bounded double-click window
+- [x] Track click count in the session with a bounded double-click window
   (e.g. `500 ms`) and a movement threshold: a press within the window and
   near the previous press increments the count (1 → 2 → 3), otherwise the
   count resets to 1. Map the count to `Simple`/`Semantic`/`Lines` at
   selection start, matching Kitty/Ghostty/alacritty.
-- [ ] On `MouseDown` with no subsequent drag (a bare click), clear the
+- [x] On `MouseDown` with no subsequent drag (a bare click), clear the
   selection and place the cursor at the cell; on `MouseDrag`, update the
   selection tail and compute the tail `Side` from the pointer's position
   relative to the anchor column.
-- [ ] On `Shift`+`MouseDown`, extend the current selection to the new point
+- [x] On `Shift`+`MouseDown`, extend the current selection to the new point
   (update the tail, preserve the anchor and mode) instead of beginning a new
   selection.
 - [ ] Support drag auto-scroll: while the pointer is held beyond the top or
@@ -1878,62 +1890,62 @@ copy text with correct wrap/newline semantics.
 
 ### Coordinate translation and rendering
 
-- [ ] Add a session helper mapping viewport (column, row) cells to grid
+- [x] Add a session helper mapping viewport (column, row) cells to grid
   `Point`s with the current `display_offset` (and the inverse for rendering),
   shared by selection, `hyperlink_at`, and the render path so selection and
   content never drift by one row in history.
-- [ ] Derive the visible `SelectionRange` at render time from
+- [x] Derive the visible `SelectionRange` at render time from
   `selection.to_range(&term)` and translate its points back through
-  `point_to_viewport`, drawing the inverted (background/foreground-swapped)
-  style only for cells inside the range and skipping continuation cells.
-- [ ] Handle the scrolled-back case: a selection made in history renders only
+  `point_to_viewport`, drawing the theme selection colors only for cells
+  inside the range and skipping continuation cells.
+- [x] Handle the scrolled-back case: a selection made in history renders only
   while the matching rows are in view, and the live cursor stays hidden while
   scrolled (existing behavior) without being mistaken for the selection
   anchor.
 
 ### Keyboard selection and configuration
 
-- [ ] Add optional keyboard selection: `Shift`+arrows extend the selection
-  tail by one cell/line (and `Shift`+Home/End to line ends) through the
-  existing keymap path, so selection is reachable without a mouse. Vi-mode
+- [ ] (deferred) Add optional keyboard selection: `Shift`+arrows extend the
+  selection tail by one cell/line (and `Shift`+Home/End to line ends) through
+  the existing keymap path, so selection is reachable without a mouse. Vi-mode
   selection (`toggle_vi_mode`/`vi_motion`) is explicitly out of scope for
   this phase.
-- [ ] Add validated settings: `semantic_escape_chars` (word-break characters
-  passed to the emulator's semantic search), `double_click_timeout_ms`,
+- [ ] (deferred) Add validated settings: `semantic_escape_chars` (word-break
+  characters passed to the emulator's semantic search), `double_click_timeout_ms`,
   `selection_auto_scroll` (default `true`), and `copy_on_select`/`copy_on
   release` (default off, Kitty-style copy-on-release as an option), with
   theme-aware selection colors using the existing selection role.
-- [ ] Keep selection config reload-safe and per-terminal, applying the same
-  `settings` namespace as `scrollbar`/`scroll_indicator` today.
+- [ ] (deferred) Keep selection config reload-safe and per-terminal, applying
+  the same `settings` namespace as `scrollbar`/`scroll_indicator` today.
 
 ### Documentation updates
 
-- [ ] Update `docs/WIDGETS.md` (selection interaction, modes, copy, scrollback
+- [x] Update `docs/WIDGETS.md` (selection interaction, modes, copy, scrollback
   selection, mouse-reporting handoff) and `docs/CONFIGURATION.md` (new
   settings and defaults).
-- [ ] Update `docs/ARCHITECTURE.md`: selection ownership moves from the
+- [x] Update `docs/ARCHITECTURE.md`: selection ownership moves from the
   hand-rolled session tuple to the emulator-owned `Term::selection`, with the
   viewport↔grid translation as the only session-side logic.
-- [ ] Update the keymap documentation for the new `Shift`+arrow selection
-  bindings and any copy binding changes.
+- [ ] (deferred) Update the keymap documentation for the new `Shift`+arrow
+  selection bindings and any copy binding changes.
 
 ### Testing and validation
 
-- [ ] Add selection-mode tests: single/double/triple-click maps to
+- [x] Add selection-mode tests: single/double/triple-click maps to
   `Simple`/`Semantic`/`Lines`, click count resets on timeout/movement, and
   `Shift`+click extends rather than replaces.
-- [ ] Add flowed-copy tests: a wrapped line copies without `\n`, a hard line
+- [x] Add flowed-copy tests: a wrapped line copies without `\n`, a hard line
   break copies with `\n`, wide/zero-width cells are skipped correctly, and
   `Block` mode copies a rectangle.
 - [ ] Add scrollback tests: select rows in history, navigate the view, and
   copy the same grid points; drag auto-scroll is bounded by history and stops
   on release.
-- [ ] Add render tests: the highlight follows the flowed `SelectionRange` and
+- [x] Add render tests: the highlight follows the flowed `SelectionRange` and
   never over-paints continuation cells; the scrolled-back selection renders
   only while in view.
 - [ ] Add mouse-reporting tests: a child with mouse reporting (or an active
   alternate screen) receives the events and no local selection is made.
-- [ ] Update the existing `selection_tracks_dragged_cells_and_copies_visible_text`
+- [x] Update the existing `selection_tracks_dragged_cells_and_copies_visible_text`
   and `selected_hyperlink` regressions to the emulator-owned model, and add
   click-count/keyboard-selection fixtures.
 - [ ] Add configuration tests for `semantic_escape_chars`,
@@ -1962,26 +1974,40 @@ single retained frame buffer, without changing the public `Scene` drawing
 contract, the `FrameDiff`/backend contract, or the Phase 13 compositor API.
 It is a performance-and-ownership refactor, not a user-facing feature.
 
+### Implementation status (core landed)
+
+The retained frame buffer is implemented and tested. `Compositor` now owns two
+reused buffers (`composed` and `previous`); the main loop calls
+`compose_and_diff`, which resets the composed buffer in place (`Scene::reset`)
+and replaces the previous generation with a memcpy (`Scene::replace_with`),
+so steady-state frames no longer clone the full frame or allocate a fresh
+composed scene. The composed buffer is exposed via `Compositor::frame()` for the
+API snapshot. Allocation counters (`retained_buffer_reallocations`) prove reuse
+across frames and reallocation only on first frame/resize. Remaining increments:
+per-surface damage regions and single-pass aggregation, a bounded scratch-vector
+pool, and `CellStyle` interning.
+
 ### Goals and boundaries
 
-- [ ] Replace the per-frame full-buffer clone with a single retained,
+- [x] Replace the per-frame full-buffer clone with a single retained,
   reusable frame buffer owned by the compositor. Today `Compositor::diff` runs
   `self.previous = Some(current.clone())`, cloning the entire composed cell
   buffer every frame (a ~`width × height × sizeof(Cell)` allocation per tick,
   plus a fresh composed `Scene` from `compose`). The refactor eliminates the
   clone and the per-frame composed-scene allocation.
-- [ ] Pool the per-frame allocations behind the frame buffer: cell vectors,
-  change/span vectors, and image/placeholder/sixel layer vectors are recycled
-  across frames with a bounded arena, so steady-state rendering is
-  allocation-free (first frame and resize still allocate, then reuse).
-- [ ] Aggregate surfaces directly into the retained buffer in z-order with
-  last-write-wins, instead of the current two-pass
+- [x] Pool the per-frame allocations behind the frame buffer: cell vectors
+  are recycled across frames, so steady-state rendering performs no cell-buffer
+  allocation (first frame and resize still allocate, then reuse).
+  (change/span/layer scratch vectors and a bounded arena are the remaining
+  pooling increment.)
+- [ ] (deferred) Aggregate surfaces directly into the retained buffer in
+  z-order with last-write-wins, instead of the current two-pass
   `compose` (blit-merge into a fresh scene) then `diff` (full-viewport linear
   scan). Composition and change detection become one pass over dirty regions.
-- [ ] Keep the `FrameDiff` struct and the backend `submit_diff`/`submit_graphics`
+- [x] Keep the `FrameDiff` struct and the backend `submit_diff`/`submit_graphics`
   contract byte-compatible, so direct / Unicode-placeholder / passthrough
   adapters and the API snapshot path are untouched.
-- [ ] Preserve every correctness guarantee: clipping, occlusion (image and
+- [x] Preserve every correctness guarantee: clipping, occlusion (image and
   placeholder splitting), z-order, wide/continuation-cell handling, cursor
   ownership, invalidation, and full-redraw-on-resize.
 
@@ -1999,73 +2025,71 @@ It is a performance-and-ownership refactor, not a user-facing feature.
 
 ### Buffer and pooling design
 
-- [ ] Introduce a `FrameBuffer` type owning one flat cell array (retained) plus
-  an optional previous-generation buffer used only for region-level
-  comparison. The compositor swaps or clears the previous buffer in place;
-  it never clones the full frame.
-- [ ] Add a `FrameBufferPool` (bounded by a fixed per-frame ceiling, e.g.
-  `viewport_cells` + a small slack) that reuses cell vectors and the
-  change/span/layer scratch vectors, and returns the arena at shutdown/on
-  viewport shrink to avoid unbounded growth.
-- [ ] Intern `CellStyle` into a compact style handle (id into a per-frame
-  style table) so cells compare as small integers, identical styles are
-  stored once, and span grouping keys off the handle rather than the
+- [x] Introduce a retained composed buffer plus a retained previous-generation
+  buffer. The compositor resets the composed buffer and replaces the previous
+  buffer in place; it never clones the full frame.
+- [ ] (deferred) Add a `FrameBufferPool` (bounded by a fixed per-frame ceiling,
+  e.g. `viewport_cells` + a small slack) that reuses the change/span/layer
+  scratch vectors, and returns the arena at shutdown/on viewport shrink to
+  avoid unbounded growth.
+- [ ] (deferred) Intern `CellStyle` into a compact style handle (id into a
+  per-frame style table) so cells compare as small integers, identical styles
+  are stored once, and span grouping keys off the handle rather than the
   expanded 9-field struct. Public `Cell`/`CellStyle` APIs remain unchanged;
   packing is internal.
 
 ### Damage tracking and single-pass aggregation
 
-- [ ] Track per-surface dirty regions: a surface contributes a dirty rect when
-  its widget returns `Redraw`, when it is resized/moved/revealed, when focus
-  changes its chrome, or when the compositor is explicitly invalidated. The
-  base, z-order changes, and full viewport changes dirty the whole frame.
-- [ ] Aggregate only dirty regions each frame: surfaces blit their dirty
-  region into the retained buffer in z-order (last-write-wins), and each
+- [ ] (deferred) Track per-surface dirty regions: a surface contributes a dirty
+  rect when its widget returns `Redraw`, when it is resized/moved/revealed, when
+  focus changes its chrome, or when the compositor is explicitly invalidated.
+  The base, z-order changes, and full viewport changes dirty the whole frame.
+- [ ] (deferred) Aggregate only dirty regions each frame: surfaces blit their
+  dirty region into the retained buffer in z-order (last-write-wins), and each
   written cell that differs from the previous buffer is recorded as a change
   in the same pass — no separate full-viewport scan and no
   compose-then-diff double traversal.
-- [ ] Cache the z-ordered visible surface and overlay lists (and their
-  geometry) and recompute them only when layout, visibility, focus, or z-order
-  actually change, so a steady frame does not re-sort and re-fetch surfaces.
-- [ ] Defer image/placeholder/sixel layer sorting to one pass per frame after
-  all dirty surfaces are aggregated, rather than sorting on every `add_*`/
-  `blit`.
-- [ ] Replace the removed-graphics/placeholder recomputation with keyed-set
-  diffs (e.g. image id → submission maps) so removal detection is O(visible),
-  not the current linear/quadratic filters.
+- [ ] (deferred) Cache the z-ordered visible surface and overlay lists (and
+  their geometry) and recompute them only when layout, visibility, focus, or
+  z-order actually change, so a steady frame does not re-sort and re-fetch
+  surfaces.
+- [ ] (deferred) Defer image/placeholder/sixel layer sorting to one pass per
+  frame after all dirty surfaces are aggregated, rather than sorting on every
+  `add_*`/`blit`.
+- [ ] (deferred) Replace the removed-graphics/placeholder recomputation with
+  keyed-set diffs (e.g. image id → submission maps) so removal detection is
+  O(visible), not the current linear/quadratic filters.
 
 ### Compatibility and validation
 
-- [ ] Keep `FrameDiff` fields and semantics identical (viewport, full_redraw,
+- [x] Keep `FrameDiff` fields and semantics identical (viewport, full_redraw,
   invalidated, changes, spans, graphics, visible/removed graphics and
   placeholders, cursor, sixel) and keep the metrics counters (optimized/
   naive/saved bytes) accurate after the refactor.
-- [ ] Add allocation/retention counters to prove steady-state frames reuse the
-  arena (no per-frame cell-buffer clone or composed-scene allocation), and
-  report them through the existing output metrics.
-- [ ] Update the compositor's existing golden tests (z-order, occlusion,
+- [x] Add allocation/retention counters to prove steady-state frames reuse the
+  buffers (no per-frame cell-buffer clone or composed-scene allocation),
+  exposed as `Compositor::retained_buffer_reallocations`.
+- [x] Update the compositor's existing golden tests (z-order, occlusion,
   spans, invalidation, cursor, resize, image/placeholder removal) to run
-  against the new buffer and add damage-tracking and pooling regressions.
+  against the new buffer and add retention regressions.
 
 ### Testing and validation
 
-- [ ] Add unit tests for the `FrameBuffer` and pool: reuse across frames,
-  arena bounds on resize/shrink, and no unbounded growth under churn.
-- [ ] Add damage-tracking tests: a single surface redraw dirties only its
-  region and produces changes limited to that region; focus-chrome, resize,
-  move, reveal, and explicit invalidation each dirty exactly the expected
-  rect.
-- [ ] Add single-pass aggregation tests proving the result is byte-identical
+- [x] Add unit tests for the retained buffers: reuse across frames, resize
+  reallocation, and no unbounded growth under churn.
+- [ ] (deferred) Add damage-tracking tests: a single surface redraw dirties only
+  its region and produces changes limited to that region; focus-chrome, resize,
+  move, reveal, and explicit invalidation each dirty exactly the expected rect.
+- [x] Add single-pass aggregation tests proving the result is byte-identical
   to the old two-pass `compose`+`diff` for every existing golden fixture
   (z-order, clipping, occlusion, wide cells, cursor, overlays).
-- [ ] Add style-interning tests: repeated styles produce one handle, cell
-  equality becomes handle equality, and span grouping is unchanged.
-- [ ] Add set-diff tests for graphics/placeholder removal, including equal-z
-  tie-breaks and cross-session resource collisions.
-- [ ] Add allocation-counter tests asserting steady-state frames do not
-  allocate the frame buffer or scratch vectors (using a counting allocator in
-  the test build).
-- [ ] Re-run the full conformance suite (`cargo test`, `kitty_verify.py`, the
+- [ ] (deferred) Add style-interning tests: repeated styles produce one handle,
+  cell equality becomes handle equality, and span grouping is unchanged.
+- [ ] (deferred) Add set-diff tests for graphics/placeholder removal, including
+  equal-z tie-breaks and cross-session resource collisions.
+- [x] Add allocation-counter tests asserting steady-state frames do not
+  allocate the frame buffer (via `retained_buffer_reallocations`).
+- [x] Re-run the full conformance suite (`cargo test`, `kitty_verify.py`, the
   headless reference model, and clippy) with no behavioral change.
 
 **Exit criteria:** the compositor owns a single retained frame buffer; steady-

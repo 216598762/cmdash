@@ -17,6 +17,7 @@ pub mod reload;
 pub mod scene;
 pub mod script;
 pub mod session;
+pub mod session_events;
 #[cfg(feature = "sixel")]
 pub mod sixel;
 pub mod state;
@@ -72,6 +73,10 @@ pub use scene::{Cell, CellStyle, CellWidth, Color, Scene, SceneCursor, Underline
 pub use session::{
     SessionError, SessionWakeup, TerminalSession, TerminalSize, UiEvent, kitty_stream_stats,
     ui_event_channel,
+};
+pub use session_events::{
+    SessionContextSnapshot, SessionEvent, SessionEventBus, SessionEventKind, SessionEventMode,
+    SessionEventReceiver, format_session_event,
 };
 #[cfg(feature = "sixel")]
 pub use sixel::{SixelError, SixelImage, SixelSubmission, encode_rgb};

@@ -10,10 +10,14 @@ the configured `command` is spawned through `/bin/sh -c`, its stdout feeds a
 bounded output ring rendered into the surface, its stderr becomes a bounded
 diagnostic, and its lifecycle (spawn, read, restart, reap, kill) is owned by
 the widget. Script output wakes the same coalescing `SessionWakeup` as terminal
-PTY readers, so widgets coexist with active sessions on one frame loop. The
-former compiled data widgets (`text`, `clock`, `system`, `status`, `key_value`,
-`gauge`, `list`, `log`, `sparkline`, `separator`, `spacer`) have been removed;
-existing configurations migrate them to equivalent `widget` scripts on load.
+PTY readers, so widgets coexist with active sessions on one frame loop. Scripts
+may opt into read-only session context (`CMDASH_SESSION_*` at spawn) and a
+bounded session-event bus: terminal sessions publish focus/title/line/exit
+events, and subscribing widgets receive them as newline-delimited `text` or
+`json` lines on their script's fd 3. The former compiled data widgets (`text`,
+`clock`, `system`, `status`, `key_value`, `gauge`, `list`, `log`, `sparkline`,
+`separator`, `spacer`) have been removed; existing configurations migrate them
+to equivalent `widget` scripts on load.
 
 This page documents the widget contract and runtime behavior. For the complete
 TOML schema and configuration discovery rules, see
@@ -627,7 +631,18 @@ mouse events are passed to the focused input-capable widget when the pointer is
 inside its area. Terminal widgets preserve terminal mouse reporting while also
 updating cmdash selection state for drag selection.
 
-### Terminal keys and copy
+### Terminal selection and copy
+
+Selection is owned by the emulator grid (`alacritty_terminal`'s `Selection`)
+rather than a hand-rolled viewport rectangle. Single-click+drag selects a
+flowed range, double-click selects a semantic word, and triple-click selects a
+whole line; the click count is bounded by a double-click window and a movement
+threshold, and `Shift`+click extends the current selection. Selection points are
+anchored to absolute grid lines, so a selection survives scrollback navigation,
+and copy uses the emulator's own `selection_to_string` for correct wrap/newline
+semantics. The highlight follows the flowed selection range with the theme
+selection colors. When the child has enabled mouse reporting (or the alternate
+screen is active), the events reach the child and no local selection is made.
 
 For a focused terminal widget, key events are encoded for the PTY and paste is
 sent through the session's bracketed-paste-aware path. `Ctrl+Shift+C` copies the

@@ -18,7 +18,8 @@ use crate::{
     plugin::PluginRegistry,
     scene::{CellStyle, Color, Scene},
     session::{SessionWakeup, TerminalSession, TerminalSize},
-    state::WidgetId,
+    session_events::SessionEventBus,
+    state::{SessionId, WidgetId},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -450,6 +451,16 @@ pub trait Widget: Send {
         None
     }
 
+    /// The terminal-session id backing this widget, if it is a terminal.
+    fn session_id(&self) -> Option<SessionId> {
+        None
+    }
+
+    /// The title of this widget's terminal session, if it is a terminal.
+    fn session_title(&self) -> Option<String> {
+        None
+    }
+
     fn handle_mouse(
         &mut self,
         _mouse: MouseEvent,
@@ -481,6 +492,7 @@ pub trait Widget: Send {
 #[derive(Clone, Default)]
 pub struct WidgetRuntimeContext {
     session_wakeup: Option<SessionWakeup>,
+    session_event_bus: Option<SessionEventBus>,
     initial_terminal_size: Option<TerminalSize>,
     kitty_graphics: bool,
     theme: Theme,
@@ -495,11 +507,17 @@ impl WidgetRuntimeContext {
     pub fn with_session_wakeup(wakeup: SessionWakeup) -> Self {
         Self {
             session_wakeup: Some(wakeup),
+            session_event_bus: None,
             initial_terminal_size: None,
             kitty_graphics: false,
             theme: Theme::default(),
             clipboard: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn with_session_event_bus(mut self, bus: SessionEventBus) -> Self {
+        self.session_event_bus = Some(bus);
+        self
     }
 
     pub fn with_initial_terminal_size(mut self, size: TerminalSize) -> Self {
@@ -519,6 +537,10 @@ impl WidgetRuntimeContext {
 
     pub fn session_wakeup(&self) -> Option<&SessionWakeup> {
         self.session_wakeup.as_ref()
+    }
+
+    pub fn session_event_bus(&self) -> Option<&SessionEventBus> {
+        self.session_event_bus.as_ref()
     }
 
     pub const fn initial_terminal_size(&self) -> Option<TerminalSize> {
@@ -717,6 +739,14 @@ impl WidgetRuntime {
 
     pub fn widget_kind(&self, id: WidgetId) -> Option<&str> {
         self.instances.get(&id).map(|entry| entry.widget.kind())
+    }
+
+    pub fn session_id(&self, id: WidgetId) -> Option<SessionId> {
+        self.instances.get(&id).and_then(|entry| entry.widget.session_id())
+    }
+
+    pub fn session_title(&self, id: WidgetId) -> Option<String> {
+        self.instances.get(&id).and_then(|entry| entry.widget.session_title())
     }
 
     pub fn statuses(&self) -> impl Iterator<Item = WidgetStatus> + '_ {
@@ -1132,6 +1162,14 @@ impl Widget for TerminalWidget {
         self.session.selected_hyperlink()
     }
 
+    fn session_id(&self) -> Option<SessionId> {
+        Some(self.session.session_id())
+    }
+
+    fn session_title(&self) -> Option<String> {
+        Some(self.title.clone())
+    }
+
     fn handles_input(&self) -> bool {
         true
     }
@@ -1207,7 +1245,8 @@ impl Widget for TerminalWidget {
         if !self.session.reports_mouse() {
             match mouse.kind {
                 crossterm::event::MouseEventKind::Down(_) => {
-                    self.session.begin_selection(position);
+                    self.session
+                        .begin_selection(position, mouse.modifiers.contains(KeyModifiers::SHIFT));
                 }
                 crossterm::event::MouseEventKind::Drag(_) => {
                     self.session.update_selection(position);
@@ -1364,6 +1403,9 @@ fn terminal_widget_factory(
         reason: error.to_string(),
     })?;
     session.set_kitty_graphics_support(context.kitty_graphics());
+    if let Some(bus) = context.session_event_bus() {
+        session.set_session_event_bus(bus.clone());
+    }
     if let Some(limit) = scrollback_limit {
         session.set_scrollback_limit(limit);
     }

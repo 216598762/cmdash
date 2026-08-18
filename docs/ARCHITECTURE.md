@@ -50,6 +50,7 @@ The terms below are deliberately separate:
 - **Widget instance:** one configured and stateful use of a widget type.
 - **Surface:** a rectangular region assigned to a widget instance by layout.
 - **Session:** a stateful producer of terminal content. A session normally maps to one PTY and one terminal-emulator instance.
+- **Selection:** owned by the emulator (`alacritty_terminal`'s `Term::selection`), not a session-side rectangle. The session tracks only the click-count state and the viewport↔grid `Point` translation, then derives the flowed copy/highlight from `Selection::to_range`/`selection_to_string`.
 - **Scene:** retained, backend-neutral visual output for a surface for the current frame.
 - **Frame:** the complete scene tree/composition result submitted to the terminal backend.
 - **Notification:** bounded user-facing status or recovery information rendered in the dashboard UI rather than written to the PTY.
@@ -82,6 +83,16 @@ The coordinator updates application state and schedules a frame. It does not ren
 ### 3.3 Application state and commands
 
 Contains workspace layout, focus, keymaps, widget configuration, session registry, and command handling.
+
+`AppState` also owns the coordinator-wide session-event bus
+(`src/session_events.rs`). Terminal sessions publish bounded focus/title/line/
+exit events, and script widgets subscribe through the shared
+`WidgetRuntimeContext`; each subscriber gets a bounded queue (drop-oldest plus a
+reported overflow diagnostic) and delivers events to its spawned script on fd 3
+as `text` or `json` lines. The same bus carries the read-only session-context
+snapshot that `session_env` exposes as `CMDASH_SESSION_*` at spawn. Events are
+published from the coordinator thread (focus, line, exit) or routed through a
+`UiEvent` (title), never written into a terminal PTY.
 
 Key dispatch is owned by a single coordinator path. `AppState` holds a
 validated `Keymap` built from the `[keybindings]` configuration (falling back

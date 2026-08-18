@@ -19,6 +19,7 @@ use crate::{
     keymap::{KeyAction, Keymap},
     layout::{LayoutError, LayoutTree},
     scene::{CellStyle, Scene},
+    session_events::{SessionEvent, SessionEventBus, SessionEventKind},
     widget::{WidgetError, WidgetRegistry, WidgetRuntime, WidgetUpdateReport},
 };
 
@@ -327,6 +328,8 @@ pub struct AppState {
     layout_dirty: bool,
     next_widget_id: u64,
     keymap: Keymap,
+    session_event_bus: SessionEventBus,
+    last_focused_session: Option<(SessionId, String)>,
 }
 
 impl AppState {
@@ -362,6 +365,8 @@ impl AppState {
             layout_dirty: false,
             next_widget_id: 1,
             keymap: Keymap::default(),
+            session_event_bus: SessionEventBus::new(),
+            last_focused_session: None,
         }
     }
 
@@ -434,6 +439,12 @@ impl AppState {
                 .unwrap_or(0)
                 .saturating_add(1),
             keymap,
+            session_event_bus: registry
+                .context()
+                .session_event_bus()
+                .cloned()
+                .unwrap_or_else(SessionEventBus::new),
+            last_focused_session: None,
         };
 
         for widget in &config.workspace.widgets {
@@ -580,7 +591,44 @@ impl AppState {
         if active_terminal.is_some_and(|id| report.changed().contains(&id)) {
             self.reset_cursor_blink();
         }
+        self.publish_session_events();
         report
+    }
+
+    /// Recomputes the read-only session context and publishes a focus event
+    /// when the focused terminal session changes.
+    fn publish_session_events(&mut self) {
+        let count = self
+            .widget_runtime
+            .widget_ids()
+            .filter(|id| self.widget_runtime.widget_kind(*id) == Some("terminal"))
+            .count();
+        let focused = self.active_terminal_widget().and_then(|id| {
+            let session_id = self.widget_runtime.session_id(id)?;
+            let title = self.session_event_bus.title_of(session_id).or_else(|| {
+                self.widget_runtime.session_title(id)
+            })?;
+            Some((session_id, title))
+        });
+        self.session_event_bus.update_context(count, focused.clone());
+        if focused != self.last_focused_session {
+            self.last_focused_session = focused.clone();
+            if let Some((session_id, title)) = focused {
+                self.session_event_bus.publish(SessionEvent::new(
+                    session_id,
+                    SessionEventKind::Focus { title },
+                ));
+            }
+        }
+    }
+
+    /// Publishes a terminal-session title change to the event bus (called when
+    /// the frontend observes a `UiEvent::SessionTitle`).
+    pub fn publish_session_title(&mut self, id: SessionId, title: String) {
+        self.session_event_bus.publish(SessionEvent::new(
+            id,
+            SessionEventKind::Title { title },
+        ));
     }
 
     /// Returns the delay until the focused visible terminal should blink again.
@@ -1578,6 +1626,39 @@ mod tests {
             kitty_text_fallback: false,
             sixel: false,
         }
+    }
+
+    #[test]
+    fn session_focus_events_are_published_when_focus_changes() {
+        let bus = SessionEventBus::new();
+        let events = bus.subscribe(8);
+        let registry = WidgetRegistry::builtins_with_context(
+            crate::widget::WidgetRuntimeContext::new().with_session_event_bus(bus.clone()),
+        );
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "terminal"
+            command = "sh"
+            title = " shell "
+            "#,
+        )
+        .unwrap();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(SurfaceId::new(1))))
+            .unwrap();
+        state.update_widgets(SystemTime::now());
+        let mut focus_title = None;
+        for event in events.drain() {
+            if let SessionEventKind::Focus { title } = event.kind {
+                focus_title = Some(title);
+            }
+        }
+        assert_eq!(focus_title.as_deref(), Some(" shell "));
+        state.shutdown_widgets();
     }
 
     #[test]

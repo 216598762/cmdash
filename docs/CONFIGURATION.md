@@ -197,10 +197,13 @@ exactly two built-in types: `terminal` and `widget`.
   - `handles_input` (`false` default) forwards focused keys to the script's
     stdin.
   - `session_env` (`true` default) exposes `CMDASH_WIDGET_ID`,
-    `CMDASH_WIDGET_TITLE`, `CMDASH_SURFACE_COLUMNS`, and `CMDASH_SURFACE_ROWS`
-    at spawn.
-  - `session_events`: `off` (default), `text`, or `json` (parsed/validated;
-    fd-3 delivery is a follow-up increment).
+    `CMDASH_WIDGET_TITLE`, `CMDASH_SURFACE_COLUMNS`, `CMDASH_SURFACE_ROWS`,
+    `CMDASH_SESSION_COUNT`, `CMDASH_FOCUSED_SESSION`, and
+    `CMDASH_FOCUSED_TITLE` at spawn (the session context is a read-only
+    snapshot taken at spawn).
+  - `session_events`: `off` (default), `text`, or `json` — subscribes the
+    widget to bounded terminal-session events (focus, title, line output, and
+    exit) delivered as newline-delimited lines on the script's fd 3.
 - A terminal widget owns its PTY, emulator, selection, graphics resources, and
   shutdown lifecycle.
 - `settings.scrollbar` and `settings.scroll_indicator` accept `true` or `false`

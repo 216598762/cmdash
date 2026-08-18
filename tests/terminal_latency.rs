@@ -103,7 +103,8 @@ fn wait_for_marker(
                 | UiEvent::ClipboardStore(_)
                 | UiEvent::ClipboardRead(_)
                 | UiEvent::Bell(_)
-                | UiEvent::Notification(_, _),
+                | UiEvent::Notification(_, _)
+                | UiEvent::SessionTitle(_, _),
             ) => {}
             Ok(UiEvent::Input(_)) => return Err("unexpected input event".to_owned()),
             Ok(UiEvent::OuterInput(_)) => {}
@@ -150,7 +151,8 @@ fn round_trip(
                 | UiEvent::ClipboardStore(_)
                 | UiEvent::ClipboardRead(_)
                 | UiEvent::Bell(_)
-                | UiEvent::Notification(_, _),
+                | UiEvent::Notification(_, _)
+                | UiEvent::SessionTitle(_, _),
             ) => {}
             Ok(UiEvent::Input(_)) => return Err("unexpected input event".to_owned()),
             Ok(UiEvent::OuterInput(_)) => {}

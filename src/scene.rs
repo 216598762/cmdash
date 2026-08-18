@@ -189,6 +189,49 @@ impl Scene {
         }
     }
 
+    /// Clears this scene in place to a blank frame of `area`, reallocating cell
+    /// storage only when the area changes so a retained frame buffer can be
+    /// reused across frames without a per-frame allocation.
+    pub fn reset(&mut self, area: Rect) {
+        self.area = area;
+        let cell_count = area.width as usize * area.height as usize;
+        let blank = Cell::blank(CellStyle::new(Color::reset(), Color::reset()));
+        if self.cells.len() == cell_count {
+            self.cells.fill(blank);
+        } else {
+            self.cells.clear();
+            self.cells.resize(cell_count, blank);
+        }
+        self.cursor = None;
+        self.image_layers.clear();
+        self.placeholder_layers.clear();
+        #[cfg(feature = "sixel")]
+        self.sixel_layers.clear();
+    }
+
+    /// Replaces this scene's contents with `other`'s in place, reusing the
+    /// existing cell-buffer allocation when the sizes match (a memcpy, not an
+    /// allocation). Used to retain the previous frame in the compositor.
+    pub fn replace_with(&mut self, other: &Scene) {
+        self.area = other.area;
+        if self.cells.len() == other.cells.len() {
+            self.cells.copy_from_slice(&other.cells);
+        } else {
+            self.cells.clear();
+            self.cells.extend_from_slice(&other.cells);
+        }
+        self.cursor = other.cursor;
+        self.image_layers.clear();
+        self.image_layers.extend(other.image_layers.iter().cloned());
+        self.placeholder_layers.clear();
+        self.placeholder_layers.extend_from_slice(&other.placeholder_layers);
+        #[cfg(feature = "sixel")]
+        {
+            self.sixel_layers.clear();
+            self.sixel_layers.extend(other.sixel_layers.iter().cloned());
+        }
+    }
+
     pub const fn area(&self) -> Rect {
         self.area
     }

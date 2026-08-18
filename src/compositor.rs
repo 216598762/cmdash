@@ -134,18 +134,29 @@ impl FrameDiff {
 
 #[derive(Clone, Debug, Default)]
 pub struct Compositor {
+    /// Retained composed frame buffer, reused across frames by the main loop.
+    composed: Option<Scene>,
+    /// Retained previous generation, updated in place (never full-frame cloned).
     previous: Option<Scene>,
     pending_invalidations: Vec<Rect>,
+    composed_reallocations: u64,
+    previous_reallocations: u64,
 }
 
 impl Compositor {
     pub const fn new() -> Self {
         Self {
+            composed: None,
             previous: None,
             pending_invalidations: Vec::new(),
+            composed_reallocations: 0,
+            previous_reallocations: 0,
         }
     }
 
+    /// Composes a fresh, owned `Scene` for a single frame. Retained for callers
+    /// that need an owned scene (tests); the main loop uses `compose_and_diff`
+    /// so the composed buffer is reused in place.
     pub fn compose(
         &self,
         viewport: Rect,
@@ -154,43 +165,68 @@ impl Compositor {
         surface_scenes: &BTreeMap<SurfaceId, Scene>,
     ) -> Scene {
         let mut composed = Scene::new(viewport);
-        composed.blit(base, viewport);
-
-        let mut surfaces: Vec<_> = state
-            .workspace()
-            .surfaces()
-            .values()
-            .filter(|surface| surface.visible())
-            .map(|surface| (surface.z_index(), surface.id()))
-            .collect();
-        surfaces.sort_unstable();
-
-        for (_, id) in surfaces {
-            let Some(surface) = state.workspace().surfaces().get(&id) else {
-                continue;
-            };
-            let Some(surface_scene) = surface_scenes.get(&id) else {
-                continue;
-            };
-            composed.blit(surface_scene, surface.area());
-        }
-
-        let mut overlays: Vec<_> = state
-            .workspace()
-            .overlays()
-            .values()
-            .filter(|overlay| overlay.visible())
-            .map(|overlay| (overlay.z_index(), overlay.id()))
-            .collect();
-        overlays.sort_unstable();
-
-        for (_, id) in overlays {
-            if let Some(overlay) = state.workspace().overlays().get(&id) {
-                overlay.render(&mut composed);
-            }
-        }
-
+        blit_frame(&mut composed, viewport, state, base, surface_scenes);
         composed
+    }
+
+    /// Composes the frame into the retained buffer and diffs it against the
+    /// previous generation. The composed buffer is available via `frame()` for
+    /// snapshot consumers. This is the steady-state path: the composed buffer
+    /// is reset in place and the previous buffer is replaced with a memcpy, so
+    /// a steady frame performs no cell-buffer allocations.
+    pub fn compose_and_diff(
+        &mut self,
+        viewport: Rect,
+        state: &AppState,
+        base: &Scene,
+        surface_scenes: &BTreeMap<SurfaceId, Scene>,
+    ) -> FrameDiff {
+        self.compose_into(viewport, state, base, surface_scenes);
+        let current = self
+            .composed
+            .as_ref()
+            .expect("composed frame is initialized");
+        diff_against_previous(
+            current,
+            &mut self.previous,
+            &mut self.pending_invalidations,
+            &mut self.previous_reallocations,
+        )
+    }
+
+    /// The retained composed buffer from the last `compose_and_diff`.
+    pub fn frame(&self) -> &Scene {
+        self.composed.as_ref().expect("no frame has been composed yet")
+    }
+
+    /// Number of times the retained buffers (re)allocated their cell storage.
+    /// Steady-state frames reuse the buffers, so this advances only on the
+    /// first frame and viewport resizes.
+    pub const fn retained_buffer_reallocations(&self) -> u64 {
+        self.composed_reallocations + self.previous_reallocations
+    }
+
+    fn compose_into(
+        &mut self,
+        viewport: Rect,
+        state: &AppState,
+        base: &Scene,
+        surface_scenes: &BTreeMap<SurfaceId, Scene>,
+    ) {
+        if self
+            .composed
+            .as_ref()
+            .is_none_or(|composed| composed.area() != viewport)
+        {
+            self.composed = Some(Scene::new(viewport));
+            self.composed_reallocations = self.composed_reallocations.saturating_add(1);
+        }
+        let composed = self
+            .composed
+            .as_mut()
+            .expect("composed frame is initialized");
+        composed.reset(viewport);
+        blit_frame(composed, viewport, state, base, surface_scenes);
     }
 
     pub fn invalidate(&mut self, area: Rect) {
@@ -199,104 +235,184 @@ impl Compositor {
         }
     }
 
+    /// Diffs an externally supplied scene against the retained previous buffer,
+    /// updating the previous buffer in place. Convenience path for callers and
+    /// tests that build a scene outside the retained compose path.
     pub fn diff(&mut self, current: &Scene) -> FrameDiff {
-        let viewport = current.area();
-        let full_redraw = self
-            .previous
-            .as_ref()
-            .is_none_or(|previous| previous.area() != viewport);
-        let invalidated: Vec<_> = self
-            .pending_invalidations
-            .drain(..)
-            .filter_map(|area| intersect(area, viewport))
-            .collect();
-        let previous = self.previous.as_ref();
-        let cursor_changed =
-            full_redraw || previous.is_none_or(|previous| previous.cursor() != current.cursor());
-        let graphics_changed = full_redraw
-            || previous.is_none_or(|previous| {
-                previous.image_layers() != current.image_layers()
-                    || previous.placeholder_layers() != current.placeholder_layers()
-            });
-        #[cfg(feature = "sixel")]
-        let sixel_changed = full_redraw
-            || previous.is_none_or(|previous| previous.sixel_layers() != current.sixel_layers());
-        #[cfg(feature = "sixel")]
-        let sixel = if sixel_changed {
-            current.sixel_layers().to_vec()
-        } else {
-            Vec::new()
-        };
-        let graphics = if graphics_changed {
-            current.image_layers().to_vec()
-        } else {
-            Vec::new()
-        };
-        let current_graphics = current
-            .image_layers()
-            .iter()
-            .map(|image| (image.terminal_image_id(), image))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let removed_graphics = previous
-            .into_iter()
-            .flat_map(|previous| previous.image_layers())
-            .filter(|image| {
-                current_graphics
-                    .get(&image.terminal_image_id())
-                    .is_none_or(|current| *current != *image)
-            })
-            .cloned()
-            .collect();
-        let current_placeholders = current.placeholder_layers();
-        let removed_placeholders = previous
-            .into_iter()
-            .flat_map(|previous| previous.placeholder_layers())
-            .filter(|placeholder| !current_placeholders.contains(placeholder))
-            .copied()
-            .collect::<Vec<_>>();
-        let mut changes = Vec::new();
+        diff_against_previous(
+            current,
+            &mut self.previous,
+            &mut self.pending_invalidations,
+            &mut self.previous_reallocations,
+        )
+    }
+}
 
-        for (index, cell) in current.cells().iter().enumerate() {
-            let column = index % viewport.width as usize;
-            let row = index / viewport.width as usize;
-            let x = viewport.x.saturating_add(column as u16);
-            let y = viewport.y.saturating_add(row as u16);
-            let forced = invalidated.iter().any(|area| contains(*area, x, y));
-            let changed = full_redraw
-                || forced
-                || previous
-                    .and_then(|previous| previous.cell_at(x, y))
-                    .copied()
-                    != Some(*cell);
+/// Blits the base, z-ordered visible surfaces, and z-ordered visible overlays
+/// into `composed`, sharing the composition logic between the owned `compose`
+/// and the retained `compose_into`.
+fn blit_frame(
+    composed: &mut Scene,
+    viewport: Rect,
+    state: &AppState,
+    base: &Scene,
+    surface_scenes: &BTreeMap<SurfaceId, Scene>,
+) {
+    composed.blit(base, viewport);
 
-            if changed {
-                changes.push(CellChange { x, y, cell: *cell });
+    let mut surfaces: Vec<_> = state
+        .workspace()
+        .surfaces()
+        .values()
+        .filter(|surface| surface.visible())
+        .map(|surface| (surface.z_index(), surface.id()))
+        .collect();
+    surfaces.sort_unstable();
+
+    for (_, id) in surfaces {
+        let Some(surface) = state.workspace().surfaces().get(&id) else {
+            continue;
+        };
+        let Some(surface_scene) = surface_scenes.get(&id) else {
+            continue;
+        };
+        composed.blit(surface_scene, surface.area());
+    }
+
+    let mut overlays: Vec<_> = state
+        .workspace()
+        .overlays()
+        .values()
+        .filter(|overlay| overlay.visible())
+        .map(|overlay| (overlay.z_index(), overlay.id()))
+        .collect();
+    overlays.sort_unstable();
+
+    for (_, id) in overlays {
+        if let Some(overlay) = state.workspace().overlays().get(&id) {
+            overlay.render(composed);
+        }
+    }
+}
+
+/// Computes a frame diff between `current` and the retained `previous` buffer,
+/// then updates `previous` in place (reusing its cell allocation when the
+/// viewport is unchanged).
+fn diff_against_previous(
+    current: &Scene,
+    previous: &mut Option<Scene>,
+    invalidations: &mut Vec<Rect>,
+    reallocations: &mut u64,
+) -> FrameDiff {
+    let viewport = current.area();
+    let full_redraw = previous
+        .as_ref()
+        .is_none_or(|previous| previous.area() != viewport);
+    let invalidated: Vec<_> = invalidations
+        .drain(..)
+        .filter_map(|area| intersect(area, viewport))
+        .collect();
+    let previous_scene = previous.as_ref();
+    let cursor_changed =
+        full_redraw || previous_scene.is_none_or(|previous| previous.cursor() != current.cursor());
+    let graphics_changed = full_redraw
+        || previous_scene.is_none_or(|previous| {
+            previous.image_layers() != current.image_layers()
+                || previous.placeholder_layers() != current.placeholder_layers()
+        });
+    #[cfg(feature = "sixel")]
+    let sixel_changed = full_redraw
+        || previous_scene.is_none_or(|previous| previous.sixel_layers() != current.sixel_layers());
+    #[cfg(feature = "sixel")]
+    let sixel = if sixel_changed {
+        current.sixel_layers().to_vec()
+    } else {
+        Vec::new()
+    };
+    let graphics = if graphics_changed {
+        current.image_layers().to_vec()
+    } else {
+        Vec::new()
+    };
+    let current_graphics = current
+        .image_layers()
+        .iter()
+        .map(|image| (image.terminal_image_id(), image))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let removed_graphics = previous_scene
+        .into_iter()
+        .flat_map(|previous| previous.image_layers())
+        .filter(|image| {
+            current_graphics
+                .get(&image.terminal_image_id())
+                .is_none_or(|current| *current != *image)
+        })
+        .cloned()
+        .collect();
+    let current_placeholders = current.placeholder_layers();
+    let removed_placeholders = previous_scene
+        .into_iter()
+        .flat_map(|previous| previous.placeholder_layers())
+        .filter(|placeholder| !current_placeholders.contains(placeholder))
+        .copied()
+        .collect::<Vec<_>>();
+    let mut changes = Vec::new();
+
+    for (index, cell) in current.cells().iter().enumerate() {
+        let column = index % viewport.width as usize;
+        let row = index / viewport.width as usize;
+        let x = viewport.x.saturating_add(column as u16);
+        let y = viewport.y.saturating_add(row as u16);
+        let forced = invalidated.iter().any(|area| contains(*area, x, y));
+        let changed = full_redraw
+            || forced
+            || previous_scene
+                .and_then(|previous| previous.cell_at(x, y))
+                .copied()
+                != Some(*cell);
+
+        if changed {
+            changes.push(CellChange { x, y, cell: *cell });
+        }
+    }
+
+    // Retain the previous generation in place: reuse the existing cell buffer
+    // when the viewport is unchanged (a memcpy, not an allocation); allocate
+    // only on the first frame or a resize.
+    match previous {
+        Some(previous) => {
+            if previous.cells().len() != current.cells().len() {
+                *reallocations = reallocations.saturating_add(1);
             }
+            previous.replace_with(current);
         }
+        None => {
+            *previous = Some(current.clone());
+            *reallocations = reallocations.saturating_add(1);
+        }
+    }
 
-        self.previous = Some(current.clone());
-        let spans = group_changes(&changes);
-        FrameDiff {
-            viewport,
-            full_redraw,
-            invalidated,
-            changes,
-            spans,
-            graphics,
-            visible_graphics: current.image_layers().to_vec(),
-            removed_graphics,
-            placeholders: if graphics_changed {
-                current.placeholder_layers().to_vec()
-            } else {
-                Vec::new()
-            },
-            visible_placeholders: current.placeholder_layers().to_vec(),
-            removed_placeholders,
-            cursor: current.cursor(),
-            cursor_changed,
-            #[cfg(feature = "sixel")]
-            sixel,
-        }
+    let spans = group_changes(&changes);
+    FrameDiff {
+        viewport,
+        full_redraw,
+        invalidated,
+        changes,
+        spans,
+        graphics,
+        visible_graphics: current.image_layers().to_vec(),
+        removed_graphics,
+        placeholders: if graphics_changed {
+            current.placeholder_layers().to_vec()
+        } else {
+            Vec::new()
+        },
+        visible_placeholders: current.placeholder_layers().to_vec(),
+        removed_placeholders,
+        cursor: current.cursor(),
+        cursor_changed,
+        #[cfg(feature = "sixel")]
+        sixel,
     }
 }
 
@@ -633,5 +749,66 @@ mod tests {
 
         assert!(diff.full_redraw());
         assert_eq!(diff.changes().len(), 10);
+    }
+
+    #[test]
+    fn compose_and_diff_matches_the_owned_compose_path() {
+        let viewport = Rect::new(0, 0, 8, 4);
+        let mut state = crate::AppState::new(capabilities());
+        let surface = Surface::new(SurfaceId::new(1), Rect::new(1, 1, 4, 2)).with_z_index(0);
+        state
+            .dispatch(Command::Surface(SurfaceCommand::Add(surface)))
+            .unwrap();
+        let mut surface_scene = Scene::new(surface.area());
+        surface_scene.text(surface.area().x, surface.area().y, "LLLL", style());
+        let scenes = BTreeMap::from([(surface.id(), surface_scene)]);
+        let mut base = Scene::new(viewport);
+        base.text(0, 0, "base", style());
+
+        let owned = Compositor::new().compose(viewport, &state, &base, &scenes);
+        let mut retained = Compositor::new();
+        retained.compose_and_diff(viewport, &state, &base, &scenes);
+        let frame = retained.frame();
+        assert_eq!(owned.cells(), frame.cells());
+        assert_eq!(owned.cursor(), frame.cursor());
+    }
+
+    #[test]
+    fn retained_buffers_are_reused_across_steady_state_frames() {
+        let viewport = Rect::new(0, 0, 4, 2);
+        let state = crate::AppState::new(capabilities());
+        let base = Scene::new(viewport);
+        let scenes = BTreeMap::new();
+        let mut compositor = Compositor::new();
+
+        compositor.compose_and_diff(viewport, &state, &base, &scenes);
+        assert_eq!(compositor.retained_buffer_reallocations(), 2);
+
+        for _ in 0..5 {
+            compositor.compose_and_diff(viewport, &state, &base, &scenes);
+        }
+        assert_eq!(
+            compositor.retained_buffer_reallocations(),
+            2,
+            "steady-state frames must reuse the retained buffers"
+        );
+    }
+
+    #[test]
+    fn resizing_reallocates_each_retained_buffer_once() {
+        let state = crate::AppState::new(capabilities());
+        let base = Scene::new(Rect::new(0, 0, 4, 2));
+        let scenes = BTreeMap::new();
+        let mut compositor = Compositor::new();
+
+        compositor.compose_and_diff(Rect::new(0, 0, 4, 2), &state, &base, &scenes);
+        assert_eq!(compositor.retained_buffer_reallocations(), 2);
+
+        compositor.compose_and_diff(Rect::new(0, 0, 5, 2), &state, &base, &scenes);
+        assert_eq!(
+            compositor.retained_buffer_reallocations(),
+            4,
+            "a resize reallocates the composed and previous buffers once each"
+        );
     }
 }

@@ -7,7 +7,8 @@
 
 use std::{
     collections::VecDeque,
-    io::{Read, Write},
+    fs::File,
+    io::{self, Read, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         mpsc::{self, Receiver},
@@ -15,6 +16,12 @@ use std::{
     },
     thread,
     time::{Duration, Instant, SystemTime},
+};
+
+#[cfg(unix)]
+use std::os::unix::{
+    io::{AsRawFd, FromRawFd},
+    process::CommandExt,
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
@@ -25,6 +32,10 @@ use crate::{
     config::{LabelPolicy, WidgetInstanceConfig},
     scene::{CellStyle, Scene},
     session::{SessionWakeup, TerminalSize},
+    session_events::{
+        SessionEventBus, SessionEventMode, SessionEventReceiver, format_session_event,
+        DEFAULT_SESSION_EVENT_CAPACITY,
+    },
     widget::{
         bordered_chrome, parse_log_line, StatusLevel, Widget, WidgetAppearance, WidgetError,
         WidgetHealth, WidgetUpdate,
@@ -40,13 +51,6 @@ enum ScriptMode {
     Interval,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SessionEventMode {
-    Off,
-    Text,
-    Json,
-}
-
 #[derive(Clone, Debug)]
 struct ScriptSettings {
     mode: ScriptMode,
@@ -55,9 +59,6 @@ struct ScriptSettings {
     restart: bool,
     handles_input: bool,
     session_env: bool,
-    // Parsed and validated now; the fd-3 event pipe delivery is the remaining
-    // Phase 17 work item.
-    #[allow(dead_code)]
     session_events: SessionEventMode,
     max_lines: usize,
     max_bytes: usize,
@@ -89,16 +90,8 @@ impl ScriptSettings {
         let restart = parse_bool(settings.get("restart"), true, "restart")?;
         let handles_input = parse_bool(settings.get("handles_input"), false, "handles_input")?;
         let session_env = parse_bool(settings.get("session_env"), true, "session_env")?;
-        let session_events = match settings.get("session_events").map(String::as_str) {
-            None | Some("off") => SessionEventMode::Off,
-            Some("text") => SessionEventMode::Text,
-            Some("json") => SessionEventMode::Json,
-            Some(other) => {
-                return Err(WidgetError::InvalidConfiguration(format!(
-                    "widget session_events must be \"off\", \"text\", or \"json\", got {other:?}"
-                )));
-            }
-        };
+        let session_events = SessionEventMode::parse(settings.get("session_events").map(String::as_str))
+            .map_err(WidgetError::InvalidConfiguration)?;
         let max_lines =
             parse_bounded_u64(settings.get("max_lines"), 1024, 1, 1_000_000, "max_lines")? as usize;
         let max_bytes = parse_bounded_u64(
@@ -171,10 +164,12 @@ struct ScriptProcess {
     interval: Duration,
     restart: bool,
     stdin_enabled: bool,
+    session_events: SessionEventMode,
     wakeup: Option<SessionWakeup>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout_rx: Option<Receiver<Vec<u8>>>,
+    event_fd: Option<File>,
     stderr_tail: Arc<Mutex<String>>,
     started_at: Option<Instant>,
     consecutive_exits: u32,
@@ -190,6 +185,7 @@ impl ScriptProcess {
         interval: Duration,
         restart: bool,
         stdin_enabled: bool,
+        session_events: SessionEventMode,
         wakeup: Option<SessionWakeup>,
     ) -> Self {
         Self {
@@ -198,10 +194,12 @@ impl ScriptProcess {
             interval,
             restart,
             stdin_enabled,
+            session_events,
             wakeup,
             child: None,
             stdin: None,
             stdout_rx: None,
+            event_fd: None,
             stderr_tail: Arc::new(Mutex::new(String::new())),
             started_at: None,
             consecutive_exits: 0,
@@ -235,7 +233,38 @@ impl ScriptProcess {
         for (key, value) in env {
             command.env(key, value);
         }
+
+        // Open the fd-3 event pipe for `session_events != off` subscribers and
+        // hand the read end to the child as file descriptor 3.
+        #[cfg(unix)]
+        let (event_read, event_write) = if self.session_events.is_enabled() {
+            let (read, write) = open_event_pipe().map_err(|error| error.to_string())?;
+            set_nonblocking(&write).map_err(|error| error.to_string())?;
+            (Some(read), Some(write))
+        } else {
+            (None, None)
+        };
+        #[cfg(not(unix))]
+        let (event_read, event_write): (Option<File>, Option<File>) = (None, None);
+
+        #[cfg(unix)]
+        if let Some(read) = event_read {
+            unsafe {
+                command.pre_exec(move || {
+                    let read_fd = read.as_raw_fd();
+                    if libc::dup2(read_fd, 3) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    // `dup2` clears FD_CLOEXEC on fd 3; dropping `read` here
+                    // closes the original read end in the child, leaving fd 3
+                    // as the sole delivery channel.
+                    Ok(())
+                });
+            }
+        }
+
         let mut child = command.spawn().map_err(|error| error.to_string())?;
+        self.event_fd = event_write;
         let stdout: ChildStdout = child.stdout.take().ok_or("script stdout is unavailable")?;
         let stderr = child.stderr.take().ok_or("script stderr is unavailable")?;
         let stdin = child.stdin.take();
@@ -368,6 +397,18 @@ impl ScriptProcess {
             .map_err(|error| error.to_string())
     }
 
+    /// Delivers one formatted session-event line to the child on fd 3. The
+    /// pipe is non-blocking, so a child that stops reading only loses the
+    /// events it would have missed rather than stalling the coordinator.
+    fn write_event_line(&mut self, line: &str) {
+        let Some(fd) = self.event_fd.as_mut() else {
+            return;
+        };
+        let mut bytes = line.as_bytes().to_vec();
+        bytes.push(b'\n');
+        let _ = fd.write_all(&bytes);
+    }
+
     fn shutdown(&mut self) -> Result<(), String> {
         let Some(mut child) = self.child.take() else {
             return Ok(());
@@ -409,6 +450,34 @@ impl Drop for ScriptProcess {
     }
 }
 
+/// Creates an anonymous pipe and returns `(read_end, write_end)`. The read end
+/// becomes the spawned script's fd 3; the write end is retained by the widget
+/// for non-blocking event delivery.
+#[cfg(unix)]
+fn open_event_pipe() -> io::Result<(File, File)> {
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let read = unsafe { File::from_raw_fd(fds[0]) };
+    let write = unsafe { File::from_raw_fd(fds[1]) };
+    Ok((read, write))
+}
+
+/// Marks a pipe write end non-blocking so a stalled child cannot stall the
+/// coordinator thread that delivers events.
+#[cfg(unix)]
+fn set_nonblocking(file: &File) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 struct ScriptWidget {
     id: u64,
     title: String,
@@ -417,9 +486,12 @@ struct ScriptWidget {
     appearance: WidgetAppearance,
     theme: Theme,
     process: ScriptProcess,
+    bus: Option<SessionEventBus>,
+    events: Option<SessionEventReceiver>,
     lines: VecDeque<String>,
     ring_bytes: usize,
     overflowed: bool,
+    event_overflowed: bool,
     pending: Vec<u8>,
     surface_size: TerminalSize,
     visible: bool,
@@ -430,7 +502,7 @@ impl ScriptWidget {
         if !self.settings.session_env {
             return Vec::new();
         }
-        vec![
+        let mut env = vec![
             ("CMDASH_WIDGET_ID".to_owned(), self.id.to_string()),
             ("CMDASH_WIDGET_TITLE".to_owned(), self.title.clone()),
             (
@@ -441,7 +513,18 @@ impl ScriptWidget {
                 "CMDASH_SURFACE_ROWS".to_owned(),
                 self.surface_size.rows.to_string(),
             ),
-        ]
+        ];
+        if let Some(bus) = &self.bus {
+            let context = bus.context_snapshot();
+            env.push(("CMDASH_SESSION_COUNT".to_owned(), context.count.to_string()));
+            if let Some(id) = context.focused_id {
+                env.push(("CMDASH_FOCUSED_SESSION".to_owned(), id.get().to_string()));
+            }
+            if let Some(title) = context.focused_title {
+                env.push(("CMDASH_FOCUSED_TITLE".to_owned(), title));
+            }
+        }
+        env
     }
 
     fn ingest(&mut self, chunk: &[u8]) -> bool {
@@ -485,6 +568,10 @@ impl ScriptWidget {
                 tail
             };
             WidgetHealth::Failed(detail)
+        } else if self.event_overflowed {
+            WidgetHealth::Degraded(
+                "widget session-event queue overflowed; oldest events dropped".to_owned(),
+            )
         } else if self.overflowed {
             WidgetHealth::Degraded(
                 "widget output exceeded its ring; oldest lines dropped".to_owned(),
@@ -524,6 +611,18 @@ impl Widget for ScriptWidget {
         self.process.drain_stdout(|chunk| buffer.extend_from_slice(chunk));
         if !buffer.is_empty() {
             changed |= self.ingest(&buffer);
+        }
+        // Deliver queued session events to the child on fd 3 and surface queue
+        // overflow as a diagnostic.
+        if let Some(events) = &self.events {
+            for event in events.drain() {
+                let line = format_session_event(&event, self.settings.session_events);
+                self.process.write_event_line(&line);
+            }
+            if events.take_overflow() {
+                self.event_overflowed = true;
+                changed = true;
+            }
         }
         let now = Instant::now();
         self.process.reap(now);
@@ -668,12 +767,19 @@ pub(crate) fn script_widget_factory(
     let surface_size = context
         .initial_terminal_size()
         .unwrap_or_else(|| TerminalSize::new(80, 24));
+    let bus = context.session_event_bus().cloned();
+    let events = if settings.session_events.is_enabled() {
+        bus.as_ref().map(|bus| bus.subscribe(DEFAULT_SESSION_EVENT_CAPACITY))
+    } else {
+        None
+    };
     let process = ScriptProcess::new(
         command,
         settings.mode,
         settings.interval,
         settings.restart,
         settings.handles_input,
+        settings.session_events,
         context.session_wakeup().cloned(),
     );
     Ok(Box::new(ScriptWidget {
@@ -684,9 +790,12 @@ pub(crate) fn script_widget_factory(
         appearance,
         theme,
         process,
+        bus,
+        events,
         lines: VecDeque::new(),
         ring_bytes: 0,
         overflowed: false,
+        event_overflowed: false,
         pending: Vec::new(),
         surface_size,
         visible: true,
@@ -696,7 +805,10 @@ pub(crate) fn script_widget_factory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::widget::Widget;
+    use crate::{
+        session_events::{SessionEvent, SessionEventKind},
+        widget::Widget,
+    };
 
     fn make_widget(command: &str, mode: ScriptMode) -> ScriptWidget {
         make_widget_with(command, mode, &[])
@@ -726,11 +838,15 @@ mod tests {
                 Duration::from_millis(100),
                 restart,
                 handles_input,
+                SessionEventMode::Off,
                 None,
             ),
+            bus: None,
+            events: None,
             lines: VecDeque::new(),
             ring_bytes: 0,
             overflowed: false,
+            event_overflowed: false,
             pending: Vec::new(),
             surface_size: TerminalSize::new(80, 24),
             visible: true,
@@ -838,6 +954,88 @@ mod tests {
         let mut map = std::collections::BTreeMap::new();
         map.insert("render".to_owned(), "chart".to_owned());
         assert!(ScriptSettings::from_settings(&map).is_err());
+    }
+
+    fn make_event_widget(command: &str) -> (SessionEventBus, ScriptWidget) {
+        let bus = SessionEventBus::new();
+        let events = bus.subscribe(DEFAULT_SESSION_EVENT_CAPACITY);
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("session_events".to_owned(), "text".to_owned());
+        let parsed = ScriptSettings::from_settings(&map).unwrap();
+        let (restart, handles_input) = (parsed.restart, parsed.handles_input);
+        let widget = ScriptWidget {
+            id: 9,
+            title: " events ".to_owned(),
+            label: true,
+            settings: parsed,
+            appearance: WidgetAppearance::default(),
+            theme: Theme::default(),
+            process: ScriptProcess::new(
+                command.to_owned(),
+                ScriptMode::Stream,
+                Duration::from_millis(100),
+                restart,
+                handles_input,
+                SessionEventMode::Text,
+                None,
+            ),
+            bus: Some(bus.clone()),
+            events: Some(events),
+            lines: VecDeque::new(),
+            ring_bytes: 0,
+            overflowed: false,
+            event_overflowed: false,
+            pending: Vec::new(),
+            surface_size: TerminalSize::new(80, 24),
+            visible: true,
+        };
+        (bus, widget)
+    }
+
+    #[test]
+    fn fd3_delivers_session_events_to_the_spawned_script() {
+        let (bus, mut widget) =
+            make_event_widget("IFS= read -r line <&3; printf 'event:%s\\n' \"$line\"");
+        widget.initialize().unwrap();
+        bus.publish(SessionEvent::new(
+            crate::state::SessionId::new(9),
+            SessionEventKind::Focus {
+                title: "shell".to_owned(),
+            },
+        ));
+        let expected = "event:session 9 focus shell";
+        let mut found = false;
+        for _ in 0..100 {
+            let _ = widget.update(SystemTime::now());
+            if widget.lines.iter().any(|line| line == expected) {
+                found = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(found, "expected {expected:?} in {:?}", widget.lines);
+        widget.shutdown().unwrap();
+    }
+
+    #[test]
+    fn session_env_exposes_session_context_at_spawn() {
+        let (bus, mut widget) = make_event_widget(
+            "printf '%s|%s|%s\\n' \"$CMDASH_SESSION_COUNT\" \"$CMDASH_FOCUSED_SESSION\" \"$CMDASH_FOCUSED_TITLE\"",
+        );
+        bus.update_context(2, Some((crate::state::SessionId::new(5), "nvim".to_owned())));
+        widget.initialize().unwrap();
+        let expected = "2|5|nvim";
+        let mut found = false;
+        for _ in 0..100 {
+            let _ = widget.update(SystemTime::now());
+            if widget.lines.iter().any(|line| line == expected) {
+                found = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(found, "expected {expected:?} in {:?}", widget.lines);
+        widget.shutdown().unwrap();
     }
 
     #[test]
