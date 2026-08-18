@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    fmt,
     io::{self, Read, Write},
     sync::{
         Arc, Mutex,
@@ -102,40 +101,21 @@ impl Dimensions for TerminalSize {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SessionError {
+    #[error("invalid terminal size {}x{}", .0.columns, .0.rows)]
     InvalidSize(TerminalSize),
+    #[error("could not spawn terminal session: {0}")]
     Spawn(String),
+    #[error("terminal session I/O failed: {0}")]
     Io(String),
+    #[error("terminal session resize failed: {0}")]
     Resize(String),
+    #[error("terminal session is closed")]
     Closed,
+    #[error("Kitty graphics parsing failed: {0}")]
     Graphics(String),
 }
-
-impl fmt::Display for SessionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidSize(size) => {
-                write!(
-                    formatter,
-                    "invalid terminal size {}x{}",
-                    size.columns, size.rows
-                )
-            }
-            Self::Spawn(message) => {
-                write!(formatter, "could not spawn terminal session: {message}")
-            }
-            Self::Io(message) => write!(formatter, "terminal session I/O failed: {message}"),
-            Self::Resize(message) => write!(formatter, "terminal session resize failed: {message}"),
-            Self::Closed => formatter.write_str("terminal session is closed"),
-            Self::Graphics(message) => {
-                write!(formatter, "Kitty graphics parsing failed: {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SessionError {}
 
 #[derive(Debug)]
 pub enum UiEvent {
@@ -925,9 +905,17 @@ impl TerminalSession {
     /// if any. The position is in content-area-relative cell coordinates
     /// (column, row), matching the selection and render mapping.
     pub fn hyperlink_at(&self, position: (u16, u16)) -> Option<String> {
+        // Positions are viewport-relative, but `display_iter` yields absolute
+        // grid lines (negative when scrolled back into history), so the same
+        // offset translation as the render path applies here.
+        let display_offset = self.term.grid().display_offset() as i32;
         for indexed in self.term.grid().display_iter() {
             let point = indexed.point;
-            if point.column.0 as u16 == position.0 && point.line.0 as u16 == position.1 {
+            let viewport_row = point.line.0 + display_offset;
+            if viewport_row < 0 {
+                continue;
+            }
+            if point.column.0 as u16 == position.0 && viewport_row as u16 == position.1 {
                 return indexed.cell.hyperlink().map(|link| link.uri().to_owned());
             }
         }
@@ -1440,11 +1428,22 @@ impl TerminalSession {
             area.x.saturating_add(cursor_point.column.0 as u16),
             area.y.saturating_add(cursor_point.line.0 as u16),
         );
+        // `display_iter` yields absolute grid lines: when the view is scrolled
+        // back into history the visible rows are negative. Like
+        // alacritty's own `point_to_viewport`, the viewport row is the grid
+        // line plus the display offset; casting the raw line into `u16`
+        // would wrap history rows ~to 65535 and silently drop them, tearing
+        // scrolled text away from its images.
+        let display_offset = self.term.grid().display_offset() as i32;
         for indexed in self.term.grid().display_iter() {
             let point = indexed.point;
             let cell = indexed.cell;
+            let viewport_row = point.line.0 + display_offset;
+            if viewport_row < 0 {
+                continue;
+            }
             let x = area.x.saturating_add(point.column.0 as u16);
-            let y = area.y.saturating_add(point.line.0 as u16);
+            let y = area.y.saturating_add(viewport_row as u16);
             if x >= area.x.saturating_add(area.width) || y >= area.y.saturating_add(area.height) {
                 continue;
             }
@@ -3515,6 +3514,59 @@ mod tests {
         assert!(session.captures_mouse_scroll());
         session.processor.advance(&mut session.term, b"\x1b[?1049l");
         assert!(!session.captures_mouse_scroll());
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn scrolled_back_text_renders_history_in_step_with_images() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        // Anchor a static-cursor image at row 0 while the screen is empty, so
+        // the lines that follow scroll it into history in front of the view.
+        session
+            .consume_output(b"\x1b_Ga=T,f=24,i=33,c=1,r=1,C=1,q=2;AQID\x1b\\")
+            .unwrap();
+        for line in 0..10u8 {
+            session
+                .processor
+                .advance(&mut session.term, format!("row{line}\r\n").as_bytes());
+        }
+        let history = session.scrollback_lines();
+        assert!(history > 0);
+
+        // Scrolled back to the top, the viewport must show the oldest history
+        // rows (which are *negative* absolute grid lines) rather than the
+        // default fill, so text stays glued to the image above it.
+        assert!(session.scroll_display(Scroll::Top));
+        assert_eq!(session.scrollback_offset(), history);
+        let scene = session.render_with_theme_and_cursor(
+            Rect::new(0, 0, 20, 4),
+            true,
+            Theme::fallback(),
+            true,
+        );
+        for (row, expected) in ["row0", "row1", "row2", "row3"].iter().enumerate() {
+            let got: String = (0..4)
+                .map(|column| scene.cell_at(column, row as u16).unwrap().symbol)
+                .collect();
+            assert_eq!(got, *expected, "history row {row} must render its text");
+        }
+        // The image scrolled onto the same top line its grid anchor resolves
+        // to, exactly where the renderer now shows row0 behind it.
+        let graphics = session.graphics(Rect::new(0, 0, 20, 4));
+        assert_eq!(graphics.len(), 1, "scrolled-back image must be visible");
+        assert_eq!(graphics[0].placement().y(), 0);
+
+        // Step down one line; the view must shift exactly one row: the old
+        // bottom row's content moves up and the next live row appears at the
+        // bottom.
+        session.scroll_display(Scroll::Delta(-1));
+        let scene = session.render(Rect::new(0, 0, 20, 4), false);
+        for (row, expected) in ["row1", "row2", "row3", "row4"].iter().enumerate() {
+            let got: String = (0..4)
+                .map(|column| scene.cell_at(column, row as u16).unwrap().symbol)
+                .collect();
+            assert_eq!(got, *expected, "scrolled row {row} must render its text");
+        }
         session.shutdown().unwrap();
     }
 }

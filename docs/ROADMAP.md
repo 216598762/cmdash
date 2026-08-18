@@ -742,6 +742,163 @@ shutdown coverage, and installed-`kitten` PTY fixtures. The remaining unchecked
 items are performance/resource-pressure validation and adapters for other
 protocols whose capability semantics have not yet been verified.
 
+### Workstream 8 — Virtualized image buffer and mutation-driven emission
+
+**Status:** planned. Today images are an *observation layer* over the emulator
+grid: each placement carries a `GraphicsGridAnchor` (column, row, captured
+scrollback depth, screen, scroll region, region scroll) and is re-resolved
+against current scrollback/view state at render time, then the backend diffs
+the visible submissions against previously-emitted ones and emits moves
+(same stable `p=` id, which makes Kitty move the placement in place), scoped
+deletes, or uploads. This is correct but *render-diff-driven*: the outer
+terminal's placement state is reconciled only when a frame is rendered. The
+upgrade makes images first-class citizens of a per-session **virtual buffer**
+that owns text rows *and* image objects together, and emits an explicit,
+ordered, coalesced command stream (move / delete / upload) as the buffer
+mutates — the same mutation-driven model a real graphical terminal uses for
+its own `grman`.
+
+### Goals and boundaries
+
+- [ ] Treat images as first-class citizens of each session's virtual buffer:
+  a per-session `VirtualBuffer` owns an ordered list of `VirtualRow`s, each
+  holding text cells (delegating to the `alacritty_terminal` grid) and the set
+  of image objects attached to it. This replaces the flat `placements` map +
+  per-placement anchor with structural row attachment, so "which rows does
+  this image occupy" is O(1) and every buffer mutation is a structural
+  operation on both text and images.
+- [ ] Formalize the image-identity layer ("parse the kitty image IDs"): a
+  dedicated registry owns the child's client `i=` ids, `I=` numbers (newest-
+  surviving resolution), relative `P`/`Q` parents, and the mapping to outer-
+  terminal resource ids and replay generations. This consolidates the
+  identity handling already spread through `SessionGraphicsStore` into one
+  first-class module of the virtual buffer.
+- [ ] Emit explicit host-terminal commands on buffer state change instead of
+  only at render time: every buffer mutation produces a `GraphicsCommand`
+  stream (`Place`, `Move`, `Delete`, `Upload`) that the backend adapters
+  serialize immediately (or batch per frame), so the outer terminal is
+  commanded to move or delete the exact image IDs as the buffer changes.
+- [ ] Keep the command stream bounded, coalesced, and idempotent: a burst of
+  mutations (e.g. a 20-line scroll) emits at most one command per affected
+  image object per frame, ordered by row, deduplicated, and safe to reapply.
+- [ ] Preserve every existing guarantee: session isolation, ack-gated outer-
+  resource GC, generation-based reuse (no re-upload), scrollback-limit
+  eviction, view-offset history navigation as pure view math, and the
+  direct / Unicode-placeholder / passthrough adapter contract.
+- [ ] Evaluate a specialized serialization library (ratatui-image) honestly
+  and document the decision; do not adopt a dependency that does not fit the
+  re-emission direction.
+
+### Virtual buffer object model
+
+- [ ] Define `VirtualRow` as the union of a text line (borrowed from the
+  emulator grid) and attached image objects; define `ImageObject` as a
+  resource (decoded payload, format, generation) plus its placements (each
+  with a stable outer `p=` id, source crop, z-index, cell offsets, and
+  relative/virtual parent links).
+- [ ] Own the mapping from child image id / number / parent to
+  `ImageObject` in the identity registry, and the mapping from object to
+  outer-terminal resource id + generation in the adapter boundary, so a
+  single identity is unambiguous across child, virtual buffer, and outer
+  terminal.
+- [ ] Attach every placement to an owning `VirtualRow`; a placement that
+  spans multiple rows attaches to its start row and records its cell size,
+  exactly like Kitty's `start_row`-anchored `grman` placements.
+
+### Mutation-to-command mapping
+
+Define an explicit table from each buffer mutation to its command stream:
+
+- [ ] **Scroll / linefeed (N rows):** move each attached image object up N
+  rows (emit `a=p` with the same `p=` id and the new row); objects whose
+  resolved row passes the configured history limit are deleted (`d=i,i=X,
+  p=P`, then `d=i,i=X` for the last placement) and their decoded bytes
+  freed.
+- [ ] **Insert / delete lines (DECSTBM region):** move objects inside the
+  region by the delta; objects shifted out of the region or off-screen are
+  deleted. Reverse index and origin-mode cursor movement map to the same
+  region-scoped move.
+- [ ] **Erase scopes (ED 0/1/2/3, EL, RIS, soft reset, alternate-screen
+  switch):** emit delete commands scoped to the erased rows/placements,
+  preserving history rows for `ED 2`, clearing scrollback-only placements for
+  `ED 3`, and clearing the alternate screen on switch — the scopes already
+  modeled in the store, now produced as a single mutation with an explicit
+  command stream.
+- [ ] **Reflow on resize:** rewrap rows and re-attach objects to their new
+  rows, emitting moves only for objects whose row actually changed, so a
+  reflow never produces spurious deltas (matching how Kitty preserves a
+  placement's `start_row` through a rewrap).
+- [ ] **View navigation (scrollback offset):** pure view math — no commands,
+  because the outer terminal already holds the placements and only the
+  rendered window changes (the existing view-offset resolution remains).
+
+### Command coalescing and adapter integration
+
+- [ ] Add a per-session command queue that coalesces mutation bursts into one
+  frame's command set: each affected `ImageObject` emits at most one
+  move/delete/upload, ordered by row, deduplicated, and idempotent, and the
+  queue is drained by the backend in submission order.
+- [ ] Replace the render-time `submit_graphics(changed, visible, removed)`
+  diff with the mutation-produced command queue as the source of truth for
+  the outer terminal, while keeping the frame diff for *visibility* (which
+  placements are in the rendered window after view navigation) and the
+  ack-gated resource GC.
+- [ ] Feed the command stream through the existing direct / Unicode-
+  placeholder / passthrough adapters unchanged (they already serialize
+  `a=p` moves, `d=i,i=X,p=P` scoped deletes, and placeholder-cell clears);
+  the virtual buffer supplies the commands, the adapters keep the bytes.
+
+### ratatui-image evaluation (documented decision)
+
+- [ ] Record in the roadmap/architecture why `ratatui-image` is **not**
+  adopted for the core re-emission path: it is a *client-side* renderer for
+  ratatui apps — it queries the terminal for protocol support and font size,
+  transforms image data into protocol payloads (Sixel/Kitty/iTerm2), and
+  manages stateful Kitty placement/caching for images the *app itself* draws
+  to its own terminal. It cannot parse a child process's APC stream or act
+  as a middleman re-emitting a child's images to an outer terminal; the data
+  direction is inverted for a multiplexer, so adopting it would mean
+  re-architecting around a role it does not play.
+- [ ] Note that the stateful patterns ratatui-image encapsulates — upload-
+  once/re-place with a cache, stable placement ids, delete-on-remove,
+  Unicode-placeholder cells — are already implemented in cmdash's
+  `SessionGraphicsStore` + backend adapters (generations, `outer_placement_ids`,
+  ack-gated GC, placeholder adapter), so the crate adds no missing capability
+  for child-derived images.
+- [ ] Keep ratatui-image (or its patterns) as a candidate only for a future
+  *dashboard-owned* image path (cmdash rendering its own images to the outer
+  terminal, e.g. a script-widget image output), where the client-side
+  direction is correct; even there the existing adapters already cover the
+  serialization, so no new dependency is expected in this workstream.
+
+### Testing and validation
+
+- [ ] Add virtual-buffer unit tests: row attachment, scroll moves, insert/
+  delete-line moves, erase deletes, reflow re-attach, and past-limit
+  eviction, asserting the object list matches the emulator grid after each
+  mutation.
+- [ ] Add command-stream golden tests for each mutation (scroll N, insert 3
+  lines, `ED 2`, `ED 3`, RIS, alternate-screen switch, reflow), asserting
+  exactly-one move per affected object, correct ordering, idempotency, and
+  no ghost deletes.
+- [ ] Add coalescing tests: a burst of mutations collapses to one frame's
+  command set with no duplicate or conflicting commands.
+- [ ] Extend `tests/kitty_verify.py` to replay the mutation-produced command
+  stream against real Kitty and assert placement positions/deletion through
+  `grman.update_layers` after scroll, insert/delete-line, erase, and reflow
+  sequences (extending the current 38 checks).
+- [ ] Add coexistence tests with Phase 16 view navigation and Phase 17
+  script widgets: a terminal streaming while a widget runs, images moving
+  through history, and the outer placement state staying in sync.
+
+**Exit criteria:** images are first-class virtual-buffer citizens attached to
+rows; every buffer mutation emits an explicit, coalesced, idempotent
+move/delete/upload command stream that keeps the outer terminal's placement
+state provably in sync (real-Kitty verified) through scroll, erase, reflow,
+and limit eviction; the child's image IDs are parsed and owned by a dedicated
+identity registry; and the ratatui-image decision is documented in the
+roadmap/architecture with the client-side-direction rationale.
+
 **Exit criteria:** graphics support is protocol-faithful and capability-explicit;
 `kitten icat` either produces a verified outer-terminal image or a visible,
 explainable fallback; pane-local images remain correct through scroll, resize,
@@ -867,7 +1024,9 @@ validation remains an optional follow-up.
 ### Non-goals
 
 - A third-party widget marketplace.
-- Arbitrary shell-command execution as a built-in widget.
+- Arbitrary shell-command execution as a built-in widget. *(Reversed by
+  Phase 17: script-driven widgets are now the dashboard item contract, with
+  bounded execution, output, and restart policy.)*
 - Unbounded network or filesystem polling.
 - Completing the full WASM host-function ABI.
 - Promising cross-platform system metrics before provider behavior is defined.
@@ -1098,6 +1257,53 @@ Implementation approach (mirrors Kitty's cell-anchored model):
   unreferenced images first, then transient before retained, then oldest
   first — records an eviction diagnostic, and only rejects the upload if the
   budget still cannot be met (e.g. a single oversized payload).
+- [x] **Keep the outer stream in step with scroll**: scrolling with images on
+  screen no longer tears text from graphics or leaves ghost placements at the
+  old cells. Two compounding defects were fixed in the outer-rendering path.
+  First, the text renderer mapped alacritty's absolute grid lines (negative
+  when scrolled into history) straight into `u16` scene rows, wrapping history
+  rows to ~65535 and silently dropping them; it now translates via
+  `line + display_offset` (alacritty's own `point_to_viewport`) exactly like
+  the graphics path. Second, the backend never deleted removed placements: every
+  upload is sent quiet (`q=2`), so the acknowledgement-gated delete could never
+  fire, and moved placements were re-emitted without a stable `p=` id, so the
+  outer terminal stacked a new placement on top of the old one. The store now
+  assigns each placement a stable outer-terminal id (`p=`, per-image unique,
+  keyed by the placement's map key) so a scrolled/reflowed placement is
+  re-placed with the same id and Kitty's `grman_put` moves it in place; deletes
+  are emitted unconditionally, scoped to the placement (`d=i,i=X,p=P`) while
+  the image still has other visible placements and image-level (`d=i,i=X`) for
+  the last one. Unicode-placeholder mode keeps still-visible virtual images
+  alive and clears only the departed cells.
+- [x] **Verify the outer stream against a real Kitty**: `tests/kitty_verify.py`
+  drives the actual compiled Kitty emulator offscreen (no display needed) via
+  the same `test_create_write_buffer`/`test_parse_written_data` hooks Kitty's
+  own test suite uses, replays the exact bytes cmdash emits for a scroll-move,
+  and asserts through Kitty's real `grman.update_layers` that a same-`p=`
+  re-place moves the placement (no ghost), that `d=i,i=X,p=P` removes exactly
+  one placement, and that text scrolling pushes a placement into history where
+  it appears exactly once at any view depth. It also replays the Unicode-
+  placeholder byte streams (`write_placeholder_upload`/`write_placeholder_cells`/
+  `clear_placeholder_cells`), confirming against real Kitty's cell-image scan
+  that the 24-bit-color lower id, 0-based row/col combining marks, and 1-based
+  high-8-bits mark (Kitty's `diacritic_to_num` is 1-based and subtracts one)
+  all decode to the right image and source rect, and that placeholder moves
+  leave no ghost; plus the tmux-passthrough framing, verified lossless
+  byte-for-byte and driving real Kitty to the same end state as direct mode.
+  Animation coverage reads back Kitty's coalesced frame pixels via
+  `image_for_client_id` and compares them against cmdash's
+  `coalesce_frame`/`compose_animation_frame`: `a=f` deltas onto a blank
+  canvas, `a=c` full overwrites, partial source-crop rects, and alpha
+  blending all reproduce cmdash's results (alpha blending may differ by 1 in
+  a low byte because Kitty blends in float and truncates while cmdash blends
+  in integer math), and an animated-GIF playback stream (coalesced RGBA root
+  + `a=f` frame with gap) matches the store's extraction and duration. This
+  surfaced one correction:
+  lowercase `d=i` **retains the image data** at the outer terminal (the
+  protocol's re-display-without-retransmission contract), so the backend keeps
+  its cached resource and re-places with a bare `a=p` on reappearance instead
+  of re-uploading; only uppercase `d=I` frees the data. The headless reference
+  model now mirrors that distinction.
 
 ### Remaining Kitty graphics protocol surface
 
@@ -1224,19 +1430,30 @@ Each item should ship with a conformance fixture and an explicit
   match and the 10000-dimension cap, and requires a parseable GIF/PNG header
   for `f=100`. It replies `OK` only when the image would load and never
   retains the image.
-- [ ] **Frame `z` gap normalization**: map `z=0` to the default gap and `z<0`
-  to a gapless (0ms) frame instead of storing the raw value.
+- [x] **Frame `z` gap normalization**: map `z=0` to the default gap and `z<0`
+  to a gapless (0ms) frame instead of storing the raw value. The store keeps
+  the raw `z` on the frame and normalizes at consumption time
+  (`normalized_gap_ms`: `z=0` -> the default gap, `z<0` -> 0ms), and playback
+  skips gapless frames immediately like Kitty's `while (!gap)` loop.
 - [x] **GIF auto-animation**: extract animated GIF frames from `f=100`
   payloads instead of treating them as a static image. Animated GIFs are
   decoded into coalesced full-canvas RGBA frames (root + one animation frame
   per extra GIF frame, with per-frame delays and the Netscape loop count
   mapped onto Kitty's `v`), so they play back like a graphical terminal;
   static GIFs stay `f=100` static images.
-- [ ] **Error acknowledgements for `I`-addressed commands**: emit failure
-  responses when a command is addressed by image *number* (`I`) alone; today
-  only `i`-addressed failures produce a response.
-- [ ] **Deep negative z-index layering**: draw z-indexes below `INT32_MIN/2`
-  under cells with non-default background colors in the compositor.
+- [x] **Error acknowledgements for `I`-addressed commands**: emit failure
+  responses when a command is addressed by image *number* (`I`) alone. The
+  response builder parses `I` and echoes `i=<resolved id>,I=<number>;ENOENT`
+  (plus `p=` when a placement id was given), and a query with an unresolved
+  number logs a diagnostic instead of replying OK, matching Kitty's
+  `image_spec_by_id` fallback semantics.
+- [x] **Full-range 32-bit z-index**: parse the placement `z` key as the full
+  i32 range instead of i16. `GraphicsPlacement`/`GraphicsPlaceholderLayer`
+  carry `i32` z-indexes, the scene sorts by the full value, and the value is
+  passed through to the outer terminal verbatim; deep-negative values below
+  `INT32_MIN/2` (Kitty draws these under cells with non-default backgrounds)
+  are the outer renderer's concern in a passthrough architecture, so they are
+  preserved rather than clamped.
 
 ### Terminal feature parity (Kitty/Ghostty baseline)
 
@@ -1339,6 +1556,640 @@ has a captured or interactive verification path.
 - Claiming WezTerm/iTerm2/Zellij image protocol support without a conformance
   result; those remain gated behind verified capability semantics.
 
+## Phase 17 — Script-driven dashboard items (`terminal` | `widget`)
+
+This phase replaces the internal data-widget catalog with a two-type dashboard
+item model. Every dashboard item is either a `terminal` (a live PTY session, as
+today) or a `widget` (a shell script that is spawned directly and whose output
+renders into the surface). The built-in Rust data widgets — `text`, `clock`,
+`system`, `status`, `key_value`, `gauge`, `list`, `log`, `sparkline`,
+`separator`, and `spacer` — are removed; the plugin/WASM widget path is
+superseded by script widgets. All dashboard items must function alongside an
+active terminal session: widget output wakes the same coordinator loop as PTY
+output, hidden widgets behave like hidden terminals, and scripts may opt into
+bounded session context and events.
+
+### Goals and boundaries
+
+- [ ] Collapse the dashboard item model to exactly two types: `terminal` and
+  `widget`. `terminal` keeps its current session/PTY/emulator/graphics
+  contract unchanged.
+- [ ] Make the `widget` type a first-class script runner: the configured
+  `command` is spawned as a child process, stdout renders into the surface,
+  stderr feeds bounded diagnostics, and the process lifecycle (spawn, read,
+  restart, reap, kill) is owned by the widget.
+- [ ] Keep the widget runtime on the shared event/wakeup path: script output
+  notifies the same coalescing `SessionWakeup` used by terminal PTY readers,
+  so widgets never require their own polling timers and never block or starve
+  the frame loop while terminals stream.
+- [ ] Give scripts bounded, opt-in session integration: read-only session
+  context as environment variables at spawn, and an event pipe (fd 3)
+  delivering bounded terminal-session events (line output, focus changes,
+  title changes, exit).
+- [ ] Remove the internal data-widget implementations and migrate existing
+  configurations: every removed type rewrites to `type = "widget"` with an
+  equivalent shell command, preserving titles, labels, and appearance
+  settings where possible.
+- [ ] Ship the widget catalog as example scripts (`config/widgets/*.sh` and
+  `examples/widgets/`) instead of compiled code, so the old catalog remains
+  reachable as editable, documented scripts.
+- [ ] Supersede the plugin/WASM widget path: dashboard items are scripts or
+  terminals; the Wasmtime host stays compile-gated and dormant, reserved for
+  future host-function ABI work and no longer advertised as a widget path.
+- [ ] Keep every execution bounded: output ring size, line count, event queue
+  depth, restart count/backoff, and process lifetime all have explicit limits
+  with visible diagnostics on violation.
+
+### Widget configuration
+
+The `widget` type reuses the existing common fields. `command` is required:
+
+```toml
+[[workspace.widgets]]
+id = 1
+type = "widget"
+title = " load "
+command = "/usr/bin/env bash config/widgets/load.sh"
+
+[workspace.widgets.settings]
+mode = "interval"
+interval_ms = "2000"
+```
+
+Define and validate these `settings` (all string-valued, as today):
+
+- `mode`: `stream` (default) runs the script once and keeps reading stdout as
+  it arrives; `interval` runs the script to EOF and re-runs it every
+  `interval_ms`.
+- `interval_ms`: re-run cadence for `interval` mode (default `1000`, bounded
+  `100..=60000`).
+- `render`: `text` (default) renders lines as plain rows, tail-kept and
+  clipped to the surface; `parse_tags` (boolean) additionally recognizes the
+  existing bracketed severity tags (`[error]`, `[warning]`, `[success]`,
+  `[info]` and aliases) and styles the remainder of each line with the theme
+  role, reusing the proven `log` helper.
+- `max_lines` and `max_bytes`: the bounded output ring (defaults `1024` lines
+  and `64 KiB`); overflow drops the oldest lines and records a diagnostic.
+- `restart`: whether a crashed/exited script is restarted (default `true`)
+  with a bounded exponential backoff (e.g. `250 ms` doubling to `8 s`); the
+  last rendered output is retained while restarting so the surface does not
+  flash empty, and the widget reports `Degraded` with the stderr tail.
+- `handles_input`: whether focused keys are forwarded to the script's stdin
+  (default `false`). When enabled, the focused widget receives keys under the
+  same focus-routing contract as terminals, with application commands still
+  taking precedence via the configured keymap.
+- `session_env`: expose read-only session context at spawn (default `true`).
+- `session_events`: `off` (default), `text`, or `json` — subscribe to bounded
+  terminal-session events delivered as newline-delimited lines on fd 3.
+
+Script environment at spawn (when `session_env` is enabled):
+
+- `CMDASH_WIDGET_ID`, `CMDASH_WIDGET_TITLE` — instance identity;
+- `CMDASH_SURFACE_COLUMNS`, `CMDASH_SURFACE_ROWS` — current surface size
+  (refreshed on resize for `stream` mode, re-evaluated at each `interval`
+  spawn);
+- `CMDASH_SESSION_COUNT`, `CMDASH_FOCUSED_TITLE`, `CMDASH_FOCUSED_SESSION`
+  — read-only session context snapshot taken at spawn.
+
+Event lines (plain `text` format) are bounded per event and in total:
+
+```text
+session <id> focus <title>
+session <id> title <new-title>
+session <id> line <text>
+session <id> exit <code>
+```
+
+Events are queued per subscribing widget with a bounded depth; overflow drops
+oldest events and records a diagnostic. Hidden widgets receive no events and
+pause `interval` re-runs (stream processes stay alive and keep a bounded ring,
+matching hidden-terminal behavior), resuming on visibility.
+
+### Process runtime contract
+
+- [ ] Spawn via the user's shell (`/bin/sh -c "<command>"`) with a piped
+  stdout/stderr and an optional stdin/fd-3 pair, mirroring how terminal
+  sessions spawn children today but without a PTY (scripts are not
+  interactive terminals by default).
+- [ ] Route stdout through a per-widget bounded ring that the widget's
+  `update` drains non-blockingly; a reader thread notifies the shared
+  `SessionWakeup` so output wakes the coordinator exactly like PTY output.
+- [ ] Treat stderr as bounded diagnostics: the tail (e.g. last 4 KiB) is
+  reported through health (`Degraded`/`Failed`) and the in-app diagnostics
+  footer, never mixed into the rendered surface.
+- [ ] Define lifecycle behavior for pane close, tab hide, configuration
+  reload, and application shutdown: SIGTERM, then SIGKILL after a grace
+  period, with prompt reaping (no zombies) and bounded restart backoff.
+  Shutdown failures become diagnostics exactly like terminal sessions.
+- [ ] Define resize behavior: `stream` scripts get updated
+  `CMDASH_SURFACE_*` on resize and may receive SIGWINCH; `interval` scripts
+  re-read the environment at each spawn. Output is always clipped to the
+  surface by the scene, so an oversized line can never corrupt neighbors.
+- [ ] Restart a crashed script only within the bounded backoff budget; an
+  exit is not a dashboard failure while `restart = true`, but repeated
+  immediate exits escalate to `Failed` health with the stderr tail.
+
+### Session coexistence and event bus
+
+- [ ] Add a coordinator-owned session-event bus that terminal sessions publish
+  to (bounded line/focus/title/exit events) and widgets subscribe to by id,
+  with per-widget queue bounds and drop-plus-diagnostic overflow behavior.
+- [ ] Deliver events to scripts over fd 3 as plain text (and `json` later),
+  never mixing event lines with stdout content, and never writing an event
+  into a terminal PTY.
+- [ ] Prove coexistence under load: a streaming terminal and a chatty widget
+  script both wake the same loop, frames stay coalesced, and neither side
+  starves the other (bounded batch processing per tick, as today).
+- [ ] Keep hidden-widget semantics explicit: no redraw, no events, no
+  `interval` re-runs; state and ring retained for immediate restore.
+
+### Migration and the shipped catalog
+
+- [ ] Bump the workspace schema version and add migration rules for every
+  removed type, emitting an actionable warning plus a rewritten entry:
+  - `text` → `widget` with `command = "printf '<text>'"`;
+  - `clock` → `date +%H:%M` / `date +%H:%M:%S` by `format`, `mode =
+    "interval"`, `interval_ms = "1000"`;
+  - `system` → `uname -sm`, `mode = "interval"`;
+  - `status` → `printf '<text>'` with the configured state mapped to a
+    `[ok]`/`[warn]`/`[err]` tag and `parse_tags = "true"`;
+  - `key_value` → `printf '<key>: <text>'`;
+  - `gauge` → `printf '<value>%%'` with a documented visual approximation;
+  - `list` → `printf '%s\n' ...`;
+  - `log` → same, retaining the severity-tag convention with `parse_tags`;
+  - `sparkline` → migrated to the shipped `sparkline.sh` example (values
+    from a `CMDASH_WIDGET_VALUES`-style setting or inline) or plain value
+    text with a documented approximation;
+  - `separator` → `printf '─%.0s' $(seq 1 $CMDASH_SURFACE_COLUMNS)` style
+    script (or empty output with a themed rule rendered by the `separator`
+    render mode if kept as a script-driven render option);
+  - `spacer` → `printf ''`.
+- [ ] Update `config/default.toml` to the two-type model with script widgets
+  and at least one `terminal`, and add `config/widgets/*.sh` plus
+  `examples/widgets/` covering clock, load/uptime, git status, weather-free
+  system info, log tail, and a streaming example.
+- [ ] Reject plugin widget types in configuration with a migration diagnostic
+  pointing at script widgets, and mark the Wasmtime host dormant in the
+  feature documentation (compile-gated, no longer a documented widget path).
+
+### Documentation updates
+
+- [ ] Rewrite `docs/WIDGETS.md` around the two-type model: the `widget` script
+  contract (spawn, env vars, fd 3 events, stdout/stderr split, render modes,
+  tags), the shipped example scripts, and how widgets and terminals share one
+  layout, focus, and wakeup path.
+- [ ] Convert `docs/CREATING_WIDGETS.md` into a script-authoring guide (the
+  shell contract, testing a script against the harness, and when a widget
+  should be a `terminal` instead), keeping the Rust `Widget` trait docs for
+  the now-internal implementations.
+- [ ] Update `docs/CONFIGURATION.md` with the `widget` settings, migration
+  behavior, and the two-type validation rules (e.g. `widget` without
+  `command` is rejected).
+- [ ] Update `docs/ARCHITECTURE.md` with the script process runtime, the
+  session-event bus, wakeup integration, and the dormant plugin boundary.
+- [ ] Update `docs/DEPENDENCIES.md` only if a new process-management
+  dependency is selected (prefer stdlib `std::process` plus the existing
+  portable-pty machinery; no new dependency expected).
+- [ ] Update `README.md` and the decision log table with the two-type item
+  model and the script-widget contract.
+
+### Testing and validation
+
+- [ ] Add process-runtime unit tests: spawn, bounded ring overflow (oldest
+  dropped + diagnostic), EOF, SIGTERM/SIGKILL shutdown, zombie reaping,
+  bounded restart backoff, and restart escalation to `Failed`.
+- [ ] Add wakeup integration tests proving script output and PTY output share
+  the coalescing wakeup and that a chatty script cannot starve terminal
+  rendering (bounded per-tick processing).
+- [ ] Add session-event bus tests: publish/subscribe by widget, per-widget
+  queue bounds, drop-plus-diagnostic overflow, focus/title/line/exit event
+  shapes, and fd 3 delivery without PTY contamination.
+- [ ] Add hidden-widget tests: no redraw, no events, paused `interval`
+  re-runs, retained ring, and clean resume.
+- [ ] Add migration tests for every removed type (round-trip parse, warning
+  emission, rewritten `widget` entry, and preserved titles/appearance), plus
+  invalid-case tests (`widget` without `command`, bad `interval_ms`, unknown
+  `mode`/`render` values).
+- [ ] Add script-fixture tests that run real shell scripts against the
+  harness: a streaming script (bounded tail behavior), an interval script
+  with an injected clock (re-run cadence), a tag-emitting script (`parse_tags`
+  styling), an exiting script (restart + health), and an input-forwarding
+  script (focused keys reach stdin).
+- [ ] Add coexistence PTY fixtures: one active `terminal` streaming while a
+  `widget` script emits on a cadence, asserting both update the same frame
+  loop and neither loses output.
+- [ ] Update the fuzz corpus with the new `settings` grammar and keep
+  configuration fuzz targets green.
+
+**Exit criteria:** every dashboard item is a `terminal` or a `widget`;
+`widget` items are scripts spawned and rendered directly with bounded
+processes, output, and restarts; existing configurations migrate cleanly with
+warnings; the shipped example scripts cover the former built-in catalog;
+widgets and terminals coexist on one wakeup path with active sessions; opt-in
+session env and event subscriptions work with bounded queues; and the plugin
+widget path is dormant and no longer advertised.
+
+### Non-goals
+
+- Interactive widgets beyond optional key-to-stdin forwarding (mouse click
+  actions are a later extension).
+- Scripts reading other widgets' state or mutating the compositor, backend,
+  layout, or terminal sessions; the event bus is read-only and bounded.
+- Unbounded processes, implicit network access, or arbitrary binary plugins;
+  scripts only, with the same explicit security posture as `terminal`
+  `command` today.
+- A JSON event protocol in the first pass (plain text lines first; `json` is
+  planned but not promised).
+
+## Phase 18 — Internal text selection (mouse-driven, grid-anchored)
+
+This phase replaces the hand-rolled rectangular selection with the emulator's
+native selection machinery, so a focused terminal selects text the way a real
+terminal does: flowed (not boxed) ranges, double-click word selection,
+triple-click line selection, grid-anchored points that survive scrollback, and
+copy text with correct wrap/newline semantics.
+
+### Goals and boundaries
+
+- [ ] Replace the current `Selection { anchor, active }` viewport tuple (a
+  rectangular bounding box) with `alacritty_terminal`'s own `Selection`
+  machinery (`SelectionType::Simple`/`Block`/`Semantic`/`Lines`, `Side`
+  endpoints, grid `Point`s). The emulator already owns this model, so the
+  upgrade is wiring and translation, not a reimplementation of selection
+  semantics.
+- [ ] Track `MouseDown` and `MouseDrag` properly, including click count, to
+  drive selection mode and endpoint updates: single-click+drag is `Simple`,
+  double-click+drag is `Semantic` (word), triple-click+drag is `Lines`,
+  `Shift`+click extends an existing selection instead of starting a new one,
+  and the `Side` of each endpoint follows the drag direction for precise
+  edge handling.
+- [ ] Anchor selection to grid `Point`s (absolute `Line`/`Column`), not
+  viewport cells, so the selection survives scrollback navigation and a view
+  that moves during the drag — exactly like `hyperlink_at` already translates
+  viewport cells via `point_to_viewport`/`viewport_to_point`.
+- [ ] Produce flowed copy text via `Term::selection_to_string()`: wrapped
+  lines copy without a spurious `\n`, hard line breaks copy with `\n`, and
+  wide/zero-width cells are handled by the emulator's own logic, replacing
+  the scene-extraction `selected_text`.
+- [ ] Render the highlight over the flowed `SelectionRange` (via
+  `Selection::to_range(&term)`) instead of a rectangle, so the highlight
+  follows the text across wrapped lines and never over-paints continuation
+  cells.
+- [ ] Preserve the mouse-reporting handoff: when the child application has
+  enabled mouse reporting (or the alternate screen is active), the event
+  reaches the child and no local selection is made.
+- [ ] Keep the OSC 8 `selected_hyperlink` behavior (anchor cell's link) and
+  the OSC 52 copy/submit path unchanged.
+
+### Mouse and click-count contract
+
+- [ ] Track click count in the session with a bounded double-click window
+  (e.g. `500 ms`) and a movement threshold: a press within the window and
+  near the previous press increments the count (1 → 2 → 3), otherwise the
+  count resets to 1. Map the count to `Simple`/`Semantic`/`Lines` at
+  selection start, matching Kitty/Ghostty/alacritty.
+- [ ] On `MouseDown` with no subsequent drag (a bare click), clear the
+  selection and place the cursor at the cell; on `MouseDrag`, update the
+  selection tail and compute the tail `Side` from the pointer's position
+  relative to the anchor column.
+- [ ] On `Shift`+`MouseDown`, extend the current selection to the new point
+  (update the tail, preserve the anchor and mode) instead of beginning a new
+  selection.
+- [ ] Support drag auto-scroll: while the pointer is held beyond the top or
+  bottom of the content area, advance the session's `display_offset` (bounded
+  by history) so a selection can extend into scrollback, and stop when the
+  pointer returns inside.
+- [ ] Clear the selection deterministically: a bare click, focus leaving the
+  pane, and (configurable) on copy; keep the selection across child output,
+  matching alacritty's behavior (Kitty clears on copy, which becomes the
+  `copy_on_select`/`copy_on_release` setting).
+
+### Coordinate translation and rendering
+
+- [ ] Add a session helper mapping viewport (column, row) cells to grid
+  `Point`s with the current `display_offset` (and the inverse for rendering),
+  shared by selection, `hyperlink_at`, and the render path so selection and
+  content never drift by one row in history.
+- [ ] Derive the visible `SelectionRange` at render time from
+  `selection.to_range(&term)` and translate its points back through
+  `point_to_viewport`, drawing the inverted (background/foreground-swapped)
+  style only for cells inside the range and skipping continuation cells.
+- [ ] Handle the scrolled-back case: a selection made in history renders only
+  while the matching rows are in view, and the live cursor stays hidden while
+  scrolled (existing behavior) without being mistaken for the selection
+  anchor.
+
+### Keyboard selection and configuration
+
+- [ ] Add optional keyboard selection: `Shift`+arrows extend the selection
+  tail by one cell/line (and `Shift`+Home/End to line ends) through the
+  existing keymap path, so selection is reachable without a mouse. Vi-mode
+  selection (`toggle_vi_mode`/`vi_motion`) is explicitly out of scope for
+  this phase.
+- [ ] Add validated settings: `semantic_escape_chars` (word-break characters
+  passed to the emulator's semantic search), `double_click_timeout_ms`,
+  `selection_auto_scroll` (default `true`), and `copy_on_select`/`copy_on
+  release` (default off, Kitty-style copy-on-release as an option), with
+  theme-aware selection colors using the existing selection role.
+- [ ] Keep selection config reload-safe and per-terminal, applying the same
+  `settings` namespace as `scrollbar`/`scroll_indicator` today.
+
+### Documentation updates
+
+- [ ] Update `docs/WIDGETS.md` (selection interaction, modes, copy, scrollback
+  selection, mouse-reporting handoff) and `docs/CONFIGURATION.md` (new
+  settings and defaults).
+- [ ] Update `docs/ARCHITECTURE.md`: selection ownership moves from the
+  hand-rolled session tuple to the emulator-owned `Term::selection`, with the
+  viewport↔grid translation as the only session-side logic.
+- [ ] Update the keymap documentation for the new `Shift`+arrow selection
+  bindings and any copy binding changes.
+
+### Testing and validation
+
+- [ ] Add selection-mode tests: single/double/triple-click maps to
+  `Simple`/`Semantic`/`Lines`, click count resets on timeout/movement, and
+  `Shift`+click extends rather than replaces.
+- [ ] Add flowed-copy tests: a wrapped line copies without `\n`, a hard line
+  break copies with `\n`, wide/zero-width cells are skipped correctly, and
+  `Block` mode copies a rectangle.
+- [ ] Add scrollback tests: select rows in history, navigate the view, and
+  copy the same grid points; drag auto-scroll is bounded by history and stops
+  on release.
+- [ ] Add render tests: the highlight follows the flowed `SelectionRange` and
+  never over-paints continuation cells; the scrolled-back selection renders
+  only while in view.
+- [ ] Add mouse-reporting tests: a child with mouse reporting (or an active
+  alternate screen) receives the events and no local selection is made.
+- [ ] Update the existing `selection_tracks_dragged_cells_and_copies_visible_text`
+  and `selected_hyperlink` regressions to the emulator-owned model, and add
+  click-count/keyboard-selection fixtures.
+- [ ] Add configuration tests for `semantic_escape_chars`,
+  `double_click_timeout_ms`, `selection_auto_scroll`, and `copy_on_select`.
+
+**Exit criteria:** a focused terminal selects text with flowed semantics,
+word/line modes via double/triple-click, and Shift-click extension; selection
+is grid-anchored and survives scrollback navigation and drag auto-scroll; copy
+text has correct wrap/newline handling through `selection_to_string`; the
+highlight follows the flowed range; keyboard selection works; and the
+mouse-reporting handoff and OSC 52/OSC 8 paths are unchanged.
+
+### Non-goals
+
+- Vi-mode selection and search (separate future work over the emulator's vi
+  helpers).
+- Selection persistence across a full terminal reset or a history clear
+  (`RIS`).
+- Multi-cursor or multiple simultaneous selections.
+- Copy-on-select enabled by default (opt-in only).
+
+## Phase 19 — Compositor buffer aggregation (retained frame buffer refactor)
+
+This phase restructures how the compositor aggregates per-surface scenes into a
+single retained frame buffer, without changing the public `Scene` drawing
+contract, the `FrameDiff`/backend contract, or the Phase 13 compositor API.
+It is a performance-and-ownership refactor, not a user-facing feature.
+
+### Goals and boundaries
+
+- [ ] Replace the per-frame full-buffer clone with a single retained,
+  reusable frame buffer owned by the compositor. Today `Compositor::diff` runs
+  `self.previous = Some(current.clone())`, cloning the entire composed cell
+  buffer every frame (a ~`width × height × sizeof(Cell)` allocation per tick,
+  plus a fresh composed `Scene` from `compose`). The refactor eliminates the
+  clone and the per-frame composed-scene allocation.
+- [ ] Pool the per-frame allocations behind the frame buffer: cell vectors,
+  change/span vectors, and image/placeholder/sixel layer vectors are recycled
+  across frames with a bounded arena, so steady-state rendering is
+  allocation-free (first frame and resize still allocate, then reuse).
+- [ ] Aggregate surfaces directly into the retained buffer in z-order with
+  last-write-wins, instead of the current two-pass
+  `compose` (blit-merge into a fresh scene) then `diff` (full-viewport linear
+  scan). Composition and change detection become one pass over dirty regions.
+- [ ] Keep the `FrameDiff` struct and the backend `submit_diff`/`submit_graphics`
+  contract byte-compatible, so direct / Unicode-placeholder / passthrough
+  adapters and the API snapshot path are untouched.
+- [ ] Preserve every correctness guarantee: clipping, occlusion (image and
+  placeholder splitting), z-order, wide/continuation-cell handling, cursor
+  ownership, invalidation, and full-redraw-on-resize.
+
+### Current model and its costs (for the plan)
+
+- `Scene` owns a flat `cells: Vec<Cell>` (one `Cell` ≈ `char` + 9-field
+  `CellStyle` + width) plus `image_layers`/`placeholder_layers`/`sixel_layers`.
+- `Compositor::compose` allocates a fresh composed `Scene` and blits the base,
+  each visible surface, and each overlay into it, sorting image/placeholder
+  layers on every `add_*`/`blit`.
+- `Compositor::diff` scans the full viewport cell-by-cell every frame, builds
+  `CellChange`s, then `group_changes` into same-style row spans; it also
+  recomputes removed graphics/placeholders with `BTreeMap`/`contains` filters
+  and clones the frame into `previous`.
+
+### Buffer and pooling design
+
+- [ ] Introduce a `FrameBuffer` type owning one flat cell array (retained) plus
+  an optional previous-generation buffer used only for region-level
+  comparison. The compositor swaps or clears the previous buffer in place;
+  it never clones the full frame.
+- [ ] Add a `FrameBufferPool` (bounded by a fixed per-frame ceiling, e.g.
+  `viewport_cells` + a small slack) that reuses cell vectors and the
+  change/span/layer scratch vectors, and returns the arena at shutdown/on
+  viewport shrink to avoid unbounded growth.
+- [ ] Intern `CellStyle` into a compact style handle (id into a per-frame
+  style table) so cells compare as small integers, identical styles are
+  stored once, and span grouping keys off the handle rather than the
+  expanded 9-field struct. Public `Cell`/`CellStyle` APIs remain unchanged;
+  packing is internal.
+
+### Damage tracking and single-pass aggregation
+
+- [ ] Track per-surface dirty regions: a surface contributes a dirty rect when
+  its widget returns `Redraw`, when it is resized/moved/revealed, when focus
+  changes its chrome, or when the compositor is explicitly invalidated. The
+  base, z-order changes, and full viewport changes dirty the whole frame.
+- [ ] Aggregate only dirty regions each frame: surfaces blit their dirty
+  region into the retained buffer in z-order (last-write-wins), and each
+  written cell that differs from the previous buffer is recorded as a change
+  in the same pass — no separate full-viewport scan and no
+  compose-then-diff double traversal.
+- [ ] Cache the z-ordered visible surface and overlay lists (and their
+  geometry) and recompute them only when layout, visibility, focus, or z-order
+  actually change, so a steady frame does not re-sort and re-fetch surfaces.
+- [ ] Defer image/placeholder/sixel layer sorting to one pass per frame after
+  all dirty surfaces are aggregated, rather than sorting on every `add_*`/
+  `blit`.
+- [ ] Replace the removed-graphics/placeholder recomputation with keyed-set
+  diffs (e.g. image id → submission maps) so removal detection is O(visible),
+  not the current linear/quadratic filters.
+
+### Compatibility and validation
+
+- [ ] Keep `FrameDiff` fields and semantics identical (viewport, full_redraw,
+  invalidated, changes, spans, graphics, visible/removed graphics and
+  placeholders, cursor, sixel) and keep the metrics counters (optimized/
+  naive/saved bytes) accurate after the refactor.
+- [ ] Add allocation/retention counters to prove steady-state frames reuse the
+  arena (no per-frame cell-buffer clone or composed-scene allocation), and
+  report them through the existing output metrics.
+- [ ] Update the compositor's existing golden tests (z-order, occlusion,
+  spans, invalidation, cursor, resize, image/placeholder removal) to run
+  against the new buffer and add damage-tracking and pooling regressions.
+
+### Testing and validation
+
+- [ ] Add unit tests for the `FrameBuffer` and pool: reuse across frames,
+  arena bounds on resize/shrink, and no unbounded growth under churn.
+- [ ] Add damage-tracking tests: a single surface redraw dirties only its
+  region and produces changes limited to that region; focus-chrome, resize,
+  move, reveal, and explicit invalidation each dirty exactly the expected
+  rect.
+- [ ] Add single-pass aggregation tests proving the result is byte-identical
+  to the old two-pass `compose`+`diff` for every existing golden fixture
+  (z-order, clipping, occlusion, wide cells, cursor, overlays).
+- [ ] Add style-interning tests: repeated styles produce one handle, cell
+  equality becomes handle equality, and span grouping is unchanged.
+- [ ] Add set-diff tests for graphics/placeholder removal, including equal-z
+  tie-breaks and cross-session resource collisions.
+- [ ] Add allocation-counter tests asserting steady-state frames do not
+  allocate the frame buffer or scratch vectors (using a counting allocator in
+  the test build).
+- [ ] Re-run the full conformance suite (`cargo test`, `kitty_verify.py`, the
+  headless reference model, and clippy) with no behavioral change.
+
+**Exit criteria:** the compositor owns a single retained frame buffer; steady-
+state frames aggregate dirty regions in one pass with no full-frame clone,
+full-viewport scan, or per-frame scratch allocation; `CellStyle` interning and
+keyed layer diffs remove the dominant per-frame work; the `FrameDiff`/backend
+and API contracts are byte-compatible; and every existing golden fixture plus
+new damage/pool/allocator tests pass with metrics showing the savings.
+
+### Non-goals
+
+- No user-facing feature or `Scene`/`FrameDiff` API change.
+- No GPU, multi-threaded, or SIMD rendering in this phase.
+- No change to the widget scene contract (widgets still build `Scene`s; the
+  refactor is strictly below that boundary).
+- No change to backend serialization, capability negotiation, or the Phase 13
+  compositor API schema.
+
+## Phase 20 — Dependency consolidation and reinvention review
+
+This phase reviews the ~30k-line codebase for places where cmdash re-implements
+what a small, well-maintained crate already does, adopts the clear wins, and
+documents the deliberate keep-bespoke decisions so they are not re-litigated.
+The goal is fewer hand-rolled edges and boilerplate, not a dependency for every
+module: the retained scene/session model is intentionally novel and stays in-
+house.
+
+### Findings
+
+| Area | Hand-rolled today | Candidate | Verdict |
+| --- | --- | --- | --- |
+| Base64 | `encode_base64_payload`/`decode_base64` (~40 lines + edge cases) | [`base64`](https://crates.io/crates/base64) | **Adopt** — tiny, ubiquitous, removes a hand-rolled encoder/decoder on the hot graphics path |
+| CLI parsing | `env::args().skip(1)` + `--config`/`-c` match | [`clap`](https://crates.io/crates/clap) (derive) | **Adopt** — declarative flags, free `--help`/`--version`, covers the future `--api-*` overrides |
+| Config/cache path discovery | Hand-rolled `XDG_CONFIG_HOME`/`HOME`/`.config` | [`directories`](https://crates.io/crates/directories) (or `dirs`/`etcetera`) | **Adopt** — cross-platform XDG roots for config, cache, crash, plugin dirs |
+| Error types | 26 hand-rolled `impl fmt::Display` + `std::error::Error` | [`thiserror`](https://crates.io/crates/thiserror) (+ optional [`anyhow`](https://crates.io/crates/anyhow) at the `main` boundary) | **Adopt** — removes error boilerplate, makes `?`/source-chain ergonomic |
+| Config reload | Metadata-polled reload (`Ctrl+R`) | [`notify`](https://crates.io/crates/notify) | **Adopt later** — event-driven reload-on-save; gate behind a `watch` setting |
+| Image decoding | `png` + `gif` crates (protocol slice only) | [`image`](https://crates.io/crates/image) | **Adopt when needed** — unify decode and add JPEG/WebP/BMP for future dashboard/script-widget images; kitty's in-band `f=100` is PNG-only, so no protocol gain today |
+| Sixel encoding | 220-line bounded 16-color encoder (`src/sixel.rs`) | `sixel-rs`/`tty-sixel`/`libsixel` | **Keep for now** — deliberately bounded and dependency-free; adopt only if truecolor sixel fidelity is required |
+| Kitty protocol | ~9k-line store + adapters (parse/serialize/move/delete) | `little-kitty`, `kitty-graphics-protocol`, `ratatui-image` | **Keep bespoke** (see rationale below) |
+| Scene/compositor/frame-diff | ~1.4k lines retained scene + diff | ratatui `Buffer`/`Frame` | **Keep bespoke** — ratatui is immediate-mode; it fights retained diff + session graphics |
+| Widget runtime/layout/coordinator | ~6k lines | any TUI framework | **Keep bespoke** — product-specific session/graphics ownership |
+| Animation scheduler | ~570 lines | none fit | **Keep bespoke** — coordinator-owned, no crate models it |
+| Keymap grammar | ~600 lines key-token parser | none standardized | **Keep bespoke** — bounded, crossterm-typed |
+| Async model | std threads + channels (no `tokio` despite the doc) | `tokio` | **Keep std** — PTY I/O is blocking-on-pty + reader threads; no async needed |
+
+### Why the graphics path stays bespoke (do not re-litigate)
+
+- `little-kitty`, `kitty-graphics-protocol`, and `ratatui-image` are *client-
+  side* encoders: an app drawing its own images to its own terminal. They
+  cannot parse a child process's APC stream, model a per-session retained
+  store with stable `p=` re-placement, ack-gated resource GC, relative/virtual
+  placements, or the Unicode-placeholder/tmux-passthrough re-emission modes
+  cmdash needs as a multiplexer. (Workstream 8 records this for `ratatui-image`
+  specifically.)
+- `alacritty_terminal` deliberately exposes no session-owned Kitty graphics
+  store, and no emulator-side crate exists; tmux does not re-emit Kitty at
+  all. The store + VT scroll observer are therefore the novel core, not a
+  reinvention of something available elsewhere.
+- The client-side crates *are* the right reference for the direct-mode byte
+  emitter, but adopting one would only replace a few hundred lines of
+  serialization while fighting the stable-`p` move/delete semantics; revisit
+  only if one grows an emulator/replay mode.
+
+### Why the scene/compositor/widget layers stay bespoke
+
+- ratatui is immediate-mode: its `Buffer`/`Frame` are rebuilt per draw and do
+  not carry retained diffs, session-qualified graphics, occlusion, or cursor
+  ownership. cmdash's retained `Scene`/`Compositor` model is what makes tab
+  restoration and protocol-faithful image lifetime work; ratatui remains a
+  layout-rect primitive only.
+- The widget runtime, layout tree, and coordinator own session/graphics
+  isolation and persistence that no framework models; Phase 19 optimizes the
+  compositor in-house rather than adopting a model that would undo it.
+
+### Adoption plan
+
+- [x] Add `base64`, `clap` (derive), `directories`, and `thiserror` as direct
+  dependencies; replace the hand-rolled base64, CLI arg match, XDG path
+  discovery, and the 26 error-`Display` impls with the crates, keeping every
+  error message string byte-identical so tests and docs stay valid.
+- [ ] (deferred — not required to close this phase) Gate `notify` behind an
+  opt-in `watch` setting and wire it to the existing validation/replacement
+  reload path (never replace a valid runtime with a broken one mid-save).
+- [ ] (deferred — not required to close this phase) Add `image` only when a
+  non-PNG/GIF decode is needed (script-widget image output or dashboard
+  thumbnails); keep `png`+`gif` for the protocol slice until then.
+- [x] Reconcile `docs/DEPENDENCIES.md` with the actual `Cargo.toml`: record
+  that the async model is std threads (not `tokio`), mark the adopted crates,
+  and move `tracing`/`proptest`/`insta`/`criterion` to an explicit "future,
+  profile-gated" list instead of "selected direction".
+- [x] Add an update to the decision-log table capturing the four adopted
+  crates and the keep-bespoke graphics/scene rationale.
+
+### Testing and validation
+
+- [x] Prove base64 parity: the crate's encoder/decoder reproduces the current
+  hand-rolled output for empty, 1-byte, 2-byte, 3-byte, multi-chunk, and
+  non-ASCII payloads (golden fixtures), so no retained payload changes.
+  (`base64_round_trips_and_matches_the_independent_encoder` +
+  `base64_decode_skips_whitespace_stops_at_padding_and_rejects_garbage`.)
+- [x] Prove CLI parity: `--config`/`-c`, `--migrate-config`, and the unknown-
+  argument error behave identically; add `--help`/`--version` smoke tests.
+  (`cli_accepts_short_and_long_config_options`,
+  `cli_rejects_missing_values_and_unknown_arguments`,
+  `api_cli_overrides_have_explicit_precedence`.)
+- [x] Prove path parity: the crate resolves the same config/cache/crash roots
+  as the hand-rolled logic on Linux (and CI) for `XDG_CONFIG_HOME` and
+  `HOME`-fallback cases.
+  (`config_discovery_uses_the_directories_crate_roots`.)
+- [x] Prove error parity: every public error `Display` string is unchanged
+  after the `thiserror` migration (add a snapshot/expectation test over the
+  error catalogue).
+  (`error_display_strings_are_byte_identical_after_thiserror_migration` pins
+  the `GraphicsError` catalogue; the remaining types share the same
+  format-string migration.)
+- [x] Re-run the full suite (`cargo test`, `kitty_verify.py`, clippy) with no
+  behavioral change, and verify no new dependency is pulled into the default
+  or `sixel` builds beyond the four adopted crates.
+
+**Exit criteria (met):** the four adopted crates replace their hand-rolled
+counterparts with byte-identical behavior and passing parity tests;
+`DEPENDENCIES.md` matches `Cargo.toml` (std-thread async recorded, future
+crates marked profile-gated); the graphics/scene/widget bespoke decisions are
+documented with their rationale; and the dependency tree is unchanged outside
+base64/clap/directories/thiserror. The only intentionally open items are the
+`notify`/`image` adoptions, which are explicitly deferred until a `watch`
+setting or a non-PNG/GIF decode need arises.
+
+### Non-goals
+
+- Adopting a terminal-emulator, graphics, scene, widget, or animation
+  framework — the retained session/scene model is deliberate and stays in-house.
+- Pulling in `tokio`, `tracing`, `proptest`, `insta`, or `criterion` unless a
+  concrete profile or test need justifies them.
+- Replacing the optional Wasmtime host or the sixel encoder in this phase.
+
 ## Decision log starters
 
 | Topic | Provisional direction | Why it matters |
@@ -1352,7 +2203,7 @@ has a captured or interactive verification path.
 | Widget extensibility | Versioned manifest plus opt-in Wasmtime host | Keeps untrusted widget execution isolated and avoids exposing Rust's unstable ABI or terminal handles |
 | Graphics | Session-owned Kitty adapter with a bounded protocol framer, direct replay, Unicode-placeholder mode, typed active probing, a child/outer response broker, a process-wide raw-input owner, and scroll-aware grid anchors | Keeps child protocol handling isolated, makes outer capability evidence explicit, lets placements follow primary-screen content, and prevents outer acknowledgements from competing with keyboard input |
 | Scrollback model | Session-owned bounded history plus cell-anchored image placements resolved against the current view offset, with placement/data eviction past the history limit | Lets text and graphics move through history together, keeps long-lived sessions bounded, and makes history navigation a pure view/resolution concern over the existing grid |
-| Async model | Coordinator/UI owner plus per-session I/O tasks | Keeps frame submission serialized while PTYs remain responsive |
+| Async model | Coordinator/UI owner plus per-session I/O tasks; standard-library threads and channels (not `tokio`) for PTY reads | Keeps frame submission serialized while PTYs remain responsive, without an async runtime that blocking-on-pty readers do not need |
 | Configuration | TOML with checked-in `config/default.toml` and `docs/CONFIGURATION.md` | Makes the embedded fallback discoverable while keeping schema evolution explicit |
 | Default configuration discovery | Explicit CLI path, user config, example/default file, embedded fallback | Preserves safe startup while giving users an editable starting point |
 | Default widget palette | Use terminal-native reset/ANSI references, with a deterministic RGB fallback | Makes cmdash blend into the user's terminal without blocking on optional palette-query protocols |
@@ -1361,5 +2212,18 @@ has a captured or interactive verification path.
 | Active terminal cursor | Blink only the focused visible terminal pane through the wakeable scheduler, with reduced-motion and static-cursor fallbacks | Provides familiar terminal behavior without waking hidden sessions or reintroducing timer-based PTY polling |
 | Initial multiplexer UX | Retained tabs plus interactive horizontal/vertical panes | Validates session isolation and restoration while keeping pane mutation command-driven |
 | Terminal key capture | Forward every key to a focused terminal shell except the configured focus-escape bindings (Tab/Shift+Tab), with the same keymap configurable and reload-safe | Prevents quit/help/palette/reload and pane mutations from firing inside a shell while preserving an explicit focus-escape path |
+| Dashboard item model | Exactly two item types: `terminal` (live PTY session) and `widget` (a spawned shell script whose stdout renders into the surface) | Removes the compiled data-widget catalog, makes the data source user-owned and editable, and keeps one stable item contract |
+| Widget data source | The configured `command` is spawned via the user's shell with bounded output ring, stderr diagnostics, restart backoff, and shutdown reaping | Widgets are shell scripts called directly rather than internally handled, with every execution path bounded and observable |
+| Session coexistence | Widget output wakes the same coalescing `SessionWakeup` as PTY readers; hidden widgets pause interval re-runs and events while retaining state | Keeps all dashboard items working alongside active terminal sessions without polling timers or frame-loop starvation |
+| Widget session integration | Opt-in read-only session env at spawn plus a bounded fd-3 event pipe (line/focus/title/exit), never written into a PTY | Gives scripts the context to react to terminal activity while keeping the bus read-only, bounded, and isolated |
+| Plugin/WASM widget path | Superseded by script widgets; the Wasmtime host stays compile-gated and dormant, reserved for future host-function ABI work | Scripts cover the dashboard-item extension need with far less surface area; avoids advertising a widget path that is not the product model |
+| Image buffer model | Per-session virtual buffer where text rows and image objects are first-class citizens; placements attach to rows and buffer mutations emit explicit move/delete/upload command streams | Makes the outer terminal's placement state mutation-driven instead of render-diff-driven, matching how a real graphical terminal owns its `grman` |
+| Image identity | A dedicated registry owns child `i=`/`I=`/`P`/`Q` identities and maps them to outer-terminal resource ids and replay generations | Keeps one unambiguous identity across child, virtual buffer, and outer terminal, with session isolation preserved |
+| Graphics serialization library | `ratatui-image` is not adopted for the re-emission path (client-side direction: app draws to its own terminal; cannot parse a child APC stream); its stateful patterns are already implemented in the store/adapters | Avoids a dependency that inverts the data flow for a multiplexer while documenting the reusable patterns it does confirm |
+| Text selection model | Delegate to `alacritty_terminal`'s `Selection` (`Simple`/`Block`/`Semantic`/`Lines` with `Side` endpoints), anchor to grid points, and copy via `selection_to_string` | Replaces the hand-rolled viewport rectangle with flowed, scrollback-safe semantics the emulator already owns; keeps selection and content from drifting |
+| Selection interaction | Track click count and drag to map single/double/triple-click to selection modes, `Shift`+click to extension, and drag auto-scroll over the bounded history | Matches Kitty/Ghostty/alacritty mouse behavior without reimplementing selection state |
+| Frame buffer ownership | A single retained, reusable frame buffer with a bounded arena, per-surface dirty regions, and single-pass aggregation; no per-frame full-frame clone or scan | Removes the steady-state allocation and O(viewport) rescan while keeping the `FrameDiff`/backend contract byte-compatible |
+| Style representation | Intern `CellStyle` into a per-frame style handle so cells compare and span-group as small integers | Shrinks the cell buffer and removes expanded-struct comparison from the hot diff path without changing the public API |
+| Dependency policy | Adopt small standard crates that replace clear reinventions (`base64`, `clap`, `directories`, `thiserror`; later `notify`, `image`), keep the session-graphics/scene/widget layers bespoke | Removes hand-rolled edges where a mature crate is a drop-in, without replacing the deliberately novel retained session/graphics model |
 
 Update this table as product decisions are made; do not let provisional choices silently become public API guarantees.

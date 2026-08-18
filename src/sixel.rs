@@ -64,22 +64,13 @@ pub struct SixelImage<'a> {
     pub rgb: &'a [u8],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SixelError {
+    #[error("sixel image cannot be empty")]
     EmptyImage,
+    #[error("sixel RGB data has invalid dimensions")]
     InvalidDimensions,
 }
-
-impl std::fmt::Display for SixelError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EmptyImage => formatter.write_str("sixel image cannot be empty"),
-            Self::InvalidDimensions => formatter.write_str("sixel RGB data has invalid dimensions"),
-        }
-    }
-}
-
-impl std::error::Error for SixelError {}
 
 const PALETTE: [(u8, u8, u8); 16] = [
     (0, 0, 0),

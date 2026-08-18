@@ -26,12 +26,46 @@ use cmdash::{
 #[cfg(not(target_os = "linux"))]
 use crossterm::event;
 use crossterm::event::Event;
+use clap::Parser;
+use directories::ProjectDirs;
 
 const MAX_EVENTS_PER_BATCH: usize = 32;
 #[cfg(not(target_os = "linux"))]
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
+
+#[derive(clap::Parser)]
+#[command(
+    name = "cmdash",
+    version,
+    about = "A modular terminal dashboard and multiplexer"
+)]
+struct Cli {
+    /// Path to the TOML configuration file.
+    #[arg(short = 'c', long = "config", value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Rewrite the configuration file to the latest schema version.
+    #[arg(long = "migrate-config")]
+    migrate_config: bool,
+
+    /// Enable the local compositor API.
+    #[arg(long = "api")]
+    api: bool,
+
+    /// Disable the local compositor API.
+    #[arg(long = "api-disable")]
+    api_disable: bool,
+
+    /// Enable the local compositor API in read-only mode.
+    #[arg(long = "api-read-only")]
+    api_read_only: bool,
+
+    /// Path for the compositor API Unix socket.
+    #[arg(long = "api-socket", value_name = "PATH")]
+    api_socket: Option<String>,
+}
 
 struct InputReader {
     cancellation: Arc<AtomicBool>,
@@ -86,24 +120,24 @@ impl MaintenanceWaker {
 
 fn main() -> io::Result<()> {
     let mut backend = CrosstermBackend::new(io::stdout());
-    let args: Vec<_> = env::args().skip(1).collect();
-    if args.iter().any(|argument| argument == "--migrate-config") {
-        let path = config_path(&args)?.ok_or_else(|| {
+    let cli = Cli::parse();
+    if cli.migrate_config {
+        let path = cli.config.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "--migrate-config requires --config <path>",
             )
         })?;
         let migrations =
-            AppConfig::rewrite_file(&path).map_err(|error| io::Error::other(format!("{error}")))?;
+            AppConfig::rewrite_file(path).map_err(|error| io::Error::other(format!("{error}")))?;
         for migration in migrations {
             println!("migrated: {}", migration.warning());
         }
         return Ok(());
     }
-    let explicit_config_path = config_path(&args)?;
+    let explicit_config_path = cli.config.clone();
     let (config_path, mut config) = load_config(explicit_config_path.as_deref())?;
-    apply_api_cli_overrides(&mut config, &args)?;
+    apply_api_cli_overrides(&mut config, &cli)?;
     config
         .validate()
         .map_err(|error| io::Error::other(format!("application config rejected: {error}")))?;
@@ -367,10 +401,8 @@ fn load_config(path: Option<&Path>) -> io::Result<(Option<PathBuf>, AppConfig)> 
 
     let candidates = [
         env::var_os("CMDASH_CONFIG").map(PathBuf::from),
-        env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .map(|directory| directory.join("cmdash/config.toml")),
+        ProjectDirs::from("", "", "cmdash")
+            .map(|directories| directories.config_dir().join("config.toml")),
         Some(PathBuf::from("config/default.toml")),
     ];
     for candidate in candidates.into_iter().flatten() {
@@ -385,58 +417,20 @@ fn load_config(path: Option<&Path>) -> io::Result<(Option<PathBuf>, AppConfig)> 
     Ok((None, config))
 }
 
-fn config_path(args: &[String]) -> io::Result<Option<PathBuf>> {
-    let mut path = None;
-    let mut arguments = args.iter();
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--migrate-config" | "--api" | "--api-disable" | "--api-read-only" => {}
-            "--api-socket" => {
-                let _ = arguments.next().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "--api-socket requires a path")
-                })?;
-            }
-            "--config" | "-c" => {
-                let value = arguments.next().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "--config requires a TOML path")
-                })?;
-                if path.replace(PathBuf::from(value)).is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "configuration path was provided more than once",
-                    ));
-                }
-            }
-            unknown => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown argument {unknown:?}; use --config <path>"),
-                ));
-            }
-        }
+fn apply_api_cli_overrides(config: &mut AppConfig, cli: &Cli) -> io::Result<()> {
+    if cli.api {
+        config.api.enabled = true;
     }
-    Ok(path)
-}
-
-fn apply_api_cli_overrides(config: &mut AppConfig, args: &[String]) -> io::Result<()> {
-    let mut arguments = args.iter();
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--api" => config.api.enabled = true,
-            "--api-disable" => config.api.enabled = false,
-            "--api-read-only" => {
-                config.api.enabled = true;
-                config.api.read_only = true;
-            }
-            "--api-socket" => {
-                let socket = arguments.next().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "--api-socket requires a path")
-                })?;
-                config.api.socket = socket.clone();
-                config.api.enabled = true;
-            }
-            _ => {}
-        }
+    if cli.api_disable {
+        config.api.enabled = false;
+    }
+    if cli.api_read_only {
+        config.api.enabled = true;
+        config.api.read_only = true;
+    }
+    if let Some(socket) = &cli.api_socket {
+        config.api.socket.clone_from(socket);
+        config.api.enabled = true;
     }
     Ok(())
 }
@@ -989,6 +983,7 @@ fn sync_dashboard_surfaces(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use cmdash::{BackendCapabilities, FocusTarget, SurfaceId};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
@@ -1204,23 +1199,27 @@ mod tests {
     }
 
     #[test]
-    fn config_path_accepts_short_and_long_options() {
+    fn cli_accepts_short_and_long_config_options() {
         assert_eq!(
-            config_path(&["--config".to_owned(), "dashboard.toml".to_owned()]).unwrap(),
+            Cli::try_parse_from(["cmdash", "--config", "dashboard.toml"])
+                .unwrap()
+                .config,
             Some(PathBuf::from("dashboard.toml"))
         );
         assert_eq!(
-            config_path(&["-c".to_owned(), "dashboard.toml".to_owned()]).unwrap(),
+            Cli::try_parse_from(["cmdash", "-c", "dashboard.toml"])
+                .unwrap()
+                .config,
             Some(PathBuf::from("dashboard.toml"))
         );
-        assert_eq!(config_path(&[]).unwrap(), None);
+        assert_eq!(Cli::try_parse_from(["cmdash"]).unwrap().config, None);
     }
 
     #[test]
-    fn config_path_rejects_missing_values_and_unknown_arguments() {
-        assert!(config_path(&["--config".to_owned()]).is_err());
-        assert!(config_path(&["--api-socket".to_owned()]).is_err());
-        assert!(config_path(&["--verbose".to_owned()]).is_err());
+    fn cli_rejects_missing_values_and_unknown_arguments() {
+        assert!(Cli::try_parse_from(["cmdash", "--config"]).is_err());
+        assert!(Cli::try_parse_from(["cmdash", "--api-socket"]).is_err());
+        assert!(Cli::try_parse_from(["cmdash", "--verbose"]).is_err());
     }
 
     #[test]
@@ -1229,17 +1228,31 @@ mod tests {
             "version = 1\n[api]\nenabled = true\nread_only = false\nsocket = \"/tmp/from-file.sock\"\n",
         )
         .unwrap();
-        apply_api_cli_overrides(
-            &mut config,
-            &[
-                "--api-disable".to_owned(),
-                "--api-socket".to_owned(),
-                "/tmp/from-cli.sock".to_owned(),
-            ],
-        )
+        let cli = Cli::try_parse_from([
+            "cmdash",
+            "--api-disable",
+            "--api-socket",
+            "/tmp/from-cli.sock",
+        ])
         .unwrap();
+        apply_api_cli_overrides(&mut config, &cli).unwrap();
         assert!(config.api.enabled);
         assert_eq!(config.api.socket, "/tmp/from-cli.sock");
         assert!(!config.api.read_only);
+    }
+
+    #[test]
+    fn config_discovery_uses_the_directories_crate_roots() {
+        // Phase 20 parity contract: `ProjectDirs::from("", "", "cmdash")` is the
+        // replacement for the hand-rolled XDG discovery and must resolve to the
+        // `<config_dir>/cmdash` root on every supported platform.
+        let dirs = ProjectDirs::from("", "", "cmdash")
+            .expect("config discovery must resolve a project root");
+        let config_dir = dirs.config_dir();
+        assert!(
+            config_dir.ends_with("cmdash"),
+            "config root must end with the application name, got {config_dir:?}"
+        );
+        assert!(config_dir.is_absolute());
     }
 }

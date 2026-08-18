@@ -386,6 +386,39 @@ placement ID is available instead of terminating the terminal widget.
 The retained session store supports multiple placements per image and replaces
 only the matching `(image_id, placement_id)` pair. Resource IDs remain
 session-qualified, while the backend derives a separate outer-terminal image ID.
+
+Every placement also carries a **stable outer-terminal placement id** (`p=`),
+assigned by the store from a per-image monotonic sequence and keyed by the
+placement's map key for its whole lifetime. Because Kitty matches placements by
+`(i, p)` and its `grman_put` reuses an existing ref with that pair, a placement
+that moves under scrollback navigation or reflow is re-placed with the *same*
+`p=` id and the outer terminal relocates it instead of stacking a duplicate.
+Deletes are emitted unconditionally (uploads are quiet `q=2`, so an
+acknowledgement-gated delete could never fire and removed placements lingered as
+ghosts at their old cells): a departed placement whose image still has other
+visible placements is removed with a placement-scoped `d=i,i=X,p=P`, and the
+last placement gets an image-level `d=i,i=X`. Verified against a real Kitty
+(`tests/kitty_verify.py` drives the compiled emulator offscreen and inspects its
+real `grman.update_layers`), lowercase `d=i` releases the placement but retains
+the image data at the outer terminal, so the cached resource is kept and a
+reappearance re-places with a bare `a=p` instead of re-uploading; only the
+uppercase `d=I` frees the data. In Unicode-placeholder mode the virtual image
+is kept alive for its remaining placeholder cells and only the departed cells
+are cleared by the diff. The harness additionally replays the placeholder byte
+streams against real Kitty's cell-image scan: the 24-bit-color lower id, the
+0-based row/col combining marks, and the 1-based high-8-bits mark (Kitty's
+`diacritic_to_num` returns index+1 and the decode subtracts one) reproduce the
+correct image/source-rect binding, and tmux-passthrough framing is verified
+lossless against the direct-mode bytes. Animation is cross-checked through
+Kitty's coalesced-frame readback (`image_for_client_id`): `a=f` deltas, `a=c`
+full/partial-rect overwrites, and alpha blending produce byte-identical frames
+(alpha blending may differ by 1 in a low byte: Kitty truncates float math,
+cmdash uses integer math), and the animated-GIF stream cmdash serves (coalesced
+RGBA root + `a=f` frames with gaps) matches Kitty's frame data, gap, and total
+animation duration. The text renderer maps grid lines to viewport rows
+with alacritty's own `line + display_offset` translation, so history text stays
+glued to the images anchored above it during scroll.
+
 A bounded `GraphicsProtocolBroker` keeps child-PTY responses in a separate queue
 from outer-terminal probe traffic. `GraphicsCapabilityProbe` emits a Kitty/DA1/
 pixel-size probe, correlates only the outer Kitty acknowledgement, and reports

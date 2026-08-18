@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt};
+use std::collections::BTreeMap;
 
 use crate::config::AppearanceConfig;
 use crate::scene::Color;
@@ -229,34 +229,15 @@ fn parse_color(value: &str) -> Result<Color, AppearanceError> {
     Err(AppearanceError::InvalidColor(value.to_owned()))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AppearanceError {
+    #[error("unknown appearance theme {0:?}; expected inherit or fallback")]
     UnknownTheme(String),
+    #[error("unknown appearance color role {0:?}")]
     UnknownColorRole(String),
+    #[error("invalid appearance color {0:?}; expected inherit, ansi:N, or #RRGGBB")]
     InvalidColor(String),
 }
-
-impl fmt::Display for AppearanceError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownTheme(theme) => {
-                write!(
-                    formatter,
-                    "unknown appearance theme {theme:?}; expected inherit or fallback"
-                )
-            }
-            Self::UnknownColorRole(role) => {
-                write!(formatter, "unknown appearance color role {role:?}")
-            }
-            Self::InvalidColor(color) => write!(
-                formatter,
-                "invalid appearance color {color:?}; expected inherit, ansi:N, or #RRGGBB"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for AppearanceError {}
 
 #[cfg(test)]
 mod tests {

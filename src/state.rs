@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    fmt,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -295,24 +294,15 @@ pub enum CommandError {
     NoSplitForPane(WidgetId),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AppStateConfigError {
+    #[error("invalid config: {0}")]
     InvalidConfig(ConfigError),
+    #[error("widget setup failed: {0}")]
     Widget(WidgetError),
+    #[error("layout setup failed: {0}")]
     Layout(LayoutError),
 }
-
-impl fmt::Display for AppStateConfigError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidConfig(error) => write!(formatter, "invalid config: {error}"),
-            Self::Widget(error) => write!(formatter, "widget setup failed: {error}"),
-            Self::Layout(error) => write!(formatter, "layout setup failed: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for AppStateConfigError {}
 
 pub struct AppState {
     workspace: WorkspaceState,

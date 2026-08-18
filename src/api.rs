@@ -427,7 +427,7 @@ pub struct GraphicsDto {
     pub generation: u64,
     pub format: u8,
     pub area: RectDto,
-    pub z_index: i16,
+    pub z_index: i32,
 }
 
 impl From<&crate::graphics::GraphicsSubmission> for GraphicsDto {

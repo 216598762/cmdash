@@ -90,46 +90,23 @@ impl PluginManifestV1 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PluginManifestError {
+    #[error("plugin manifest parse error: {0}")]
     Parse(String),
+    #[error("plugin manifest needs name and version")]
     MissingIdentity,
+    #[error("plugin manifest version mismatch: expected {expected}, got {actual}")]
     ManifestVersionMismatch { expected: u32, actual: u32 },
+    #[error("plugin manifest ABI mismatch: expected {expected}, got {actual}")]
     AbiMismatch { expected: u32, actual: u32 },
+    #[error("plugin manifest declares no widgets")]
     NoWidgets,
+    #[error("invalid plugin widget type {0:?}")]
     InvalidWidgetType(String),
+    #[error("duplicate plugin widget type {0:?}")]
     DuplicateWidgetType(String),
 }
-
-impl std::fmt::Display for PluginManifestError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Parse(message) => write!(formatter, "plugin manifest parse error: {message}"),
-            Self::MissingIdentity => formatter.write_str("plugin manifest needs name and version"),
-            Self::ManifestVersionMismatch { expected, actual } => {
-                write!(
-                    formatter,
-                    "plugin manifest version mismatch: expected {expected}, got {actual}"
-                )
-            }
-            Self::AbiMismatch { expected, actual } => {
-                write!(
-                    formatter,
-                    "plugin manifest ABI mismatch: expected {expected}, got {actual}"
-                )
-            }
-            Self::NoWidgets => formatter.write_str("plugin manifest declares no widgets"),
-            Self::InvalidWidgetType(kind) => {
-                write!(formatter, "invalid plugin widget type {kind:?}")
-            }
-            Self::DuplicateWidgetType(kind) => {
-                write!(formatter, "duplicate plugin widget type {kind:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PluginManifestError {}
 
 pub mod capabilities {
     pub const RENDER_SCENE: u64 = 1 << 0;
@@ -195,15 +172,23 @@ impl PluginDescriptorV1 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PluginError {
+    #[error("plugin ABI mismatch: expected {expected}, got {actual}")]
     AbiMismatch { expected: u32, actual: u32 },
+    #[error("plugin requires unsupported host ABI {0}")]
     UnsupportedHostAbi(u32),
+    #[error("plugin capabilities {requested:#x} exceed host capabilities {available:#x}")]
     UnsupportedCapabilities { requested: u64, available: u64 },
+    #[error("invalid plugin widget type {0:?}")]
     InvalidWidgetType(String),
+    #[error("invalid plugin descriptor")]
     InvalidDescriptor,
+    #[error("duplicate plugin widget type {0:?}")]
     DuplicateWidgetType(String),
+    #[error("unknown plugin widget type {0:?}")]
     UnknownWidgetType(String),
+    #[error("plugin widget failed: {0}")]
     Widget(WidgetError),
 }
 
@@ -321,41 +306,7 @@ pub fn widget_error(error: PluginError) -> WidgetError {
     WidgetError::Plugin(error.to_string())
 }
 
-impl std::fmt::Display for PluginError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AbiMismatch { expected, actual } => {
-                write!(
-                    formatter,
-                    "plugin ABI mismatch: expected {expected}, got {actual}"
-                )
-            }
-            Self::UnsupportedHostAbi(version) => {
-                write!(formatter, "plugin requires unsupported host ABI {version}")
-            }
-            Self::UnsupportedCapabilities {
-                requested,
-                available,
-            } => write!(
-                formatter,
-                "plugin capabilities {requested:#x} exceed host capabilities {available:#x}"
-            ),
-            Self::InvalidWidgetType(kind) => {
-                write!(formatter, "invalid plugin widget type {kind:?}")
-            }
-            Self::InvalidDescriptor => formatter.write_str("invalid plugin descriptor"),
-            Self::DuplicateWidgetType(kind) => {
-                write!(formatter, "duplicate plugin widget type {kind:?}")
-            }
-            Self::UnknownWidgetType(kind) => {
-                write!(formatter, "unknown plugin widget type {kind:?}")
-            }
-            Self::Widget(error) => write!(formatter, "plugin widget failed: {error}"),
-        }
-    }
-}
 
-impl std::error::Error for PluginError {}
 
 pub struct ExternalTextPlugin;
 

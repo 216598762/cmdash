@@ -2,13 +2,62 @@
 
 This is an evaluation list and initial direction, not a dependency lockfile. The decisions recorded below are the starting point for the package skeleton; each crate still needs to be pinned and verified when it is added. Before adding a library, verify its current API, maintenance activity, license compatibility with MIT, transitive dependencies, Linux behavior, and fit with cmdash's retained per-session scene model.
 
+## Current state (reconciled with `Cargo.toml`)
+
+This section is the authoritative snapshot; it supersedes the "initial
+direction" tables below wherever they diverge. See Phase 20 in
+[ROADMAP.md](ROADMAP.md) for the full reinvention review.
+
+### Active dependencies (locked in `Cargo.toml`)
+
+| Crate | Role |
+| --- | --- |
+| `alacritty_terminal` 0.26 | Per-session terminal emulator (grid, modes, cursor, scrollback, parsing); Kitty APC is intercepted by cmdash, which owns the graphics store. |
+| `crossterm` 0.29 | Raw mode, keyboard/mouse input, resize, cursor, basic terminal control. |
+| `portable-pty` 0.9 | PTY open, spawn, resize, child lifecycle. |
+| `ratatui` 0.29 | Layout primitives (`Rect`) only; scene/compositor are cmdash-owned. |
+| `unicode-width` 0.2 | Display-width and wide-cell continuation tracking. |
+| `serde` + `toml` 0.9 | Versioned TOML configuration parsing. |
+| `serde_json` | Phase 13 compositor API envelopes. |
+| `flate2` | RFC 1950 zlib decode for Kitty `o=z` payloads. |
+| `png` + `gif` | Kitty `f=100` (PNG) decode and GIF auto-animation decode. |
+| `libc` | Pixel-size ioctl and narrow Unix syscall access. |
+| `wasmtime` (optional) | Opt-in `wasm-plugins` isolation host. |
+
+### Async model
+
+There is no `tokio`. Per-session PTY reads run on standard-library reader
+threads that push bytes through bounded channels and notify the coordinator
+with a coalescing wakeup; frame composition stays on one UI/coordinator owner.
+Blocking-on-PTY readers do not need an async runtime.
+
+### Phase 20 adoption decisions
+
+- **Adopt:** `base64` (replaces the hand-rolled encoder/decoder), `clap`
+  (derive; replaces the `--config`/`-c` arg match), `directories` (XDG
+  config/cache/crash roots), `thiserror` (replaces 26 hand-rolled error impls;
+  `anyhow` optional at the `main` boundary).
+- **Adopt when needed:** `notify` (reload-on-save), `image` (non-PNG/GIF
+  decode for script-widget/dashboard images).
+- **Keep bespoke (deliberate):** Kitty graphics store + VT scroll observer,
+  scene/compositor/frame-diff, widget runtime/layout/coordinator, animation
+  scheduler, keymap grammar. No emulator-side Kitty crate exists, and
+  ratatui's immediate-mode model fights retained diff + session graphics.
+
+### Future, profile-gated (not adopted)
+
+`tracing`/`tracing-subscriber`, `proptest`, `insta`, `criterion`,
+`assert_cmd`, `tempfile`, `compact_str`, `unicode-segmentation`, and a sixel
+crate (`sixel-rs`/`tty-sixel`/`libsixel`) are candidates to add only when a
+concrete profile, test, or fidelity need justifies them.
+
 ## Stage 1 decisions
 
 | Concern | Initial direction | Boundary or gate |
 | --- | --- | --- |
 | Terminal backend | `crossterm` | Owns raw mode, input, resize, and basic controls; cmdash owns retained scenes and frame composition. |
 | Terminal emulator | `alacritty_terminal` | One emulator per session; Kitty APC sequences are intercepted by a cmdash-owned session adapter because graphics resources are not global emulator state. |
-| PTY and async runtime | `portable-pty` + `tokio` | Per-session I/O tasks communicate with the UI/coordinator through bounded messages. |
+| PTY and async runtime | `portable-pty` + standard-library threads/channels | Per-session PTY reader threads communicate with the UI/coordinator through bounded channels; no async runtime is used. |
 | Layout primitives | `ratatui` + `unicode-width` | Use Ratatui layout/text primitives behind the backend-neutral scene boundary and track narrow/wide cell occupancy explicitly. |
 | Plugin boundary | Versioned manifest plus Wasmtime | Active v1 host descriptor/manifest, widget settings map, import-free Wasmtime host, and capability negotiation; enabled only with `wasm-plugins`. |
 | Workspace scope | One active workspace | Add saved/multiple workspace behavior only after the core runtime contracts are stable. |
@@ -32,15 +81,16 @@ These are the strongest candidates for the first executable once the package ske
 | --- | --- | --- | --- |
 | Terminal I/O | [`crossterm`](https://crates.io/crates/crossterm) | Raw mode, keyboard/mouse input, resize events, cursor and basic terminal control | Selected initial backend; graphics submission and retained scene output remain behind a cmdash-owned boundary. |
 | PTYs | [`portable-pty`](https://crates.io/crates/portable-pty) | Spawn shells/processes, read/write PTY streams, resize sessions | Active v0.9 integration; continue validating Linux process lifecycle, signal handling, and shutdown semantics. |
-| Async runtime | [`tokio`](https://crates.io/crates/tokio) | Event coordination, PTY I/O tasks, timers, bounded channels, cancellation | Selected initial direction; keep frame composition on one coordinator/UI owner. |
+| Async runtime | Rust standard library | Per-session PTY reader threads + bounded channels + a coalescing wakeup | No async runtime; blocking-on-PTY readers do not need one, and frame composition stays on one coordinator/UI owner. |
 | Serialization | [`serde`](https://crates.io/crates/serde) | Versioned widget/application configuration types | Active in the initial widget configuration model; avoid serializing live PTY/emulator state in the first release. |
+| Base64 | [`base64`](https://crates.io/crates/base64) | Encode/decode Kitty graphics payloads | Adopted (Phase 20): replaces the hand-rolled `encode_base64_payload`/`decode_base64`. |
 | Configuration format | [`toml`](https://crates.io/crates/toml) | Initial hand-authored workspace and widget configuration | Active version-1 parser with checked-in `config/default.toml`, safe metadata-polled reload, atomic migration rewrite, and explicit schema/version handling. |
 | Animation timing | Rust standard library | Deterministic coordinator-owned animation clocks, deadlines, and bounded progress | No animation dependency is required; motion stays behind the scene/coordinator boundary. See [`ANIMATION.md`](ANIMATION.md). |
 | Local compositor API | `serde_json` + Rust Unix sockets | Bounded newline-delimited API envelopes and Linux-first local transport | Active Phase 13 implementation; no HTTP server or network listener is included. |
-| Diagnostics | [`tracing`](https://crates.io/crates/tracing) + [`tracing-subscriber`](https://crates.io/crates/tracing-subscriber) | Structured logs for sessions, plugins, frame timing, and protocol failures | Future structured logger; current recovery diagnostics are bounded and rendered in-app. |
-| Error types | [`thiserror`](https://crates.io/crates/thiserror) + [`anyhow`](https://crates.io/crates/anyhow) | Typed library errors and application-level context | Strong candidates; use typed errors at plugin/session boundaries. |
-| User paths | [`directories`](https://crates.io/crates/directories) | XDG-compatible config, cache, data, and plugin discovery paths | Strong candidate; confirm exact Linux/XDG behavior needed by the app. |
-| CLI | [`clap`](https://crates.io/crates/clap) | Startup flags, config path, diagnostics mode, and version output | Still a future option; current `--config` / `-c` parsing remains dependency-free. |
+| Diagnostics | [`tracing`](https://crates.io/crates/tracing) + [`tracing-subscriber`](https://crates.io/crates/tracing-subscriber) | Structured logs for sessions, plugins, frame timing, and protocol failures | Future profile-gated structured logger; current recovery diagnostics are bounded and rendered in-app. |
+| Error types | [`thiserror`](https://crates.io/crates/thiserror) (+ optional [`anyhow`](https://crates.io/crates/anyhow) at the `main` boundary) | Typed library errors | Adopted (Phase 20): replaces 26 hand-rolled error impls with byte-identical messages; `anyhow` stays optional. |
+| User paths | [`directories`](https://crates.io/crates/directories) | XDG-compatible config, cache, data, and plugin discovery paths | Adopted (Phase 20): replaces the hand-rolled `XDG_CONFIG_HOME`/`HOME` discovery. |
+| CLI | [`clap`](https://crates.io/crates/clap) (derive) | Startup flags, config path, diagnostics mode, and version output | Adopted (Phase 20): replaces the `--config`/`-c` arg match and adds `--help`/`--version`. |
 
 ## Terminal backend and input
 
@@ -201,11 +251,20 @@ The most valuable first regression test remains: two tabs each use graphics imag
 
 ## Suggested implementation evaluation order
 
-1. Add and pin `crossterm`, `ratatui`, `portable-pty`, `tokio`, `serde`, `toml`, `tracing`, and `directories` as the package skeleton requires them.
-2. Integrate `alacritty_terminal` behind the per-session emulator boundary and verify the APIs needed for grid, alternate screen, cursor, scrollback, and resize behavior.
-3. Verify Kitty support and choose the smallest suitable cmdash-owned adapter using `little-kitty`, `kitty-graphics-protocol`, or a local implementation; the current Phase 5 slice uses a local adapter with session-qualified IDs and visible-placement replay.
-4. Exercise the versioned manifest/descriptor through the opt-in Wasmtime host; add host functions only with explicit capability and quota tests.
-5. Add `notify`, `proptest`, `insta`, benchmarks, and other support crates as actual features require them.
-6. Run the checked-in fuzz targets before releases and attach the reproducible Linux archive plus checksum generated by the release workflow.
+1. Pin the active set already in `Cargo.toml` (`crossterm`, `ratatui`,
+   `portable-pty`, `serde`, `toml`, `alacritty_terminal`, `png`, `gif`,
+   `flate2`, `unicode-width`, `libc`) and keep the async model on standard-
+   library threads/channels (no `tokio`).
+2. Adopt the Phase 20 drop-ins next: `base64`, `clap`, `directories`, and
+   `thiserror`, each with byte-parity/behavior-parity tests.
+3. Verify Kitty support and keep the cmdash-owned adapter as the source of
+   truth; `little-kitty`/`kitty-graphics-protocol` remain client-side
+   references, not dependencies (see Phase 20 rationale).
+4. Exercise the versioned manifest/descriptor through the opt-in Wasmtime
+   host; add host functions only with explicit capability and quota tests.
+5. Add `notify`, `proptest`, `insta`, `criterion`, and other support crates
+   only as a concrete profile or test need justifies them.
+6. Run the checked-in fuzz targets before releases and attach the
+   reproducible Linux archive plus checksum generated by the release workflow.
 
 The initial directions are now recorded, but dependency versions and protocol/API compatibility must still be verified in the Cargo package before they become locked implementation choices.

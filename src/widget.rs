@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    fmt,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -542,32 +541,21 @@ impl WidgetRuntimeContext {
 pub type WidgetFactory =
     fn(&WidgetInstanceConfig, &WidgetRuntimeContext) -> Result<Box<dyn Widget>, WidgetError>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum WidgetError {
+    #[error("duplicate widget type {0:?}")]
     DuplicateWidgetType(String),
+    #[error("unknown widget type {0:?}")]
     UnknownWidgetType(String),
+    #[error("duplicate widget id {}", .0.get())]
     DuplicateWidgetId(WidgetId),
+    #[error("{0}")]
     InvalidConfiguration(String),
+    #[error("failed to initialize {kind:?} widget: {reason}")]
     InitializationFailed { kind: String, reason: String },
+    #[error("{0}")]
     Plugin(String),
 }
-
-impl fmt::Display for WidgetError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DuplicateWidgetType(kind) => write!(formatter, "duplicate widget type {kind:?}"),
-            Self::UnknownWidgetType(kind) => write!(formatter, "unknown widget type {kind:?}"),
-            Self::DuplicateWidgetId(id) => write!(formatter, "duplicate widget id {}", id.get()),
-            Self::InvalidConfiguration(message) => formatter.write_str(message),
-            Self::InitializationFailed { kind, reason } => {
-                write!(formatter, "failed to initialize {kind:?} widget: {reason}")
-            }
-            Self::Plugin(message) => formatter.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for WidgetError {}
 
 #[derive(Clone, Default)]
 pub struct WidgetRegistry {

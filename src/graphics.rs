@@ -1,11 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fmt,
     fs::File,
     io::{Read, Seek, SeekFrom},
     time::{Duration, Instant},
 };
 
+use base64::Engine as _;
 use flate2::read::ZlibDecoder;
 use ratatui::layout::Rect;
 
@@ -250,7 +250,7 @@ pub struct GraphicsPlacement {
     y: u16,
     width: u16,
     height: u16,
-    z_index: i16,
+    z_index: i32,
     source: Option<GraphicsSourceRect>,
     cursor_static: bool,
     anchor: GraphicsGridAnchor,
@@ -278,6 +278,16 @@ pub struct GraphicsPlacement {
     /// render, never scroll, and are only deleted by the id/number/range
     /// selectors (`i/I`, `n/N`, `r/R`), matching Kitty's `is_virtual_ref`.
     virtual_placement: bool,
+    /// The stable identity of this placement: the `placements` map key
+    /// assigned at creation. It survives every re-render and the
+    /// viewport-re-anchored move, so the outer terminal can be told that
+    /// the very same placement has moved (Kitty matches `(i, p)`).
+    key: u64,
+    /// The outer-terminal placement id (Kitty `p=`), assigned per image so
+    /// it is collision-free within the image. Re-placing the same placement
+    /// at a new cell reuses this id, which makes Kitty move the existing
+    /// placement instead of stacking a new one.
+    outer_placement_id: u32,
 }
 
 /// A source rectangle in the logical image, in pixels.
@@ -341,7 +351,7 @@ impl GraphicsPlacement {
         self.height
     }
 
-    pub const fn z_index(&self) -> i16 {
+    pub const fn z_index(&self) -> i32 {
         self.z_index
     }
 
@@ -389,6 +399,14 @@ impl GraphicsPlacement {
         self.virtual_placement
     }
 
+    pub const fn key(&self) -> u64 {
+        self.key
+    }
+
+    pub const fn outer_placement_id(&self) -> u32 {
+        self.outer_placement_id
+    }
+
     pub const fn area(&self) -> Rect {
         Rect::new(self.x, self.y, self.width, self.height)
     }
@@ -402,11 +420,11 @@ impl GraphicsPlacement {
 pub struct GraphicsPlaceholderLayer {
     resource: GraphicsResourceId,
     area: Rect,
-    z_index: i16,
+    z_index: i32,
 }
 
 impl GraphicsPlaceholderLayer {
-    pub const fn new(resource: GraphicsResourceId, area: Rect, z_index: i16) -> Self {
+    pub const fn new(resource: GraphicsResourceId, area: Rect, z_index: i32) -> Self {
         Self {
             resource,
             area,
@@ -422,7 +440,7 @@ impl GraphicsPlaceholderLayer {
         self.area
     }
 
-    pub const fn z_index(&self) -> i16 {
+    pub const fn z_index(&self) -> i32 {
         self.z_index
     }
 
@@ -1292,51 +1310,27 @@ impl GraphicsDiagnostic {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum GraphicsError {
+    #[error("Kitty graphics command has no action")]
     MissingAction,
+    #[error("invalid Kitty graphics parameter {0:?}")]
     InvalidParameter(String),
+    #[error("Kitty graphics image id must be nonzero")]
     InvalidImageId,
+    #[error("Kitty graphics image {0} was not found")]
     ImageNotFound(u32),
+    #[error("Kitty graphics parent placement for image {0} was not found")]
     ParentNotFound(u32),
+    #[error("Kitty graphics relative placement would create a cycle")]
     RelativeCycle,
+    #[error("Kitty graphics relative placement chain exceeds the maximum depth")]
     RelativeDepthExceeded,
+    #[error("invalid Kitty graphics base64 payload")]
     InvalidPayload,
+    #[error("unsupported Kitty graphics transfer mode {0:?}")]
     UnsupportedTransfer(String),
 }
-
-impl fmt::Display for GraphicsError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingAction => formatter.write_str("Kitty graphics command has no action"),
-            Self::InvalidParameter(parameter) => {
-                write!(formatter, "invalid Kitty graphics parameter {parameter:?}")
-            }
-            Self::InvalidImageId => formatter.write_str("Kitty graphics image id must be nonzero"),
-            Self::ImageNotFound(image) => {
-                write!(formatter, "Kitty graphics image {image} was not found")
-            }
-            Self::ParentNotFound(image) => {
-                write!(formatter, "Kitty graphics parent placement for image {image} was not found")
-            }
-            Self::RelativeCycle => {
-                formatter.write_str("Kitty graphics relative placement would create a cycle")
-            }
-            Self::RelativeDepthExceeded => {
-                formatter.write_str("Kitty graphics relative placement chain exceeds the maximum depth")
-            }
-            Self::InvalidPayload => formatter.write_str("invalid Kitty graphics base64 payload"),
-            Self::UnsupportedTransfer(transfer) => {
-                write!(
-                    formatter,
-                    "unsupported Kitty graphics transfer mode {transfer:?}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for GraphicsError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GraphicsAnimationState {
@@ -1527,6 +1521,14 @@ pub struct SessionGraphicsStore {
     next_internal_image_id: u32,
     next_placement_key: u64,
     next_resource_generation: u64,
+    /// Outer-terminal placement ids (`p=`) emitted so far, per image id.
+    /// Monotonic per image, so ids are never reused and therefore never
+    /// collide within an image (Kitty matches placements by `(i, p)`).
+    next_outer_placement_id: BTreeMap<u32, u32>,
+    /// The `p=` id assigned to each placement key, so a placement re-placed
+    /// at a new location (scroll, reflow) keeps its identity at the outer
+    /// terminal and is moved rather than re-created.
+    outer_placement_ids: BTreeMap<u64, u32>,
     last_image_id: Option<u32>,
     outer_kitty_graphics: bool,
     diagnostics: Vec<GraphicsDiagnostic>,
@@ -1559,6 +1561,8 @@ impl SessionGraphicsStore {
             next_internal_image_id: 1,
             next_placement_key: 1,
             next_resource_generation: 1,
+            next_outer_placement_id: BTreeMap::new(),
+            outer_placement_ids: BTreeMap::new(),
             last_image_id: None,
             outer_kitty_graphics: true,
             diagnostics: Vec::new(),
@@ -1703,8 +1707,9 @@ impl SessionGraphicsStore {
         let limit = i64::try_from(scrollback_limit).unwrap_or(i64::MAX);
         let mut evicted = false;
         let mut unreferenced_images = BTreeSet::new();
+        let mut scrolled_out = Vec::new();
 
-        self.placements.retain(|_, placement| {
+        self.placements.retain(|key, placement| {
             // Relative placements follow their parent's lifetime rather than
             // their own scroll position; they are removed by the orphan prune
             // below once a scrolled-out parent is evicted.
@@ -1730,10 +1735,17 @@ impl SessionGraphicsStore {
             if scroll_delta > i64::from(anchor.row()).saturating_add(limit) {
                 unreferenced_images.insert(placement.resource().image());
                 evicted = true;
+                scrolled_out.push(*key);
                 return false;
             }
             true
         });
+        for key in scrolled_out {
+            self.remove_placement_key(key);
+        }
+        if self.prune_orphaned_relatives() {
+            evicted = true;
+        }
         if self.prune_orphaned_relatives() {
             evicted = true;
         }
@@ -1921,7 +1933,7 @@ impl SessionGraphicsStore {
         }
         let mut removed = false;
         for key in to_remove {
-            if self.placements.remove(&key).is_some() {
+            if self.remove_placement_key(key).is_some() {
                 removed = true;
             }
         }
@@ -1932,8 +1944,7 @@ impl SessionGraphicsStore {
     /// reset on entry.
     fn erase_screen(&mut self, screen: GraphicsScreen) -> bool {
         let before = self.placements.len();
-        self.placements
-            .retain(|_, placement| placement.anchor.screen() != screen);
+        self.retain_placements(|_, placement| placement.anchor.screen() != screen);
         (self.placements.len() != before) | self.prune_orphaned_relatives()
     }
 
@@ -2962,7 +2973,7 @@ impl SessionGraphicsStore {
                         // that also carry the given z-index.
                         let column = parameter_u32(&values, "x", 1)?.saturating_sub(1) as i32;
                         let row = parameter_u32(&values, "y", 1)?.saturating_sub(1) as i32;
-                        let z = parameter_i16(&values, "z", 0)?;
+                        let z = parameter_i32(&values, "z", 0)?;
                         self.remove_placements_where(
                             scrollback,
                             scroll_region,
@@ -3042,7 +3053,7 @@ impl SessionGraphicsStore {
                     Some("z") | Some("Z") => {
                         // Delete placements with the given z-index on the
                         // active screen.
-                        let z = parameter_i16(&values, "z", 0)?;
+                        let z = parameter_i32(&values, "z", 0)?;
                         self.remove_placements_where(
                             scrollback,
                             scroll_region,
@@ -3076,7 +3087,7 @@ impl SessionGraphicsStore {
                         // `image`). A `p` key narrows either to one placement.
                         if let Some(placement) = placement_id(&values) {
                             let key = (u64::from(image) << 32) | u64::from(placement);
-                            self.placements.remove(&key);
+                            self.remove_placement_key(key);
                             self.prune_orphaned_relatives();
                         } else {
                             self.remove_image_placements(image);
@@ -3133,8 +3144,7 @@ impl SessionGraphicsStore {
     }
 
     fn remove_image_placements(&mut self, image: u32) {
-        self.placements
-            .retain(|_, placement| placement.resource().image() != image);
+        self.retain_placements(|_, placement| placement.resource().image() != image);
         self.prune_orphaned_relatives();
     }
 
@@ -3188,7 +3198,7 @@ impl SessionGraphicsStore {
         }
         let mut removed = false;
         for key in to_remove {
-            if self.placements.remove(&key).is_some() {
+            if self.remove_placement_key(key).is_some() {
                 removed = true;
             }
         }
@@ -3228,7 +3238,7 @@ impl SessionGraphicsStore {
             }
         }
         let before = self.placements.len();
-        self.placements.retain(|key, _| rooted.contains(key));
+        self.retain_placements(|key, _| rooted.contains(&key));
         self.placements.len() != before
     }
 
@@ -4022,6 +4032,9 @@ impl SessionGraphicsStore {
             );
             return Ok(());
         }
+        // Stable identity for the outer terminal: the same placement keeps
+        // its `p=` id across moves, and ids never collide within an image.
+        let outer_placement_id = self.outer_placement_id_for(key, image);
         // Kitty's X/Y keys are sub-cell pixel offsets from the anchor cell's
         // top-left corner, so the image can be placed below cell granularity.
         let cell_x_offset = parameter_u16(values, "X", 0)?;
@@ -4110,7 +4123,7 @@ impl SessionGraphicsStore {
             y: clamp_to_u16(logical_y),
             width,
             height,
-            z_index: parameter_i16(values, "z", 0)?,
+            z_index: parameter_i32(values, "z", 0)?,
             source,
             cursor_static,
             cell_x_offset,
@@ -4124,6 +4137,8 @@ impl SessionGraphicsStore {
                 .with_scroll_region(anchor_region, anchor_region_scroll),
             parent,
             virtual_placement,
+            key,
+            outer_placement_id,
         };
         // Relative and virtual placements never move the cursor, regardless of
         // the `C` key (Kitty excludes `unicode_placement` from cursor motion).
@@ -4174,6 +4189,54 @@ impl SessionGraphicsStore {
             if !self.placements.contains_key(&key) {
                 return key;
             }
+        }
+    }
+
+    /// Assigns the outer-terminal placement id (Kitty `p=`) for a placement
+    /// key. A key seen before keeps its id, so a placement that moves (scroll
+    /// re-anchoring, reflow) is re-placed with the same `p=` and the outer
+    /// terminal relocates it instead of leaving the old cells painted. New
+    /// keys draw from a per-image monotonic sequence, which guarantees ids
+    /// never collide within an image (Kitty matches by `(i, p)`).
+    fn outer_placement_id_for(&mut self, key: u64, image: u32) -> u32 {
+        if let Some(&id) = self.outer_placement_ids.get(&key) {
+            return id;
+        }
+        let next = self.next_outer_placement_id.entry(image).or_insert(1);
+        let id = *next;
+        *next = next.wrapping_add(1).max(1);
+        self.outer_placement_ids.insert(key, id);
+        id
+    }
+
+    /// Removes a placement by key. A client-identified placement (`(image <<
+    /// 32) | p`) keeps its outer placement id in the mapping so a later
+    /// re-insert of the same key reuses it (the outer terminal treats the
+    /// same `(i, p)` as the same placement); internally allocated keys never
+    /// recur, so their ids are released.
+    fn remove_placement_key(&mut self, key: u64) -> Option<GraphicsPlacement> {
+        let removed = self.placements.remove(&key);
+        if removed.is_some() && key < (1u64 << 32) {
+            self.outer_placement_ids.remove(&key);
+        }
+        removed
+    }
+
+    /// Removes every placement whose key satisfies `keep`, returning the
+    /// pruned keys via `remove_placement_key` after iteration ends (the
+    /// retain closure cannot otherwise reach other store fields).
+    fn retain_placements(&mut self, mut keep: impl FnMut(u64, &GraphicsPlacement) -> bool) {
+        let mut pruned = Vec::new();
+        self.placements.retain(|key, placement| {
+            if keep(*key, placement) {
+                true
+            } else {
+                pruned.push(*key);
+                false
+            }
+        });
+        for key in pruned {
+            self.remove_placement_key(key);
         }
     }
 
@@ -4778,21 +4841,6 @@ pub fn kitty_error_response(parameters: &[u8], error: &GraphicsError) -> Vec<u8>
     }
 }
 
-fn parameter_i16(
-    values: &BTreeMap<String, String>,
-    key: &str,
-    default: i16,
-) -> Result<i16, GraphicsError> {
-    values
-        .get(key)
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|_| GraphicsError::InvalidParameter(value.clone()))
-        })
-        .unwrap_or(Ok(default))
-}
-
 pub fn terminal_image_id(resource: GraphicsResourceId) -> u32 {
     let session = resource.session().get() as u32;
     session.wrapping_mul(0x0010_0001) ^ resource.image()
@@ -5058,27 +5106,9 @@ fn decode_gif_rgba(payload: &[u8], max_decoded_bytes: usize) -> Option<(Vec<u8>,
 }
 
 fn encode_base64_payload(bytes: &[u8]) -> Vec<u8> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let first = u32::from(chunk[0]);
-        let second = u32::from(chunk.get(1).copied().unwrap_or(0));
-        let third = u32::from(chunk.get(2).copied().unwrap_or(0));
-        let combined = (first << 16) | (second << 8) | third;
-        output.push(TABLE[((combined >> 18) & 63) as usize]);
-        output.push(TABLE[((combined >> 12) & 63) as usize]);
-        output.push(if chunk.len() > 1 {
-            TABLE[((combined >> 6) & 63) as usize]
-        } else {
-            b'='
-        });
-        output.push(if chunk.len() > 2 {
-            TABLE[(combined & 63) as usize]
-        } else {
-            b'='
-        });
-    }
-    output
+    base64::engine::general_purpose::STANDARD
+        .encode(bytes)
+        .into_bytes()
 }
 
 /// Inflates a zlib stream, bounding the decompressed size so a malicious
@@ -5254,34 +5284,21 @@ fn resolve_transfer_payload(
 }
 
 pub(crate) fn decode_base64(payload: &[u8]) -> Option<Vec<u8>> {
-    let mut output = Vec::new();
-    let mut accumulator = 0u32;
-    let mut bits = 0u8;
-    for byte in payload
+    // Preserve the previous permissive contract: skip ASCII whitespace and
+    // stop at the first padding byte, then decode standard base64.
+    let end = payload
+        .iter()
+        .position(|byte| *byte == b'=')
+        .unwrap_or(payload.len());
+    let mut filtered: Vec<u8> = payload[..end]
         .iter()
         .copied()
         .filter(|byte| !byte.is_ascii_whitespace())
-    {
-        if byte == b'=' {
-            break;
-        }
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        } as u32;
-        accumulator = (accumulator << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((accumulator >> bits) as u8);
-            accumulator &= (1 << bits) - 1;
-        }
+        .collect();
+    if filtered.len() % 4 != 0 {
+        filtered.resize(filtered.len() + (4 - filtered.len() % 4), b'=');
     }
-    Some(output)
+    base64::engine::general_purpose::STANDARD.decode(filtered).ok()
 }
 
 fn intersect(first: Rect, second: Rect) -> Option<Rect> {
@@ -5417,6 +5434,48 @@ mod tests {
             .map(|submission| submission.resource().image())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![90, 91]);
+    }
+
+    #[test]
+    fn outer_placement_ids_are_stable_per_key_and_unique_per_image() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(11));
+        store
+            .apply_kitty_command(b"a=T,f=24,i=1,c=1,r=1,C=1,q=2", b"AQID")
+            .unwrap();
+        store
+            .apply_kitty_command(b"a=p,i=1,c=1,r=1,C=1,q=2", b"")
+            .unwrap();
+        store
+            .apply_kitty_command(b"a=T,f=24,i=2,c=1,r=1,C=1,q=2", b"BAUG")
+            .unwrap();
+        let ids = store
+            .visible_submissions(Rect::new(0, 0, 10, 10))
+            .iter()
+            .map(|submission| {
+                (
+                    submission.resource().image(),
+                    submission.placement().outer_placement_id(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Unique per image, independent of the images' client ids.
+        assert_eq!(ids, vec![(1, 1), (1, 2), (2, 1)]);
+
+        // Deleting a client-identified placement and re-placing the same
+        // `(i, p)` reuses its outer id: the outer terminal treats it as the
+        // same placement (Kitty matches by `(i, p)`).
+        store
+            .apply_kitty_command(b"a=d,d=i,i=1,p=1", b"")
+            .unwrap();
+        store
+            .apply_kitty_command(b"a=p,i=1,p=1,c=1,r=1,C=1,q=2", b"")
+            .unwrap();
+        let again = store.visible_submissions(Rect::new(0, 0, 10, 10));
+        let image_one = again
+            .iter()
+            .find(|submission| submission.resource().image() == 1)
+            .expect("image 1 should be re-placed");
+        assert_eq!(image_one.placement().outer_placement_id(), 1);
     }
 
     #[test]
@@ -6420,6 +6479,48 @@ mod tests {
     }
 
     #[test]
+    fn base64_round_trips_and_matches_the_independent_encoder() {
+        // The crate encoder must byte-match the independent test encoder and
+        // round-trip through the crate decoder for every quantum boundary plus
+        // a non-ASCII byte run.
+        let samples: &[&[u8]] = &[
+            b"",
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"fooba",
+            b"foobar",
+            b"\x00\xff\x10\x80\x7f",
+        ];
+        for bytes in samples {
+            let encoded = encode_base64_payload(bytes);
+            assert_eq!(
+                encoded,
+                encode_base64_for_test(bytes),
+                "crate encoder diverged for {bytes:?}"
+            );
+            assert_eq!(
+                decode_base64(&encoded).as_deref(),
+                Some(*bytes),
+                "crate decoder failed to round-trip {bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn base64_decode_skips_whitespace_stops_at_padding_and_rejects_garbage() {
+        // The previous hand-rolled decoder skipped ASCII whitespace and
+        // stopped at the first padding byte; preserve that contract.
+        assert_eq!(decode_base64(b"T Q =="), decode_base64(b"TQ=="));
+        assert_eq!(decode_base64(b"\nT\tQ\r\n=="), decode_base64(b"TQ=="));
+        assert_eq!(decode_base64(b"TQ==ignored"), decode_base64(b"TQ=="));
+        assert!(decode_base64(b"TQ!=").is_none());
+        assert!(decode_base64(b"@@@@").is_none());
+        assert_eq!(decode_base64(b"").as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
     fn transmit_and_display_creates_a_cursor_relative_placement() {
         let mut store = SessionGraphicsStore::new(SessionId::new(8));
         assert_eq!(
@@ -6722,6 +6823,51 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.contains("Gi=99,p=7;ENOENT:"));
         assert!(response.contains("image 99"));
+    }
+
+    #[test]
+    fn error_display_strings_are_byte_identical_after_thiserror_migration() {
+        // Phase 20 parity contract: the `thiserror` attributes reproduce the
+        // hand-rolled `Display` strings exactly, so downstream error responses
+        // and diagnostics never change.
+        let catalogue = [
+            (GraphicsError::MissingAction.to_string(), "Kitty graphics command has no action"),
+            (
+                GraphicsError::InvalidParameter("a=b".to_string()).to_string(),
+                "invalid Kitty graphics parameter \"a=b\"",
+            ),
+            (
+                GraphicsError::InvalidImageId.to_string(),
+                "Kitty graphics image id must be nonzero",
+            ),
+            (
+                GraphicsError::ImageNotFound(99).to_string(),
+                "Kitty graphics image 99 was not found",
+            ),
+            (
+                GraphicsError::ParentNotFound(7).to_string(),
+                "Kitty graphics parent placement for image 7 was not found",
+            ),
+            (
+                GraphicsError::RelativeCycle.to_string(),
+                "Kitty graphics relative placement would create a cycle",
+            ),
+            (
+                GraphicsError::RelativeDepthExceeded.to_string(),
+                "Kitty graphics relative placement chain exceeds the maximum depth",
+            ),
+            (
+                GraphicsError::InvalidPayload.to_string(),
+                "invalid Kitty graphics base64 payload",
+            ),
+            (
+                GraphicsError::UnsupportedTransfer("s".to_string()).to_string(),
+                "unsupported Kitty graphics transfer mode \"s\"",
+            ),
+        ];
+        for (actual, expected) in catalogue {
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
@@ -8634,6 +8780,45 @@ mod tests {
             .map(|submission| submission.resource().image())
             .collect::<Vec<_>>();
         assert_eq!(images, vec![2, 3]);
+    }
+
+    #[test]
+    fn z_index_accepts_the_full_32_bit_range_and_keeps_total_order() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(65));
+        // The protocol says the z-index is a 32-bit integer; Kitty draws
+        // placements below `INT32_MIN/2` under the cell backgrounds. All of
+        // these must parse and keep their relative order.
+        for (image, z) in [
+            (1, i32::MAX),
+            (2, -1_073_741_825), // just below INT32_MIN/2 (Kitty's "below" tier)
+            (3, 0),
+            (4, i32::MIN),
+            (5, -1_073_741_823), // just above INT32_MIN/2
+        ] {
+            store
+                .apply_kitty_command_with_context(
+                    format!("a=T,f=24,i={image},c=1,r=1,z={z},q=2").as_bytes(),
+                    b"AQID",
+                    (0, 0),
+                    (0, 0),
+                )
+                .unwrap();
+        }
+        assert_eq!(store.placement_count(), 5);
+        let zs: Vec<_> = store
+            .visible_submissions(Rect::new(0, 0, 8, 4))
+            .iter()
+            .map(|submission| submission.placement().z_index())
+            .collect();
+        assert_eq!(zs, vec![i32::MIN, -1_073_741_825, -1_073_741_823, 0, i32::MAX]);
+        // A value beyond the 32-bit range is rejected.
+        let error = store.apply_kitty_command(b"a=T,f=24,i=6,c=1,r=1,z=2147483648,q=2", b"AQID");
+        assert!(error.is_err());
+        // The z-index delete selector matches deep negative values too.
+        store
+            .apply_kitty_command(b"a=d,d=z,z=-1073741825", b"")
+            .unwrap();
+        assert_eq!(store.placement_count(), 4);
     }
 
     #[test]

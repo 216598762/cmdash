@@ -1,29 +1,14 @@
-use std::{fmt, fs, path::PathBuf, time::SystemTime};
+use std::{fs, path::PathBuf, time::SystemTime};
 
 use crate::config::{AppConfig, ConfigFileError, LoadedConfig};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ReloadError {
+    #[error("could not inspect config {}: {message}", .path.display())]
     Metadata { path: PathBuf, message: String },
+    #[error("{0}")]
     Config(ConfigFileError),
 }
-
-impl fmt::Display for ReloadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Metadata { path, message } => {
-                write!(
-                    formatter,
-                    "could not inspect config {}: {message}",
-                    path.display()
-                )
-            }
-            Self::Config(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for ReloadError {}
 
 pub struct ConfigReloader {
     path: PathBuf,

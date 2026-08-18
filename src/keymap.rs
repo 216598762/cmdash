@@ -410,37 +410,19 @@ fn default_bindings() -> Vec<(KeyAction, &'static str)> {
     ]
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum KeymapError {
+    #[error("unknown keybinding action {0:?}")]
     UnknownAction(String),
+    #[error("invalid keybinding chord {0:?}")]
     InvalidChord(String),
+    #[error("keybinding {chord} for {} conflicts with {}", .action.name(), .existing.name())]
     Conflict {
         chord: KeyChord,
         action: KeyAction,
         existing: KeyAction,
     },
 }
-
-impl fmt::Display for KeymapError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownAction(name) => write!(formatter, "unknown keybinding action {name:?}"),
-            Self::InvalidChord(chord) => write!(formatter, "invalid keybinding chord {chord:?}"),
-            Self::Conflict {
-                chord,
-                action,
-                existing,
-            } => write!(
-                formatter,
-                "keybinding {chord} for {} conflicts with {}",
-                action.name(),
-                existing.name()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for KeymapError {}
 
 #[cfg(test)]
 mod tests {

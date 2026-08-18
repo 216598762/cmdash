@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt, fs,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -411,36 +411,15 @@ fn validate_layout(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ConfigFileError {
+    #[error("could not read config {}: {message}", .path.display())]
     Read { path: PathBuf, message: String },
+    #[error("could not rewrite config {}: {message}", .path.display())]
     Write { path: PathBuf, message: String },
+    #[error("invalid config: {0}")]
     Invalid(ConfigError),
 }
-
-impl fmt::Display for ConfigFileError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Read { path, message } => {
-                write!(
-                    formatter,
-                    "could not read config {}: {message}",
-                    path.display()
-                )
-            }
-            Self::Write { path, message } => {
-                write!(
-                    formatter,
-                    "could not rewrite config {}: {message}",
-                    path.display()
-                )
-            }
-            Self::Invalid(error) => write!(formatter, "invalid config: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for ConfigFileError {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct PluginConfig {
@@ -596,71 +575,43 @@ pub enum LabelPolicy {
     Never,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ConfigError {
+    #[error("TOML parse error: {0}")]
     Parse(String),
+    #[error("unsupported config version {0}; expected {current}", current = CURRENT_CONFIG_VERSION)]
     UnsupportedVersion(u32),
+    #[error("workspace name cannot be empty")]
     EmptyWorkspaceName,
+    #[error("widget type cannot be empty")]
     EmptyWidgetType,
+    #[error("duplicate widget id {}", .0.get())]
     DuplicateWidgetId(WidgetId),
+    #[error("duplicate overlay id {}", .0.get())]
     DuplicateOverlayId(OverlayId),
+    #[error("overlay {} has an empty area", .0.get())]
     InvalidOverlayArea(OverlayId),
+    #[error("layout references missing widget {}", .0.get())]
     LayoutWidgetNotFound(WidgetId),
+    #[error("layout references missing overlay {}", .0.get())]
     LayoutOverlayNotFound(OverlayId),
+    #[error("layout nodes must have children")]
     EmptyLayoutChildren,
+    #[error("active tab index {0} is out of range")]
     InvalidActiveTab(usize),
+    #[error("plugin name and manifest path cannot be empty")]
     InvalidPluginConfig,
+    #[error("invalid appearance: {0}")]
     InvalidAppearance(String),
+    #[error("invalid animation: {0}")]
     InvalidAnimation(String),
+    #[error("invalid api: {0}")]
     InvalidApi(String),
+    #[error("invalid keybindings: {0}")]
     InvalidKeybindings(String),
+    #[error("duplicate plugin name {0:?}")]
     DuplicatePluginName(String),
 }
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Parse(message) => write!(formatter, "TOML parse error: {message}"),
-            Self::UnsupportedVersion(version) => {
-                write!(
-                    formatter,
-                    "unsupported config version {version}; expected {CURRENT_CONFIG_VERSION}"
-                )
-            }
-            Self::EmptyWorkspaceName => formatter.write_str("workspace name cannot be empty"),
-            Self::EmptyWidgetType => formatter.write_str("widget type cannot be empty"),
-            Self::DuplicateWidgetId(id) => write!(formatter, "duplicate widget id {}", id.get()),
-            Self::DuplicateOverlayId(id) => write!(formatter, "duplicate overlay id {}", id.get()),
-            Self::InvalidOverlayArea(id) => {
-                write!(formatter, "overlay {} has an empty area", id.get())
-            }
-            Self::LayoutWidgetNotFound(id) => {
-                write!(formatter, "layout references missing widget {}", id.get())
-            }
-            Self::LayoutOverlayNotFound(id) => {
-                write!(formatter, "layout references missing overlay {}", id.get())
-            }
-            Self::EmptyLayoutChildren => formatter.write_str("layout nodes must have children"),
-            Self::InvalidActiveTab(index) => {
-                write!(formatter, "active tab index {index} is out of range")
-            }
-            Self::InvalidPluginConfig => {
-                formatter.write_str("plugin name and manifest path cannot be empty")
-            }
-            Self::InvalidAppearance(message) => write!(formatter, "invalid appearance: {message}"),
-            Self::InvalidAnimation(message) => write!(formatter, "invalid animation: {message}"),
-            Self::InvalidApi(message) => write!(formatter, "invalid api: {message}"),
-            Self::InvalidKeybindings(message) => {
-                write!(formatter, "invalid keybindings: {message}")
-            }
-            Self::DuplicatePluginName(name) => {
-                write!(formatter, "duplicate plugin name {name:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {}
 
 #[cfg(test)]
 mod tests {

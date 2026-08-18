@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::layout::Rect;
 
@@ -33,32 +30,17 @@ pub struct LayoutTree {
     hidden_widgets: BTreeSet<WidgetId>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum LayoutError {
+    #[error("layout references missing widget {}", .0.get())]
     MissingWidget(WidgetId),
+    #[error("layout references missing overlay {}", .0.get())]
     MissingOverlay(OverlayId),
+    #[error("layout nodes must have children")]
     EmptyChildren,
+    #[error("active tab index {0} is out of range")]
     InvalidActiveTab(usize),
 }
-
-impl fmt::Display for LayoutError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingWidget(id) => {
-                write!(formatter, "layout references missing widget {}", id.get())
-            }
-            Self::MissingOverlay(id) => {
-                write!(formatter, "layout references missing overlay {}", id.get())
-            }
-            Self::EmptyChildren => formatter.write_str("layout nodes must have children"),
-            Self::InvalidActiveTab(index) => {
-                write!(formatter, "active tab index {index} is out of range")
-            }
-        }
-    }
-}
-
-impl std::error::Error for LayoutError {}
 
 impl LayoutTree {
     pub fn from_config(

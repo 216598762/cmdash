@@ -906,22 +906,85 @@ impl<W: Write> CrosstermBackend<W> {
         Ok(())
     }
 
+    /// Emits a delete for a whole image. Deletes are written unconditionally:
+    /// every upload is sent quiet (`q=2`), so an acknowledgement-gated delete
+    /// could never fire and removed placements would linger as ghosts at the
+    /// outer terminal. A quiet delete of an id the outer terminal does not
+    /// know is a harmless no-op.
     fn request_graphics_delete(&mut self, image_id: u32) -> io::Result<()> {
-        let should_delete = if let Some(resource) = self.uploaded_generations.get_mut(&image_id) {
+        if let Some(resource) = self.uploaded_generations.get_mut(&image_id) {
             resource.pending_delete = true;
-            if resource.acknowledged && !resource.delete_sent {
-                resource.delete_sent = true;
-                true
-            } else {
-                false
-            }
-        } else {
-            true
-        };
-        if should_delete {
-            self.write_graphics_delete(image_id)?;
+            resource.delete_sent = true;
         }
-        Ok(())
+        self.write_graphics_delete(image_id)
+    }
+
+    /// Emits a placement-scoped delete (`d=i` with a `p=` id), which removes
+    /// exactly one placement while keeping the image data for its other
+    /// placements, mirroring Kitty's `id_filter_func`.
+    fn graphics_delete_scoped_bytes(&self, image_id: u32, placement_id: u32) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        if self.capabilities.kitty_graphics_mode() == KittyGraphicsMode::Passthrough {
+            write_passthrough_command(&mut bytes, |buffer| {
+                write!(buffer, "\x1b_Ga=d,d=i,i={image_id},p={placement_id};\x1b\\")
+            })?;
+        } else {
+            write!(&mut bytes, "\x1b_Ga=d,d=i,i={image_id},p={placement_id};\x1b\\")?;
+        }
+        Ok(bytes)
+    }
+
+    /// Handles a placement that left the visible set. A placement re-placed
+    /// at a new location this frame (scroll re-anchoring, reflow) is not
+    /// deleted at all: it is re-placed with its stable `p=` id and the outer
+    /// terminal moves it. Otherwise the placement is deleted by id, scoped to
+    /// the placement when the image still has other visible placements, and
+    /// the whole image (data included) when this was its last placement.
+    fn remove_outer_placement(
+        &mut self,
+        submission: &GraphicsSubmission,
+        changed: &[GraphicsSubmission],
+        visible: &[GraphicsSubmission],
+    ) -> io::Result<()> {
+        let image_id = submission.terminal_image_id();
+        let key = submission.placement().key();
+        // A placement still present in this frame's visible set (possibly at
+        // a new cell after scroll re-anchoring) is not being deleted: it is
+        // re-placed with its stable `p=` id and the outer terminal moves it.
+        let alive = changed.iter().any(|candidate| candidate.placement().key() == key)
+            || visible
+                .iter()
+                .any(|candidate| candidate.placement().key() == key);
+        if alive {
+            return Ok(());
+        }
+        let other_placements_visible = visible.iter().any(|candidate| {
+            candidate.terminal_image_id() == image_id && candidate.placement().key() != key
+        });
+        if self.capabilities.kitty_unicode_placeholders {
+            // Placeholder-mode images are uploaded once as a virtual image
+            // (no placement ids); deleting by placement would erase the whole
+            // virtual image, so a still-visible image is kept alive and the
+            // cell-level diff clears the departed placeholder cells. Only the
+            // last placement gets an image-level delete.
+            if !other_placements_visible {
+                self.request_graphics_delete(image_id)?;
+            }
+            return Ok(());
+        }
+        if other_placements_visible {
+            let bytes = self
+                .graphics_delete_scoped_bytes(image_id, submission.placement().outer_placement_id())?;
+            self.writer.write_all(&bytes)?;
+            return Ok(());
+        }
+        // Last placement of the image: release the placement at the outer
+        // terminal with a lowercase image-level delete. Verified against a
+        // real Kitty: lowercase `d=i` retains the image data (the protocol's
+        // contract, so a scrolled-away image is re-displayed without
+        // retransmission), and the cached resource is kept so a later
+        // appearance re-places with a bare `a=p` instead of re-uploading.
+        self.request_graphics_delete(image_id)
     }
 
     fn handle_graphics_acknowledgement(
@@ -995,8 +1058,10 @@ impl<W: Write> CrosstermBackend<W> {
     }
 
     /// Cancels pending outer transfers without pretending that an unacknowledged
-    /// upload reached the terminal. Already accepted resources are cleaned up
-    /// through the normal acknowledgement-gated delete path.
+    /// upload reached the terminal. Uploads are sent quiet (`q=2`), so no
+    /// resource is ever marked acknowledged; images are left in the outer
+    /// terminal's retained set (a real terminal keeps them across the
+    /// invocation), matching Kitty rather than issuing a delete storm on exit.
     pub fn cancel_graphics_transfers(&mut self) -> io::Result<()> {
         let acknowledged = self
             .uploaded_generations
@@ -1162,7 +1227,7 @@ impl<W: Write> Backend for CrosstermBackend<W> {
         }
         if self.capabilities.kitty_unicode_placeholders {
             for submission in removed {
-                self.request_graphics_delete(submission.terminal_image_id())?;
+                self.remove_outer_placement(submission, changed, visible)?;
             }
             if let Some(reason) = placeholder_geometry_error(visible) {
                 return Ok(GraphicsSubmissionStatus::Failed {
@@ -1202,7 +1267,7 @@ impl<W: Write> Backend for CrosstermBackend<W> {
             });
         }
         for submission in removed {
-            self.request_graphics_delete(submission.terminal_image_id())?;
+            self.remove_outer_placement(submission, changed, visible)?;
         }
         let mut uploaded = 0;
         for submission in changed {
@@ -1288,6 +1353,9 @@ impl<W: Write> Backend for CrosstermBackend<W> {
     fn submit_diff(&mut self, diff: &FrameDiff) -> Result<(), Self::Error> {
         self.cursor = diff.cursor();
         if self.capabilities.kitty_unicode_placeholders {
+            // Only clear the departed placeholder cells here; image-lifecycle
+            // deletes are emitted by the graphics submission path so the
+            // last-placement and moved-placement rules apply uniformly.
             let removed =
                 submissions_for_placeholders(diff.removed_graphics(), diff.removed_placeholders());
             for submission in if removed.is_empty() {
@@ -1295,7 +1363,6 @@ impl<W: Write> Backend for CrosstermBackend<W> {
             } else {
                 removed
             } {
-                self.request_graphics_delete(submission.terminal_image_id())?;
                 clear_placeholder_cells(&mut self.writer, &submission)?;
             }
         }
@@ -1538,9 +1605,7 @@ fn write_direct_placement<W: Write>(
     if placement.z_index() != 0 {
         write!(writer, ",z={}", placement.z_index())?;
     }
-    if let Some(placement_id) = placement.placement_id() {
-        write!(writer, ",p={placement_id}")?;
-    }
+    write_outer_placement_id(writer, placement)?;
     write_source_crop(writer, placement)?;
     write_cell_offsets(writer, placement)?;
     writer.write_all(b";\x1b\\")
@@ -1559,6 +1624,20 @@ fn write_source_crop<W: Write>(
             source.width(),
             source.height()
         )?;
+    }
+    Ok(())
+}
+
+/// Emits the placement's stable outer-terminal id (Kitty `p=`), which lets
+/// the outer terminal recognize a re-placed placement as a move of the same
+/// placement rather than a new one.
+fn write_outer_placement_id<W: Write>(
+    writer: &mut W,
+    placement: &crate::graphics::GraphicsPlacement,
+) -> io::Result<()> {
+    let outer_placement_id = placement.outer_placement_id();
+    if outer_placement_id != 0 {
+        write!(writer, ",p={outer_placement_id}")?;
     }
     Ok(())
 }
@@ -1625,9 +1704,7 @@ fn write_direct_upload<W: Write>(
     if placement.z_index() != 0 {
         write!(writer, ",z={}", placement.z_index())?;
     }
-    if let Some(placement_id) = placement.placement_id() {
-        write!(writer, ",p={placement_id}")?;
-    }
+    write_outer_placement_id(writer, placement)?;
     write_source_crop(writer, placement)?;
     write_cell_offsets(writer, placement)?;
     writer.write_all(b";")?;
@@ -2558,6 +2635,13 @@ mod tests {
         assert_eq!(batch.graphics_acknowledgements.len(), 1);
         let before = backend.writer().len();
         backend.submit_diff(&second).unwrap();
+        backend
+            .submit_graphics(
+                second.graphics(),
+                second.visible_graphics(),
+                second.removed_graphics(),
+            )
+            .unwrap();
         let cleanup = &backend.writer()[before..];
         assert!(cleanup.windows(7).any(|window| window == b"a=d,d=i"));
         assert!(cleanup.windows(2).any(|window| window == b"  "));

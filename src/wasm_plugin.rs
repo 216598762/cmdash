@@ -5,8 +5,6 @@
 //! ABI is finalized, and instantiates each module in its own store. No terminal
 //! handles, filesystem access, or WASI capabilities are exposed.
 
-use std::fmt;
-
 use wasmtime::{Config, Engine, Instance, Linker, Module, Store};
 
 pub const WASM_PLUGIN_RUNTIME: &str = "wasm";
@@ -26,34 +24,19 @@ impl Default for WasmLimits {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum WasmPluginError {
+    #[error("WASM module is {actual} bytes; limit is {limit}")]
     ModuleTooLarge { limit: usize, actual: usize },
+    #[error("could not create WASM engine: {0}")]
     Engine(String),
+    #[error("WASM module rejected: {0}")]
     Module(String),
+    #[error("WASM imports are not allowed yet: {0}")]
     ImportsNotAllowed(String),
+    #[error("WASM plugin instantiation failed: {0}")]
     Instantiation(String),
 }
-
-impl fmt::Display for WasmPluginError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ModuleTooLarge { limit, actual } => {
-                write!(formatter, "WASM module is {actual} bytes; limit is {limit}")
-            }
-            Self::Engine(message) => write!(formatter, "could not create WASM engine: {message}"),
-            Self::Module(message) => write!(formatter, "WASM module rejected: {message}"),
-            Self::ImportsNotAllowed(module) => {
-                write!(formatter, "WASM imports are not allowed yet: {module}")
-            }
-            Self::Instantiation(message) => {
-                write!(formatter, "WASM plugin instantiation failed: {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for WasmPluginError {}
 
 pub struct WasmPluginHost {
     engine: Engine,

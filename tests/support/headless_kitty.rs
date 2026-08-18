@@ -47,7 +47,7 @@ struct Resource {
     height: u16,
     pixel_width: u16,
     pixel_height: u16,
-    z: i16,
+    z: i32,
     image_number: u32,
     payload: Vec<u8>,
     pixels: Option<Vec<HeadlessPixel>>,
@@ -89,7 +89,7 @@ pub struct HeadlessPlaceholder {
     pub y: u16,
     pub row: u16,
     pub column: u16,
-    pub z: i16,
+    pub z: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,7 +100,7 @@ pub struct HeadlessPlacement {
     pub y: u16,
     pub width: u16,
     pub height: u16,
-    pub z: i16,
+    pub z: i32,
     source: Option<SourceRect>,
 }
 
@@ -137,7 +137,7 @@ pub struct HeadlessKittyTerminal {
     viewport: Option<(u16, u16)>,
     acknowledgements: Vec<Vec<u8>>,
     pending_input: Vec<u8>,
-    virtual_placements: BTreeMap<u32, (u16, u16, i16)>,
+    virtual_placements: BTreeMap<u32, (u16, u16, i32)>,
     next_image_id: u32,
     framebuffer: Option<Framebuffer>,
 }
@@ -646,7 +646,7 @@ impl HeadlessKittyTerminal {
                         height,
                         pixel_width,
                         pixel_height,
-                        z: parameter_i16(&parameters, "z", 0)?,
+                        z: parameter_i32(&parameters, "z", 0)?,
                         image_number,
                         payload: payload.to_vec(),
                         pixels,
@@ -663,7 +663,7 @@ impl HeadlessKittyTerminal {
                     } else {
                         self.virtual_placements.insert(
                             image_id,
-                            (width, height, parameter_i16(&parameters, "z", 0)?),
+                            (width, height, parameter_i32(&parameters, "z", 0)?),
                         );
                     }
                 }
@@ -680,7 +680,7 @@ impl HeadlessKittyTerminal {
                         (
                             parameter_u16(&parameters, "c", resource.width)?,
                             parameter_u16(&parameters, "r", resource.height)?,
-                            parameter_i16(&parameters, "z", resource.z)?,
+                            parameter_i32(&parameters, "z", resource.z)?,
                         ),
                     );
                 } else {
@@ -691,10 +691,30 @@ impl HeadlessKittyTerminal {
             Some("d") | Some("D") => match parameter_string(&parameters, "d") {
                 Some("i") | Some("I") => {
                     let image_id = parameter_u32(&parameters, "i")?;
-                    self.resources.remove(&image_id);
-                    self.virtual_placements.remove(&image_id);
-                    self.placements
-                        .retain(|placement| placement.image_id != image_id);
+                    let uppercase = parameter_string(&parameters, "d") == Some("I");
+                    // A `p` key narrows the delete to one placement of the
+                    // image, keeping the image data for its other placements
+                    // (Kitty's `id_filter_func`). Without it, lowercase `d=i`
+                    // releases the placements but retains the image data so
+                    // a scrolled-away image can be re-displayed without
+                    // retransmission (verified against a real Kitty); only
+                    // uppercase `d=I` frees the data too.
+                    let placement_id = parameter_u32(&parameters, "p")
+                        .ok()
+                        .filter(|placement_id| *placement_id != 0);
+                    if let Some(placement_id) = placement_id {
+                        self.placements.retain(|placement| {
+                            !(placement.image_id == image_id
+                                && placement.placement_id == Some(placement_id))
+                        });
+                    } else {
+                        if uppercase {
+                            self.resources.remove(&image_id);
+                        }
+                        self.virtual_placements.remove(&image_id);
+                        self.placements
+                            .retain(|placement| placement.image_id != image_id);
+                    }
                     self.actions.push("delete");
                     self.acknowledgements.push(kitty_acknowledgement(image_id));
                 }
@@ -1105,7 +1125,7 @@ impl HeadlessKittyTerminal {
             y,
             width,
             height,
-            z: parameter_i16(parameters, "z", 0)?,
+            z: parameter_i32(parameters, "z", 0)?,
             source: source_rect(parameters)?,
         });
         // A real graphics terminal advances the cursor right by `c` cells and
@@ -1649,30 +1669,17 @@ fn parameter_u16(
             value
                 .parse()
                 .map_err(|error| format!("invalid Kitty APC {key}: {error}"))
-        })
-        .unwrap_or(Ok(default))
+        })        .unwrap_or(Ok(default))
 }
+
+
+
 
 fn parameter_i32(
     parameters: &BTreeMap<String, String>,
     key: &str,
     default: i32,
 ) -> Result<i32, String> {
-    parameters
-        .get(key)
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|error| format!("invalid Kitty APC {key}: {error}"))
-        })
-        .unwrap_or(Ok(default))
-}
-
-fn parameter_i16(
-    parameters: &BTreeMap<String, String>,
-    key: &str,
-    default: i16,
-) -> Result<i16, String> {
     parameters
         .get(key)
         .map(|value| {

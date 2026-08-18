@@ -2,10 +2,10 @@
 mod headless_kitty;
 
 use cmdash::{
-    Backend, BackendCapabilities, CrosstermBackend, GraphicsAnimationState,
-    GraphicsCapabilityConfidence, GraphicsCapabilitySource, GraphicsSubmission,
-    GraphicsSubmissionStatus, Scene, SessionGraphicsStore, SessionId, TerminalSession,
-    TerminalSize,
+    Backend, BackendCapabilities, Compositor, CrosstermBackend, GraphicsAnimationState,
+    GraphicsCapabilityConfidence, GraphicsCapabilitySource, GraphicsScreen,
+    GraphicsScrollRegion, GraphicsSubmission, GraphicsSubmissionStatus, Scene,
+    SessionGraphicsStore, SessionId, TerminalSession, TerminalSize,
 };
 use headless_kitty::{HeadlessKittyTerminal, HeadlessPixel};
 use ratatui::layout::Rect;
@@ -480,7 +480,10 @@ fn headless_framebuffer_applies_source_crops_and_delete_updates_pixels() {
     deleted.extend_from_slice(b"\x1b_Ga=d,d=i,i=63;\x1b\\");
     let terminal = HeadlessKittyTerminal::replay_with_framebuffer(&deleted, 3, 1).unwrap();
     assert_eq!(terminal.visible_pixel_count(), 0);
-    assert_eq!(terminal.resource_count(), 0);
+    // Lowercase `d=i` releases the placement but retains the image data
+    // (verified against a real Kitty), so the resource survives for a
+    // re-display without retransmission.
+    assert_eq!(terminal.resource_count(), 1);
 }
 
 #[test]
@@ -726,7 +729,7 @@ fn direct_adapter_matches_captured_upload_stream() {
 
     assert_eq!(
         backend.writer(),
-        b"\x1b[1;1H\x1b_Ga=T,f=24,i=7,c=2,r=1,C=1,q=2,m=0;AQID\x1b\\\x1b[?25l"
+        b"\x1b[1;1H\x1b_Ga=T,f=24,i=7,c=2,r=1,C=1,q=2,m=0,p=1;AQID\x1b\\\x1b[?25l"
     );
     let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
     assert_eq!(model.actions(), &["transmit"]);
@@ -799,14 +802,16 @@ fn direct_adapter_reuses_resources_and_captures_placement_only_replay() {
 
     assert_eq!(
         &backend.writer()[first_len..],
-        b"\x1b[1;1H\x1b_Ga=p,i=8,c=1,r=1,C=1,q=2;\x1b\\\x1b[?25l"
+        b"\x1b[1;1H\x1b_Ga=p,i=8,c=1,r=1,C=1,q=2,p=1;\x1b\\\x1b[?25l"
     );
     assert_eq!(backend.metrics().graphics_uploads, 1);
     assert_eq!(backend.metrics().graphics_reuses, 1);
     let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
     assert_eq!(model.actions(), &["transmit", "place"]);
     assert_eq!(model.resource_count(), 1);
-    assert_eq!(model.placement_count(), 2);
+    // The re-place carries the same stable `p=1` id, so the outer terminal
+    // reuses the existing placement instead of stacking a duplicate.
+    assert_eq!(model.placement_count(), 1);
 }
 
 #[test]
@@ -833,8 +838,272 @@ fn direct_adapter_matches_captured_delete_stream() {
     assert_eq!(&backend.writer()[first_len..], b"\x1b_Ga=d,d=i,i=9;\x1b\\");
     let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
     assert_eq!(model.actions(), &["transmit", "delete"]);
-    assert_eq!(model.resource_count(), 0);
+    // Lowercase `d=i` keeps the image data at the outer terminal (verified
+    // against a real Kitty), so the resource survives for re-display.
+    assert_eq!(model.resource_count(), 1);
     assert_eq!(model.placement_count(), 0);
+}
+
+#[test]
+fn scrolled_placement_replaces_in_place_without_a_stale_ghost() {
+    // A placement re-anchored by scrollback view movement must not leave a
+    // ghost painted at its old cells: the backend re-places it with the same
+    // stable `p=` id, so the outer terminal moves the placement (Kitty's
+    // `grman_put` reuses the ref by `(i, p)`) instead of stacking a second
+    // placement. This is the end-to-end regression for the scroll-tearing
+    // report: the diff sees the placement as removed (old cell) and changed
+    // (new cell) simultaneously.
+    let mut store = SessionGraphicsStore::new(SessionId::new(1));
+    store
+        .apply_kitty_command_with_scroll_region(
+            b"a=T,f=24,i=7,c=1,r=1,q=2",
+            b"AQID",
+            (0, 1),
+            (10, 20),
+            0,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::new(0, 6, 6),
+            0,
+        )
+        .unwrap();
+    let area = Rect::new(0, 0, 4, 3);
+    let mut compositor = Compositor::new();
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+
+    // Frame 1: the placement is visible at row 1.
+    let frame1 = store.visible_submissions_with_state(area, 0, GraphicsScreen::Primary);
+    assert_eq!(frame1.len(), 1);
+    assert_eq!(frame1[0].placement().y(), 1);
+    let mut scene1 = Scene::new(area);
+    scene1.add_image_layer(frame1[0].clone());
+    let diff1 = compositor.diff(&scene1);
+    backend.submit_diff(&diff1).unwrap();
+    backend
+        .submit_graphics_frame(
+            diff1.graphics(),
+            diff1.visible_graphics(),
+            diff1.removed_graphics(),
+            diff1.visible_placeholders(),
+            diff1.removed_placeholders(),
+        )
+        .unwrap();
+    let first_len = backend.writer().len();
+
+    // Frame 2: one line of history scrolls in; the same placement resolves to
+    // row 0 and keeps its stable key and outer placement id.
+    let second = store.visible_submissions_with_state(area, 1, GraphicsScreen::Primary);
+    assert_eq!(second[0].placement().y(), 0);
+    assert_eq!(second[0].placement().key(), frame1[0].placement().key());
+    assert_eq!(
+        second[0].placement().outer_placement_id(),
+        frame1[0].placement().outer_placement_id()
+    );
+    let mut scene2 = Scene::new(area);
+    scene2.add_image_layer(second[0].clone());
+    let diff2 = compositor.diff(&scene2);
+    assert_eq!(diff2.graphics().len(), 1);
+    assert_eq!(diff2.removed_graphics().len(), 1);
+    backend.submit_diff(&diff2).unwrap();
+    backend
+        .submit_graphics_frame(
+            diff2.graphics(),
+            diff2.visible_graphics(),
+            diff2.removed_graphics(),
+            diff2.visible_placeholders(),
+            diff2.removed_placeholders(),
+        )
+        .unwrap();
+
+    let scroll_stream = &backend.writer()[first_len..];
+    assert!(
+        !scroll_stream.windows(6).any(|window| window == b"a=d,d="),
+        "a moved placement must not be deleted: {:?}",
+        String::from_utf8_lossy(scroll_stream)
+    );
+    let re_place = format!("q=2,p={};", second[0].placement().outer_placement_id());
+    assert!(
+        scroll_stream
+            .windows(re_place.len())
+            .any(|window| window == re_place.as_bytes()),
+        "the re-place must keep the stable placement id: {:?}",
+        String::from_utf8_lossy(scroll_stream)
+    );
+    let terminal = HeadlessKittyTerminal::replay_with_framebuffer(backend.writer(), 4, 3).unwrap();
+    assert_eq!(terminal.resource_count(), 1);
+    assert_eq!(
+        terminal.placement_count(),
+        1,
+        "a moved placement must not leave a ghost at the outer terminal"
+    );
+    assert_eq!(
+        (terminal.placements()[0].x, terminal.placements()[0].y),
+        (0, 0)
+    );
+
+    // Frame 3: the placement is removed entirely; its last placement frees
+    // the whole image with an image-level delete.
+    let scroll_len = backend.writer().len();
+    let diff3 = compositor.diff(&Scene::new(area));
+    backend.submit_diff(&diff3).unwrap();
+    backend
+        .submit_graphics_frame(
+            diff3.graphics(),
+            diff3.visible_graphics(),
+            diff3.removed_graphics(),
+            diff3.visible_placeholders(),
+            diff3.removed_placeholders(),
+        )
+        .unwrap();
+    let cleanup = &backend.writer()[scroll_len..];
+    assert!(
+        cleanup.windows(6).any(|window| window == b"a=d,d="),
+        "removing the last placement must release it at the outer terminal: {:?}",
+        String::from_utf8_lossy(cleanup)
+    );
+    let terminal = HeadlessKittyTerminal::replay_with_framebuffer(backend.writer(), 4, 3).unwrap();
+    // The lowercase delete keeps the image data (verified against a real
+    // Kitty), so a scrolled-away image re-displays without retransmission.
+    assert_eq!(terminal.resource_count(), 1);
+    assert_eq!(terminal.placement_count(), 0);
+}
+
+#[test]
+fn pty_scroll_moves_and_removes_outer_placements_in_step_with_text() {
+    // End-to-end regression for scroll tearing: a real PTY places an image,
+    // one line of output scrolls it into history, and navigating the view
+    // must re-place the same placement (same `p=` id, no ghost) and, when it
+    // leaves the view, delete the image cleanly.
+    let script = r"printf '\033[1;1H\033_Ga=T,f=24,i=31,s=1,v=1,c=1,r=1,C=1,q=2;AQID\033\\'; for i in 0 1 2 3 4 5 6 7 8 9; do echo row$i; done";
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(31),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(6, 4),
+    )
+    .expect("could not spawn scroll-tearing fixture");
+    let area = Rect::new(0, 0, 6, 4);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && session.scrollback_lines() < 1 {
+        session
+            .poll_output()
+            .expect("scroll-tearing fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        session.scrollback_lines() >= 1,
+        "image should have scrolled into history"
+    );
+
+    let mut compositor = Compositor::new();
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+
+    // Scroll to the top: the history line carrying the image is at row 0.
+    assert!(session.scroll_display(alacritty_terminal::grid::Scroll::Top));
+    let mut scene1 = session.render(area, false);
+    for graphics in session.graphics(area) {
+        scene1.add_image_layer(graphics);
+    }
+    assert_eq!(scene1.image_layers().len(), 1);
+    assert_eq!(scene1.image_layers()[0].placement().y(), 0);
+    let diff1 = compositor.diff(&scene1);
+    backend.submit_diff(&diff1).unwrap();
+    backend
+        .submit_graphics_frame(
+            diff1.graphics(),
+            diff1.visible_graphics(),
+            diff1.removed_graphics(),
+            diff1.visible_placeholders(),
+            diff1.removed_placeholders(),
+        )
+        .unwrap();
+    let first_len = backend.writer().len();
+
+    // Scroll back down one line: the image leaves the view. The backend must
+    // emit a delete and the outer terminal must end up with nothing painted.
+    assert!(session.scroll_display(alacritty_terminal::grid::Scroll::Delta(-1)));
+    let mut scene2 = session.render(area, false);
+    for graphics in session.graphics(area) {
+        scene2.add_image_layer(graphics);
+    }
+    assert!(scene2.image_layers().is_empty());
+    let diff2 = compositor.diff(&scene2);
+    assert_eq!(diff2.removed_graphics().len(), 1);
+    backend.submit_diff(&diff2).unwrap();
+    backend
+        .submit_graphics_frame(
+            diff2.graphics(),
+            diff2.visible_graphics(),
+            diff2.removed_graphics(),
+            diff2.visible_placeholders(),
+            diff2.removed_placeholders(),
+        )
+        .unwrap();
+    let cleanup = &backend.writer()[first_len..];
+    assert!(
+        cleanup.windows(6).any(|window| window == b"a=d,d="),
+        "leaving the view must delete the placement: {:?}",
+        String::from_utf8_lossy(cleanup)
+    );
+    let terminal = HeadlessKittyTerminal::replay_with_framebuffer(backend.writer(), 6, 4).unwrap();
+    // Lowercase `d=i` releases the placement but retains the image data.
+    assert_eq!(terminal.resource_count(), 1);
+    assert_eq!(terminal.placement_count(), 0);
+    session
+        .shutdown()
+        .expect("could not shut down scroll-tearing fixture");
+}
+
+#[test]
+fn removing_one_placement_keeps_the_image_for_its_other_placements() {
+    // Two placements of the same image; removing one must delete exactly that
+    // placement (`d=i` scoped with `p=`), keeping the image data alive for
+    // the other placement instead of erasing both.
+    let mut store = SessionGraphicsStore::new(SessionId::new(1));
+    store
+        .apply_kitty_command(b"a=T,f=24,i=5,c=1,r=1,q=2", b"AQID")
+        .unwrap();
+    store
+        .apply_kitty_command(b"a=p,i=5,c=1,r=1,q=2", b"")
+        .unwrap();
+    let visible = store.visible_submissions(Rect::new(0, 0, 4, 2));
+    assert_eq!(visible.len(), 2);
+    assert_ne!(
+        visible[0].placement().outer_placement_id(),
+        visible[1].placement().outer_placement_id()
+    );
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+    backend.submit_graphics(&visible, &visible, &[]).unwrap();
+    let first_len = backend.writer().len();
+
+    backend
+        .submit_graphics(&[], &visible[1..], std::slice::from_ref(&visible[0]))
+        .unwrap();
+    let scoped = &backend.writer()[first_len..];
+    let expected = format!(
+        "\x1b_Ga=d,d=i,i={},p={};\x1b\\",
+        visible[0].terminal_image_id(),
+        visible[0].placement().outer_placement_id()
+    );
+    assert!(
+        scoped.windows(expected.len()).any(|window| window == expected.as_bytes()),
+        "expected a placement-scoped delete: {:?}",
+        String::from_utf8_lossy(scoped)
+    );
+    assert!(
+        scoped.windows(6).any(|window| window == b"a=d,d="),
+        "expected a delete command: {:?}",
+        String::from_utf8_lossy(scoped)
+    );
+    let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
+    assert_eq!(
+        model.resource_count(),
+        1,
+        "image data must survive for the other placement"
+    );
+    assert_eq!(model.placement_count(), 1);
 }
 
 #[test]
@@ -886,7 +1155,7 @@ fn passthrough_adapter_matches_captured_escaped_stream() {
         )
         .expect("passthrough capture should write");
 
-    let command = b"\x1b_Ga=T,f=24,i=10,c=1,r=1,C=1,q=2,m=0;AQID\x1b\\";
+    let command = b"\x1b_Ga=T,f=24,i=10,c=1,r=1,C=1,q=2,m=0,p=1;AQID\x1b\\";
     let mut expected = b"\x1b[1;1H\x1bPtmux;".to_vec();
     for byte in command {
         if *byte == 0x1b {
@@ -933,7 +1202,7 @@ fn headless_terminal_accepts_delete_and_returns_a_kitty_acknowledgement() {
 
     terminal.feed(&delete_stream).unwrap();
     terminal.finish().unwrap();
-    assert_eq!(terminal.resource_count(), 0);
+    assert_eq!(terminal.resource_count(), 1);
     assert_eq!(terminal.placement_count(), 0);
     assert_eq!(terminal.actions(), &["transmit", "delete"]);
     assert_eq!(
@@ -948,7 +1217,11 @@ fn headless_terminal_accepts_delete_and_returns_a_kitty_acknowledgement() {
 }
 
 #[test]
-fn resource_gc_waits_for_upload_ack_then_delete_ack() {
+fn resource_removal_emits_delete_immediately_without_upload_ack() {
+    // Uploads are always sent quiet (`q=2`), so the outer terminal never
+    // acknowledges; a delete gated on the upload ack could never fire and the
+    // removed placement would linger as a ghost. Deletes are idempotent and
+    // are emitted unconditionally instead.
     let submission = captured_submission(12, 1, 1);
     let mut backend = CrosstermBackend::new(Vec::new())
         .with_capabilities(capabilities(true, false, false, false));
@@ -963,27 +1236,43 @@ fn resource_gc_waits_for_upload_ack_then_delete_ack() {
 
     backend
         .submit_graphics(&[], &[], std::slice::from_ref(&submission))
-        .expect("unacknowledged resource removal should be deferred");
-    assert_eq!(backend.writer().len(), upload_len);
-
-    let upload_ack = backend.feed_outer_input(b"\x1b_Gi=12;OK\x1b\\");
-    assert_eq!(upload_ack.terminal_bytes, b"");
-    assert_eq!(upload_ack.graphics_acknowledgements.len(), 1);
-    assert!(upload_ack.graphics_acknowledgements[0].success);
+        .expect("removal should write the delete immediately");
     assert_eq!(
         &backend.writer()[upload_len..],
         b"\x1b_Ga=d,d=i,i=12;\x1b\\"
     );
+    // The lowercase delete retains the image data at the outer terminal and
+    // the cached resource survives, so a reappearance re-places with a bare
+    // `a=p` instead of re-uploading (verified against a real Kitty).
     assert_eq!(backend.metrics().graphics_gc, 0);
+    let reuse_start = backend.writer().len();
+    backend
+        .submit_graphics(
+            std::slice::from_ref(&submission),
+            std::slice::from_ref(&submission),
+            &[],
+        )
+        .expect("reappearance should reuse the retained resource");
+    let re_place = format!("q=2,p={};", submission.placement().outer_placement_id());
+    assert!(
+        backend.writer()[reuse_start..]
+            .windows(re_place.len())
+            .any(|window| window == re_place.as_bytes()),
+        "reappearance must re-place without re-uploading"
+    );
+    assert_eq!(backend.metrics().graphics_uploads, 1);
+    assert_eq!(backend.metrics().graphics_reuses, 1);
 
-    let delete_ack = backend.feed_outer_input(b"\x1b_Gi=12;OK\x1b\\");
-    assert_eq!(delete_ack.graphics_acknowledgements.len(), 1);
-    assert!(delete_ack.graphics_acknowledgements[0].success);
-    assert_eq!(backend.metrics().graphics_acknowledgements, 2);
+    // An acknowledgement for the still-pending delete reaps the tracked
+    // resource without touching the outer terminal's retained data.
+    let upload_ack = backend.feed_outer_input(b"\x1b_Gi=12;OK\x1b\\");
+    assert_eq!(upload_ack.graphics_acknowledgements.len(), 1);
+    assert!(upload_ack.graphics_acknowledgements[0].success);
     assert_eq!(backend.metrics().graphics_gc, 1);
     let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
-    assert_eq!(model.actions(), &["transmit", "delete"]);
-    assert_eq!(model.resource_count(), 0);
+    assert_eq!(model.actions(), &["transmit", "delete", "place"]);
+    assert_eq!(model.resource_count(), 1);
+    assert_eq!(model.placement_count(), 1);
 }
 
 #[test]
@@ -1819,7 +2108,7 @@ fn placeholder_redraws_do_not_reupload_an_unchanged_resource() {
 }
 
 #[test]
-fn repeated_acknowledged_cleanup_does_not_leak_outer_resources() {
+fn repeated_acknowledged_cleanup_releases_placements_but_retains_data() {
     let mut backend = CrosstermBackend::new(Vec::new())
         .with_capabilities(capabilities(true, false, false, false));
 
@@ -1847,7 +2136,11 @@ fn repeated_acknowledged_cleanup_does_not_leak_outer_resources() {
     assert_eq!(backend.metrics().graphics_gc, 32);
     assert_eq!(backend.metrics().graphics_ack_failures, 0);
     let model = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
-    assert_eq!(model.resource_count(), 0);
+    // The backend's tracking is fully cleaned up (graphics_gc == 32), while
+    // the outer terminal retains the image data: lowercase `d=i` keeps it so
+    // a scrolled-away image re-displays without retransmission (verified
+    // against a real Kitty).
+    assert_eq!(model.resource_count(), 32);
     assert_eq!(model.placement_count(), 0);
 }
 
