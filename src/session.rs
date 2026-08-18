@@ -1784,7 +1784,8 @@ impl TerminalSession {
                 if terminal_cursor_visible
                     && let Some(cell) = scene.cell_at(cursor_cell.0, cursor_cell.1).copied()
                 {
-                    let cursor_style = CellStyle::new(cell.style.background, cell.style.foreground);
+                    let cell_style = cell.style.resolve();
+                    let cursor_style = CellStyle::new(cell_style.background, cell_style.foreground);
                     scene.set(cursor_cell.0, cursor_cell.1, cell.symbol, cursor_style);
                 }
             }
@@ -2950,7 +2951,7 @@ mod tests {
         assert_eq!(session.cursor_position(), (3, 0));
         assert_eq!(scene.cell_at(0, 0).unwrap().symbol, 'r');
         assert_eq!(
-            scene.cell_at(0, 0).unwrap().style.foreground,
+            scene.cell_at(0, 0).unwrap().style.resolve().foreground,
             Color::ansi(1)
         );
         session.write_bytes(b"\n").unwrap();
@@ -3196,8 +3197,14 @@ mod tests {
         let scene = session.render(Rect::new(0, 0, 20, 4), false);
         let selected = scene.cell_at(1, 0).unwrap();
         let theme = crate::appearance::Theme::fallback();
-        assert_eq!(selected.style.foreground, theme.selection_foreground());
-        assert_eq!(selected.style.background, theme.selection_background());
+        assert_eq!(
+            selected.style.resolve().foreground,
+            theme.selection_foreground()
+        );
+        assert_eq!(
+            selected.style.resolve().background,
+            theme.selection_background()
+        );
         session.shutdown().unwrap();
     }
 
@@ -3782,7 +3789,7 @@ mod tests {
             .processor
             .advance(&mut session.term, b"\x1b[3;4;9;7;8mX\x1b[0m");
         let scene = session.render(Rect::new(0, 0, 20, 4), false);
-        let style = scene.cell_at(0, 0).unwrap().style;
+        let style = scene.cell_at(0, 0).unwrap().style.resolve();
         assert!(style.italic);
         assert_eq!(style.underline, Underline::Plain);
         assert!(style.strikeout);
@@ -3800,7 +3807,7 @@ mod tests {
         );
         let scene = session.render(Rect::new(0, 0, 20, 4), false);
         let styles: Vec<_> = (0..6)
-            .map(|column| scene.cell_at(column, 0).unwrap().style)
+            .map(|column| scene.cell_at(column, 0).unwrap().style.resolve())
             .collect();
         assert_eq!(styles[0].underline, Underline::Plain);
         assert_eq!(styles[1].underline, Underline::Double);

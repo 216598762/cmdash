@@ -376,6 +376,7 @@ pub struct StyleDto {
 
 impl From<CellStyle> for StyleDto {
     fn from(style: CellStyle) -> Self {
+        let style = style.resolve();
         Self {
             foreground: ColorDto::from(style.foreground),
             background: ColorDto::from(style.background),

@@ -1738,7 +1738,7 @@ mod tests {
         assert_eq!(scene[&id].cell_at(0, 0).unwrap().symbol, '╔');
         assert_eq!(scene[&id].cell_at(11, 1).unwrap().symbol, '║');
         assert_eq!(
-            scene[&id].cell_at(4, 3).unwrap().style.foreground,
+            scene[&id].cell_at(4, 3).unwrap().style.resolve().foreground,
             Color::rgb(1, 2, 3)
         );
     }
@@ -1849,7 +1849,7 @@ mod tests {
         assert_eq!(runtime.widget_kind(id), Some("greeting"));
         assert_eq!(scene[&id].cell_at(0, 0).unwrap().symbol, 'h');
         assert_eq!(
-            scene[&id].cell_at(0, 0).unwrap().style.foreground,
+            scene[&id].cell_at(0, 0).unwrap().style.resolve().foreground,
             Theme::inherited().accent()
         );
     }

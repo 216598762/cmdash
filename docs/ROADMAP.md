@@ -2005,10 +2005,11 @@ per-frame `StyleInterner` handle rather than the expanded `CellStyle` struct;
 lists are cached and recomputed only when the set/visibility/z-order changes
 (`z_order_recomputations` proves the reuse), and removed-graphics/placeholder
 detection is a keyed-set diff (images by resource + placement key, placeholders
-by their full identity) skipped when the layers are unchanged. Remaining
-increments: deferring layer sorting to one pass per frame, and the optional
-full cell-buffer shrink (blocked on changing `CellStyle` from a public value
-type to an interned handle).
+by their full identity) skipped when the layers are unchanged. `CellStyle` is
+now a 4-byte handle into a process-wide `StyleTable` (the constructor/builder
+API is unchanged), so the cell buffer stores compact styles; the per-frame
+`StyleInterner` is now redundant with that global table. Remaining increment:
+deferring image/placeholder/sixel layer sorting to one pass per frame.
 
 ### Goals and boundaries
 
@@ -2035,8 +2036,9 @@ type to an interned handle).
 
 ### Current model and its costs (for the plan)
 
-- `Scene` owns a flat `cells: Vec<Cell>` (one `Cell` ≈ `char` + 9-field
-  `CellStyle` + width) plus `image_layers`/`placeholder_layers`/`sixel_layers`.
+- `Scene` owns a flat `cells: Vec<Cell>` (one `Cell` ≈ `char` + 4-byte
+  interned `CellStyle` handle + width) plus
+  `image_layers`/`placeholder_layers`/`sixel_layers`.
 - `Compositor::compose` allocates a fresh composed `Scene` and blits the base,
   each visible surface, and each overlay into it, sorting image/placeholder
   layers on every `add_*`/`blit`.
@@ -2058,11 +2060,14 @@ type to an interned handle).
 - [x] Intern `CellStyle` into a compact style handle (id into a per-frame style
   table) so identical styles are stored once and span grouping keys off the
   handle rather than the expanded 9-field struct (`CellSpan` carries the
-  `StyleId`; `Compositor::last_frame_distinct_styles` proves dedup). The public
-  `Cell`/`CellStyle` APIs are unchanged: interning keys the diff/span path only.
-  (Shrinking the cell buffer itself to store handles remains deferred — it
-  requires turning `CellStyle` into a handle-backed type, an API change this
-  phase deliberately avoids.)
+  `StyleId`; `Compositor::last_frame_distinct_styles` proves dedup).
+- [x] Migrate `CellStyle` itself to a handle-backed interned type: a
+  process-wide `StyleTable` stores each distinct `StyleData` once and
+  `CellStyle` carries a 4-byte index, shrinking the cell buffer and making
+  styles compare as integers. The public constructor/builder API (`new`, `bold`,
+  `dim`, …) is unchanged; field reads go through `CellStyle::resolve()`. (The
+  now-redundant per-frame compositor `StyleInterner` can be removed in a
+  follow-up.)
 
 ### Damage tracking and single-pass aggregation
 
@@ -2290,7 +2295,7 @@ setting or a non-PNG/GIF decode need arises.
 | Text selection model | Delegate to `alacritty_terminal`'s `Selection` (`Simple`/`Block`/`Semantic`/`Lines` with `Side` endpoints), anchor to grid points, and copy via `selection_to_string` | Replaces the hand-rolled viewport rectangle with flowed, scrollback-safe semantics the emulator already owns; keeps selection and content from drifting |
 | Selection interaction | Track click count and drag to map single/double/triple-click to selection modes, `Shift`+click to extension, and drag auto-scroll over the bounded history | Matches Kitty/Ghostty/alacritty mouse behavior without reimplementing selection state |
 | Frame buffer ownership | A single retained, reusable frame buffer with a bounded arena, per-surface dirty regions, and single-pass aggregation; no per-frame full-frame clone or scan | Removes the steady-state allocation and O(viewport) rescan while keeping the `FrameDiff`/backend contract byte-compatible |
-| Style representation | Intern `CellStyle` into a per-frame style handle so cells compare and span-group as small integers | Shrinks the cell buffer and removes expanded-struct comparison from the hot diff path without changing the public API |
+| Style representation | `CellStyle` is a 4-byte handle into a process-wide `StyleTable` (constructor/builder API unchanged, field access via `resolve()`) | Shrinks the cell buffer and makes styles compare as integers in the diff path |
 | Dependency policy | Adopt small standard crates that replace clear reinventions (`base64`, `clap`, `directories`, `thiserror`; later `notify`, `image`), keep the session-graphics/scene/widget layers bespoke | Removes hand-rolled edges where a mature crate is a drop-in, without replacing the deliberately novel retained session/graphics model |
 
 Update this table as product decisions are made; do not let provisional choices silently become public API guarantees.

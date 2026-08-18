@@ -1,3 +1,8 @@
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
+
 use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
 
@@ -37,8 +42,11 @@ pub enum Underline {
     Dashed,
 }
 
+/// The interned payload behind a `CellStyle` handle. Each distinct foreground/
+/// background/attribute combination is stored once in the process-wide style
+/// table, and `CellStyle` carries only the compact table index.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct CellStyle {
+pub(crate) struct StyleData {
     pub foreground: Color,
     pub background: Color,
     pub bold: bool,
@@ -51,8 +59,8 @@ pub struct CellStyle {
     pub hidden: bool,
 }
 
-impl CellStyle {
-    pub const fn new(foreground: Color, background: Color) -> Self {
+impl StyleData {
+    const fn new(foreground: Color, background: Color) -> Self {
         Self {
             foreground,
             background,
@@ -66,50 +74,111 @@ impl CellStyle {
             hidden: false,
         }
     }
+}
 
-    pub const fn bold(mut self) -> Self {
-        self.bold = true;
-        self
+/// Process-wide style interner. `CellStyle` resolves through this table so a
+/// cell stores a 4-byte handle instead of the expanded 9-field struct. The
+/// table only grows (styles are never evicted), but it is bounded in practice
+/// by the color/attribute space a session actually renders.
+#[derive(Default)]
+struct StyleTable {
+    styles: Vec<StyleData>,
+    ids: HashMap<StyleData, u32>,
+}
+
+impl StyleTable {
+    fn intern(&mut self, data: StyleData) -> u32 {
+        if let Some(&id) = self.ids.get(&data) {
+            return id;
+        }
+        let id = self.styles.len() as u32;
+        self.styles.push(data);
+        self.ids.insert(data, id);
+        id
+    }
+}
+
+fn style_table() -> &'static Mutex<StyleTable> {
+    static TABLE: OnceLock<Mutex<StyleTable>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(StyleTable::default()))
+}
+
+/// A compact, interned terminal cell style. The public constructor and builder
+/// API is unchanged, but the value is now a handle into the process-wide style
+/// table, so `Cell` shrinks by the size of the expanded style struct and styles
+/// compare as integers.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CellStyle(u32);
+
+impl CellStyle {
+    pub fn new(foreground: Color, background: Color) -> Self {
+        Self::from_data(StyleData::new(foreground, background))
     }
 
-    pub const fn dim(mut self) -> Self {
-        self.dim = true;
-        self
+    pub fn bold(self) -> Self {
+        self.map(|data| data.bold = true)
     }
 
-    pub const fn italic(mut self) -> Self {
-        self.italic = true;
-        self
+    pub fn dim(self) -> Self {
+        self.map(|data| data.dim = true)
     }
 
-    pub const fn underline(mut self) -> Self {
-        self.underline = Underline::Plain;
-        self
+    pub fn italic(self) -> Self {
+        self.map(|data| data.italic = true)
     }
 
-    pub const fn underline_style(mut self, underline: Underline) -> Self {
-        self.underline = underline;
-        self
+    pub fn underline(self) -> Self {
+        self.map(|data| data.underline = Underline::Plain)
     }
 
-    pub const fn underline_color(mut self, color: Color) -> Self {
-        self.underline_color = Some(color);
-        self
+    pub fn underline_style(self, underline: Underline) -> Self {
+        self.map(|data| data.underline = underline)
     }
 
-    pub const fn strikeout(mut self) -> Self {
-        self.strikeout = true;
-        self
+    pub fn underline_color(self, color: Color) -> Self {
+        self.map(|data| data.underline_color = Some(color))
     }
 
-    pub const fn reverse(mut self) -> Self {
-        self.reverse = true;
-        self
+    pub fn strikeout(self) -> Self {
+        self.map(|data| data.strikeout = true)
     }
 
-    pub const fn hidden(mut self) -> Self {
-        self.hidden = true;
-        self
+    pub fn reverse(self) -> Self {
+        self.map(|data| data.reverse = true)
+    }
+
+    pub fn hidden(self) -> Self {
+        self.map(|data| data.hidden = true)
+    }
+
+    /// Returns a copy with the dim attribute set to `dim` (used by the
+    /// animation layer's motion transition, which mutates every cell).
+    pub fn with_dim(self, dim: bool) -> Self {
+        self.map(|data| data.dim = dim)
+    }
+
+    /// Resolves this handle to its interned style data.
+    pub(crate) fn resolve(self) -> StyleData {
+        style_table()
+            .lock()
+            .expect("style table mutex poisoned")
+            .styles[self.0 as usize]
+    }
+
+    fn from_data(data: StyleData) -> Self {
+        Self(
+            style_table()
+                .lock()
+                .expect("style table mutex poisoned")
+                .intern(data),
+        )
+    }
+
+    fn map(self, f: impl FnOnce(&mut StyleData)) -> Self {
+        let mut table = style_table().lock().expect("style table mutex poisoned");
+        let mut data = table.styles[self.0 as usize];
+        f(&mut data);
+        Self(table.intern(data))
     }
 }
 
@@ -282,7 +351,7 @@ impl Scene {
         }
         let dim = progress < 500;
         for cell in &mut self.cells {
-            cell.style.dim = dim;
+            cell.style = cell.style.with_dim(dim);
         }
     }
 
@@ -688,12 +757,33 @@ fn intersect(first: Rect, second: Rect) -> Option<Rect> {
 mod tests {
     use super::*;
 
-    const STYLE: CellStyle = CellStyle::new(Color::rgb(1, 2, 3), Color::rgb(4, 5, 6));
+    fn style() -> CellStyle {
+        CellStyle::new(Color::rgb(1, 2, 3), Color::rgb(4, 5, 6))
+    }
+
+    #[test]
+    fn cell_style_is_a_compact_handle_with_global_dedup() {
+        // The handle is a single 4-byte table index, not the expanded style
+        // struct, so the cell buffer shrinks accordingly.
+        assert_eq!(std::mem::size_of::<CellStyle>(), std::mem::size_of::<u32>());
+
+        let first = CellStyle::new(Color::rgb(1, 2, 3), Color::rgb(4, 5, 6));
+        let again = CellStyle::new(Color::rgb(1, 2, 3), Color::rgb(4, 5, 6));
+        let other = CellStyle::new(Color::rgb(9, 9, 9), Color::rgb(4, 5, 6));
+        assert_eq!(first, again, "identical styles must resolve to one handle");
+        assert_ne!(first, other, "distinct styles must get distinct handles");
+
+        let data = first.resolve();
+        assert_eq!(data.foreground, Color::rgb(1, 2, 3));
+        assert_eq!(data.background, Color::rgb(4, 5, 6));
+        assert!(!data.bold);
+        assert!(first.bold().resolve().bold);
+    }
 
     #[test]
     fn text_is_clipped_to_the_scene() {
         let mut scene = Scene::new(Rect::new(0, 0, 4, 1));
-        scene.text(2, 0, "abcd", STYLE);
+        scene.text(2, 0, "abcd", style());
 
         assert_eq!(scene.cell_at(0, 0).unwrap().symbol, ' ');
         assert_eq!(scene.cell_at(1, 0).unwrap().symbol, ' ');
@@ -704,7 +794,7 @@ mod tests {
     #[test]
     fn wide_text_tracks_its_continuation_cell() {
         let mut scene = Scene::new(Rect::new(0, 0, 5, 1));
-        scene.text(0, 0, "界a", STYLE);
+        scene.text(0, 0, "界a", style());
 
         assert_eq!(scene.cell_at(0, 0).unwrap().symbol, '界');
         assert_eq!(scene.cell_at(0, 0).unwrap().width, CellWidth::Wide);
@@ -716,7 +806,7 @@ mod tests {
     #[test]
     fn wide_text_is_not_started_when_it_would_be_clipped() {
         let mut scene = Scene::new(Rect::new(0, 0, 2, 1));
-        scene.text(1, 0, "界", STYLE);
+        scene.text(1, 0, "界", style());
 
         assert_eq!(scene.cell_at(0, 0).unwrap().symbol, ' ');
         assert_eq!(scene.cell_at(1, 0).unwrap().symbol, ' ');
@@ -869,8 +959,8 @@ mod tests {
     #[test]
     fn drawing_outside_the_scene_is_ignored() {
         let mut scene = Scene::new(Rect::new(2, 3, 4, 2));
-        scene.set(0, 0, 'x', STYLE);
-        scene.set(2, 3, 'o', STYLE);
+        scene.set(0, 0, 'x', style());
+        scene.set(2, 3, 'o', style());
 
         assert!(scene.cell_at(0, 0).is_none());
         assert_eq!(scene.cell_at(2, 3).unwrap().symbol, 'o');

@@ -1536,6 +1536,7 @@ fn write_style_if_changed<W: Write>(
 }
 
 fn write_style<W: Write>(writer: &mut W, style: CellStyle) -> io::Result<()> {
+    let style = style.resolve();
     queue!(
         writer,
         SetAttribute(Attribute::Reset),
