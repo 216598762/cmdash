@@ -158,4 +158,56 @@ mod tests {
         assert!(matches!(reloader.poll(), Err(ReloadError::Config(_))));
         fs::remove_file(path).unwrap();
     }
+
+    #[cfg(feature = "watch")]
+    #[test]
+    fn config_watcher_reports_direct_and_atomic_saves() {
+        use std::sync::mpsc;
+
+        let path = std::env::temp_dir().join(format!(
+            "cmdash-watch-{}-{}.toml",
+            std::process::id(),
+            thread::current().name().unwrap_or("watch")
+        ));
+        fs::write(&path, "version = 1\n").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let _watcher = ConfigWatcher::spawn(path.clone(), move |result| {
+            if let Ok(event) = result {
+                let _ = tx.send(event);
+            }
+        })
+        .expect("config watcher should start");
+        // Let the notify backend subscribe before mutating the file.
+        thread::sleep(Duration::from_millis(50));
+
+        // A plain rewrite is the simplest save path.
+        fs::write(&path, "version = 1\n[workspace]\nname = \"direct\"\n").unwrap();
+        let direct = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("watcher did not report a direct save");
+
+        // Editors save atomically: write a sibling temp file, then rename it
+        // over the config. The watcher must catch this because it watches the
+        // parent directory, not the inode of the original file.
+        let tmp =
+            std::env::temp_dir().join(format!("cmdash-watch-{}-tmp.toml", std::process::id()));
+        fs::write(&tmp, "version = 1\n[workspace]\nname = \"atomic\"\n").unwrap();
+        fs::rename(&tmp, &path).unwrap();
+        let atomic = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("watcher did not report an atomic rename-over save");
+
+        for event in [direct, atomic] {
+            assert!(
+                matches!(
+                    event.kind,
+                    notify::EventKind::Create(_) | notify::EventKind::Modify(_)
+                ),
+                "unexpected event kind: {:?}",
+                event.kind
+            );
+        }
+        fs::remove_file(path).ok();
+    }
 }
