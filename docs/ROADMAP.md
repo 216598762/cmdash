@@ -2370,6 +2370,84 @@ in the default build, so the default dependency tree stays minimal.
   concrete profile or test need justifies them.
 - Replacing the optional Wasmtime host or the sixel encoder in this phase.
 
+## Pane-level emulation, resize, scroll-margins, and graphics — reconciliation
+
+This section records four pane-focused requirements and reconciles them against
+what is already shipped. The framing below (an in-memory grid, TIOCSWINSZ,
+DECSTBM isolation, and graphic wrapping) is the classic raw-forwarding
+multiplexer checklist. cmdash deliberately does *not* forward a child's raw
+byte stream into a single shared terminal: every `terminal` pane owns one full
+emulator plus its own graphics store, and the composite is re-rendered at
+absolute screen coordinates. That one decision makes three of the four items
+moot and the fourth already solved.
+
+### 1. In-memory VTE screen buffer per pane
+
+**Requirement:** parse each pane's VT100/ANSI stream into an internal
+`Grid[rows][cols]` and redraw cells at `(pane_x + cell_x, pane_y + cell_y)`.
+
+**Status: implemented, and superseded by the emulator.** Each `terminal` pane
+owns one `alacritty_terminal` instance
+(`TerminalSession::term: Term<SessionEventListener>` in `src/session.rs`,
+landed in Phase 3). The emulator owns the cell grid, modes, cursor,
+scrollback, and DECSTBM region itself; cmdash never parses the stream into its
+own cell matrix. The "final composite redraw at explicit coordinates" half is
+the retained `Scene` → `Compositor` → backend path (Phase 1, optimized in
+Phase 19): cells are emitted at absolute screen coordinates and diffed, with no
+raw stream ever forwarded to stdout.
+
+### 2. Window-size propagation (TIOCSWINSZ)
+
+**Requirement:** send TIOCSWINSZ to the child PTY on pane create/resize.
+
+**Status: implemented.** `Session::resize` (`src/session.rs`) calls
+`self.master.resize(PtySize { rows, cols, pixel_width, pixel_height })` —
+`portable-pty` performs the ioctl — then resizes the emulator, re-anchors
+image placements across the reflow, and updates the reported size. The initial
+size is applied through the same `PtySize` at spawn, so both creation and
+resize propagate column/row (and pixel) boundaries to the child. Covered by
+Phase 1/3 resize handling and `terminal_session_resizes_and_rejects_invalid_sizes`.
+
+### 3. DECSTBM scroll margins
+
+**Requirement:** constrain scrolling to a pane's vertical range via
+`CSI top;bottom r`.
+
+**Status: implemented, with a corrected model.** In a raw-forwarding
+multiplexer you would emit DECSTBM so one pane's scroll cannot bleed into
+another. Because cmdash renders each session independently at absolute
+coordinates, DECSTBM is *not* a layout-isolation tool here. Instead it is
+faithfully emulated per session: `alacritty_terminal` applies the child's own
+scroll region, and the graphics side mirrors it through
+`ScrollRegionTracker` (its vte `Handler` callback `set_scrolling_region` in
+`src/session.rs`) plus `GraphicsScrollRegion` (`src/graphics.rs`), so image
+placements inside a partial region scroll and insert/delete-line correctly
+(Workstream 8, Phase 16). No per-pane margin injection is needed or desired;
+adding one would corrupt a child's legitimate full-screen scrolling.
+
+### 4. Filter/wrap graphic protocols
+
+**Requirement:** intercept Kitty/Sixel escapes, clip them to pane bounds, and
+recompute offsets relative to the pane frame on scroll.
+
+**Status: implemented.** The Kitty APC is intercepted before the emulator and
+routed into the per-session `SessionGraphicsStore` (Phase 5). Placements carry
+a `GraphicsGridAnchor`, are clipped and re-anchored on scroll/resize/reflow,
+and are re-emitted at pane-relative→screen coordinates (Graphics compatibility
+program, Workstream 8). Optional sixel flows through the retained scene with
+capability negotiation (Phase 9). Pane-scoped clipping and scroll re-anchoring
+are covered by the graphics conformance suite and `tests/kitty_verify.py`.
+
+### Verdict
+
+No new build work is required: all four items are already shipped and tested,
+and the raw-forwarding assumption behind items 1 and 3 is intentionally
+replaced by the one-emulator-per-pane model recorded in the decision log below.
+If a future mode ever forwards a child's raw stream to an outer terminal (for
+example a tmux-control or passthrough mode), items 3 and 4 would need to be
+revisited *in that mode only* — that is explicitly out of scope for the current
+architecture.
+
 ## Decision log starters
 
 | Topic | Provisional direction | Why it matters |
@@ -2377,6 +2455,7 @@ in the default build, so the default dependency tree stays minimal.
 | Workspace scope | One active workspace initially; saved workspaces later | Keeps persistence and lifecycle complexity out of the first runtime contract |
 | Terminal backend | `crossterm` behind the cmdash backend boundary | Supplies raw mode, input, resize, and basic controls without owning retained composition |
 | Terminal emulator | One `alacritty_terminal` instance plus a cmdash-owned graphics adapter per session | Preserves emulator and image state isolation while leaving a Kitty verification gate |
+| Emulation vs forwarding model | One full emulator per pane; no raw stream forwarding into a shared terminal | Makes per-pane grid/resize/scroll isolation inherent and removes the need for DECSTBM-based layout isolation or manual stream wrapping |
 | Terminal capabilities | ANSI/VT text and core interaction required; graphics and enhanced input optional | Ensures unsupported terminal features degrade deliberately rather than corrupting output |
 | Terminal session ownership | One emulator and graphics store for each terminal tab/session | Prevents state and image-ID cross-contamination |
 | Rendering | Retained, backend-neutral scene composed into complete frames | Makes widgets modular and tab restoration deterministic |
