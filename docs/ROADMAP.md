@@ -952,10 +952,11 @@ Define an explicit table from each buffer mutation to its command stream:
 
 ### Testing and validation
 
-- [ ] Add virtual-buffer unit tests: row attachment, scroll moves, insert/
+- [x] Add virtual-buffer unit tests: row attachment, scroll moves, insert/
   delete-line moves, erase deletes, reflow re-attach, and past-limit
   eviction, asserting the object list matches the emulator grid after each
-  mutation.
+  mutation. *(Covered by the `virtual_buffer` unit tests plus the store golden
+  tests for erase/reflow/scroll/IL-DL.)*
 - [x] Add command-stream golden tests for each mutation (scroll N, insert 3
   lines, `ED 2`, `ED 3`, RIS, alternate-screen switch, reflow), asserting
   exactly-one move per affected object, correct ordering, idempotency, and
