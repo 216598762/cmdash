@@ -30,9 +30,16 @@ Kitty's own `grman`/`update_layers`, that:
     float and truncates, cmdash blends in integer math).
 
 Prerequisites: a kitty installation whose Python package is importable (the
-`kitty.fast_data_types` C extension). Run from the repo root:
+`kitty.fast_data_types` C extension). Run from the repo root with either the
+system Python (when kitty's package is on the import path, e.g. Arch's
+`/usr/lib/kitty`):
 
     python3 tests/kitty_verify.py
+
+or with kitty's embedded Python, which works for any kitty install (including
+the standalone kitty.app bundle used in CI):
+
+    kitty +runpy "exec(open('tests/kitty_verify.py').read(), {'__name__': '__main__'})"
 
 No display server is needed: the Screen is driven offscreen via the same
 `test_create_write_buffer`/`test_parse_written_data` hooks Kitty's own test
@@ -40,9 +47,14 @@ suite uses.
 """
 import sys
 
-sys.path.insert(0, '/usr/lib/kitty')
-
-from kitty.fast_data_types import Screen  # noqa: E402
+try:
+    from kitty.fast_data_types import Screen  # noqa: E402
+except ImportError:
+    # Arch/pacman keeps the kitty package outside the default sys.path.
+    # `kitty +runpy` (used in CI) already has it importable, so this fallback
+    # only fires when running under a system Python.
+    sys.path.insert(0, '/usr/lib/kitty')
+    from kitty.fast_data_types import Screen  # noqa: E402
 
 
 class Callbacks:
