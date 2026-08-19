@@ -31,6 +31,26 @@ fn write_image_fixture(name: &str, bytes: &[u8]) -> std::path::PathBuf {
     path
 }
 
+/// Reports whether the `kitten` executable is available on `PATH`.
+///
+/// The installed-`kitten` fixtures exercise cmdash's emulator against a real
+/// `kitten icat` process, but they must not fail the suite on machines that
+/// do not have Kitty installed. Callers skip (not fail) when this is `false`.
+fn kitten_available() -> bool {
+    Command::new("kitten")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Reports whether the `tmux` executable is available on `PATH`.
+fn tmux_available() -> bool {
+    Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 /// A shell-based stand-in for kitty's `kitten icat` detection handshake.
 ///
 /// It emits the direct, file, and shared-memory Kitty query commands followed
@@ -221,8 +241,11 @@ fn icat_negotiation_receives_graphics_and_da1_responses_without_kitty() {
 }
 
 #[test]
-#[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
 fn installed_kitten_detect_support_completes_inside_the_pty_fixture() {
+    if !kitten_available() {
+        eprintln!("skipping: kitten is not installed");
+        return;
+    }
     let mut session = TerminalSession::spawn_with_session_id(
         SessionId::new(200_002),
         Some("kitten"),
@@ -260,8 +283,11 @@ fn installed_kitten_detect_support_completes_inside_the_pty_fixture() {
 }
 
 #[test]
-#[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
 fn installed_kitten_image_upload_reaches_the_retained_graphics_store() {
+    if !kitten_available() {
+        eprintln!("skipping: kitten is not installed");
+        return;
+    }
     let path = write_image_fixture("upload", TINY_GIF);
 
     let mut session = TerminalSession::spawn_with_session_id(
@@ -313,26 +339,16 @@ fn installed_kitten_image_upload_reaches_the_retained_graphics_store() {
 }
 
 #[test]
-#[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
 fn installed_kitten_file_transfer_stream_reaches_the_retained_graphics_store() {
+    if !kitten_available() {
+        eprintln!("skipping: kitten is not installed");
+        return;
+    }
     // Drive kitten's real file-transfer fast path (`--transfer-mode file`):
     // kitten writes the decoded pixels to a `kitty-tty-graphics-protocol-*`
     // temp file and transmits `t=t` with that path. The store must read it,
     // retain the image, and delete the temp file (marker convention).
     let path = write_image_fixture("file-transfer", TINY_GIF);
-    if !Command::new("kitten")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-    {
-        eprintln!("skipping file-transfer fixture: kitten is not installed");
-        let _ = std::fs::remove_file(&path);
-        return;
-    }
-    // The store deletes a `t=t` temp file after reading it (marker
-    // convention). Snapshot the shm dir before/after so a parallel test's
-    // leftover files don't make this flaky.
-    let shm_before = shm_temp_files();
 
     let mut session = TerminalSession::spawn_with_session_id(
         SessionId::new(200_009),
@@ -371,22 +387,17 @@ fn installed_kitten_file_transfer_stream_reaches_the_retained_graphics_store() {
         session.graphics_diagnostics()
     );
     // kitten transmits `t=t` (temp-file) for --transfer-mode file, so the
-    // capture must carry the temp-file marker path (base64-encoded in the
-    // payload).
+    // capture must carry a `t=t` command whose base64 payload names the temp
+    // file. Parsing the command (rather than scanning the whole stream) makes
+    // the filename deterministic for the deletion check below.
     let capture = session.graphics_protocol_capture();
-    let uses_file_transfer = capture.windows(3).any(|window| window == b"t=t")
-        && capture
-            .split(|byte| *byte == b';')
-            .nth(1)
-            .is_some_and(|payload| {
-                String::from_utf8_lossy(&decode_base64_for_test(payload))
-                    .contains("tty-graphics-protocol")
-            });
+    let temp_path = file_transfer_temp_path(capture);
     assert!(
-        uses_file_transfer,
+        temp_path.is_some(),
         "kitten did not use the file-transfer fast path: capture={:?}",
         String::from_utf8_lossy(capture)
     );
+    let temp_path = temp_path.expect("checked above");
     // The 1x1 GIF decodes to a single RGBA pixel (4 bytes) in the retained
     // store; the temp file is deleted after reading.
     let submission = &submissions[0];
@@ -401,34 +412,45 @@ fn installed_kitten_file_transfer_stream_reaches_the_retained_graphics_store() {
     session
         .shutdown()
         .expect("could not shut down kitten file-transfer fixture");
-    // The store removed the temp file it read (no *new* marker files remain).
-    let after = shm_temp_files();
+    // The store deletes the `t=t` temp file after reading it. Check the exact
+    // path kitten transmitted rather than the shared /dev/shm directory, which
+    // parallel tests can populate with their own `t=s` objects mid-run.
     assert!(
-        after.len() <= shm_before.len(),
-        "t=t temp file was not deleted after reading: new files={:?}",
-        after.iter().filter(|name| !shm_before.contains(name)).collect::<Vec<_>>()
+        !temp_path.exists(),
+        "t=t temp file was not deleted after reading: {temp_path:?}"
     );
 }
 
-/// Lists the `kitty-tty-graphics-protocol-*` temp files currently in the
-/// shared-memory directory (where kitten writes them for `--transfer-mode
-/// file`).
-fn shm_temp_files() -> Vec<String> {
-    let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/dev/shm") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("kitty-tty-graphics-protocol-") {
-                files.push(name);
+/// Extracts the temp-file path kitten transmitted with `t=t`
+/// (`--transfer-mode file`). The filename is the base64-decoded payload of the
+/// first graphics command whose parameters carry the `t=t` field and whose
+/// name uses Kitty's `tty-graphics-protocol` temp-file convention.
+fn file_transfer_temp_path(capture: &[u8]) -> Option<std::path::PathBuf> {
+    let mut adapter = GraphicsProtocolAdapter::default();
+    let mut events = adapter.feed(capture).ok()?;
+    if let Ok(tail) = adapter.finish() {
+        events.extend(tail);
+    }
+    for event in events {
+        let GraphicsProtocolEvent::Command(command) = event else {
+            continue;
+        };
+        if command.parameters().windows(3).any(|field| field == b"t=t") {
+            let path = String::from_utf8(decode_base64_for_test(command.payload())).ok()?;
+            if path.contains("tty-graphics-protocol") {
+                return Some(std::path::PathBuf::from(path));
             }
         }
     }
-    files
+    None
 }
 
 #[test]
-#[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
 fn installed_kitten_place_option_reaches_the_expected_retained_geometry() {
+    if !kitten_available() {
+        eprintln!("skipping: kitten is not installed");
+        return;
+    }
     let path = write_image_fixture("place", TINY_GIF);
     let mut session = TerminalSession::spawn_with_session_id(
         SessionId::new(200_004),
@@ -468,8 +490,11 @@ fn installed_kitten_place_option_reaches_the_expected_retained_geometry() {
 }
 
 #[test]
-#[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
 fn installed_kitten_unicode_placeholder_option_reaches_the_pty_session() {
+    if !kitten_available() {
+        eprintln!("skipping: kitten is not installed");
+        return;
+    }
     let path = write_image_fixture("placeholder", TINY_GIF);
     let mut session = TerminalSession::spawn_with_session_id(
         SessionId::new(200_005),
@@ -525,18 +550,16 @@ fn installed_kitten_unicode_placeholder_option_reaches_the_pty_session() {
 }
 
 #[test]
-#[ignore = "requires installed kitten and tmux executables, but not a Kitty terminal"]
 fn installed_kitten_tmux_passthrough_reaches_the_session_adapter() {
-    let path = write_image_fixture("passthrough", TINY_GIF);
-    if !Command::new("tmux")
-        .arg("-V")
-        .output()
-        .is_ok_and(|output| output.status.success())
-    {
-        eprintln!("skipping passthrough fixture: tmux is not installed");
-        let _ = std::fs::remove_file(&path);
+    if !kitten_available() {
+        eprintln!("skipping: kitten is not installed");
         return;
     }
+    if !tmux_available() {
+        eprintln!("skipping: tmux is not installed");
+        return;
+    }
+    let path = write_image_fixture("passthrough", TINY_GIF);
     // icat writes graphics to the PTY's controlling TTY, not redirected
     // stdout. The fixture starts a private tmux server so icat can query the
     // passthrough policy, while the session still receives the wrapped bytes.
@@ -576,11 +599,14 @@ fn installed_kitten_tmux_passthrough_reaches_the_session_adapter() {
     let mut events = adapter
         .feed(bytes)
         .expect("passthrough capture was rejected");
-    events.extend(
-        adapter
-            .finish()
-            .expect("passthrough capture was incomplete"),
-    );
+    // `tmux kill-server` can cut the trailing passthrough command off
+    // mid-write, leaving an unterminated tail after the complete commands
+    // `feed` already parsed. The assertions below only need those complete
+    // commands, so an incomplete tail is tolerated rather than treated as a
+    // capture failure.
+    if let Ok(tail) = adapter.finish() {
+        events.extend(tail);
+    }
     let commands = events
         .into_iter()
         .filter_map(|event| match event {
@@ -618,8 +644,11 @@ fn installed_kitten_tmux_passthrough_reaches_the_session_adapter() {
 }
 
 #[test]
-#[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
 fn installed_kitten_animation_reaches_the_retained_frame_store() {
+    if !kitten_available() {
+        eprintln!("skipping: kitten is not installed");
+        return;
+    }
     let path = write_image_fixture("animation", ANIMATED_GIF);
     let mut session = TerminalSession::spawn_with_session_id(
         SessionId::new(200_007),
@@ -673,8 +702,11 @@ fn installed_kitten_animation_reaches_the_retained_frame_store() {
 }
 
 #[test]
-#[ignore = "requires the installed kitten executable, but not a Kitty terminal"]
 fn installed_kitten_failure_path_does_not_create_a_graphics_frame() {
+    if !kitten_available() {
+        eprintln!("skipping: kitten is not installed");
+        return;
+    }
     let missing = std::env::temp_dir().join(format!(
         "cmdash-kitty-missing-{}-{}.gif",
         std::process::id(),

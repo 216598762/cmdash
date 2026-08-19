@@ -140,3 +140,30 @@ jobs:
 
       - name: Run tests on minimum supported Rust version
         run: cargo test --locked --all-targets --all-features
+
+  kitten-integration:
+    name: Real kitten icat and tmux integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Install kitty (provides kitten)
+        run: |
+          curl -L https://sw.kovidgoyal.net/kitty/installer.sh | sh /dev/stdin launch=n
+          echo "$HOME/.local/kitty.app/bin" >> "$GITHUB_PATH"
+
+      - name: Verify tool availability
+        run: |
+          kitten --version
+          tmux -V
+
+      - name: Run kitten/tmux fixtures and the PTY latency benchmark
+        run: cargo test --locked --all-features --test kitty_protocol --test terminal_latency -- --include-ignored

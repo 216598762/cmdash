@@ -17,7 +17,7 @@ const RECEIVE_TIMEOUT: Duration = Duration::from_secs(2);
 const READY_MARKER: &str = "__CMDASH_LATENCY_READY__";
 
 #[test]
-#[ignore = "run explicitly with --ignored --nocapture to measure local PTY latency"]
+#[ignore = "timing measurement, not a correctness gate; run via --include-ignored (also exercised by the CI kitten-integration job)"]
 fn terminal_key_to_echo_latency_benchmark() {
     let (sender, receiver, wakeup) = ui_event_channel();
     drop(sender);
