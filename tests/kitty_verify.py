@@ -561,6 +561,29 @@ def main():
           s.grman.image_count == 0, f'image_count={s.grman.image_count}')
 
     # -----------------------------------------------------------------------
+    # Scenario 7: DECSTBM region scroll. A child sets a partial scroll region,
+    # places an image inside it, then scrolls the region with a linefeed. Real
+    # Kitty must move the placement up by one row inside the region (it follows
+    # the text) and keep it reachable in history — exactly the behavior cmdash's
+    # ScrollRegionTracker models in
+    # `session_graphics_follow_decstbm_scrolling_without_primary_scrollback`.
+    s, c = create_screen(4, 6, scrollback=100)
+    parse_bytes(s, b'\x1b[2;5r')  # region rows 2..5 => 0-based rows 1..5
+    parse_bytes(s, b'\x1b[5;1H\x1b_Ga=T,f=24,i=7,s=1,v=1,c=1,r=1,C=1,q=2,p=1;AQID\x1b\\')
+
+    def region_rows(screen, scrolled_by):
+        return [(lyr['image_id'], row_of(lyr, 6)) for lyr in layers(screen, scrolled_by)]
+
+    check('7.1 placement starts inside the region at row 4',
+          region_rows(s, 0) == [(1, 4)], describe_layers(layers(s)))
+    parse_bytes(s, b'\n')  # linefeed at the region bottom scrolls the region
+    check('7.2 region scroll moves the placement up one row to row 3',
+          region_rows(s, 0) == [(1, 3)], describe_layers(layers(s)))
+    check('7.3 region-scrolled placement stays reachable in region history',
+          region_rows(s, 1) == [(1, 4)] and region_rows(s, 2) == [(1, 5)],
+          f"dep1={region_rows(s, 1)} dep2={region_rows(s, 2)}")
+
+    # -----------------------------------------------------------------------
     failed = [name for name, ok, _ in checks if not ok]
     print()
     print(f"{len(checks) - len(failed)}/{len(checks)} checks passed")

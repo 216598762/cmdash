@@ -3213,6 +3213,63 @@ mod tests {
         assert!(session.is_closed());
     }
 
+    /// Renders the session's visible screen as a flat string of cell symbols
+    /// (rows joined left-to-right), for polling-based assertions over real PTY
+    /// output.
+    fn rendered_text(session: &TerminalSession) -> String {
+        let columns = session.size().columns;
+        let rows = session.size().rows;
+        let scene = session.render(Rect::new(0, 0, columns, rows), false);
+        let mut text = String::with_capacity(usize::from(columns) * usize::from(rows));
+        for y in 0..rows {
+            for x in 0..columns {
+                if let Some(cell) = scene.cell_at(x, y) {
+                    text.push(cell.symbol);
+                }
+            }
+        }
+        text
+    }
+
+    fn wait_for_rendered_substring(session: &mut TerminalSession, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            session.poll_output().unwrap();
+            if rendered_text(session).contains(needle) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "terminal output never contained {needle:?}; rendered={:?}",
+            rendered_text(session)
+        );
+    }
+
+    #[test]
+    fn pty_child_observes_tiocswinsz_on_spawn_and_resize() {
+        // The child prints `stty size` (rows then columns) before and after a
+        // resize. This proves the TIOCSWINSZ ioctl actually reaches the child
+        // process — for both spawn-time and resize-time propagation — rather
+        // than only updating cmdash's internal `session.size()` bookkeeping.
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &["-c", "stty size; read x; stty size; sleep 5"],
+            TerminalSize::new(40, 8),
+        )
+        .unwrap();
+
+        // Spawn-time size: 40 columns x 8 rows => `stty size` prints "8 40".
+        wait_for_rendered_substring(&mut session, "8 40");
+
+        // Resize, then unblock the child's `read` so it re-queries its size.
+        session.resize(TerminalSize::new(60, 12)).unwrap();
+        session.write_bytes(b"\n").unwrap();
+        wait_for_rendered_substring(&mut session, "12 60");
+
+        session.shutdown().unwrap();
+    }
+
     #[test]
     fn terminal_modes_and_styles_are_reported_from_emulator_output() {
         let mut session = TerminalSession::spawn_with_args(

@@ -2406,7 +2406,11 @@ raw stream ever forwarded to stdout.
 image placements across the reflow, and updates the reported size. The initial
 size is applied through the same `PtySize` at spawn, so both creation and
 resize propagate column/row (and pixel) boundaries to the child. Covered by
-Phase 1/3 resize handling and `terminal_session_resizes_and_rejects_invalid_sizes`.
+Phase 1/3 resize handling, `terminal_session_resizes_and_rejects_invalid_sizes`,
+and — against a real child PTY —
+`pty_child_observes_tiocswinsz_on_spawn_and_resize` (a shell prints `stty size`
+before and after a resize, proving the ioctl reaches the process, not just
+cmdash's internal size bookkeeping).
 
 ### 3. DECSTBM scroll margins
 
@@ -2423,7 +2427,11 @@ scroll region, and the graphics side mirrors it through
 `src/session.rs`) plus `GraphicsScrollRegion` (`src/graphics.rs`), so image
 placements inside a partial region scroll and insert/delete-line correctly
 (Workstream 8, Phase 16). No per-pane margin injection is needed or desired;
-adding one would corrupt a child's legitimate full-screen scrolling.
+adding one would corrupt a child's legitimate full-screen scrolling. Verified
+against real Kitty in `tests/kitty_verify.py` Scenario 7: a linefeed at a
+DECSTBM region's bottom moves an in-region placement up one row and keeps it
+reachable in region history — byte-for-byte the model
+`session_graphics_follow_decstbm_scrolling_without_primary_scrollback` asserts.
 
 ### 4. Filter/wrap graphic protocols
 
