@@ -8,6 +8,8 @@ pub mod config;
 pub mod crash;
 pub mod dashboard;
 pub mod graphics;
+#[cfg(feature = "image")]
+pub mod image;
 pub mod input;
 pub mod keymap;
 pub mod layout;
@@ -60,6 +62,8 @@ pub use graphics::{
     GraphicsResponseDestination, GraphicsScreen, GraphicsScrollRegion, GraphicsSourceRect,
     GraphicsSubmission, OuterInputEvent, SessionGraphicsStore, kitty_error_response,
 };
+#[cfg(feature = "image")]
+pub use image::{DecodedImage, decode_image};
 pub use input::{command_for_key, terminal_capture_command};
 pub use keymap::{KeyAction, KeyChord, Keymap, KeymapError};
 pub use layout::{LayoutError, LayoutNode, LayoutTree};
@@ -69,6 +73,8 @@ pub use plugin::{
     PluginDescriptorV1, PluginError, PluginHostV1, PluginManifestError, PluginManifestV1,
     PluginModule, PluginRegistry, PluginRuntime, PluginWidgetManifest,
 };
+#[cfg(feature = "watch")]
+pub use reload::ConfigWatcher;
 pub use reload::{ConfigReloader, ReloadError};
 pub use scene::{Cell, CellStyle, CellWidth, Color, Scene, SceneCursor, Underline};
 pub use session::{

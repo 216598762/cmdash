@@ -2257,8 +2257,8 @@ house.
 | CLI parsing | `env::args().skip(1)` + `--config`/`-c` match | [`clap`](https://crates.io/crates/clap) (derive) | **Adopt** — declarative flags, free `--help`/`--version`, covers the future `--api-*` overrides |
 | Config/cache path discovery | Hand-rolled `XDG_CONFIG_HOME`/`HOME`/`.config` | [`directories`](https://crates.io/crates/directories) (or `dirs`/`etcetera`) | **Adopt** — cross-platform XDG roots for config, cache, crash, plugin dirs |
 | Error types | 26 hand-rolled `impl fmt::Display` + `std::error::Error` | [`thiserror`](https://crates.io/crates/thiserror) (+ optional [`anyhow`](https://crates.io/crates/anyhow) at the `main` boundary) | **Adopt** — removes error boilerplate, makes `?`/source-chain ergonomic |
-| Config reload | Metadata-polled reload (`Ctrl+R`) | [`notify`](https://crates.io/crates/notify) | **Adopt later** — event-driven reload-on-save; gate behind a `watch` setting |
-| Image decoding | `png` + `gif` crates (protocol slice only) | [`image`](https://crates.io/crates/image) | **Adopt when needed** — unify decode and add JPEG/WebP/BMP for future dashboard/script-widget images; kitty's in-band `f=100` is PNG-only, so no protocol gain today |
+| Config reload | Metadata-polled reload (`Ctrl+R`) | [`notify`](https://crates.io/crates/notify) | **Adopted (feature-gated)** — event-driven reload-on-save behind the `watch` feature; default build keeps metadata polling |
+| Image decoding | `png` + `gif` crates (protocol slice only) | [`image`](https://crates.io/crates/image) | **Adopted (feature-gated)** — JPEG/BMP `decode_image` for future dashboard/script-widget images behind the `image` feature; kitty's in-band `f=100` is PNG-only, so no protocol gain today |
 | Sixel encoding | 220-line bounded 16-color encoder (`src/sixel.rs`) | `sixel-rs`/`tty-sixel`/`libsixel` | **Keep for now** — deliberately bounded and dependency-free; adopt only if truecolor sixel fidelity is required |
 | Kitty protocol | ~9k-line store + adapters (parse/serialize/move/delete) | `little-kitty`, `kitty-graphics-protocol`, `ratatui-image` | **Keep bespoke** (see rationale below) |
 | Scene/compositor/frame-diff | ~1.4k lines retained scene + diff | ratatui `Buffer`/`Frame` | **Keep bespoke** — ratatui is immediate-mode; it fights retained diff + session graphics |
@@ -2302,12 +2302,15 @@ house.
   dependencies; replace the hand-rolled base64, CLI arg match, XDG path
   discovery, and the 26 error-`Display` impls with the crates, keeping every
   error message string byte-identical so tests and docs stay valid.
-- [ ] (deferred — not required to close this phase) Gate `notify` behind an
-  opt-in `watch` setting and wire it to the existing validation/replacement
-  reload path (never replace a valid runtime with a broken one mid-save).
-- [ ] (deferred — not required to close this phase) Add `image` only when a
-  non-PNG/GIF decode is needed (script-widget image output or dashboard
-  thumbnails); keep `png`+`gif` for the protocol slice until then.
+- [x] Gate `notify` behind the opt-in `watch` cargo feature and wire it to the
+  existing validation/replacement reload path: a `ConfigWatcher` watches the
+  config file's parent directory and emits a `ConfigChanged` event, which runs
+  the same re-validate-and-swap reload as `Ctrl+R`, so a broken mid-save write
+  never replaces a valid runtime. The default build keeps metadata polling.
+- [x] Gate `image` behind the opt-in `image` cargo feature with a tested
+  JPEG/BMP `decode_image` entry point for the script-widget/dashboard image
+  path; the protocol slice keeps `png`+`gif` (Kitty `f=100` is PNG-only), and
+  WebP is skipped because its decoder is not vendored for offline builds.
 - [x] Reconcile `docs/DEPENDENCIES.md` with the actual `Cargo.toml`: record
   that the async model is std threads (not `tokio`), mark the adopted crates,
   and move `tracing`/`proptest`/`insta`/`criterion` to an explicit "future,
@@ -2345,10 +2348,12 @@ house.
 counterparts with byte-identical behavior and passing parity tests;
 `DEPENDENCIES.md` matches `Cargo.toml` (std-thread async recorded, future
 crates marked profile-gated); the graphics/scene/widget bespoke decisions are
-documented with their rationale; and the dependency tree is unchanged outside
-base64/clap/directories/thiserror. The only intentionally open items are the
-`notify`/`image` adoptions, which are explicitly deferred until a `watch`
-setting or a non-PNG/GIF decode need arises.
+documented with their rationale; and the default dependency tree is unchanged
+outside base64/clap/directories/thiserror. The two deferred adoptions are now
+closed out as optional, feature-gated dependencies: `notify` (the `watch`
+feature, wired to the reload path) and `image` (the `image` feature, a tested
+JPEG/BMP decode hook for the dashboard/script-widget image path). Neither is
+in the default build, so the default dependency tree stays minimal.
 
 ### Non-goals
 

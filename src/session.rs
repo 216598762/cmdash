@@ -188,6 +188,10 @@ pub enum UiEvent {
     Notification(SessionId, String),
     /// A session's (OSC 0/2) window title changed.
     SessionTitle(SessionId, String),
+    /// The file-backed config changed on disk (notify watcher); the frontend
+    /// should reload and re-validate it without replacing a valid runtime with
+    /// a broken one. Emitted only when the `watch` feature is compiled in.
+    ConfigChanged,
     Tick,
     AnimationFrame,
     ApiWakeup,

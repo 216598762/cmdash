@@ -2,6 +2,11 @@ use std::{fs, path::PathBuf, time::SystemTime};
 
 use crate::config::{AppConfig, ConfigFileError, LoadedConfig};
 
+#[cfg(feature = "watch")]
+use notify::Watcher;
+#[cfg(feature = "watch")]
+use std::path::Path;
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ReloadError {
     #[error("could not inspect config {}: {message}", .path.display())]
@@ -66,6 +71,65 @@ fn modified(path: &PathBuf) -> Result<SystemTime, ReloadError> {
             path: path.clone(),
             message: error.to_string(),
         })
+}
+
+/// An event-driven config watcher for reload-on-save. Only compiled with the
+/// `watch` feature; the default build keeps the metadata-polled reloader.
+///
+/// The watcher watches the config file's parent directory (so an editor's
+/// atomic rename-over rewrite is caught) and invokes `on_change` when the
+/// config file itself is created, modified, or removed. It deliberately does
+/// not reload anything itself: the caller routes the signal through the same
+/// re-validate-and-swap reload path as `Ctrl+R`, so a broken mid-save write
+/// can never replace a valid runtime.
+#[cfg(feature = "watch")]
+pub struct ConfigWatcher {
+    _watcher: notify::RecommendedWatcher,
+}
+
+#[cfg(feature = "watch")]
+impl ConfigWatcher {
+    /// Starts watching `path` and calling `on_change` on relevant events.
+    /// Dropping the returned watcher stops the underlying notify thread.
+    pub fn spawn(
+        path: impl Into<PathBuf>,
+        mut on_change: impl FnMut(notify::Result<notify::Event>) + Send + 'static,
+    ) -> Result<Self, ReloadError> {
+        let path = path.into();
+        let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let watch_dir = canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let watched_file = canonical.clone();
+        let mut watcher =
+            notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+                let Ok(event) = result else {
+                    return;
+                };
+                let touches_config = event.paths.iter().any(|p| p == &watched_file);
+                let mutates_config = matches!(
+                    event.kind,
+                    notify::EventKind::Create(_)
+                        | notify::EventKind::Modify(_)
+                        | notify::EventKind::Remove(_)
+                );
+                if touches_config && mutates_config {
+                    on_change(Ok(event));
+                }
+            })
+            .map_err(|error| ReloadError::Metadata {
+                path: canonical.clone(),
+                message: error.to_string(),
+            })?;
+        watcher
+            .watch(&watch_dir, notify::RecursiveMode::NonRecursive)
+            .map_err(|error| ReloadError::Metadata {
+                path: canonical,
+                message: error.to_string(),
+            })?;
+        Ok(Self { _watcher: watcher })
+    }
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use clap::Parser;
 use cmdash::{
     ApiServer, AppConfig, AppState, Backend, Command, Compositor, CrosstermBackend,
     GraphicsInputDemultiplexer, GraphicsSubmissionStatus, OuterInputEvent, SessionEventBus,
@@ -27,7 +28,6 @@ use cmdash::{
 #[cfg(not(target_os = "linux"))]
 use crossterm::event;
 use crossterm::event::Event;
-use clap::Parser;
 use directories::ProjectDirs;
 
 const MAX_EVENTS_PER_BATCH: usize = 32;
@@ -158,6 +158,20 @@ fn main() -> io::Result<()> {
     let mut state = AppState::from_config(backend.capabilities(), &registry, &config)
         .map_err(|error| io::Error::other(format!("application config rejected: {error}")))?;
     let mut compositor = Compositor::new();
+    // RAII guard: kept alive for the whole run so the notify watcher keeps
+    // emitting `ConfigChanged` events; dropped (which stops the watcher) when
+    // `main` returns.
+    #[cfg(feature = "watch")]
+    let _config_watcher = config_path
+        .as_ref()
+        .map(|path| {
+            let sender = event_sender.clone();
+            cmdash::ConfigWatcher::spawn(path.clone(), move |_| {
+                let _ = sender.send(UiEvent::ConfigChanged);
+            })
+        })
+        .transpose()
+        .map_err(|error| io::Error::other(error.to_string()))?;
     let mut reloader = config_path
         .map(ConfigReloader::new)
         .transpose()
@@ -206,6 +220,36 @@ struct RunContext<'a> {
     api: Option<&'a mut ApiServer>,
 }
 
+/// Applies an already-validated config, recording any migrations and keeping
+/// the current runtime when the reload is rejected (never swap a valid
+/// runtime for a broken one).
+fn apply_loaded_config(
+    state: &mut AppState,
+    registry: &WidgetRegistry,
+    loaded: cmdash::LoadedConfig,
+) {
+    for migration in &loaded.migrations {
+        state.record_diagnostic(format!("config migration: {}", migration.warning()));
+    }
+    if let Err(error) = state.reload_config(registry, &loaded.config) {
+        state.record_diagnostic(format!("config reload rejected: {error}"));
+    }
+}
+
+/// Re-reads and applies the file-backed config. Shared by the `Ctrl+R`
+/// keybinding and the `watch` feature's on-save event so both take the same
+/// validate-then-swap path.
+fn reload_config_from_disk(
+    state: &mut AppState,
+    registry: &WidgetRegistry,
+    reloader: &mut ConfigReloader,
+) {
+    match reloader.reload_with_migrations() {
+        Ok(loaded) => apply_loaded_config(state, registry, loaded),
+        Err(error) => state.record_diagnostic(format!("config reload failed: {error}")),
+    }
+}
+
 fn run<B>(
     backend: &mut B,
     state: &mut AppState,
@@ -237,17 +281,7 @@ where
             .schedule_animation(animation_schedule);
         if let Some(reloader) = context.reloader.as_deref_mut() {
             match reloader.poll_with_migrations() {
-                Ok(Some(loaded)) => {
-                    for migration in &loaded.migrations {
-                        state.record_diagnostic(format!(
-                            "config migration: {}",
-                            migration.warning()
-                        ));
-                    }
-                    if let Err(error) = state.reload_config(context.registry, &loaded.config) {
-                        state.record_diagnostic(format!("config reload rejected: {error}"));
-                    }
-                }
+                Ok(Some(loaded)) => apply_loaded_config(state, context.registry, loaded),
                 Ok(None) => {}
                 Err(error) => state.record_diagnostic(format!("config reload failed: {error}")),
             }
@@ -276,8 +310,13 @@ where
         } else {
             state.widget_surface_scenes()
         };
-        let diff =
-            compositor.compose_and_diff(area, state, &base, &surface_scenes, widget_report.changed());
+        let diff = compositor.compose_and_diff(
+            area,
+            state,
+            &base,
+            &surface_scenes,
+            widget_report.changed(),
+        );
         backend.submit_diff(&diff)?;
         // Workstream 8 adapter swap: the mutation-driven command stream is the
         // source of truth for which placements need upload/place/delete; the
@@ -743,7 +782,7 @@ fn dispatch_available_events<B: Backend<Error = io::Error>>(
     event_receiver: &Receiver<UiEvent>,
     pty_wakeup: &SessionWakeup,
     registry: &WidgetRegistry,
-    reloader: Option<&mut ConfigReloader>,
+    mut reloader: Option<&mut ConfigReloader>,
 ) -> io::Result<bool> {
     let mut events = Vec::with_capacity(MAX_EVENTS_PER_BATCH);
     collect_ui_event(
@@ -754,11 +793,21 @@ fn dispatch_available_events<B: Backend<Error = io::Error>>(
             .map_err(|_| io::Error::other("input and PTY event channel disconnected"))?,
         &mut events,
         pty_wakeup,
+        registry,
+        reloader.as_deref_mut(),
     )?;
 
     while events.len() < MAX_EVENTS_PER_BATCH {
         match event_receiver.try_recv() {
-            Ok(event) => collect_ui_event(backend, state, event, &mut events, pty_wakeup)?,
+            Ok(event) => collect_ui_event(
+                backend,
+                state,
+                event,
+                &mut events,
+                pty_wakeup,
+                registry,
+                reloader.as_deref_mut(),
+            )?,
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
                 return Err(io::Error::other("input and PTY event channel disconnected"));
@@ -775,9 +824,16 @@ fn collect_ui_event<B: Backend<Error = io::Error>>(
     event: UiEvent,
     events: &mut Vec<Event>,
     pty_wakeup: &SessionWakeup,
+    registry: &WidgetRegistry,
+    reloader: Option<&mut ConfigReloader>,
 ) -> io::Result<()> {
     match event {
         UiEvent::Input(event) => events.push(event),
+        UiEvent::ConfigChanged => {
+            if let Some(reloader) = reloader {
+                reload_config_from_disk(state, registry, reloader);
+            }
+        }
         UiEvent::OuterInput(bytes) => {
             let batch = backend.feed_outer_input(&bytes);
             if let Some(error) = batch.graphics_error {
@@ -851,24 +907,7 @@ fn dispatch_event(
                 }
                 Some(Command::ReloadConfig) => {
                     if let Some(reloader) = reloader {
-                        match reloader.reload_with_migrations() {
-                            Ok(loaded) => {
-                                for migration in &loaded.migrations {
-                                    state.record_diagnostic(format!(
-                                        "config migration: {}",
-                                        migration.warning()
-                                    ));
-                                }
-                                if let Err(error) = state.reload_config(registry, &loaded.config) {
-                                    state.record_diagnostic(format!(
-                                        "config reload rejected: {error}"
-                                    ));
-                                }
-                            }
-                            Err(error) => {
-                                state.record_diagnostic(format!("config reload failed: {error}"));
-                            }
-                        }
+                        reload_config_from_disk(state, registry, reloader);
                     } else {
                         state.record_diagnostic("Ctrl+R requires --config <path>");
                     }
