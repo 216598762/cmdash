@@ -107,7 +107,8 @@ pub struct HeadlessPlacement {
 impl HeadlessPlacement {
     /// The placement's source crop as `(x, y, width, height)` in pixels.
     pub fn source(&self) -> Option<(u16, u16, u16, u16)> {
-        self.source.map(|source| (source.x, source.y, source.width, source.height))
+        self.source
+            .map(|source| (source.x, source.y, source.width, source.height))
     }
 }
 
@@ -360,7 +361,9 @@ impl HeadlessKittyTerminal {
     /// The resource's current wire format (`100` for a still-raw PNG/GIF, `32`
     /// once a composition has decoded it to RGBA).
     pub fn resource_format(&self, image_id: u32) -> Option<u8> {
-        self.resources.get(&image_id).map(|resource| resource.format)
+        self.resources
+            .get(&image_id)
+            .map(|resource| resource.format)
     }
 
     /// The resource's decoded root-frame pixels.
@@ -378,11 +381,7 @@ impl HeadlessKittyTerminal {
     }
 
     /// A stored animation frame's raw (delta or keyframe) pixels.
-    pub fn animation_frame_pixels(
-        &self,
-        image_id: u32,
-        frame: u32,
-    ) -> Option<&[HeadlessPixel]> {
+    pub fn animation_frame_pixels(&self, image_id: u32, frame: u32) -> Option<&[HeadlessPixel]> {
         self.resources
             .get(&image_id)
             .and_then(|resource| resource.animation_frames.get(&frame))
@@ -628,7 +627,11 @@ impl HeadlessKittyTerminal {
                         .unwrap_or((width, height));
                     let pixel_width = parameter_u16(&parameters, "s", natural_width)?;
                     let pixel_height = parameter_u16(&parameters, "v", natural_height)?;
-                    (natural.map(|(pixels, _, _)| pixels), pixel_width, pixel_height)
+                    (
+                        natural.map(|(pixels, _, _)| pixels),
+                        pixel_width,
+                        pixel_height,
+                    )
                 } else {
                     let pixel_width = parameter_u16(&parameters, "s", width)?;
                     let pixel_height = parameter_u16(&parameters, "v", height)?;
@@ -773,17 +776,15 @@ impl HeadlessKittyTerminal {
         };
         let requested_frame = parameter_u32_default(parameters, "r", 0)?;
         let frame = if requested_frame == 0 {
-            self.resources
-                .get(&image_id)
-                .map_or(2, |resource| {
-                    resource
-                        .animation_frames
-                        .keys()
-                        .next_back()
-                        .copied()
-                        .unwrap_or(1)
-                        .saturating_add(1)
-                })
+            self.resources.get(&image_id).map_or(2, |resource| {
+                resource
+                    .animation_frames
+                    .keys()
+                    .next_back()
+                    .copied()
+                    .unwrap_or(1)
+                    .saturating_add(1)
+            })
         } else {
             requested_frame
         };
@@ -824,7 +825,9 @@ impl HeadlessKittyTerminal {
                 .get(&image_id)
                 .is_some_and(|resource| resource.animation_frames.contains_key(&base_frame))
         {
-            return Err(format!("animation frame references unknown frame {base_frame}"));
+            return Err(format!(
+                "animation frame references unknown frame {base_frame}"
+            ));
         }
         let frame_pixels = decode_rgba_pixels(format, payload, rect_width, rect_height)
             .ok_or_else(|| "animation frame payload does not match its dimensions".to_owned())?;
@@ -947,7 +950,9 @@ impl HeadlessKittyTerminal {
                 .get(&image_id)
                 .is_some_and(|resource| resource.animation_frames.contains_key(&destination_frame));
         if !source_exists || !destination_exists {
-            return Err(format!("composition references an unknown frame of image {image_id}"));
+            return Err(format!(
+                "composition references an unknown frame of image {image_id}"
+            ));
         }
 
         let source_full = self.coalesce_frame(image_id, source_frame)?;
@@ -958,9 +963,7 @@ impl HeadlessKittyTerminal {
         for row in 0..height {
             let start = usize::from(source_y.saturating_add(row)) * usize::from(pixel_width)
                 + usize::from(source_x);
-            source_rect.extend_from_slice(
-                &source_full[start..start + usize::from(width)],
-            );
+            source_rect.extend_from_slice(&source_full[start..start + usize::from(width)]);
         }
         let blends = format != 24 && compose_mode == 0;
         for row in 0..height {
@@ -1174,7 +1177,10 @@ impl HeadlessKittyTerminal {
 
     /// Resolves the image id for a transmit command: an explicit `i` id, or a
     /// fresh id allocated for a numbered (`I`) image.
-    fn resolve_transmit_image(&mut self, parameters: &BTreeMap<String, String>) -> Result<u32, String> {
+    fn resolve_transmit_image(
+        &mut self,
+        parameters: &BTreeMap<String, String>,
+    ) -> Result<u32, String> {
         if parameters.contains_key("i") && parameters.contains_key("I") {
             return Err("i and I are mutually exclusive".to_owned());
         }
@@ -1197,7 +1203,10 @@ impl HeadlessKittyTerminal {
     /// Resolves the image id for a command that references an already
     /// transmitted image: an explicit `i` id, or the newest image with a
     /// given `I` number.
-    fn resolve_reference_image(&self, parameters: &BTreeMap<String, String>) -> Result<u32, String> {
+    fn resolve_reference_image(
+        &self,
+        parameters: &BTreeMap<String, String>,
+    ) -> Result<u32, String> {
         if parameters.contains_key("i") && parameters.contains_key("I") {
             return Err("i and I are mutually exclusive".to_owned());
         }
@@ -1372,9 +1381,7 @@ fn decode_raster(payload: &[u8]) -> Option<(Vec<HeadlessPixel>, u16, u16)> {
 fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<HeadlessPixel>, u16, u16)> {
     let mut decoder = png::Decoder::new(bytes);
     decoder.set_transformations(
-        png::Transformations::EXPAND
-            | png::Transformations::STRIP_16
-            | png::Transformations::ALPHA,
+        png::Transformations::EXPAND | png::Transformations::STRIP_16 | png::Transformations::ALPHA,
     );
     let mut reader = decoder.read_info().ok()?;
     let mut buffer = vec![0u8; reader.output_buffer_size()];
@@ -1482,7 +1489,8 @@ fn blend_onto(destination: &mut HeadlessPixel, source: HeadlessPixel) {
         return;
     }
     let destination_alpha = u16::from(destination.alpha);
-    let output_alpha = source_alpha.saturating_add(destination_alpha.saturating_mul(255 - source_alpha) / 255);
+    let output_alpha =
+        source_alpha.saturating_add(destination_alpha.saturating_mul(255 - source_alpha) / 255);
     if output_alpha == 0 {
         *destination = HeadlessPixel::TRANSPARENT;
         return;
@@ -1627,7 +1635,7 @@ fn parse_parameters(bytes: &[u8]) -> Result<BTreeMap<String, String>, String> {
     Ok(parameters)
 }
 
-fn parameter<'a>(parameters: &'a BTreeMap<String, String>, key: &str) -> Option<u8> {
+fn parameter(parameters: &BTreeMap<String, String>, key: &str) -> Option<u8> {
     parameters.get(key)?.parse().ok()
 }
 
@@ -1669,11 +1677,9 @@ fn parameter_u16(
             value
                 .parse()
                 .map_err(|error| format!("invalid Kitty APC {key}: {error}"))
-        })        .unwrap_or(Ok(default))
+        })
+        .unwrap_or(Ok(default))
 }
-
-
-
 
 fn parameter_i32(
     parameters: &BTreeMap<String, String>,

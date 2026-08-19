@@ -1833,11 +1833,7 @@ fn write_placeholder_cells<W: Write>(
                     "Kitty image width cannot be encoded as a Unicode placeholder",
                 )
             })?;
-            write!(
-                writer,
-                "{}{}{}{}",
-                '\u{10eeee}', row_mark, column_mark, high
-            )?;
+            write!(writer, "\u{10eeee}{}{}{}", row_mark, column_mark, high)?;
         }
     }
     writer.write_all(b"\x1b[39m")

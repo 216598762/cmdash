@@ -3,9 +3,9 @@ mod headless_kitty;
 
 use cmdash::{
     Backend, BackendCapabilities, Compositor, CrosstermBackend, GraphicsAnimationState,
-    GraphicsCapabilityConfidence, GraphicsCapabilitySource, GraphicsScreen,
-    GraphicsScrollRegion, GraphicsSubmission, GraphicsSubmissionStatus, Scene,
-    SessionGraphicsStore, SessionId, TerminalSession, TerminalSize,
+    GraphicsCapabilityConfidence, GraphicsCapabilitySource, GraphicsScreen, GraphicsScrollRegion,
+    GraphicsSubmission, GraphicsSubmissionStatus, Scene, SessionGraphicsStore, SessionId,
+    TerminalSession, TerminalSize,
 };
 use headless_kitty::{HeadlessKittyTerminal, HeadlessPixel};
 use ratatui::layout::Rect;
@@ -522,7 +522,8 @@ fn clipped_placements_render_the_visible_sub_image_in_the_outer_terminal() {
     assert_eq!(
         terminal.pixel(1, 0),
         Some(headless_kitty::HeadlessPixel::rgb(0, 255, 0))
-    );    assert_eq!(
+    );
+    assert_eq!(
         terminal.pixel(1, 1),
         Some(headless_kitty::HeadlessPixel::rgb(255, 255, 255))
     );
@@ -561,8 +562,8 @@ fn sub_cell_offset_clips_replay_with_a_pixel_shifted_crop() {
         )
         .expect("offset-clipped placement should serialize");
 
-    let terminal =
-        HeadlessKittyTerminal::replay(backend.writer()).expect("offset-clipped placement should replay");
+    let terminal = HeadlessKittyTerminal::replay(backend.writer())
+        .expect("offset-clipped placement should replay");
     let placement = terminal
         .placements()
         .first()
@@ -571,9 +572,6 @@ fn sub_cell_offset_clips_replay_with_a_pixel_shifted_crop() {
     assert_eq!((placement.width, placement.height), (3, 1));
     assert_eq!(placement.source(), Some((4, 0, 26, 10)));
 }
-
-
-
 
 #[test]
 fn headless_framebuffer_renders_unicode_placeholder_cells() {
@@ -1088,7 +1086,9 @@ fn removing_one_placement_keeps_the_image_for_its_other_placements() {
         visible[0].placement().outer_placement_id()
     );
     assert!(
-        scoped.windows(expected.len()).any(|window| window == expected.as_bytes()),
+        scoped
+            .windows(expected.len())
+            .any(|window| window == expected.as_bytes()),
         "expected a placement-scoped delete: {:?}",
         String::from_utf8_lossy(scoped)
     );
@@ -1517,12 +1517,7 @@ fn kitty_placements_advance_the_emulator_cursor_like_a_graphics_terminal() {
     assert_eq!(submissions[0].placement().area(), Rect::new(0, 0, 2, 1));
 
     let scene = session.render(area, false);
-    assert_eq!(
-        scene
-            .cell_at(2, 1)
-            .map(|cell| cell.symbol),
-        Some('X')
-    );
+    assert_eq!(scene.cell_at(2, 1).map(|cell| cell.symbol), Some('X'));
     session
         .shutdown()
         .expect("could not shut down cursor-movement fixture");
@@ -1533,15 +1528,13 @@ fn headless_model_advances_the_cursor_after_default_placements() {
     // Two default (C=0) placements stack after each other's cursor movement:
     // the 2x1 image moves the cursor from (0,0) to (2,1), so the second image
     // lands below it.
-    let stream = b"\x1b_Ga=T,f=24,i=501,c=2,r=1,q=2;AQID\x1b\\\x1b_Ga=T,f=24,i=502,c=1,r=1,q=2;BAUG\x1b\\";
+    let stream =
+        b"\x1b_Ga=T,f=24,i=501,c=2,r=1,q=2;AQID\x1b\\\x1b_Ga=T,f=24,i=502,c=1,r=1,q=2;BAUG\x1b\\";
     let model = HeadlessKittyTerminal::replay(stream).unwrap();
 
     assert_eq!(model.placement_count(), 2);
     assert_eq!((model.placements()[0].x, model.placements()[0].y), (0, 0));
-    assert_eq!(
-        (model.placements()[1].x, model.placements()[1].y),
-        (2, 1)
-    );
+    assert_eq!((model.placements()[1].x, model.placements()[1].y), (2, 1));
     assert_eq!(model.cursor(), (3, 2));
 }
 
@@ -1557,7 +1550,8 @@ fn headless_model_respects_static_and_transmit_only_cursor_policy() {
 
     // A lowercase transmit only stores the image; it neither displays nor
     // moves the cursor, so the later a=T placement starts at (0,0).
-    let stream = b"\x1b_Ga=t,f=24,i=505,s=2,v=1,q=2;AQID\x1b\\\x1b_Ga=T,f=24,i=506,c=1,r=1,q=2;BAUG\x1b\\";
+    let stream =
+        b"\x1b_Ga=t,f=24,i=505,s=2,v=1,q=2;AQID\x1b\\\x1b_Ga=T,f=24,i=506,c=1,r=1,q=2;BAUG\x1b\\";
     let model = HeadlessKittyTerminal::replay(stream).unwrap();
     assert_eq!(model.placement_count(), 1);
     assert_eq!((model.placements()[0].x, model.placements()[0].y), (0, 0));
@@ -1600,7 +1594,10 @@ fn headless_model_and_pty_session_agree_on_cursor_advancement() {
     assert_eq!(submissions.len(), 1);
     assert_eq!(submissions[0].placement().area(), Rect::new(0, 0, 2, 1));
     assert_eq!(
-        session.render(area, false).cell_at(2, 1).map(|cell| cell.symbol),
+        session
+            .render(area, false)
+            .cell_at(2, 1)
+            .map(|cell| cell.symbol),
         Some('X')
     );
     session
@@ -1662,7 +1659,11 @@ fn headless_model_and_pty_session_agree_on_virtual_parent_origin() {
     assert_eq!(model.placement_count(), 1);
     assert_eq!((model.placements()[0].x, model.placements()[0].y), (4, 3));
 
-    let script = r#"printf '\033_Ga=T,f=24,i=800,s=2,v=1,c=1,r=1,U=1,p=1,q=2;AQID\033\\\033[3;6H\033[38;2;0;3;32m\U0010EEEE\u0305\u0305\u0305\033[7;4H\033[38;2;0;3;32m\U0010EEEE\u0305\u0305\u0305\033_Ga=p,i=800,p=2,P=800,Q=1,H=1,V=1,c=1,r=1,q=2\033\\'"#;
+    // The placeholder grapheme is emitted as octal `printf` escapes
+    // (`\364\216\273\256` = U+10EEEE, `\314\205` = U+0305) rather than
+    // `\U`/`\u`, which are bash-only. Ubuntu CI runs dash as /bin/sh, whose
+    // printf does not decode `\U` and would drop the placeholder cells.
+    let script = r#"printf '\033_Ga=T,f=24,i=800,s=2,v=1,c=1,r=1,U=1,p=1,q=2;AQID\033\\\033[3;6H\033[38;2;0;3;32m\364\216\273\256\314\205\314\205\314\205\033[7;4H\033[38;2;0;3;32m\364\216\273\256\314\205\314\205\314\205\033_Ga=p,i=800,p=2,P=800,Q=1,H=1,V=1,c=1,r=1,q=2\033\\'"#;
     let mut session = TerminalSession::spawn_with_session_id(
         SessionId::new(800),
         Some("sh"),
@@ -1752,12 +1753,7 @@ fn animated_gif_payload_auto_extracts_frames_in_store_and_session() {
     let mut store = SessionGraphicsStore::new(SessionId::new(720));
     let parameters = "a=T,f=100,i=720,q=2";
     store
-        .apply_kitty_command_with_context(
-            parameters.as_bytes(),
-            encoded.as_bytes(),
-            (0, 0),
-            (0, 0),
-        )
+        .apply_kitty_command_with_context(parameters.as_bytes(), encoded.as_bytes(), (0, 0), (0, 0))
         .expect("animated GIF transmit should be accepted");
     assert_eq!(store.animation_frame_count(720), Some(1));
     assert_eq!(
@@ -1816,12 +1812,10 @@ fn headless_model_and_pty_session_agree_on_non_raw_frame_composition() {
     // convert to format 32, identically in the headless reference terminal and
     // the cmdash session emulator.
     let red = [
-        255, 0, 0, 255, 255, 0, 0, 255,
-        255, 0, 0, 255, 255, 0, 0, 255,
+        255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
     ];
     let green = [
-        0, 255, 0, 255, 0, 255, 0, 255,
-        0, 255, 0, 255, 0, 255, 0, 255,
+        0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255,
     ];
     let red_pixels = rgba_pixels(&red);
     let green_pixels = rgba_pixels(&green);
@@ -1872,7 +1866,11 @@ fn headless_model_and_pty_session_agree_on_non_raw_frame_composition() {
     let area = Rect::new(0, 0, 20, 4);
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline
-        && session.graphics(area).first().map(|submission| submission.format()) != Some(32)
+        && session
+            .graphics(area)
+            .first()
+            .map(|submission| submission.format())
+            != Some(32)
     {
         session
             .poll_output()
@@ -1916,35 +1914,36 @@ fn quiet_key_suppresses_success_responses_like_kitty() {
         .expect("q=0 must emit an OK response");
     assert!(String::from_utf8_lossy(&ok).contains("OK"));
 
-    assert!(store
-        .apply_kitty_command_with_context(b"a=T,f=24,i=2,q=1", b"BAUG", (0, 0), (0, 0))
-        .unwrap()
-        .is_none());
-    assert!(store
-        .apply_kitty_command_with_context(b"a=T,f=24,i=3,q=2", b"CAUI", (0, 0), (0, 0))
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .apply_kitty_command_with_context(b"a=T,f=24,i=2,q=1", b"BAUG", (0, 0), (0, 0))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .apply_kitty_command_with_context(b"a=T,f=24,i=3,q=2", b"CAUI", (0, 0), (0, 0))
+            .unwrap()
+            .is_none()
+    );
 
     // Query responses follow the same rule.
     let query = store
-        .apply_kitty_command_with_context(
-            b"a=q,i=1,t=d,s=1,v=1,f=24,q=0",
-            b"MTIz",
-            (0, 0),
-            (0, 0),
-        )
+        .apply_kitty_command_with_context(b"a=q,i=1,t=d,s=1,v=1,f=24,q=0", b"MTIz", (0, 0), (0, 0))
         .unwrap()
         .expect("q=0 query must emit a response");
     assert!(String::from_utf8_lossy(&query).contains("OK"));
-    assert!(store
-        .apply_kitty_command_with_context(
-            b"a=q,i=1,t=d,s=1,v=1,f=24,q=1",
-            b"MTIz",
-            (0, 0),
-            (0, 0),
-        )
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .apply_kitty_command_with_context(
+                b"a=q,i=1,t=d,s=1,v=1,f=24,q=1",
+                b"MTIz",
+                (0, 0),
+                (0, 0),
+            )
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1952,7 +1951,8 @@ fn headless_model_and_pty_session_agree_queries_do_not_retain_images() {
     // A query loads and validates its payload but never retains the image
     // (Kitty's `remove_images` after a query). A subsequent transmit is the
     // only retained resource in both the headless model and the PTY session.
-    let stream = b"\x1b_Ga=q,i=1,t=d,s=1,v=1,f=24,q=2;MTIz\x1b\\\x1b_Ga=T,f=24,i=2,c=1,r=1,q=2;AQID\x1b\\";
+    let stream =
+        b"\x1b_Ga=q,i=1,t=d,s=1,v=1,f=24,q=2;MTIz\x1b\\\x1b_Ga=T,f=24,i=2,c=1,r=1,q=2;AQID\x1b\\";
     let model = HeadlessKittyTerminal::replay(stream).unwrap();
     assert_eq!(model.resource_count(), 1);
     assert_eq!(model.placement_count(), 1);

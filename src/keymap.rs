@@ -371,14 +371,14 @@ impl Keymap {
 
     fn rebind(&mut self, action: KeyAction, chord: KeyChord) -> Result<(), KeymapError> {
         self.bindings.retain(|_, bound| *bound != action);
-        if let Some(existing) = self.bindings.get(&chord) {
-            if *existing != action {
-                return Err(KeymapError::Conflict {
-                    chord,
-                    action,
-                    existing: *existing,
-                });
-            }
+        if let Some(existing) = self.bindings.get(&chord)
+            && *existing != action
+        {
+            return Err(KeymapError::Conflict {
+                chord,
+                action,
+                existing: *existing,
+            });
         }
         self.bindings.insert(chord, action);
         Ok(())

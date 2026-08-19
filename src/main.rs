@@ -903,7 +903,7 @@ fn dispatch_event(
             match command {
                 Some(Command::CopySelection) => {
                     state.copy_focused_selection();
-                    return Ok(false);
+                    Ok(false)
                 }
                 Some(Command::ReloadConfig) => {
                     if let Some(reloader) = reloader {

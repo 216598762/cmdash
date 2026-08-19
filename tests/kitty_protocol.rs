@@ -136,8 +136,7 @@ fn create_query_shm(_pid: u32) -> String {
 }
 
 fn encode_base64_for_test(bytes: impl AsRef<[u8]>) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes = bytes.as_ref();
     let mut output = String::new();
     for chunk in bytes.chunks(3) {

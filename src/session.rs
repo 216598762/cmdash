@@ -1496,8 +1496,8 @@ impl TerminalSession {
                     let parameters = command.parameters();
                     let payload = command.payload();
                     let response = match self.graphics.apply_kitty_command_with_scroll_region(
-                        &parameters,
-                        &payload,
+                        parameters,
+                        payload,
                         self.cursor_position(),
                         (self.size.cell_width(), self.size.cell_height()),
                         self.scrollback_lines(),
@@ -1520,7 +1520,7 @@ impl TerminalSession {
                             } else {
                                 image
                                     .filter(|image| *image != 0)
-                                    .map(|_| kitty_error_response(&parameters, &error))
+                                    .map(|_| kitty_error_response(parameters, &error))
                             }
                         }
                     };
@@ -2011,13 +2011,12 @@ fn extract_kitty_events(buffer: &[u8]) -> (Vec<KittyStreamEvent>, Vec<u8>) {
     };
     let mapped = events
         .into_iter()
-        .filter_map(|event| match event {
-            GraphicsProtocolEvent::Plain(bytes) => Some(KittyStreamEvent::Plain(bytes)),
-            GraphicsProtocolEvent::Command(command) => Some(KittyStreamEvent::Command(
-                command.parameters().to_vec(),
-                command.payload().to_vec(),
-            )),
-            GraphicsProtocolEvent::Malformed { bytes, .. } => Some(KittyStreamEvent::Plain(bytes)),
+        .map(|event| match event {
+            GraphicsProtocolEvent::Plain(bytes) => KittyStreamEvent::Plain(bytes),
+            GraphicsProtocolEvent::Command(command) => {
+                KittyStreamEvent::Command(command.parameters().to_vec(), command.payload().to_vec())
+            }
+            GraphicsProtocolEvent::Malformed { bytes, .. } => KittyStreamEvent::Plain(bytes),
         })
         .collect();
     (mapped, adapter.pending_bytes().to_vec())

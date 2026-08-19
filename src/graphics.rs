@@ -201,7 +201,7 @@ impl GraphicsGridAnchor {
         if self.scroll_region.is_full_screen() && current_region.is_full_screen() {
             row += self.scrollback as i32 - current_scrollback as i32;
         } else if self.scroll_region == current_region {
-            row -= i32::try_from(current_region_scroll - self.region_scroll).unwrap_or_else(|_| {
+            row -= i32::try_from(current_region_scroll - self.region_scroll).unwrap_or({
                 if current_region_scroll >= self.region_scroll {
                     i32::MAX
                 } else {
@@ -4461,6 +4461,7 @@ impl SessionGraphicsStore {
             .max()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_placement(
         &mut self,
         image: u32,
@@ -5789,7 +5790,7 @@ pub(crate) fn decode_base64(payload: &[u8]) -> Option<Vec<u8>> {
         .copied()
         .filter(|byte| !byte.is_ascii_whitespace())
         .collect();
-    if filtered.len() % 4 != 0 {
+    if !filtered.len().is_multiple_of(4) {
         filtered.resize(filtered.len() + (4 - filtered.len() % 4), b'=');
     }
     base64::engine::general_purpose::STANDARD
@@ -5871,7 +5872,12 @@ mod tests {
     #[test]
     fn protocol_adapter_handles_split_apc_and_c1_apc() {
         let mut adapter = GraphicsProtocolAdapter::new(1024, 128);
-        assert!(adapter.feed(b"text\x1b_Ga=T,f=24,i=1;AQ").unwrap().len() >= 1);
+        assert!(
+            !adapter
+                .feed(b"text\x1b_Ga=T,f=24,i=1;AQ")
+                .unwrap()
+                .is_empty()
+        );
         let events = adapter.feed(b"ID\x1b\\\x9fa=p,i=1;\x9c").unwrap();
         assert!(events.iter().any(|event| matches!(
             event,
