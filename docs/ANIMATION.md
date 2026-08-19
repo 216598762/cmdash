@@ -8,8 +8,8 @@ link here rather than duplicating animation options.
 ## Design guarantees
 
 - Animation is disabled by default and is safe to disable at any time.
-- The UI coordinator owns scheduling and rendering. Widgets and plugins never
-  create animation threads or write terminal escape sequences.
+- The UI coordinator owns scheduling and rendering. Widgets never create
+  animation threads or write terminal escape sequences.
 - Animation state is separate from PTY, emulator, scrollback, cursor, selection,
   and graphics state.
 - Every animation produces an ordinary clipped `Scene`; the compositor and
@@ -54,7 +54,8 @@ Widget settings may override the global timing for a specific instance:
 ```toml
 [[workspace.widgets]]
 id = 10
-type = "clock"
+type = "widget"
+command = "date +%H:%M:%S"
 
 [workspace.widgets.settings]
 animation = "true"
@@ -165,10 +166,10 @@ content rectangle during every animation frame. Overlays and pane transitions
 are invalidated through the normal compositor path, so stale cells and image
 layers cannot leak into neighboring surfaces.
 
-Plugins receive the explicit `ANIMATION` capability bit only when the host
-advertises it. The host owns scheduling, progress, limits, and shutdown. A
-plugin cannot spawn animation workers, access a PTY, emit terminal escapes, or
-retain a session/graphics resource after its widget is gone.
+The dormant WASM host would receive an explicit `ANIMATION` capability bit only
+when the host advertises it. The host owns scheduling, progress, limits, and
+shutdown; a widget cannot spawn animation workers, access a PTY, emit terminal
+escapes, or retain a session/graphics resource after its widget is gone.
 
 ## Lifecycle and failure behavior
 

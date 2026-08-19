@@ -9,15 +9,15 @@
 
 The architecture should make the second configuration a normal case rather than a special mode. Terminal support is a widget/session provider, not the foundation of every feature.
 
-### Initial decisions
+### Core decisions
 
-The first implementation will use these boundaries:
+The implementation uses these boundaries:
 
 - **Terminal backend:** `crossterm` owns raw mode, input collection, resize events, and basic terminal controls. The cmdash scene/compositor remains independent of Crossterm's frame lifecycle.
 - **Terminal emulator:** use one `alacritty_terminal` instance per session. Kitty APC sequences are intercepted by a cmdash-owned adapter and `SessionGraphicsStore`; retained image layers flow through `Scene` and `Compositor`.
-- **Workspace scope:** start with one active workspace. The state model should leave room for saved workspaces later without making them part of the first runtime contract.
-- **Plugin boundary:** use a versioned manifest and C-compatible data contract, with untrusted plugin execution isolated behind an opt-in Wasmtime host. Plugin manifests are validated before code loading, and the host must not pass Rust trait objects, terminal handles, WASI, or filesystem access across the boundary.
-- **Initial terminal capabilities:** require ANSI/VT text, cursor movement, Unicode cell output, basic colors, alternate-screen support, keyboard input, and resize handling. Treat truecolor, mouse, bracketed paste, keyboard enhancement, and Kitty graphics as optional capabilities.
+- **Workspace scope:** one active workspace. The state model leaves room for saved workspaces without making them part of the runtime contract.
+- **Plugin boundary:** an opt-in Wasmtime host validates import-free modules with fuel accounting. It is a dormant, compile-gated foundation — script widgets are the product's extension model — and it does not pass Rust trait objects, terminal handles, WASI, or filesystem access across the boundary.
+- **Terminal capabilities:** ANSI/VT text, cursor movement, Unicode cell output, basic colors, alternate-screen support, keyboard input, and resize handling are required. Truecolor, mouse, bracketed paste, keyboard enhancement, and Kitty graphics are optional capabilities.
 - **Appearance:** resolve semantic widget roles through a workspace `Theme`; the default uses terminal-native reset/ANSI references so the parent terminal owns inherited palette colors, while explicit RGB overrides and a deterministic fallback remain available.
 - **Fallback behavior:** downgrade optional color/input features when unavailable and omit unsupported or over-limit graphics with an in-app degraded diagnostic. Capability mismatches must never emit malformed output or corrupt text/layout.
 
@@ -34,19 +34,18 @@ The first implementation will use these boundaries:
 
 ```text
 Application
-└── Workspace(s)
+└── Workspace
     └── Layout tree
-        ├── WidgetInstance: dashboard, clock, monitor, ...
+        ├── WidgetInstance: widget (a shell script whose stdout renders)
         └── WidgetInstance: terminal surface
             └── Session: PTY + emulator + retained render state
-                └── Tab(s) / pane contents, depending on chosen UX model
 ```
 
 The terms below are deliberately separate:
 
 - **Workspace:** a saved arrangement and its runtime state.
 - **Layout node:** a horizontal/vertical split, stack, tab group, overlay, or leaf in a workspace layout tree.
-- **Widget type:** an implementation registered in the widget catalog.
+- **Widget type:** an implementation registered in the widget registry (`terminal` or `widget`).
 - **Widget instance:** one configured and stateful use of a widget type.
 - **Surface:** a rectangular region assigned to a widget instance by layout.
 - **Session:** a stateful producer of terminal content. A session normally maps to one PTY and one terminal-emulator instance.
@@ -57,7 +56,7 @@ The terms below are deliberately separate:
 
 A terminal tab should be modeled as a separate `Session` unless the chosen multiplexer semantics explicitly require a tab group to share one emulator. Separate sessions are the safer default because it guarantees PTY, scrollback, and graphics isolation.
 
-## 3. Proposed layers
+## 3. Component layers
 
 ### 3.1 Application shell
 
@@ -130,7 +129,7 @@ thread. See [API.md](API.md) for the wire contract and limits.
 
 ### 3.5 Application state details
 
-Suggested state ownership:
+State ownership:
 
 ```text
 AppState
@@ -150,9 +149,9 @@ SessionState
 └── render_cache / dirty regions
 ```
 
-### 3.6 Widget API and plugin boundary
+### 3.6 Widget API and extension boundary
 
-Widgets should have a small lifecycle-oriented interface, conceptually similar to:
+Widgets use a small lifecycle-oriented interface:
 
 - receive application/runtime messages;
 - update their own state;
@@ -161,9 +160,16 @@ Widgets should have a small lifecycle-oriented interface, conceptually similar t
 - produce a backend-neutral `Scene`;
 - optionally request timers, redraws, or external capabilities.
 
-Dynamic plugins are an early product requirement, so this boundary must be designed before widget implementations spread across the codebase. The host exposes the versioned, capability-based contract through an opt-in Wasmtime runtime rather than passing Rust trait objects directly across a shared-library boundary. The initial host rejects all module imports, does not link WASI, configures fuel accounting, and bounds module size; future host functions must be added explicitly to the manifest capability set. The plugin manager must document plugin lifecycle, permissions, threading, and failure isolation, and reject unsupported ABI/API versions before loading widget code.
+There are two concrete implementations: `terminal` (a live PTY session) and
+`widget` (a spawned shell script). Custom in-process widgets implement the
+public `Widget` trait and register a factory in the `WidgetRegistry`; see
+[CREATING_WIDGETS.md](CREATING_WIDGETS.md).
 
-The plugin API should avoid exposing `stdout`, raw terminal escape sequences, or a concrete terminal backend. A plugin communicates through messages and backend-neutral scene data. Built-in widgets should use the same host-facing contract wherever practical so they exercise the plugin boundary continuously.
+The opt-in Wasmtime host (behind `wasm-plugins`) is a dormant foundation rather
+than the product's extension model. It rejects all module imports, does not
+link WASI, configures fuel accounting, and bounds module size; future host
+functions must be added explicitly to the manifest capability set. It must not
+expose `stdout`, raw terminal escape sequences, or a concrete terminal backend.
 
 Widget categories can include:
 
@@ -172,7 +178,8 @@ Widget categories can include:
 - session widgets (terminal emulator surfaces);
 - container/layout widgets (split, tab group, overlay).
 
-Container widgets should compose child widget instances rather than reimplement their behavior.
+Container widgets compose child widget instances rather than reimplementing
+their behavior.
 
 ### 3.7 Widget runtime helpers and scheduling
 
@@ -180,15 +187,15 @@ The widget runtime keeps rendering, data, and scheduling concerns separate:
 
 - **Shared helpers** in `src/widget.rs` implement bounded severity styling,
   bordered surfaces, `key: value` rows, progress bars, sparkline normalization,
-  and horizontal rules. Built-in widgets reuse them instead of duplicating
+  and horizontal rules. Widgets reuse them instead of duplicating
   widget-specific rendering, and each helper clips to its area and defines
   minimum-size behavior.
 - **Provider/render separation** keeps data sources distinct from `Scene`
-  output. Synchronous widgets recompute a value in `update(now)` and return
-  `WidgetUpdate::Redraw` only when it changed (the `clock` widget is the
-  reference); terminal widgets consume session output through their owned
-  `TerminalSession`. A data provider must be testable without an interactive
-  terminal and must not outlive its owning instance.
+  output. A script widget recomputes its stdout in `update(now)` and returns
+  `WidgetUpdate::Redraw` only when it changed; terminal widgets consume session
+  output through their owned `TerminalSession`. A data provider must be
+  testable without an interactive terminal and must not outlive its owning
+  instance.
 - **Scheduling** is coordinator-owned. `WidgetRuntime::update` runs on the UI
   maintenance tick; widgets do not poll or spawn timers. Only instances with an
   assigned, visible area are rendered, so hidden or inactive widgets do not
@@ -375,9 +382,9 @@ that owns the child's `i=`/`I=`/`P`/`Q` identities. Buffer mutations — create,
 delete, scroll, insert-lines, and limit eviction — produce a coalesced
 `GraphicsCommand` stream (`Upload`/`Place`/`Delete`) that backend adapters
 serialize, so the outer terminal's placement state is *mutation-driven* rather
-than render-diff-driven. As of this increment the model and command vocabulary
-are complete and unit-tested; wiring it into `SessionGraphicsStore` (which still
-uses the anchor + render-diff model) is the remaining integration step.
+than render-diff-driven. The buffer is wired into `SessionGraphicsStore`, which
+mirrors mutations into the command stream while keeping its anchor + placement
+projection as the render authority (Workstream 8 is complete).
 
 **ratatui-image decision:** `ratatui-image` is *not* adopted for the
 re-emission path. It is a client-side renderer — it queries the terminal,
@@ -387,8 +394,11 @@ cannot parse a child process's APC stream or act as a middleman re-emitting a
 child's images to an outer terminal; the data direction is inverted for a
 multiplexer. Its stateful patterns (upload-once/re-place, stable placement ids,
 delete-on-remove, Unicode-placeholder cells) are already implemented in
-`SessionGraphicsStore` + the backend adapters. It remains a candidate only for a
-future *dashboard-owned* image path.
+`SessionGraphicsStore` + the backend adapters. Its client-side patterns are the
+reference for the dashboard-owned image path, which is now implemented: a
+script widget's `@@CMDASH_IMAGE` directive decodes to an RGBA dashboard image
+and re-emits it as `f=32` Kitty graphics (or sixel), diffed and submitted
+through the same retained-scene pipeline.
 
 A retained placement also emulates a real graphics terminal's cursor movement:
 after an image is placed the child emulator's cursor advances right by the
@@ -612,19 +622,23 @@ before an outer adapter reports a rendered result.
 
 This is why a global image map or a single terminal emulator shared by tabs is explicitly out of scope.
 
-### 5.3 Other graphics protocols
+### 5.4 Other graphics protocols
 
-The scene model should allow Kitty first, then add protocol adapters such as sixel or iTerm-style images if their support is justified. Text and layout must remain correct when graphics are unavailable. Protocol handling belongs behind a capability-aware adapter, not in dashboard widgets.
+The scene model is Kitty-first, behind a capability-aware adapter boundary. Kitty graphics are re-emitted protocol-faithfully; sixel is an opt-in dashboard path. Text and layout remain correct when graphics are unavailable, and protocol handling belongs behind the capability-aware adapter rather than in dashboard widgets.
 
-A practical initial implementation can use a mature terminal parser/emulator crate and add a narrowly scoped graphics-state adapter if the selected emulator does not expose the required protocol. The adapter must have conformance tests based on captured escape sequences. The opt-in sixel path now uses the same retained scene boundary: dashboard submissions are clipped, diffed, and emitted only after backend capability negotiation.
+The graphics-state adapter sits next to the mature `alacritty_terminal` parser/emulator and has conformance tests based on captured escape sequences. The opt-in sixel path uses the same retained scene boundary: dashboard submissions are clipped, diffed, and emitted only after backend capability negotiation.
 
-### 5.4 Resource policy
+### 5.5 Resource policy
 
-Initial behavior should retain graphics in memory while a session is alive, whether it is visible or hidden. Later, add configurable limits:
+Graphics are retained in memory while a session is alive, whether it is visible
+or hidden, subject to per-session limits:
 
-- maximum decoded bytes per session;
-- maximum number of image resources and placements;
-- LRU eviction only when a session can replay or re-request data safely;
+- maximum decoded bytes: 4 MiB;
+- maximum resources: 256;
+- maximum placements: 1,024;
+- bounded diagnostics for rejected or oversized payloads;
+- eviction (unreferenced first, then transient before retained, then oldest by
+  generation) when an upload would exceed the decoded-byte quota;
 - explicit cleanup when a session closes.
 
 Eviction must never silently change the terminal's logical state. If an image cannot be restored, the scene should show a deliberate placeholder and report a diagnostic rather than corrupting adjacent text.
@@ -641,8 +655,7 @@ terminal to resolve its own default and ANSI palette. Explicit `Color::Rgb`
 values are retained for configured truecolor roles and protocol-originated
 truecolor cells. See [APPEARANCE.md](APPEARANCE.md) for the public contract.
 
-Widgets and plugins must not query the terminal or write palette escape
-sequences directly. The backend translates the scene's color representation into
+Widgets must not query the terminal or write palette escape sequences directly. The backend translates the scene's color representation into
 Crossterm color commands, preserving the serialized frame boundary.
 
 
@@ -656,29 +669,29 @@ Image and placeholder layers are diffed as part of `FrameDiff`; stale physical i
 
 The scene should carry clipping and ownership metadata. Every image placement should include its owning `SessionId` or a derived resource namespace so the compositor can reject cross-session references during development.
 
-The first backend can target a single local terminal, but the interface should keep these concerns separate. The first interaction model prioritizes retained terminal tabs. Configuration-driven horizontal and vertical pane splits are supported, and the command layer now creates new terminal sessions, provides directional pane focus, ratio adjustment, merge/close lifecycle operations, and persists mutable layout state through safe reload while preserving retained session ownership:
+The backend targets a single local terminal but keeps these concerns separate. The interaction model prioritizes retained terminal tabs. Configuration-driven horizontal and vertical pane splits are supported, and the command layer creates new terminal sessions, provides directional pane focus, ratio adjustment, merge/close lifecycle operations, and persists mutable layout state through safe reload while preserving retained session ownership:
 
 - terminal input/output and raw mode;
 - layout and cell rendering;
 - graphics protocol submission;
 - capability detection.
 
-Candidate crates are cataloged in [External library candidates](DEPENDENCIES.md). The current shortlist is:
+The adopted crates are cataloged in [Dependencies](DEPENDENCIES.md). In summary:
 
-| Concern | Candidate direction |
+| Concern | Direction |
 | --- | --- |
 | Terminal I/O and raw mode | `crossterm` |
-| Layout and cell-oriented widgets | `ratatui` primitives behind the retained scene boundary |
-| Async runtime | `tokio` |
-| PTY management | `portable-pty`, with narrow `nix` adapters if needed |
-| Escape parsing | Parser APIs exposed by `alacritty_terminal`, with `vte` only if a narrow adapter is required |
-| Terminal emulation | `alacritty_terminal`, one instance per session |
-| Kitty/image output | Cmdash-owned session adapter and retained `Scene` image layers; zlib decoding is isolated to bounded direct payloads, while the optional sixel encoder/submission path remains dependency-free |
-| Dynamic plugins | Versioned manifest plus opt-in Wasmtime host with no imports | Isolates plugin faults and keeps terminal/filesystem capabilities explicit |
-| Errors/logging | `thiserror`, `anyhow`, `tracing`, `tracing-subscriber` |
+| Layout primitives | `ratatui` `Rect` behind the retained scene boundary |
+| Async model | standard-library threads + channels (no `tokio`) |
+| PTY management | `portable-pty`, with narrow `libc` adapters |
+| Escape parsing / emulation | `alacritty_terminal`, one instance per session |
+| Kitty/image output | cmdash-owned session adapter and retained `Scene` image layers; zlib decoding is isolated to bounded direct payloads, while the optional sixel encoder/submission path remains dependency-free |
+| Plugins | opt-in Wasmtime host with no imports (dormant; script widgets are the extension model) |
+| Errors | `thiserror` |
 | Config/serialization | `serde` + `toml` |
 
-The selected crates still require version pinning and a focused API/protocol check when the Cargo package is created. Avoid adding a crate solely to bypass a small, well-tested adapter boundary, and do not let a graphics or plugin helper become a global state owner.
+Avoid adding a crate solely to bypass a small, well-tested adapter boundary,
+and do not let a graphics or plugin helper become a global state owner.
 
 ## 7. Concurrency and lifecycle
 
@@ -694,15 +707,25 @@ Important lifecycle behavior:
 
 ## 8. Modularity strategy
 
-Dynamic plugins are an early requirement, with compile-time feature flags still used for optional host functionality:
+Optional host functionality is gated behind compile-time cargo features:
 
-- `terminal` enables PTY/session functionality;
-- graphics protocols can be independently enabled where dependencies justify it;
-- built-in and external widgets register versioned capabilities and TOML configuration schemas;
-- a workspace config chooses which widget types and instances are present;
-- plugin loading, health, permissions, and shutdown are managed by a host-side plugin manager.
+- `sixel`: the bounded 16-color dashboard RGB encoder;
+- `image`: JPEG/BMP decode for script-widget images;
+- `watch`: event-driven config reload-on-save;
+- `wasm-plugins`: the dormant Wasmtime isolation host.
 
-The plugin manager must validate manifests, reject unsupported ABI/API versions and capabilities, isolate failures to the affected widget where possible, and ensure a plugin cannot write directly to the terminal backend. The current runtime choice is Wasmtime behind the `wasm-plugins` feature; the default build remains free of that runtime. The configuration contract is `cmdash.workspace` v1, with named plugin manifests and a string-valued widget settings map; legacy/missing config versions can be rewritten and are reported through explicit migration warnings. Runtime failures can be written as bounded reproduction artifacts when `CMDASH_CRASH_DIR` is configured.
+The default build includes none of them and remains capability-aware. The
+extension model is the script `widget`: a workspace config chooses which
+instances are present, and each script's lifecycle (spawn, bounded output,
+restart backoff, shutdown) is owned by the widget runtime. In-process widgets
+register factories in the `WidgetRegistry`. The dormant Wasmtime host validates
+import-free manifests and modules, rejects unsupported ABI/API versions and
+capabilities, and cannot write directly to the terminal backend.
+
+The configuration contract is `cmdash.workspace` v1, with a string-valued
+widget settings map; legacy/missing config versions can be rewritten and are
+reported through explicit migration warnings. Runtime failures can be written
+as bounded reproduction artifacts when `CMDASH_CRASH_DIR` is configured.
 
 ## 9. Testing strategy
 

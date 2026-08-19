@@ -16,8 +16,9 @@ Configuration is selected in this order:
 4. `config/default.toml` when running from a source checkout.
 5. The embedded default configuration.
 
-An explicitly selected or discovered file is watched and can be safely reloaded
-with `Ctrl+R`. Invalid edits are rejected without replacing the active state.
+An explicitly selected or discovered file can be safely reloaded with `Ctrl+R`
+(or automatically on save when the `watch` feature is compiled in). Invalid
+edits are rejected without replacing the active state.
 When cmdash starts from the embedded fallback because no file was found, there
 is no file to reload; `Ctrl+R` reports that it requires `--config <path>`.
 
@@ -50,8 +51,8 @@ A practical edit/reload loop is:
 
 1. Keep the active file in an editor.
 2. Make one small TOML change.
-3. Save it and wait for the file-backed watcher, or press `Ctrl+R` to request an
-   immediate reload.
+3. Save it and press `Ctrl+R` to request an immediate reload. With the `watch`
+   feature compiled in, cmdash also reloads automatically on save.
 4. Check the diagnostic footer for migration warnings or rejection details.
 5. If validation fails, fix or restore the file; the last valid runtime remains
    active.
@@ -92,8 +93,9 @@ enabled = true
   [ANIMATION.md](ANIMATION.md) for its complete contract.
 - `api` enables the local, disabled-by-default compositor API; see [API.md](API.md)
   for endpoints, security, limits, and CLI overrides.
-- `plugins` contains named plugin manifest paths. Plugin loading remains
-  capability-limited; WASM support is opt-in with `--features wasm-plugins`.
+- `plugins` contains named plugin manifest paths. Manifests are validated as a
+  contract/validation example; the Wasmtime host behind `wasm-plugins` is a
+  dormant, compile-gated foundation and is not the product's extension model.
 - `keybindings` maps stable action names to key chords; see
   [Keybindings](#keybindings) below.
 
@@ -300,11 +302,20 @@ Overlay IDs must be unique and areas must have non-zero width and height.
 ## Graphics and optional features
 
 Kitty graphics are retained per terminal session and bounded by the session
-store limits. Unsupported or oversized resources become degraded diagnostics
-instead of corrupting text output. The optional `sixel` feature provides a
-bounded 16-color dashboard RGB encoder; the default build remains dependency-
-free and capability-aware. Optional WASM plugins run without imports or WASI
-access and use per-instance execution budgets.
+store limits (4 MiB decoded bytes, 256 resources, 1,024 placements per session).
+Unsupported or oversized resources become degraded diagnostics instead of
+corrupting text output. Optional cargo features add capability without changing
+the default, dependency-light build:
+
+- `sixel` — a bounded 16-color RGB encoder for dashboard-provided images.
+- `image` — JPEG/BMP decoding for the script-widget `@@CMDASH_IMAGE` directive
+  (see [WIDGETS.md](WIDGETS.md)); the image is re-emitted as Kitty `f=32` when
+  supported and falls back to sixel.
+- `watch` — event-driven config reload-on-save (a `notify` watcher on the
+  config file's parent directory); the default build keeps `Ctrl+R` reload.
+- `wasm-plugins` — the import-free Wasmtime isolation host. This is a dormant,
+  compile-gated foundation (not the extension model) and is not required for
+  normal use.
 
 ## Reload, migration, and diagnostics
 

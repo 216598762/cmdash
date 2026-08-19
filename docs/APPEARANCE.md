@@ -118,10 +118,10 @@ Widget-specific appearance overrides remain in the string-valued `settings` map:
 ```toml
 [[workspace.widgets]]
 id = 10
-type = "text"
+type = "widget"
 title = " deployment "
 label = "always"
-text = "production: healthy"
+command = "echo 'production: healthy'"
 
 [workspace.widgets.settings]
 border = "double"
@@ -156,12 +156,12 @@ title = "this title is retained as metadata but not drawn"
 
 Policies are:
 
-- `auto` (default): render the configured title or the built-in widget default;
+- `auto` (default): render the configured title or the type's default title;
 - `always`: render the title, including an empty configured title;
 - `never`: do not draw a label.
 
 A hidden label does not change the widget surface or content rectangle. This
-keeps terminal PTY sizing, mouse coordinates, graphics, selection, and plugin
+keeps terminal PTY sizing, mouse coordinates, graphics, selection, and widget
 content stable when visual chrome changes.
 
 ## Precedence and reload
@@ -180,17 +180,17 @@ Invalid appearance values reject the replacement and leave the active widgets
 and theme unchanged. Runtime-created panes inherit the focused widget's command,
 settings, label policy, and resulting appearance configuration.
 
-## Plugin contract
+## Widget contract
 
 The `WidgetRuntimeContext` exposes the resolved `Theme` to in-process widget
-factories and plugin modules. Plugins should use `Theme` roles and
-`WidgetAppearance` geometry helpers rather than hard-coded colors. The host
-continues to clip plugin scenes to their assigned surface; theme resolution does
-not grant a plugin direct terminal output access.
+factories. Widgets should use `Theme` roles and `WidgetAppearance` geometry
+helpers rather than hard-coded colors. The host clips widget scenes to their
+assigned surface; theme resolution does not grant a widget direct terminal
+output access.
 
-WASM plugins will need an explicit future appearance capability before they can
-request dynamic theme changes. They must not emit raw color escape sequences or
-assume a specific terminal palette.
+The dormant WASM host would need an explicit future appearance capability before
+it could request dynamic theme changes; it must not emit raw color escape
+sequences or assume a specific terminal palette.
 
 ## Motion
 

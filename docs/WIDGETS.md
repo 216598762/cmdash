@@ -2,22 +2,27 @@
 
 Widgets are cmdash's composable units of behavior and rendering. A workspace is
 made from widget instances placed into a layout tree. Every dashboard item is
-exactly one of two types: a `terminal` (a live PTY session) or a `widget` (a
-shell script whose stdout renders into the surface).
+exactly one of two types:
 
-A `widget` is a script run directly by the dashboard, not a compiled plugin:
-the configured `command` is spawned through `/bin/sh -c`, its stdout feeds a
-bounded output ring rendered into the surface, its stderr becomes a bounded
-diagnostic, and its lifecycle (spawn, read, restart, reap, kill) is owned by
-the widget. Script output wakes the same coalescing `SessionWakeup` as terminal
-PTY readers, so widgets coexist with active sessions on one frame loop. Scripts
-may opt into read-only session context (`CMDASH_SESSION_*` at spawn) and a
-bounded session-event bus: terminal sessions publish focus/title/line/exit
-events, and subscribing widgets receive them as newline-delimited `text` or
-`json` lines on their script's fd 3. The former compiled data widgets (`text`,
-`clock`, `system`, `status`, `key_value`, `gauge`, `list`, `log`, `sparkline`,
-`separator`, `spacer`) have been removed; existing configurations migrate them
-to equivalent `widget` scripts on load.
+- a **`terminal`** — a live PTY session with its own emulator, scrollback,
+  selection, and graphics state;
+- a **`widget`** — a shell script whose stdout renders into the surface.
+
+A `widget` is a script run directly by the dashboard, not a compiled plugin. The
+configured `command` is spawned through `/bin/sh -c`, its stdout feeds a bounded
+output ring rendered into the surface, its stderr becomes a bounded diagnostic,
+and its lifecycle (spawn, read, restart, reap, kill) is owned by the widget.
+Script output wakes the same coalescing `SessionWakeup` as terminal PTY readers,
+so widgets coexist with active sessions on one frame loop. Scripts may opt into
+read-only session context (`CMDASH_SESSION_*` at spawn) and a bounded
+session-event bus: terminal sessions publish focus/title/line/exit events, and
+subscribing widgets receive them as newline-delimited `text` or `json` lines on
+the script's fd 3.
+
+The former compiled data widgets (`text`, `clock`, `system`, `status`,
+`key_value`, `gauge`, `list`, `log`, `sparkline`, `separator`, `spacer`) have
+been removed; existing configurations migrate them to equivalent `widget`
+scripts on load.
 
 This page documents the widget contract and runtime behavior. For the complete
 TOML schema and configuration discovery rules, see
@@ -29,8 +34,8 @@ distribute a widget, see [CREATING_WIDGETS.md](CREATING_WIDGETS.md).
 
 cmdash keeps these concepts separate:
 
-- **Widget type:** an implementation identified by a string such as `clock` or
-  `terminal`.
+- **Widget type:** an implementation identified by a string (`terminal` or
+  `widget`).
 - **Widget instance:** one configured use of a widget type, identified by a
   numeric `id`.
 - **Surface:** the rectangular area assigned to an instance by the layout tree.
@@ -48,8 +53,8 @@ IDs.
 ## Quick start
 
 The checked-in [default configuration](../config/default.toml) demonstrates a
-text widget, clock, system widget, overlay, tabs, and columns. A minimal custom
-workspace is:
+clock script, a system-info script, a terminal, an overlay, tabs, and columns. A
+minimal custom workspace is:
 
 ```toml
 version = 1
@@ -59,14 +64,19 @@ name = "overview"
 
 [[workspace.widgets]]
 id = 1
-type = "text"
-title = " welcome "
-text = "cmdash is ready"
+type = "widget"
+title = " clock "
+command = "date +%H:%M:%S"
+
+[workspace.widgets.settings]
+mode = "interval"
+interval_ms = "1000"
 
 [[workspace.widgets]]
 id = 2
-type = "clock"
-format = "HH:MM"
+type = "terminal"
+title = " shell "
+command = "/bin/sh"
 
 [workspace.layout]
 type = "columns"
@@ -92,8 +102,7 @@ Most users only need two files:
 A practical cycle is:
 
 1. Start cmdash with `--config <path>` so `Ctrl+R` can reload the file.
-2. Focus widgets with `Tab` / `Shift+Tab`, or move between terminal panes with
-   `Alt+Arrow`.
+2. Focus widgets with `Tab` / `Shift+Tab`, or move between panes with `Alt+Arrow`.
 3. Use `?` and `Ctrl+P` to discover commands without memorizing the keymap.
 4. Edit the TOML file, save it, and reload with `Ctrl+R`.
 5. Keep the diagnostic footer visible while testing a new widget or layout.
@@ -101,8 +110,8 @@ A practical cycle is:
    runtime remains active.
 
 The runtime does not automatically save pane splits, widget IDs, or ratio
-changes back to TOML. Treat the file as the source of truth for the next
-process start, and copy desired runtime layout changes into it manually.
+changes back to TOML. Treat the file as the source of truth for the next process
+start, and copy desired runtime layout changes into it manually.
 
 For schema fields, discovery order, migration, and complete layout examples,
 continue to [CONFIGURATION.md](CONFIGURATION.md). For architecture and scene
@@ -118,13 +127,10 @@ id = 10
 type = "terminal"
 title = " shell "
 label = "auto"
-text = "optional type-specific text"
-format = "optional type-specific format"
-command = "sh"
+command = "/bin/sh"
 
 [workspace.widgets.settings]
 scrollback = "4096"
-profile = "default"
 padding = "1"
 border = "rounded"
 ```
@@ -132,28 +138,24 @@ border = "rounded"
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
 | `id` | integer | yes | Unique instance and surface identity. |
-| `type` | string | yes | Registered widget type. |
+| `type` | string | yes | `terminal` or `widget`. |
 | `title` | string | no | Border/title text when the widget renders one. |
 | `label` | string | no | `auto`, `always`, or `never`; controls whether the title is drawn. |
-| `text` | string | no | Type-specific display text. |
-| `format` | string | no | Type-specific display format. The clock uses this field. |
-| `command` | string | no | Command used by a terminal instance. |
-| `settings` | string map | no | Stable extension settings passed to the widget. Built-ins and the reference plugin support `padding` and `border`. |
+| `command` | string | widget | The shell command a `widget` runs (required for `widget`; optional for `terminal`, which falls back to the login shell). |
+| `settings` | string map | no | Stable extension settings passed to the widget. |
 
-Titles provide the border label and omitted titles use each widget's built-in
+Titles provide the border label and omitted titles use each type's built-in
 default. The `label` policy is explicit: `auto` (default) follows normal title
 behavior, `always` renders the title, and `never` renders no label while
 preserving content geometry. An empty title is not required to suppress labels.
 
-Unknown fields are not a substitute for `settings`: keep widget-specific
-options in the string-valued settings map so the configuration contract remains
-forward-compatible. The current built-in factories use the common fields;
-future widget types can define documented settings without changing the
-top-level schema.
+Keep widget-specific options in the string-valued `settings` map so the
+configuration contract remains forward-compatible.
 
 The configuration validator rejects duplicate IDs, empty types, invalid layout
 references, empty layout groups, and unsupported configuration versions. A
-widget factory may apply additional validation, such as the clock format check.
+widget factory may apply additional validation, such as a terminal's
+`settings.term` value or a script widget's `mode`.
 
 ### Content padding and borders
 
@@ -165,243 +167,31 @@ Widgets that draw an outline support these optional string settings:
   `none`. `border_style` is accepted as a compatibility alias.
 - `border_color` and semantic role names such as `foreground`, `background`,
   `focus`, and `muted`: `inherit`, `ansi:N`, or `#RRGGBB`.
+
 Motion and terminal cursor settings are documented in
 [ANIMATION.md](ANIMATION.md); they do not change the widget content geometry.
-
-Custom glyph sets and per-side visibility remain future appearance extensions.
 
 The configured appearance controls the widget's content rectangle. Terminal PTY
 size, terminal graphics, selection, mouse routing, and resize handling all use
 that rectangle, so increasing padding cannot cause terminal output to overlap
 the border. `border = "none"` removes the outline while retaining configured
-padding. Built-in text-like widgets retain their historical one-cell text
-inset inside the content rectangle.
+padding.
 
 For example:
 
 ```toml
 [[workspace.widgets]]
 id = 12
-type = "text"
+type = "widget"
 title = " deploy "
-text = "production: healthy"
+command = "echo 'production: healthy'"
 
 [workspace.widgets.settings]
 padding = "2"
 border = "double"
 ```
 
-## Built-in widget types
-
-### `text`
-
-`text` is a static display widget. It renders a filled, bordered surface and
-places the configured `text` inside it. It is useful for labels, status notes,
-static dashboard content, and testing a layout without starting a process.
-
-```toml
-[[workspace.widgets]]
-id = 1
-type = "text"
-title = " deployment "
-text = "production: healthy"
-```
-
-The title defaults to ` text ` when omitted. The text defaults to an empty
-string. `text` does not handle keyboard or mouse input and does not create a
-session.
-
-### `clock`
-
-`clock` displays the current UTC time derived from the system clock. Its
-`format` may be either `HH:MM` or `HH:MM:SS`; the default is `HH:MM:SS`.
-The widget requests a redraw when the displayed value changes.
-
-```toml
-[[workspace.widgets]]
-id = 2
-type = "clock"
-title = " UTC "
-format = "HH:MM:SS"
-```
-
-An unsupported format fails widget initialization rather than silently
-rendering a different value. The title defaults to ` clock `.
-
-### `system`
-
-`system` displays the current operating-system and architecture identifiers,
-for example `linux / x86_64`. It is a small diagnostic widget and does not
-start a worker or session.
-
-```toml
-[[workspace.widgets]]
-id = 3
-type = "system"
-title = " host "
-```
-
-The title defaults to ` system `. More detailed metrics are a future widget
-extension; this built-in should not be treated as a complete monitoring
-interface.
-
-### `status`
-
-`status` renders a message in a semantic state color. `settings.state` selects
-the role: `success`, `warning`, `error`, or `neutral`, with common aliases such
-as `ok`, `warn`, `err`, and `critical`. The message comes from `text`.
-
-```toml
-[[workspace.widgets]]
-id = 5
-type = "status"
-text = "all systems nominal"
-
-[workspace.widgets.settings]
-state = "success"
-```
-
-An unrecognized `state` fails initialization. The title defaults to ` status `.
-The message is drawn with the theme's success/warning/error/muted role.
-
-### `key_value`
-
-`key_value` renders a single labeled value as `key: value`, clipped to the
-widget. The value comes from `text`; the key comes from `settings.key` or the
-widget `title` when `settings.key` is absent.
-
-```toml
-[[workspace.widgets]]
-id = 6
-type = "key_value"
-title = " CPU "
-text = "42%"
-
-[workspace.widgets.settings]
-key = "CPU"
-```
-
-The key is rendered in the muted role and the value in the accent role.
-
-### `gauge`
-
-`gauge` renders a bounded progress bar for a value between `0` and `100`
-configured through `settings.value`. An optional `text` label is placed after
-the bar; when the widget is too narrow for both, it falls back to the textual
-percentage alone.
-
-```toml
-[[workspace.widgets]]
-id = 7
-type = "gauge"
-text = "utilization"
-
-[workspace.widgets.settings]
-value = "73"
-```
-
-Values outside `0..=100` fail initialization. The fill uses the theme accent
-role and the track uses the muted role.
-
-### `list`
-
-`list` renders `text` as newline-separated rows, clipped to the widget width and
-bounded to the visible height. It is a passive display widget for short static
-lists.
-
-```toml
-[[workspace.widgets]]
-id = 8
-type = "list"
-text = "alpha\nbeta\ngamma"
-```
-
-Rows beyond the visible height are omitted. The title defaults to ` list `.
-
-### `log`
-
-`log` renders newline-separated messages with per-line severity styling. A line
-may begin with a bracketed tag — `[error]`, `[warning]`, `[success]`, or `[info]`
-(plus aliases such as `err`, `warn`, and `ok`) — which colors the remainder of
-the line with the matching theme role and strips the tag.
-
-```toml
-[[workspace.widgets]]
-id = 9
-type = "log"
-text = "[error] connection lost\n[ok] recovered"
-```
-
-The widget keeps the most recent messages: when there are more lines than rows,
-the tail is shown. The title defaults to ` log `.
-
-### `sparkline`
-
-`sparkline` renders comma-separated integers as a compact series of block
-characters, normalized to the input range. Values come from `settings.values` or
-`text`; `settings.max_points` (default `64`) bounds the series.
-
-```toml
-[[workspace.widgets]]
-id = 10
-type = "sparkline"
-[workspace.widgets.settings]
-values = "2,4,1,5,8"
-```
-
-Narrow widgets fall back to a `min-max` textual summary. Malformed values or a
-series exceeding `max_points` fail initialization.
-
-### `separator`
-
-`separator` renders a horizontal rule across the widget with an optional
-centered label from `text`.
-
-```toml
-[[workspace.widgets]]
-id = 11
-type = "separator"
-text = "CPU"
-```
-
-The rule uses the muted role and the label uses the foreground role. Set
-`border = "none"` for a divider without the surrounding outline.
-
-### `spacer`
-
-`spacer` is an empty surface used for intentional layout gaps. It renders only
-its background and optional border and handles no input.
-
-```toml
-[[workspace.widgets]]
-id = 12
-type = "spacer"
-```
-
-Set `border = "none"` for an invisible gap.
-
-### Choosing a widget type
-
-Use the smallest type that matches the job:
-
-| Need | Type | Starts a process? | Accepts input? |
-| --- | --- | ---: | ---: |
-| Static text, labels, or notes | `text` | no | no |
-| A UTC time display | `clock` | no | no |
-| Basic host identity information | `system` | no | no |
-| A semantic state indicator | `status` | no | no |
-| A labeled value or diagnostic | `key_value` | no | no |
-| A bounded progress or utilization bar | `gauge` | no | no |
-| A clipped static list | `list` | no | no |
-| Recent messages with severity | `log` | no | no |
-| A compact value series | `sparkline` | no | no |
-| A horizontal divider | `separator` | no | no |
-| An empty layout gap | `spacer` | no | no |
-| A shell or interactive terminal program | `terminal` | yes | yes |
-
-A dashboard can contain only passive widgets. Add `terminal` instances only for
-workflows that need a PTY; this keeps startup fast and makes failure isolation
-clear.
+## The two item types
 
 ### `terminal`
 
@@ -421,12 +211,12 @@ clear.
 id = 4
 type = "terminal"
 title = " shell "
-command = "sh"
+command = "/bin/sh"
 ```
 
 If `command` is omitted, the session uses the platform's configured shell
 fallback. The widget handles keyboard, mouse, paste, resize, selection copy,
-and shutdown. It is the only built-in widget that currently owns a PTY.
+and shutdown. It is the only widget type that owns a PTY.
 
 The cursor is rendered by cmdash inside the terminal scene. Its optional
 presentation blink and motion settings are documented in
@@ -446,6 +236,54 @@ limit are evicted and their decoded bytes released.
 A terminal widget is not a global terminal pane. Splitting it creates another
 terminal widget and another session ID; the new pane inherits the source
 configuration while retaining independent process and emulator state.
+
+### `widget` (script widgets)
+
+A `widget` runs its `command` through the user's shell and renders stdout into
+the surface. This is the primary way to build dashboard content:
+
+```toml
+[[workspace.widgets]]
+id = 5
+type = "widget"
+title = " git "
+command = "git -C . status --short | head -n 12"
+
+[workspace.widgets.settings]
+mode = "interval"
+interval_ms = "5000"
+```
+
+Script behavior is controlled entirely through `settings`:
+
+- `mode`: `stream` (default) runs once and keeps reading stdout as it arrives;
+  `interval` runs to EOF and re-runs every `interval_ms`.
+- `interval_ms`: the re-run cadence for `interval` mode (default `1000`, bounded
+  `100..=60000`).
+- `render`: `text` (default). With `parse_tags = "true"`, each line is styled by
+  its `[error]`/`[warning]`/`[success]`/`[info]` prefix, and the tag is
+  stripped.
+- `max_lines` (default `1024`) and `max_bytes` (default `65536`) bound the
+  output ring; overflow drops the oldest lines and records a diagnostic.
+- `restart` (`true` default) restarts an exited script with bounded exponential
+  backoff; repeated immediate exits escalate to `Failed` health.
+- `handles_input` (`false` default) forwards focused keys to the script's stdin.
+- `session_env` (`true` default) exposes `CMDASH_WIDGET_ID`,
+  `CMDASH_WIDGET_TITLE`, `CMDASH_SURFACE_COLUMNS`, `CMDASH_SURFACE_ROWS`,
+  `CMDASH_SESSION_COUNT`, `CMDASH_FOCUSED_SESSION`, and `CMDASH_FOCUSED_TITLE`
+  at spawn (a read-only snapshot taken at spawn time).
+- `session_events`: `off` (default), `text`, or `json` — subscribes the widget
+  to bounded terminal-session events (focus, title, line output, exit)
+  delivered as newline-delimited lines on the script's fd 3.
+
+Example scripts ship in `config/widgets/` (clock, uptime, git status, log
+tail). Any program that prints lines on stdout works; the dashboard only
+interprets the optional image directive described under
+[Script-widget images](#script-widget-images-optional-image-feature).
+
+Because a script is an ordinary process, its output is inherently bounded by the
+ring above and its failure is isolated to that widget — it cannot take down the
+dashboard, the backend, or another widget.
 
 ## Lifecycle contract
 
@@ -476,8 +314,8 @@ recomposed.
 The runtime creates each configured instance through a registered factory and
 calls `initialize` before the instance becomes active. Initialization errors
 are associated with the widget type and prevent an invalid runtime from being
-installed. For example, a terminal startup failure or invalid clock format is
-reported as a widget setup error.
+installed. For example, a terminal startup failure or an invalid script setting
+is reported as a widget setup error.
 
 ### Updates
 
@@ -493,7 +331,7 @@ Widget health is deliberately separate from normal output:
 
 - `Healthy` means the widget is operating normally.
 - `Degraded(message)` means it is usable but an optional resource or capability
-  was limited, such as an omitted graphics payload.
+  was limited, such as an omitted graphics payload or a dropped ring line.
 - `Failed(message)` means an operation failed and the widget may no longer
   produce reliable output.
 
@@ -565,17 +403,17 @@ returns the one-cell-inset rectangle for widgets that draw an outline.
 
 ### Widget outlines and terminal content
 
-Built-in widget borders occupy the outer edge of the assigned surface. Terminal
-content is rendered into the configured content rectangle, inset by the border
-and padding; with defaults this is one cell on every side. The terminal's PTY
-size, graphics placements, selection coordinates, and mouse origin use that
-inner rectangle as well. This keeps terminal text and cursor
-output from overwriting the outline.
+Widget borders occupy the outer edge of the assigned surface. Terminal content
+is rendered into the configured content rectangle, inset by the border and
+padding; with defaults this is one cell on every side. The terminal's PTY size,
+graphics placements, selection coordinates, and mouse origin use that inner
+rectangle as well. This keeps terminal text and cursor output from overwriting
+the outline.
 
-The layout system currently sizes widgets to their assigned surface; it does
-not provide a separate general-purpose alignment option for centering a widget
-inside a larger parent area. Splits, columns, and explicit layout geometry are
-the supported positioning controls.
+The layout system sizes widgets to their assigned surface; it does not provide a
+separate general-purpose alignment option for centering a widget inside a larger
+parent area. Splits, columns, and explicit layout geometry are the supported
+positioning controls.
 
 ### Frame composition
 
@@ -586,12 +424,11 @@ alive and retain state, but their scenes and graphics are not submitted.
 
 ### Colors and theming
 
-Static theming is implemented. The default semantic theme uses terminal-native
-reset and ANSI references so widget colors follow the parent terminal palette.
-Use `[appearance.colors]` for workspace-wide role overrides and widget
-`settings` for per-instance overrides. The complete role list, color syntax,
-precedence rules, border styles, and label policy are documented in
-[APPEARANCE.md](APPEARANCE.md).
+The default semantic theme uses terminal-native reset and ANSI references so
+widget colors follow the parent terminal palette. Use `[appearance.colors]` for
+workspace-wide role overrides and widget `settings` for per-instance overrides.
+The complete role list, color syntax, precedence rules, border styles, and label
+policy are documented in [APPEARANCE.md](APPEARANCE.md).
 
 Optional retained-scene motion, transition triggers, and the coordinator-owned
 scheduler are documented in [ANIMATION.md](ANIMATION.md).
@@ -653,7 +490,7 @@ breaking scrollback, `Shift`+Left/Right always select, `Shift`+Up/Down/Home/End
 select while a selection is active and otherwise scroll history, and
 `Shift`+PageUp/PageDown always scroll. The double-click window, semantic
 word-break characters, and auto-scroll/copy behavior are configurable per
-typical terminal via `settings` (see [CONFIGURATION.md](CONFIGURATION.md)).
+terminal via `settings` (see [CONFIGURATION.md](CONFIGURATION.md)).
 
 For a focused terminal widget, key events are encoded for the PTY and paste is
 sent through the session's bracketed-paste-aware path. `Ctrl+Shift+C` copies the
@@ -689,15 +526,15 @@ input; ordinary unbound keys are passed to a focused input-capable terminal.
 ### Kitty graphics
 
 Kitty graphics are terminal-session state. A terminal widget's graphics store
-uses a session-qualified resource identity, so image ID `1` in session A is
-not the same resource as image ID `1` in session B. The store retains decoded
+uses a session-qualified resource identity, so image ID `1` in session A is not
+the same resource as image ID `1` in session B. The store retains decoded
 resources, encoded payloads, placements, z-order, and diagnostics.
 
 A widget's `graphics(area)` output is clipped to its surface and passed through
-the retained scene and compositor pipeline. The backend negotiates Kitty
-support and submits only visible current layers. When a tab is hidden, its
-resources remain associated with the hidden session but are not submitted;
-when it becomes visible again, its scene can be rebuilt from retained state.
+the retained scene and compositor pipeline. The backend negotiates Kitty support
+and submits only visible current layers. When a tab is hidden, its resources
+remain associated with the hidden session but are not submitted; when it becomes
+visible again, its scene can be rebuilt from retained state.
 
 The store has bounded defaults:
 
@@ -713,8 +550,8 @@ cells or another session's image.
 ### Optional sixel
 
 The `sixel` Cargo feature adds a dependency-free, bounded 16-color RGB encoder
-for dashboard-provided images. A widget can return sixel submissions through
-its feature-gated `sixel(area)` method. These layers are retained in `Scene`,
+for dashboard-provided images. A widget can return sixel submissions through its
+feature-gated `sixel(area)` method. These layers are retained in `Scene`,
 clipped, diffed, and submitted only when backend capability detection reports
 sixel support.
 
@@ -728,9 +565,35 @@ Terminal-originated Kitty graphics and dashboard-provided sixel images are
 separate paths. Enabling sixel does not change ownership of terminal graphics
 or make sixel available to terminal PTYs.
 
-## Plugins and extension points
+### Script-widget images (optional `image` feature)
 
-Built-in widgets are registered in a `WidgetRegistry`. A factory receives a
+A `widget` script can emit an image on its stdout with a single directive line:
+
+```text
+@@CMDASH_IMAGE <base64>
+```
+
+where `<base64>` is standard base64 of a **JPEG or BMP** file. The `image` cargo
+feature decodes the payload into RGBA and the widget surfaces it through the
+same retained `Scene` image-layer pipeline as terminal graphics: when the outer
+terminal advertises Kitty graphics the image is re-uploaded as raw RGBA (`f=32`);
+otherwise it falls back to sixel (when the `sixel` feature is also compiled in).
+A malformed directive is reported as a degraded widget diagnostic and the last
+good image is kept. Enable both features with:
+
+```text
+cargo run --features image,sixel
+```
+
+The directive is consumed (not rendered as text), uses a stable dashboard
+resource identity so re-emitted images replace in place rather than stacking,
+and the image is deleted when the widget is hidden or closed. PNG/GIF payloads
+are not accepted here: they belong to the terminal-originated Kitty protocol
+slice (`f=100`), which keeps its own narrower `png`/`gif` decoders.
+
+## Extension points
+
+Widgets are registered in a `WidgetRegistry`. A factory receives a
 `WidgetInstanceConfig` and a shared `&WidgetRuntimeContext`, then returns a
 boxed widget. The context is the construction-time capability boundary for
 services that a widget may need; factories should not reach into global state or
@@ -746,88 +609,34 @@ fn factory(
 ```
 
 `WidgetRuntimeContext::new()` creates a context without optional services. The
-context also exposes the resolved `Theme` used by built-in and external widgets.
-Applications that run terminal sessions can construct a context with
-`WidgetRuntimeContext::with_session_wakeup(wakeup)` and pass it to
-`WidgetRegistry::builtins_with_context`. The session wakeup is optional so
-widget-only dashboards and custom passive widgets remain usable without a PTY.
-The built-in terminal factory consumes this capability; other built-ins ignore
-it. Future runtime services should be added as explicit context capabilities
-with documented ownership and failure behavior.
+context exposes the resolved `Theme` and the optional session wakeup, initial
+terminal size, session-event bus, and Kitty-graphics capability. Applications
+that run terminal sessions construct a context with
+`WidgetRuntimeContext::with_session_wakeup(wakeup)` (and the other `with_*`
+builders) and pass it to `WidgetRegistry::builtins_with_context`. The session
+wakeup is optional so widget-only dashboards and custom passive widgets remain
+usable without a PTY.
 
 External in-process widgets use the same `Widget` scene contract. The public
-`WidgetRuntimeContext::theme()` method provides the resolved semantic `Theme`.
+`WidgetRuntimeContext::theme()` method provides the resolved semantic `Theme`;
 `WidgetAppearance::from_settings` parses the common `padding` and `border`
-settings, `WidgetAppearance::content_area(area)` gives the matching inner
-rectangle, and `WidgetAppearance::render_border(...)` draws the selected
-outline. Plugins that use these helpers get the same geometry and colors for
-rendering, input, and terminal-like content. The older `widget_content_area(area)` helper
-remains available for the fixed one-cell legacy contract. The host clips the
-resulting scene to the assigned surface but does not guess arbitrary plugin
-border geometry. The checked-in `ExternalTextPlugin` is the reference
-implementation of this contract.
+settings; `WidgetAppearance::content_area(area)` gives the matching inner
+rectangle; and `WidgetAppearance::render_border(...)` draws the selected
+outline. The older `widget_content_area(area)` helper remains available for the
+fixed one-cell legacy contract. The host clips the resulting scene to the
+assigned surface. The in-process authoring guide is
+[CREATING_WIDGETS.md](CREATING_WIDGETS.md).
 
-`WidgetRegistry::builtins()` remains the no-service convenience constructor.
-External implementations use the versioned plugin contract rather than writing
-directly to the terminal backend.
+### WASM isolation (dormant)
 
-### Manifest contract
-
-A plugin manifest currently contains:
-
-```toml
-manifest_version = 1
-name = "example"
-version = "1.0.0"
-abi_version = 1
-runtime = "wasm"
-capabilities = 1
-
-[[widgets]]
-type = "example-status"
-capabilities = 1
-```
-
-The host validates manifest version, identity, ABI version, widget type names,
-uniqueness, and requested capabilities before loading widget code. The widget
-type name must be non-empty and no longer than 32 bytes.
-
-The host-facing capability bits currently describe:
-
-- `RENDER_SCENE`: produce backend-neutral scene output;
-- `UPDATE`: receive update opportunities;
-- `INPUT`: receive input routed by the host;
-- `OVERLAYS`: request or contribute overlay behavior;
-- `ANIMATION`: receive host-owned, bounded animation progress (see
-  [ANIMATION.md](ANIMATION.md)).
-
-A plugin may request only capabilities available from the selected host. The
-host must not expose stdout, raw terminal escape sequences, PTY handles,
-filesystem access, or Rust trait objects across the boundary.
-
-### WASM isolation status
-
-The optional `wasm-plugins` feature uses Wasmtime for import-free validation
-and per-instance isolation. It bounds module size and fuel, creates a separate
-store for each instance, and does not link WASI or terminal imports:
-
-```text
-cargo run --features wasm-plugins
-```
-
-The current runtime foundation intentionally rejects modules with imports. The
-actual host-function ABI for lifecycle calls, input messages, bounded scene
-output, and manifest-to-runtime loading is still a future extension. A plugin
-configuration should therefore be treated as a contract/validation example,
-not as a promise that arbitrary WASM widget binaries are currently executable.
-
-When implementing a new host function, keep the following rules:
-
-1. Add it to the versioned ABI and capability declaration.
-2. Bound input sizes, output sizes, and execution time/fuel.
-3. Serialize scene data rather than exposing backend handles.
-4. Define failure and shutdown behavior for a single affected instance.
-5. Add a manifest, host, malformed-input, and resource-limit test.
+The optional `wasm-plugins` feature uses Wasmtime for import-free validation and
+per-instance isolation: it bounds module size and fuel, creates a separate store
+for each instance, and does not link WASI or terminal imports. This is a
+compile-gated foundation, not the product's extension model — script widgets
+are. The host-function ABI for lifecycle, input, and scene output remains a
+future extension, so a plugin manifest should be treated as a validation
+example rather than a promise that arbitrary WASM widget binaries are currently
+executable.
 
 ## Panes, sessions, and persistence
 
@@ -840,10 +649,10 @@ Pane commands operate on focused terminal widget instances. A split:
 5. inserts a split node with initial 50/50 ratios;
 6. focuses the new surface and invalidates the affected area.
 
-Closing or merging a pane shuts down only the removed widget session, removes its
-surface and configuration entry, and normalizes a parent with one remaining
-child. The last visible pane cannot be closed. Shutdown failures are recorded
-as bounded diagnostics.
+Closing or merging a pane shuts down only the removed widget session, removes
+its surface and configuration entry, and normalizes a parent with one remaining
+child. The last visible pane cannot be closed. Shutdown failures are recorded as
+bounded diagnostics.
 
 Runtime changes mark the layout dirty and serialize the current layout tree,
 split ratios, and active tab state into the in-memory configuration. During a
@@ -856,21 +665,21 @@ allowing the surrounding workspace arrangement to persist across reloads.
 
 ## Troubleshooting a widget
 
-- **The widget is not visible:** confirm its `id` appears in a reachable
-  `leaf`, `columns`, `split`, or active `tabs` branch. A valid but unreachable
-  widget is still initialized without receiving a visible surface.
+- **The widget is not visible:** confirm its `id` appears in a reachable `leaf`,
+  `columns`, `split`, or active `tabs` branch. A valid but unreachable widget is
+  still initialized without receiving a visible surface.
 - **A widget fails during startup:** check the diagnostic footer for its type and
   initialization error. For terminals, verify the command exists and that the
   layout gives the pane a non-zero area.
 - **A key is ignored:** focus the widget, then check whether it is interactive.
-  `text`, `clock`, and `system` intentionally do not handle input.
+  Script widgets accept keys only with `handles_input = "true"`.
 - **A terminal copy does not reach the clipboard:** selection and OSC 52 depend
   on the surrounding terminal emulator's clipboard policy.
 - **Images are missing:** Kitty and sixel are optional capability paths. Check
-  terminal support, feature flags, clipping, and graphics quota diagnostics.
-  For pane-safe Kitty rendering, use the default Unicode-placeholder mode or
-  set `CMDASH_KITTY_GRAPHICS_MODE=placeholder`; use `direct` only when the
-  outer terminal is known to support root-terminal placement semantics.
+  terminal support, feature flags, clipping, and graphics quota diagnostics. For
+  pane-safe Kitty rendering, use the default Unicode-placeholder mode or set
+  `CMDASH_KITTY_GRAPHICS_MODE=placeholder`; use `direct` only when the outer
+  terminal is known to support root-terminal placement semantics.
 - **Reload loses a change:** configuration reload is validation-based and keeps
   the last valid runtime. Check TOML syntax, duplicate IDs, layout references,
   widget type names, and schema version.
@@ -900,7 +709,7 @@ and runtime-context contract, scene rendering, lifecycle, registration, and
 testing — is [CREATING_WIDGETS.md](CREATING_WIDGETS.md). The summary below is a
 quick checklist rather than the full tutorial.
 
-A built-in widget implementation should:
+A custom widget implementation should:
 
 1. Define a state struct containing only the data it owns.
 2. Implement `kind` with a stable configuration type name.
@@ -956,20 +765,15 @@ Useful widget and integration tests include:
 - pane split, ratio adjustment, close, merge, and reload preserve valid state;
 - graphics are clipped, quota-limited, and capability-aware;
 - sixel output is tested separately under `--features sixel`;
-- plugin manifests reject unsupported versions, capabilities, and duplicate
-  widget types;
-- WASM modules with imports or excessive size are rejected;
 - update, input, and shutdown failures stay local and become diagnostics.
 
 The project also maintains fuzz targets and seed corpora for configuration
-migration, plugin manifests, Kitty APC streams, and sixel RGB encoding. Widget
-parsers and host-function decoders should add bounded fuzz inputs as their
-contracts grow.
+migration, plugin manifests, Kitty APC streams, and sixel RGB encoding.
 
 ## Related documents
 
-- [Configuration reference](CONFIGURATION.md) — discovery, TOML fields,
-  layouts, panes, overlays, migrations, and recovery.
+- [Configuration reference](CONFIGURATION.md) — discovery, TOML fields, layouts,
+  panes, overlays, migrations, and recovery.
 - [Appearance guide](APPEARANCE.md) — semantic themes, inherited terminal
   palette colors, borders, labels, and per-widget overrides.
 - [Animation guide](ANIMATION.md) — retained motion, cursor presentation,
@@ -979,7 +783,6 @@ contracts grow.
   and testing.
 - [Architecture](ARCHITECTURE.md) — state ownership, scenes, compositor, and
   backend boundaries.
-- [Dependencies](DEPENDENCIES.md) — selected crate roles and optional feature
+- [Dependencies](DEPENDENCIES.md) — dependency decisions and optional feature
   boundaries.
-- [Roadmap](ROADMAP.md) — planned host ABI, pane, fuzzing, graphics, and
-  configuration work.
+- [Roadmap](ROADMAP.md) — the staged implementation plan and completion record.

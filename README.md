@@ -1,28 +1,46 @@
 # cmdash
 
-`cmdash` is a Linux terminal application that combines a configurable dashboard with terminal-multiplexer capabilities. It is being designed as a modular compositor: a user can assemble a workspace from terminal sessions, dashboards, and other widgets without requiring terminal sessions at all.
+**A modular terminal dashboard and multiplexer for Linux.**
 
-The project is intentionally starting with architecture and behavior contracts before implementation. Read the [configuration reference](docs/CONFIGURATION.md) for the TOML schema and discovery rules, and the [widget guide](docs/WIDGETS.md) for widget lifecycle, rendering, input, plugins, panes, and graphics behavior. The most important rendering requirement is that every terminal session owns an independent terminal-emulation and graphics state. Kitty graphics, sixel content, cursor state, scrollback, and other visual state must remain isolated to the session/tab that produced them and be restored when that session becomes visible again.
+cmdash turns your terminal into a workspace you compose from two kinds of items:
 
-## Project documents
+- **`terminal`** — a live shell session (its own PTY, emulator, scrollback, text selection, and graphics state).
+- **`widget`** — a shell script you write; its stdout renders into a pane.
 
-- [Architecture](docs/ARCHITECTURE.md) — components, render pipeline, state ownership, and proposed Rust boundaries.
-- [Roadmap](docs/ROADMAP.md) — staged implementation plan and acceptance criteria.
-- [Configuration reference](docs/CONFIGURATION.md) — TOML discovery, widget/layout options, panes, migrations, and recovery.
-- [Appearance guide](docs/APPEARANCE.md) — semantic themes, parent-terminal palette inheritance, borders, labels, and color overrides.
-- [Animation guide](docs/ANIMATION.md) — retained motion, terminal cursor presentation, scheduling, accessibility, and lifecycle limits.
-- [API guide](docs/API.md) — local Unix-socket endpoints, snapshots, safe commands, limits, and security.
-- [Widget guide](docs/WIDGETS.md) — widget types, lifecycle, scenes, input, graphics, plugins, panes, and extension guidance.
-- [Creating widgets](docs/CREATING_WIDGETS.md) — the focused authoring guide with examples, the factory/context contract, rendering, lifecycle, registration, and testing.
-- [External library candidates](docs/DEPENDENCIES.md) — categorized crate list, evaluation criteria, and selection risks.
-- [Default configuration](config/default.toml) — a checked-in widget-only starting point.
+Arrange them in a layout tree of splits, tabs, columns, stacks, and overlays, all
+driven by a small TOML file. Every terminal session is fully isolated, and the
+whole workspace renders through a retained, byte-diffed compositor, so switching
+tabs or panes never leaks text or images between sessions.
+
+> cmdash is a terminal *application*. It runs inside your existing terminal
+> emulator — it does not replace your terminal.
+
+---
+
+## Why cmdash
+
+- **One config, one process.** A single `config.toml` describes every pane, its
+  layout, and its settings. No daemon, no server, no separate window manager.
+- **Real terminal emulation.** Each `terminal` runs `alacritty_terminal` with its
+  own PTY — alternate screen, cursor, scrollback, selection, hyperlinks, mouse
+  reporting, and shell sessions that behave like a real terminal.
+- **First-class graphics.** Kitty graphics are re-emitted to your outer terminal
+  protocol-faithfully, including scrollback, animation frames, and per-session
+  resource isolation. Optional sixel output is available for dashboard images.
+- **Widgets are scripts.** A `widget` is just a command run through your shell.
+  Pipe text (or an image) to stdout and it appears in the pane. No plugin SDK,
+  no recompilation.
+- **Sessions stay isolated.** Tabs keep their emulator, scrollback, selection,
+  and image resources alive while hidden and restore them exactly when shown.
+- **Degrades gracefully.** If your terminal lacks a capability (Kitty graphics,
+  sixel, OSC 52 clipboard), text and layout keep working.
+
+---
 
 ## Getting started
 
-The quickest way to try cmdash is from a source checkout. You need a Rust
-installation with the toolchain required by the package (`rust-version = 1.96`)
-and a terminal that supports the ordinary ANSI/VT controls used by the default
-build.
+You need a Rust toolchain of at least **1.96** (the project's `rust-version`)
+and an ordinary ANSI/VT-capable terminal.
 
 ```bash
 git clone https://github.com/216598762/cmdash.git
@@ -32,13 +50,14 @@ cargo run
 
 With no arguments, cmdash looks for configuration in this order:
 
-1. `$CMDASH_CONFIG`;
-2. `$XDG_CONFIG_HOME/cmdash/config.toml` or `~/.config/cmdash/config.toml`;
-3. `config/default.toml` in a source checkout;
-4. the embedded default configuration.
+1. `--config <path>` / `-c <path>` (explicit);
+2. `$CMDASH_CONFIG`;
+3. `$XDG_CONFIG_HOME/cmdash/config.toml` (or `~/.config/cmdash/config.toml`);
+4. `config/default.toml` in a source checkout;
+5. a built-in embedded fallback.
 
-The default dashboard is widget-only, so it does not start a shell. To create a
-personal configuration, copy the example and launch with an explicit path:
+To make it your own, copy the checked-in example and launch with an explicit
+path:
 
 ```bash
 mkdir -p ~/.config/cmdash
@@ -47,100 +66,160 @@ $EDITOR ~/.config/cmdash/config.toml
 cargo run -- --config ~/.config/cmdash/config.toml
 ```
 
-The same options work with a built binary, for example
-`./cmdash --config ~/.config/cmdash/config.toml`. Configuration is TOML; start
-with [CONFIGURATION.md](docs/CONFIGURATION.md) for the schema,
-[APPEARANCE.md](docs/APPEARANCE.md) for colors and widget chrome,
-[ANIMATION.md](docs/ANIMATION.md) for optional motion and cursor presentation,
-[API.md](docs/API.md) for local automation, and [WIDGETS.md](docs/WIDGETS.md)
-for widget behavior and examples.
+The same options work with a compiled binary:
+`./cmdash --config ~/.config/cmdash/config.toml`.
 
-### Daily workflow
-
-- Press `?` for the built-in help overlay or `Ctrl+P` for the command palette.
-- Use `Tab` / `Shift+Tab` to cycle focus and `Alt+Arrow` to move between panes.
-- Add a terminal pane with `Ctrl+Shift+H` or `Ctrl+Shift+V` when a terminal
-  widget is focused. Use `Ctrl+Shift+Left/Right` to adjust its split ratio.
-- Close the focused pane with `Ctrl+Shift+W`; merge it from its parent split with
-  `Ctrl+Shift+M`. The final visible pane cannot be closed.
-- Switch retained tab branches with `Ctrl+PageUp` / `Ctrl+PageDown`.
-- Drag in a terminal to select text, then press `Ctrl+Shift+C` to copy through
-  OSC 52 when the surrounding terminal supports it.
-- Edit a file-backed configuration and press `Ctrl+R` to reload it. Invalid
-  changes are rejected without replacing the active workspace. Runtime pane
-  changes are retained across reloads but are not automatically written to
-  disk, so edit the TOML file if they should survive a restart.
-- Appearance defaults to the parent terminal's native reset/ANSI palette. Use
-  `[appearance]` and the [appearance guide](docs/APPEARANCE.md) for fixed RGB
-  themes, semantic role overrides, border styles, and no-label widgets.
-- Motion is disabled by default. Enable and configure it through the
-  [animation guide](docs/ANIMATION.md); reduced motion and static cursor
-  fallbacks remain available.
-- The compositor API is disabled by default. Use `--api` for local read-only
-  automation, or see [API.md](docs/API.md) before explicitly enabling mutations.
-- Press `q` or `Esc` to quit.
-
-For an interactive terminal in the initial layout, add a terminal widget and
-layout leaf such as:
+### A minimal workspace
 
 ```toml
+version = 1
+
 [[workspace.widgets]]
-id = 10
+id = 1
+type = "widget"
+title = " clock "
+command = "date +%H:%M:%S"
+
+[workspace.widgets.settings]
+mode = "interval"
+interval_ms = "1000"
+
+[[workspace.widgets]]
+id = 2
 type = "terminal"
 title = " shell "
-command = "sh"
+command = "/bin/sh"
 
 [workspace.layout]
-type = "leaf"
-widget = 10
+type = "columns"
+children = [
+  { type = "leaf", widget = 1 },
+  { type = "leaf", widget = 2 },
+]
 ```
 
-Optional capabilities are explicit: use `cargo run --features sixel` for the
-sixel dashboard-image path or `cargo run --features wasm-plugins` for the
-import-free, resource-bounded WASM host foundation. Both remain opt-in and
-should be tested in the terminal environment where they will be used.
+The first pane re-runs `date` every second; the second is an interactive shell.
+See the [configuration reference](docs/CONFIGURATION.md) for every option.
 
-### Troubleshooting
+---
 
-- **The config is ignored:** check the discovery order above or pass
-  `--config /absolute/or/relative/path.toml` explicitly.
-- **`Ctrl+R` reports that reload needs a config path:** cmdash started with the
-  embedded/default fallback; restart with `--config` or provide a discovered
-  file.
-- **The workspace does not start:** run the same command with the config path
-  and inspect duplicate IDs, missing layout leaves, unsupported versions, and
-  invalid widget fields.
-- **A terminal is blank or too small:** focus it, resize the outer terminal,
-  and check that the configured layout gives it a non-zero area.
-- **Copy or graphics do not appear:** the surrounding terminal may not support
-  OSC 52, Kitty graphics, or sixel. Text and layout continue without optional
-  capabilities.
-- **A process exits unexpectedly:** check the in-app diagnostic footer. Set
-  `CMDASH_CRASH_DIR` before launching when a bounded crash reproduction report
-  is needed.
+## Daily use
 
-See the [configuration reference](docs/CONFIGURATION.md),
-[appearance guide](docs/APPEARANCE.md), [animation guide](docs/ANIMATION.md),
-[API guide](docs/API.md), [widget guide](docs/WIDGETS.md),
-[widget authoring guide](docs/CREATING_WIDGETS.md),
-[architecture](docs/ARCHITECTURE.md), and [roadmap](docs/ROADMAP.md) for deeper
-behavior and development details.
+| Action | Binding |
+| --- | --- |
+| Cycle focus | `Tab` / `Shift+Tab` |
+| Move focus directionally | `Alt+Arrow` |
+| Split focused terminal | `Ctrl+Shift+H` (horizontal) / `Ctrl+Shift+V` (vertical) |
+| Adjust split ratio | `Ctrl+Shift+Left` / `Ctrl+Shift+Right` |
+| Close / merge focused pane | `Ctrl+Shift+W` / `Ctrl+Shift+M` |
+| Switch tabs | `Ctrl+PageUp` / `Ctrl+PageDown` |
+| Select text | drag (double-click = word, triple-click = line); `Shift+Arrows` keyboard selection |
+| Copy selection | `Ctrl+Shift+C` (via OSC 52 when supported) |
+| Scrollback | wheel, `Shift+PageUp`/`Shift+PageDown` |
+| Command palette / help | `Ctrl+P` / `?` |
+| Reload configuration | `Ctrl+R` |
+| Quit | `q` / `Esc` |
+
+All of these bindings are configurable through the `[keybindings]` section (see
+[CONFIGURATION.md](docs/CONFIGURATION.md)).
+
+---
+
+## Configuration
+
+cmdash uses **versioned TOML** (currently version `1`). The top-level areas are:
+
+- `[workspace]` — name plus the `widgets`, `overlays`, and `layout` tree;
+- `[appearance]` — `inherit` (follow your terminal's palette) or `fallback`, plus
+  semantic color-role overrides;
+- `[animation]` — opt-in retained motion (disabled by default);
+- `[api]` — opt-in local Unix-socket automation (disabled and read-only by default);
+- `[keybindings]` — remap any action.
+
+Changes to a file-backed configuration are applied by pressing `Ctrl+R`; invalid
+edits are rejected without touching the running workspace. Use
+`--migrate-config --config <path>` to atomically rewrite an older file's version
+metadata.
+
+- [Configuration reference](docs/CONFIGURATION.md) — schema, discovery, layouts, panes, overlays, migration.
+- [Appearance guide](docs/APPEARANCE.md) — themes, palette inheritance, borders, labels.
+- [Animation guide](docs/ANIMATION.md) — motion, cursor presentation, accessibility.
+- [API guide](docs/API.md) — the local automation socket.
+
+---
+
+## Widgets
+
+A `widget` is a shell script invoked as `/bin/sh -c "<command>"`. Everything the
+script prints to **stdout** becomes pane content; **stderr** becomes a bounded
+diagnostic. Useful options:
+
+- `mode = "interval"` re-runs the script on a cadence; `stream` (default) reads
+  continuously.
+- `parse_tags = "true"` colors lines by a `[error]`/`[warning]`/`[success]`/
+  `[info]` prefix.
+- `session_env = "true"` (default) exposes `CMDASH_SESSION_*` context at spawn.
+- `session_events = "text" | "json"` subscribes the script to terminal
+  focus/title/line/exit events delivered on its **fd 3**.
+
+Widgets can also display images: print `@@CMDASH_IMAGE <base64>` (a JPEG or BMP)
+on stdout and, with the `image` feature, the decoded image is shown in the pane
+(see [WIDGETS.md](docs/WIDGETS.md)).
+
+The checked-in `config/widgets/` directory has ready-to-copy examples (clock,
+uptime, git status, log tail).
+
+---
+
+## Optional features
+
+Everything below is a cargo feature; the default build stays lean and
+capability-aware.
+
+| Feature | What it adds |
+| --- | --- |
+| `sixel` | A bounded 16-color sixel encoder for dashboard-provided images. |
+| `image` | JPEG/BMP decoding for the script-widget `@@CMDASH_IMAGE` directive. |
+| `watch` | Event-driven config reload-on-save (a `notify` watcher). |
+| `wasm-plugins` | The import-free Wasmtime isolation host (a dormant foundation; see below). |
+
+```bash
+cargo run --features image,sixel
+```
+
+The `wasm-plugins` feature exists as a compile-gated, import-free foundation for
+future native plugin isolation; it is not the product's extension model (script
+widgets are) and is not required for normal use.
+
+---
+
+## Documentation
+
+| Document | Covers |
+| --- | --- |
+| [Configuration](docs/CONFIGURATION.md) | TOML schema, discovery, keybindings, layouts, panes, overlays, migration. |
+| [Widgets](docs/WIDGETS.md) | The widget model, lifecycle, input, graphics, and the script contract. |
+| [Creating widgets](docs/CREATING_WIDGETS.md) | The authoring guide with examples and the factory/context contract. |
+| [Appearance](docs/APPEARANCE.md) | Themes, palette inheritance, borders, labels, overrides. |
+| [Animation](docs/ANIMATION.md) | Retained motion, cursor presentation, accessibility. |
+| [API](docs/API.md) | The local automation socket and its safety model. |
+| [Architecture](docs/ARCHITECTURE.md) | Components, render pipeline, session/graphics isolation. |
+| [Dependencies](docs/DEPENDENCIES.md) | Dependency decisions and the keep-bespoke rationale. |
+| [Roadmap](docs/ROADMAP.md) | The staged implementation plan and its completion record. |
+
+---
+
+## Troubleshooting
+
+- **Config ignored?** Check the discovery order above or pass `--config` explicitly.
+- **`Ctrl+R` says it needs a config path?** You started from the embedded fallback; restart with `--config`.
+- **Workspace won't start?** Check duplicate IDs, missing layout leaves, unsupported versions, and widget fields.
+- **A terminal is blank or too small?** Focus it, resize the outer terminal, and check its layout area.
+- **Copy or graphics missing?** The outer terminal may not support OSC 52, Kitty graphics, or sixel. Text and layout continue regardless.
+- **A process exits unexpectedly?** Watch the in-app diagnostic footer; set `CMDASH_CRASH_DIR` for a bounded crash report.
+
+---
 
 ## License
 
-cmdash is licensed under the [MIT License](LICENSE).
-
-## Initial principles
-
-1. **Modularity first:** widgets are optional, composable, and not coupled to terminal sessions.
-2. **Session isolation:** each terminal tab has its own PTY, emulator, render state, and graphics resource namespace.
-3. **Retained rendering:** widgets produce renderable scene data; the backend owns terminal I/O and frame submission.
-4. **External crates where practical:** parsing, PTY management, async execution, layout, and terminal backends should use mature Rust libraries rather than bespoke implementations.
-5. **Capability-aware behavior:** terminal features are detected and negotiated; unsupported graphics protocols degrade without corrupting layout or text.
-6. **Testable core:** terminal state, layout, composition, and protocol handling should be testable without an attached interactive terminal.
-
-## Status
-
-Phase 13 compositor API endpoints, options, and documentation is complete for the current local Unix-socket contract, including versioned snapshots, safe coordinator-owned commands, bounded queues, read-only defaults, and subscription polling. Phase 12 animation and dynamic widget options is complete for the current contract, including bounded retained transitions, coordinator-owned wakeups, reduced-motion/static fallbacks, and terminal cursor presentation. Phase 11 theming and appearance is complete for the current contract, including semantic roles, parent-terminal palette inheritance, RGB/ANSI overrides, border styles, and explicit label policies. Phase 10 configuration onboarding is also complete. The project has retained session-scoped graphics, bounded resource diagnostics, validated config reload and migration reporting, terminal selection/copy through OSC 52, a command palette/help surface, stabilized plugin metadata, Wasmtime isolation foundations, interactive pane focus/resize/close commands, fuzz targets and CI smoke runs, crash reproduction artifacts, and multi-target release packaging. `Ctrl+PageUp` / `Ctrl+PageDown` switch tabs, `Alt+Arrow` moves pane focus, `Ctrl+Shift+Arrow` adjusts pane ratios, `Ctrl+Shift+W` closes the focused pane, `Ctrl+P` opens the palette, `?` opens help, `Ctrl+Shift+C` copies a selection, and `--config <path>` / `-c <path>` enables safe reload with `Ctrl+R`; `--migrate-config --config <path>` rewrites legacy version metadata atomically.
-
-Optional sixel support is enabled with `--features sixel`; the default build remains capability-aware. The feature provides a bounded 16-color RGB dashboard-image encoder, while terminal-originated Kitty graphics continue to use the session-owned retained graphics path. Optional isolated WASM plugins are enabled with `--features wasm-plugins`; modules have no imports/WASI access and are subject to size and execution-budget policy.
+[MIT](LICENSE)

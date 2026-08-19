@@ -12,12 +12,13 @@ Before writing code, decide which extension path matches the job:
 
 | Need | Path |
 | --- | --- |
-| A general-purpose widget that ships with cmdash | Register a built-in factory in `WidgetRegistry::build_builtins`. |
+| Dashboard content that is just shell output | A `widget` script (the primary path); see [WIDGETS.md](WIDGETS.md). |
+| A general-purpose widget that ships with cmdash | Register an in-process factory against the public `Widget` trait (this guide). |
 | A project-local widget that does not need process isolation | Register an in-process factory against the public `Widget` trait (this guide). |
-| Untrusted, capability-limited, or separately distributed code | Use the versioned plugin manifest and the opt-in Wasmtime host; see [WIDGETS.md](WIDGETS.md) for the manifest and WASM isolation contract. |
+| Untrusted, capability-limited, or separately distributed code | The opt-in Wasmtime host (a dormant, compile-gated foundation); see [WIDGETS.md](WIDGETS.md) for its current status. |
 
 Every path produces the same backend-neutral `Scene` output and uses the same
-factory shape, so a widget can start in-process and move behind the plugin
+factory shape, so a widget can start in-process and move behind a future host
 boundary later without changing its rendering model.
 
 ## The contract
@@ -99,7 +100,9 @@ pub struct WidgetInstanceConfig {
 ```
 
 - `id` is the unique numeric widget ID from TOML.
-- `title`, `text`, `format`, and `command` are the optional type-specific fields.
+- `title` and `command` are the optional type-specific fields (`command` is
+  required for `widget`). `text` and `format` remain in the struct for legacy
+  compatibility; the two current types do not use them.
 - `label` controls whether the title is drawn in the widget border; `Never`
   removes the label without an empty-string sentinel.
 - `settings` is the stable string-to-string map for widget-specific options.
@@ -163,10 +166,10 @@ palettes and theme overrides keep working. See
 
 ### Reusing shared helpers
 
-The built-in catalog shares bounded rendering helpers — severity styling,
-`key: value` rows, progress bars, sparkline normalization, and horizontal rules.
-When you need one of these, prefer the shared helper or add a new bounded helper
-to `src/widget.rs` rather than duplicating the logic. Helpers must clip to the
+The runtime shares bounded rendering helpers — severity styling, `key: value`
+rows, progress bars, sparkline normalization, and horizontal rules. When you
+need one of these, prefer the shared helper or add a new bounded helper to
+`src/widget.rs` rather than duplicating the logic. Helpers must clip to the
 given area and define their minimum-size behavior explicitly.
 
 ## Focus, input, and resize
@@ -185,9 +188,9 @@ Terminal widgets are the canonical interactive implementation: they own a
 ## Background work and wakeups
 
 - **Synchronous refresh** is the simplest model: `update(now)` recomputes a
-  value (the `clock` widget recomputes UTC) and returns `Redraw` on change. The
-  coordinator already invokes `update` on its maintenance tick, so no timer
-  polling is needed.
+  value (an interval script recomputes its output) and returns `Redraw` on
+  change. The coordinator already invokes `update` on its maintenance tick, so
+  no timer polling is needed.
 - **Session-driven work** (terminal output) uses `WidgetRuntimeContext`'s
   optional `SessionWakeup` and is consumed through the session, not a widget
   worker.
@@ -283,8 +286,8 @@ fn greeting_factory(
 ```
 
 A data-backed widget is the same shape plus a mutable value and an `update`
-override. The `clock` widget is the reference: it stores the rendered string,
-recomputes it in `update(now)`, and returns `Redraw` only when it changed.
+override. A synchronous widget stores its rendered string, recomputes it in
+`update(now)`, and returns `Redraw` only when it changed.
 
 ```rust
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -340,7 +343,7 @@ Test configuration parsing, rendering, and lifecycle without a terminal:
 1. Parse a TOML snippet with `AppConfig::parse` and instantiate via
    `WidgetRuntime::from_config(&registry, &config)`.
 2. Render with a known `Rect` and assert cell symbols and styles — the same
-   pattern used by the built-in widget tests.
+   pattern used by the widget tests.
 3. Cover invalid settings, narrow/zero-area surfaces, and `update` coalescing.
 
 ```rust
@@ -363,11 +366,11 @@ The checked-in widget test suite follows this pattern and includes a custom
 factory registered against the public API, so the guide and the tests stay in
 sync.
 
-## Plugin and WASM restrictions
+## Isolation and restrictions
 
-External plugins use the versioned manifest contract and the opt-in Wasmtime
-host described in [WIDGETS.md](WIDGETS.md). Regardless of path, a widget must
-never:
+The opt-in Wasmtime host (behind the `wasm-plugins` feature) is a dormant,
+compile-gated foundation rather than the product's extension model; script
+widgets are. Regardless of path, a widget must never:
 
 - write to `stdout` or emit raw terminal escape sequences;
 - access PTY handles, the compositor, the backend, or global mutable state;
