@@ -495,6 +495,72 @@ def main():
           f"duration={d['animation_duration']}")
 
     # -----------------------------------------------------------------------
+    # Scenario 6: erase mutations → delete command stream. cmdash's
+    # apply_erase maps terminal erases to the same scoped/whole deletes the
+    # adapters already serialize: ED 2 (clear screen) deletes only the visible
+    # placements (history survives), ED 3 (clear scrollback) deletes only the
+    # history placements (visible survives), and RIS (reset) deletes every
+    # placement. Replay those streams against real Kitty and assert the scoped
+    # end states.
+
+    def upload(row, image_id):
+        return (
+            f'\x1b[{row + 1};1H'
+            f'\x1b_Ga=T,f=24,i={image_id},s=1,v=1,c=1,r=1,C=1,q=2,p=1;AQID\x1b\\'
+        ).encode()
+
+    def image_ids_at(screen, scrolled_by):
+        return sorted(lyr['image_id'] for lyr in layers(screen, scrolled_by))
+
+    def reachable(screen, server_id, depth=10):
+        return any(
+            server_id in image_ids_at(screen, dep) for dep in range(depth)
+        )
+
+    # ED 2 (clear screen): the visible placement is deleted; the placement
+    # scrolled into history survives and is reachable by scrolling back. To
+    # keep one visible and one in history, the history image is placed and
+    # scrolled away first, then the visible image is placed after the scroll.
+    s, c = create_screen(4, 3, scrollback=100)
+    parse_bytes(s, upload(0, 11))  # history image: server image_id 1
+    parse_bytes(s, b'row0\nrow1\nrow2\nrow3\n')  # scroll it out of view
+    parse_bytes(s, upload(1, 10))  # visible image: server image_id 2
+    check('6.1 only the visible placement shows in the live view',
+          image_ids_at(s, 0) == [2], describe_layers(layers(s)))
+    # cmdash's ED 2 stream: scoped delete of the visible placement only.
+    parse_bytes(s, b'\x1b_Ga=d,d=i,i=10,p=1;\x1b\\')
+    check('6.2 clear-screen delete removes the visible placement',
+          image_ids_at(s, 0) == [], describe_layers(layers(s)))
+    check('6.3 history placement survives and is reachable by scrolling back',
+          reachable(s, 1), describe_layers(layers(s, scrolled_by=4)))
+    check('6.4 clear-screen delete retains the image data',
+          s.grman.image_count == 2, f'image_count={s.grman.image_count}')
+
+    # ED 3 (clear scrollback): only the history placement is deleted; the
+    # visible placement stays put.
+    s, c = create_screen(4, 3, scrollback=100)
+    parse_bytes(s, upload(0, 11))  # history image: server image_id 1
+    parse_bytes(s, b'row0\nrow1\nrow2\nrow3\n')
+    parse_bytes(s, upload(1, 10))  # visible image: server image_id 2
+    parse_bytes(s, b'\x1b_Ga=d,d=i,i=11,p=1;\x1b\\')
+    check('6.5 clear-scrollback keeps the visible placement',
+          image_ids_at(s, 0) == [2], describe_layers(layers(s)))
+    check('6.6 clear-scrollback delete removed the history placement',
+          not reachable(s, 1), describe_layers(layers(s, scrolled_by=4)))
+
+    # RIS (reset): whole-image deletes for every placement; the data is
+    # released with an uppercase d=I so the outer terminal frees it too.
+    s, c = create_screen(4, 3)
+    parse_bytes(s, upload(1, 10))
+    parse_bytes(s, upload(2, 11))
+    parse_bytes(s, b'\x1b_Ga=d,d=I,i=10;\x1b\\')
+    parse_bytes(s, b'\x1b_Ga=d,d=I,i=11;\x1b\\')
+    ls = layers(s)
+    check('6.7 reset deletes remove every placement', len(ls) == 0, describe_layers(ls))
+    check('6.8 reset deletes free the image data',
+          s.grman.image_count == 0, f'image_count={s.grman.image_count}')
+
+    # -----------------------------------------------------------------------
     failed = [name for name, ok, _ in checks if not ok]
     print()
     print(f"{len(checks) - len(failed)}/{len(checks)} checks passed")

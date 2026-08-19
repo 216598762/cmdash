@@ -5752,6 +5752,14 @@ fn intersect_signed(first: (i32, i32, u16, u16), second: Rect) -> Option<Rect> {
 mod tests {
     use super::*;
 
+    fn removed_images(deltas: &GraphicsDeltas) -> Vec<u32> {
+        deltas
+            .removed
+            .iter()
+            .map(|submission| submission.resource().image())
+            .collect()
+    }
+
     #[test]
     fn protocol_adapter_handles_split_apc_and_c1_apc() {
         let mut adapter = GraphicsProtocolAdapter::new(1024, 128);
@@ -6080,6 +6088,164 @@ mod tests {
     }
 
     #[test]
+    fn erase_scopes_emit_removed_deltas_scoped_to_the_erase() {
+        let surface = Rect::new(0, 0, 8, 6);
+        let full = GraphicsScrollRegion::new(0, 6, 6);
+        let drain = |store: &mut SessionGraphicsStore, scrollback: usize| {
+            store.drain_graphics_deltas(surface, scrollback, GraphicsScreen::Primary, full, 0, 0)
+        };
+        // Place a history image (scrollback 0, resolves negative once 5 lines
+        // of scrollback exist) and a visible image (scrollback 5).
+        let place = |store: &mut SessionGraphicsStore| {
+            store
+                .apply_kitty_command_with_scroll_region(
+                    b"a=T,f=24,i=1,c=1,r=1,C=1,q=2",
+                    b"AQID",
+                    (0, 0),
+                    (10, 20),
+                    0,
+                    GraphicsScreen::Primary,
+                    full,
+                    0,
+                )
+                .unwrap();
+            store
+                .apply_kitty_command_with_scroll_region(
+                    b"a=T,f=24,i=2,c=1,r=1,C=1,q=2",
+                    b"BAUG",
+                    (0, 0),
+                    (10, 20),
+                    5,
+                    GraphicsScreen::Primary,
+                    full,
+                    0,
+                )
+                .unwrap();
+            drain(store, 5);
+        };
+
+        // ED 2 (ClearScreen): the visible image is removed; history survives.
+        {
+            let mut store = SessionGraphicsStore::new(SessionId::new(200));
+            place(&mut store);
+            assert!(store.apply_erase(
+                GraphicsErase::ClearScreen(GraphicsScreen::Primary),
+                5,
+                full,
+                0,
+            ));
+            let deltas = drain(&mut store, 5);
+            assert_eq!(deltas.changed.len(), 0);
+            assert_eq!(removed_images(&deltas), vec![2]);
+        }
+
+        // ED 3 (ClearScrollback): only the history image is removed.
+        {
+            let mut store = SessionGraphicsStore::new(SessionId::new(201));
+            place(&mut store);
+            assert!(store.apply_erase(GraphicsErase::ClearScrollback, 5, full, 0));
+            let deltas = drain(&mut store, 5);
+            assert_eq!(deltas.changed.len(), 0);
+            assert_eq!(removed_images(&deltas), vec![1]);
+        }
+
+        // RIS (All): both placements and their resources are removed.
+        {
+            let mut store = SessionGraphicsStore::new(SessionId::new(202));
+            place(&mut store);
+            assert!(store.apply_erase(GraphicsErase::All, 5, full, 0));
+            let deltas = drain(&mut store, 5);
+            assert_eq!(deltas.changed.len(), 0);
+            assert_eq!(removed_images(&deltas), vec![1, 2]);
+            assert_eq!(store.placement_count(), 0);
+            assert_eq!(store.resource_count(), 0);
+        }
+
+        // Alternate: only the alternate-screen placement is removed.
+        {
+            let mut store = SessionGraphicsStore::new(SessionId::new(203));
+            store
+                .apply_kitty_command_with_scroll_region(
+                    b"a=T,f=24,i=3,c=1,r=1,C=1,q=2",
+                    b"AwID",
+                    (0, 0),
+                    (10, 20),
+                    0,
+                    GraphicsScreen::Alternate,
+                    full,
+                    0,
+                )
+                .unwrap();
+            drain(&mut store, 0);
+            assert!(store.apply_erase(GraphicsErase::Alternate, 0, full, 0));
+            let deltas = drain(&mut store, 0);
+            assert_eq!(deltas.changed.len(), 0);
+            assert_eq!(removed_images(&deltas), vec![3]);
+            assert_eq!(store.placement_count(), 0);
+        }
+    }
+
+    #[test]
+    fn partial_erases_emit_removed_deltas_for_the_affected_rows() {
+        let surface = Rect::new(0, 0, 8, 6);
+        let full = GraphicsScrollRegion::new(0, 6, 6);
+        // Rows 0, 2, 4 hold images 1, 2, 3 respectively (visible, scrollback 5).
+        let place_at = |store: &mut SessionGraphicsStore, image: u32, row: u16| {
+            store
+                .apply_kitty_command_with_scroll_region(
+                    &format!("a=T,f=24,i={image},c=1,r=1,C=1,q=2").into_bytes(),
+                    b"AQID",
+                    (0, row),
+                    (10, 20),
+                    5,
+                    GraphicsScreen::Primary,
+                    full,
+                    0,
+                )
+                .unwrap();
+        };
+        let drain = |store: &mut SessionGraphicsStore| {
+            store.drain_graphics_deltas(surface, 5, GraphicsScreen::Primary, full, 0, 0)
+        };
+
+        // ED 0 (ClearBelow at cursor row 2): rows >= 2 removed (images 2, 3).
+        {
+            let mut store = SessionGraphicsStore::new(SessionId::new(210));
+            place_at(&mut store, 1, 0);
+            place_at(&mut store, 2, 2);
+            place_at(&mut store, 3, 4);
+            drain(&mut store);
+            assert!(store.apply_erase(
+                GraphicsErase::ClearBelow(GraphicsScreen::Primary, 2),
+                5,
+                full,
+                0,
+            ));
+            let deltas = drain(&mut store);
+            assert_eq!(deltas.changed.len(), 0);
+            assert_eq!(removed_images(&deltas), vec![2, 3]);
+        }
+
+        // ED 1 (ClearAbove at cursor row 2): rows 0..=2 removed (images 1, 2).
+        {
+            let mut store = SessionGraphicsStore::new(SessionId::new(211));
+            place_at(&mut store, 1, 0);
+            place_at(&mut store, 2, 2);
+            place_at(&mut store, 3, 4);
+            drain(&mut store);
+            assert!(store.apply_erase(
+                GraphicsErase::ClearAbove(GraphicsScreen::Primary, 2),
+                5,
+                full,
+                0,
+            ));
+            let deltas = drain(&mut store);
+            assert_eq!(deltas.changed.len(), 0);
+            assert_eq!(removed_images(&deltas), vec![1, 2]);
+        }
+    }
+
+    #[test]
     fn region_scroll_moves_only_placements_anchored_in_the_region() {
         let mut store = SessionGraphicsStore::new(SessionId::new(95));
         let region = GraphicsScrollRegion::new(2, 6, 6);
@@ -6393,6 +6559,147 @@ mod tests {
             0,
         );
         assert_eq!(visible[0].placement().area(), Rect::new(1, 1, 1, 1));
+    }
+
+    #[test]
+    fn reflow_preserves_buffer_rows_and_emits_no_spurious_moves() {
+        let surface = Rect::new(0, 0, 8, 6);
+        let full = GraphicsScrollRegion::new(0, 6, 6);
+        let mut store = SessionGraphicsStore::new(SessionId::new(220));
+        store
+            .apply_kitty_command_with_scroll_region(
+                b"a=T,f=24,i=9,c=1,r=1,q=2",
+                b"AQID",
+                (1, 4),
+                (10, 20),
+                0,
+                GraphicsScreen::Primary,
+                full,
+                0,
+            )
+            .unwrap();
+        store.drain_graphics_deltas(surface, 0, GraphicsScreen::Primary, full, 0, 0);
+        let object = store.buffer.identity().object_for_client(9).unwrap();
+        assert_eq!(
+            store.buffer.object(object).unwrap().placements[0].start_row,
+            4
+        );
+
+        // A column reflow (8 -> 4) grows the scrollback 0 -> 6 without a
+        // uniform scroll; the placement keeps its grid row and the buffer must
+        // not emit a move (a spurious delta would re-place it at a wrong row).
+        assert!(store.reanchor_on_resize(8, 4, 0, 6, full, 0));
+        let deltas = store.drain_graphics_deltas(surface, 6, GraphicsScreen::Primary, full, 0, 0);
+        assert_eq!(
+            deltas.changed.len(),
+            0,
+            "reflow must not emit spurious moves"
+        );
+        assert_eq!(deltas.removed.len(), 0);
+        assert_eq!(
+            store.buffer.object(object).unwrap().placements[0].start_row,
+            4,
+            "the buffer row is preserved through the reflow"
+        );
+
+        // The store still resolves the placement to the same visible row.
+        let visible = store.visible_submissions_with_scroll_state(
+            surface,
+            6,
+            GraphicsScreen::Primary,
+            full,
+            0,
+            0,
+        );
+        assert_eq!(visible[0].placement().area(), Rect::new(1, 4, 1, 1));
+    }
+
+    #[test]
+    fn reflow_preserves_history_buffer_rows_after_scroll() {
+        let surface = Rect::new(0, 0, 8, 6);
+        let full = GraphicsScrollRegion::new(0, 6, 6);
+        let mut store = SessionGraphicsStore::new(SessionId::new(221));
+        store
+            .apply_kitty_command_with_scroll_region(
+                b"a=T,f=24,i=9,c=1,r=1,q=2",
+                b"AQID",
+                (1, 1),
+                (10, 20),
+                0,
+                GraphicsScreen::Primary,
+                full,
+                0,
+            )
+            .unwrap();
+        store.drain_graphics_deltas(surface, 0, GraphicsScreen::Primary, full, 0, 0);
+        // Ten lines scroll into history: the buffer mirrors the scroll.
+        store.record_scroll(10);
+        let object = store.buffer.identity().object_for_client(9).unwrap();
+        assert_eq!(
+            store.buffer.object(object).unwrap().placements[0].start_row,
+            -9
+        );
+
+        // A column reflow grows the scrollback 10 -> 14; the placement keeps
+        // resolving to the same history row (-9), so no move is emitted.
+        assert!(store.reanchor_on_resize(8, 4, 10, 14, full, 0));
+        store.drain_graphics_deltas(surface, 10, GraphicsScreen::Primary, full, 0, 10);
+        let deltas = store.drain_graphics_deltas(surface, 14, GraphicsScreen::Primary, full, 0, 0);
+        assert_eq!(
+            deltas.changed.len(),
+            0,
+            "reflow must not emit spurious moves"
+        );
+        assert_eq!(deltas.removed.len(), 0);
+        assert_eq!(
+            store.buffer.object(object).unwrap().placements[0].start_row,
+            -9
+        );
+    }
+
+    #[test]
+    fn row_only_resize_shifts_buffer_rows_with_the_history_push() {
+        let surface = Rect::new(0, 0, 8, 6);
+        let full = GraphicsScrollRegion::new(0, 6, 6);
+        let mut store = SessionGraphicsStore::new(SessionId::new(222));
+        store
+            .apply_kitty_command_with_scroll_region(
+                b"a=T,f=24,i=9,c=1,r=1,q=2",
+                b"AQID",
+                (1, 4),
+                (10, 20),
+                0,
+                GraphicsScreen::Primary,
+                full,
+                0,
+            )
+            .unwrap();
+        store.drain_graphics_deltas(surface, 0, GraphicsScreen::Primary, full, 0, 0);
+        let object = store.buffer.identity().object_for_client(9).unwrap();
+        assert_eq!(
+            store.buffer.object(object).unwrap().placements[0].start_row,
+            4
+        );
+
+        // A row-only shrink (6 -> 4) pushes two lines into history: the store
+        // resolves the placement to row 2, so the buffer row must shift 4 -> 2
+        // (not 4 -> 6, which would re-place it below the bottom edge).
+        assert!(!store.reanchor_on_resize(8, 8, 0, 2, full, 0));
+        store.record_scroll(2);
+        assert_eq!(
+            store.buffer.object(object).unwrap().placements[0].start_row,
+            2,
+            "a row-only shrink mirrors the history push as a scroll"
+        );
+        let visible = store.visible_submissions_with_scroll_state(
+            surface,
+            2,
+            GraphicsScreen::Primary,
+            full,
+            0,
+            0,
+        );
+        assert_eq!(visible[0].placement().area(), Rect::new(1, 2, 1, 1));
     }
 
     #[test]

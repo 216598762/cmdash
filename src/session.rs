@@ -1773,6 +1773,17 @@ impl TerminalSession {
             old_region,
             old_region_scroll,
         );
+        // A row-only resize pushes/pulls whole lines into/out of history, which
+        // is a real scroll: mirror the net scrollback delta into the virtual
+        // buffer so its row attachment stays in sync with the anchor model.
+        // (Column changes are excluded: the re-anchor above already preserves
+        // each placement's resolved row through the rewrap.)
+        if old_columns == size.columns {
+            let delta = self.scrollback_lines() as i64 - old_scrollback as i64;
+            if delta != 0 {
+                self.graphics.record_scroll(delta);
+            }
+        }
         self.scroll_tracker.resize(size.columns, size.rows);
         *self
             .reported_size
@@ -2925,6 +2936,35 @@ mod tests {
         assert_eq!(session.graphics(Rect::new(0, 0, 20, 4)).len(), 1);
         session.consume_output(b"\x1b[?1049l").unwrap();
         assert!(session.graphics(Rect::new(0, 0, 20, 4)).is_empty());
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn row_only_resize_mirrors_the_history_push_into_the_command_stream() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 6)).unwrap();
+        // Anchor a static-cursor image on the bottom row so a row shrink
+        // pushes it up into the viewport.
+        session
+            .consume_output(b"\x1b[6;1H\x1b_Ga=T,f=24,i=33,c=1,r=1,C=1,q=2;AQID\x1b\\")
+            .unwrap();
+        assert_eq!(
+            session.graphics(Rect::new(0, 0, 20, 6))[0].placement().y(),
+            5
+        );
+        // Drain the initial placement so the next drain reflects only the resize.
+        session.drain_graphics_deltas(Rect::new(0, 0, 20, 6));
+
+        // Shrink 6 -> 4 rows: the emulator scrolls the bottom two lines into
+        // history, so the image must follow up to row 3 rather than stay at 5.
+        session.resize(TerminalSize::new(20, 4)).unwrap();
+        assert!(session.scrollback_lines() > 0);
+        let deltas = session.drain_graphics_deltas(Rect::new(0, 0, 20, 4));
+        assert_eq!(deltas.changed.len(), 1, "the resize emits one move");
+        assert_eq!(deltas.changed[0].placement().y(), 3);
+        assert_eq!(
+            session.graphics(Rect::new(0, 0, 20, 4))[0].placement().y(),
+            3
+        );
         session.shutdown().unwrap();
     }
 

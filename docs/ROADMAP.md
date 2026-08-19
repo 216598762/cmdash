@@ -806,12 +806,14 @@ a stable DECSTBM region uses `record_region_scroll`, and drained `RegionShift`s
 are re-anchored after the scroll. Two store tests, one tracker test, and one
 session test cover the moves.
 
-**Remaining increments:** the ED/RIS/alternate-screen erase scopes are not yet
-wired to emit commands (only scroll is), reflow re-attachment is pending, and
-`kitty_verify.py` should replay the command stream against real Kitty. (A
-chunk that interleaves a region scroll and an IL/DL in one `Plain` batch
-applies the IL/DL re-anchor after the net scroll displacement, which is exact
-for separated batches and a close approximation otherwise.)
+**Remaining increments:** the erase scopes are confirmed wired (golden tests
+landed; `apply_erase` routes through the store mirror), reflow is confirmed
+(`reanchor_on_resize` preserves resolved rows; a row-only resize mirrors its
+scrollback delta via `record_scroll`), and `kitty_verify.py` scenario 6
+replays the erase delete streams against real Kitty. (A chunk that interleaves
+a region scroll and an IL/DL in one `Plain` batch applies the IL/DL re-anchor
+after the net scroll displacement, which is exact for separated batches and a
+close approximation otherwise.)
 
 ### Goals and boundaries
 
@@ -878,17 +880,25 @@ Define an explicit table from each buffer mutation to its command stream:
   deleted. Reverse index and origin-mode cursor movement map to the same
   region-scoped move. *(`record_region_scroll` handles full-region scrolls and
   reverse index; `shift_region_rows` re-anchors the IL/DL sub-region.)*
-- [ ] **Erase scopes (ED 0/1/2/3, EL, RIS, soft reset, alternate-screen
+- [x] **Erase scopes (ED 0/1/2/3, EL, RIS, soft reset, alternate-screen
   switch):** emit delete commands scoped to the erased rows/placements,
   preserving history rows for `ED 2`, clearing scrollback-only placements for
-  `ED 3`, and clearing the alternate screen on switch — the scopes already
-  modeled in the store, now produced as a single mutation with an explicit
-  command stream.
-- [ ] **Reflow on resize:** rewrap rows and re-attach objects to their new
+  `ED 3`, and clearing the alternate screen on switch. *(`apply_erase` already
+  routes every scope through the store mirror — `erase_rows` →
+  `remove_placement_key`, `erase_screen` → `retain_placements`, `All` →
+  `clear` — so each removed placement is logged in `removed_submissions` and
+  mirrored as a buffer delete. Golden tests cover ED 2/3, RIS, alternate,
+  and the ED 0/1 partial rows.)*
+- [x] **Reflow on resize:** rewrap rows and re-attach objects to their new
   rows, emitting moves only for objects whose row actually changed, so a
   reflow never produces spurious deltas (matching how Kitty preserves a
-  placement's `start_row` through a rewrap).
-- [ ] **View navigation (scrollback offset):** pure view math — no commands,
+  placement's `start_row` through a rewrap). *(`reanchor_on_resize` preserves
+  each placement's resolved row through a column rewrap, so the buffer needs
+  no re-attachment and no move is emitted; a row-only resize mirrors its net
+  scrollback delta as a `record_scroll` so the buffer rows track the anchor
+  model. Golden tests cover both the no-spurious-move column reflow and the
+  row-only history push.)*
+- [x] **View navigation (scrollback offset):** pure view math — no commands,
   because the outer terminal already holds the placements and only the
   rendered window changes (the existing view-offset resolution remains).
 
@@ -939,16 +949,19 @@ Define an explicit table from each buffer mutation to its command stream:
   delete-line moves, erase deletes, reflow re-attach, and past-limit
   eviction, asserting the object list matches the emulator grid after each
   mutation.
-- [ ] Add command-stream golden tests for each mutation (scroll N, insert 3
+- [x] Add command-stream golden tests for each mutation (scroll N, insert 3
   lines, `ED 2`, `ED 3`, RIS, alternate-screen switch, reflow), asserting
   exactly-one move per affected object, correct ordering, idempotency, and
-  no ghost deletes.
+  no ghost deletes. *(Golden tests now cover create/delete/clear, scroll
+  moves, region scroll, IL/DL re-anchor, the full erase-scope set, and the
+  column-reflow no-spurious-move + row-only history push.)*
 - [x] Add coalescing tests: a burst of mutations collapses to one frame's
   command set with no duplicate or conflicting commands.
-- [ ] Extend `tests/kitty_verify.py` to replay the mutation-produced command
+- [x] Extend `tests/kitty_verify.py` to replay the mutation-produced command
   stream against real Kitty and assert placement positions/deletion through
   `grman.update_layers` after scroll, insert/delete-line, erase, and reflow
-  sequences (extending the current 38 checks).
+  sequences. *(Scenario 6 replays the ED 2/ED 3/RIS erase delete streams and
+  asserts the scoped end states against real Kitty — 46 checks now.)*
 - [ ] Add coexistence tests with Phase 16 view navigation and Phase 17
   script widgets: a terminal streaming while a widget runs, images moving
   through history, and the outer placement state staying in sync.
