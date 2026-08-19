@@ -1933,6 +1933,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terminal_graphics_deltas_flow_alongside_non_terminal_widgets() {
+        let mut terminal = TerminalWidget {
+            title: " shell ".to_owned(),
+            label: true,
+            session: TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 6)).unwrap(),
+            // No border/padding so the content area equals the surface and the
+            // projected row is the emulator's grid row.
+            appearance: WidgetAppearance {
+                padding: 0,
+                border: WidgetBorderStyle::None,
+            },
+            theme: Theme::fallback(),
+            cursor_blink: CursorBlinkSettings::default(),
+            scrollback_chrome: ScrollbackChrome::default(),
+            selection: SelectionSettings::default(),
+        };
+        // Place an image on row 3 and scroll it up one row (three lines push
+        // the cursor past the bottom once).
+        terminal
+            .session
+            .consume_output(b"\x1b[4;1H\x1b_Ga=T,f=24,i=33,c=1,r=1,C=1,q=2;AQID\x1b\\")
+            .unwrap();
+        terminal.session.consume_output(b"a\r\nb\r\nc\r\n").unwrap();
+
+        let mut runtime = WidgetRuntime::empty();
+        runtime.instances.insert(
+            WidgetId::new(1),
+            WidgetEntry {
+                widget: Box::new(terminal),
+                health: WidgetHealth::Healthy,
+            },
+        );
+        runtime.instances.insert(
+            WidgetId::new(2),
+            WidgetEntry {
+                widget: Box::new(FailingWidget),
+                health: WidgetHealth::Healthy,
+            },
+        );
+
+        let areas = BTreeMap::from([
+            (WidgetId::new(1), Rect::new(0, 0, 20, 6)),
+            (WidgetId::new(2), Rect::new(0, 7, 20, 3)),
+        ]);
+        let deltas = runtime.drain_graphics_deltas(&areas);
+        // The terminal's image surfaced as one changed submission (the
+        // scroll-move to row 2); the non-terminal widget contributed nothing.
+        assert_eq!(deltas.removed.len(), 0);
+        assert_eq!(deltas.changed.len(), 1);
+        assert_eq!(deltas.changed[0].placement().y(), 2);
+    }
+
     fn wait_for_scrollback(widget: &mut TerminalWidget) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {

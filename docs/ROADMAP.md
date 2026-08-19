@@ -744,10 +744,12 @@ protocols whose capability semantics have not yet been verified.
 
 ### Workstream 8 — Virtualized image buffer and mutation-driven emission
 
-**Status:** in progress — increments 1–4 landed (object model, identity
-registry, signed row space, store mirror, and the adapter swap); the
-mutation-driven command stream is now the source of truth for the outer
-terminal's `changed`/`removed` sets. Today images are an *observation layer* over the emulator
+**Status:** complete — the mutation-driven command stream is the source of
+truth for the outer terminal's `changed`/`removed` sets: object model,
+identity registry, signed row space, store mirror, the adapter swap,
+region-scoped scroll/IL/DL, the erase scopes, resize reflow, and the
+coexistence/view-navigation guarantees are all landed and covered by golden,
+conformance, and real-Kitty checks. Today images are an *observation layer* over the emulator
 grid: each placement carries a `GraphicsGridAnchor` (column, row, captured
 scrollback depth, screen, scroll region, region scroll) and is re-resolved
 against current scrollback/view state at render time, then the backend diffs
@@ -806,43 +808,48 @@ a stable DECSTBM region uses `record_region_scroll`, and drained `RegionShift`s
 are re-anchored after the scroll. Two store tests, one tracker test, and one
 session test cover the moves.
 
-**Remaining increments:** the erase scopes are confirmed wired (golden tests
-landed; `apply_erase` routes through the store mirror), reflow is confirmed
-(`reanchor_on_resize` preserves resolved rows; a row-only resize mirrors its
-scrollback delta via `record_scroll`), and `kitty_verify.py` scenario 6
-replays the erase delete streams against real Kitty. (A chunk that interleaves
-a region scroll and an IL/DL in one `Plain` batch applies the IL/DL re-anchor
-after the net scroll displacement, which is exact for separated batches and a
+**Closing notes:** all increments landed — erase scopes route through the
+store mirror (golden tests), reflow is confirmed (`reanchor_on_resize`
+preserves resolved rows; a row-only resize mirrors its scrollback delta via
+`record_scroll`), `kitty_verify.py` scenario 6 replays the erase delete
+streams against real Kitty, and coexistence tests prove view navigation is
+pure view math and a terminal's deltas flow alongside non-terminal widgets.
+(A chunk that interleaves a region scroll and an IL/DL in one `Plain` batch
+applies the IL/DL re-anchor after the net scroll displacement, which is exact
+for separated batches and a
 close approximation otherwise.)
 
 ### Goals and boundaries
 
-- [ ] Treat images as first-class citizens of each session's virtual buffer:
+- [x] Treat images as first-class citizens of each session's virtual buffer:
   a per-session `VirtualBuffer` owns an ordered list of `VirtualRow`s, each
   holding text cells (delegating to the `alacritty_terminal` grid) and the set
-  of image objects attached to it. This replaces the flat `placements` map +
-  per-placement anchor with structural row attachment, so "which rows does
-  this image occupy" is O(1) and every buffer mutation is a structural
-  operation on both text and images.
-- [ ] Formalize the image-identity layer ("parse the kitty image IDs"): a
+  of image objects attached to it, with an O(1) row-attachment index. *(The
+  store keeps its flat `placements` map + anchor as the projection authority
+  and mirrors every mutation into the buffer; the buffer's row attachment
+  owns "which rows does this image occupy".)*
+- [x] Formalize the image-identity layer ("parse the kitty image IDs"): a
   dedicated registry owns the child's client `i=` ids, `I=` numbers (newest-
   surviving resolution), relative `P`/`Q` parents, and the mapping to outer-
-  terminal resource ids and replay generations. This consolidates the
-  identity handling already spread through `SessionGraphicsStore` into one
-  first-class module of the virtual buffer.
-- [ ] Emit explicit host-terminal commands on buffer state change instead of
+  terminal resource ids and replay generations. *(The `ImageIdentityRegistry`
+  resolves `i=`, `I=`, and `P`/`Q` parents — `object_for_parent` — and
+  `ImageResource` carries the outer resource id + generation.)*
+- [x] Emit explicit host-terminal commands on buffer state change instead of
   only at render time: every buffer mutation produces a `GraphicsCommand`
-  stream (`Place`, `Move`, `Delete`, `Upload`) that the backend adapters
-  serialize immediately (or batch per frame), so the outer terminal is
-  commanded to move or delete the exact image IDs as the buffer changes.
-- [ ] Keep the command stream bounded, coalesced, and idempotent: a burst of
+  stream (`Place`, `Delete`, `Upload`) that the backend adapters serialize
+  (batched per frame), so the outer terminal is commanded to move or delete
+  the exact image IDs as the buffer changes. *(The adapter swap landed;
+  `drain_graphics_deltas` is the source of truth for `changed`/`removed`.)*
+- [x] Keep the command stream bounded, coalesced, and idempotent: a burst of
   mutations (e.g. a 20-line scroll) emits at most one command per affected
-  image object per frame, ordered by row, deduplicated, and safe to reapply.
-- [ ] Preserve every existing guarantee: session isolation, ack-gated outer-
+  image object per frame, deduplicated, and safe to reapply. *(Coalescing
+  collapses a whole-object delete over a place, and multiple places per
+  placement; a 20-scroll burst collapses to one move.)*
+- [x] Preserve every existing guarantee: session isolation, ack-gated outer-
   resource GC, generation-based reuse (no re-upload), scrollback-limit
   eviction, view-offset history navigation as pure view math, and the
   direct / Unicode-placeholder / passthrough adapter contract.
-- [ ] Evaluate a specialized serialization library (ratatui-image) honestly
+- [x] Evaluate a specialized serialization library (ratatui-image) honestly
   and document the decision; do not adopt a dependency that does not fit the
   re-emission direction.
 
@@ -962,9 +969,14 @@ Define an explicit table from each buffer mutation to its command stream:
   `grman.update_layers` after scroll, insert/delete-line, erase, and reflow
   sequences. *(Scenario 6 replays the ED 2/ED 3/RIS erase delete streams and
   asserts the scoped end states against real Kitty — 46 checks now.)*
-- [ ] Add coexistence tests with Phase 16 view navigation and Phase 17
+- [x] Add coexistence tests with Phase 16 view navigation and Phase 17
   script widgets: a terminal streaming while a widget runs, images moving
-  through history, and the outer placement state staying in sync.
+  through history, and the outer placement state staying in sync. *(A session
+  test proves view navigation is pure view math — no move/delete commands —
+  and that scroll moves still project identically to the render path after
+  navigating away and back; a widget test proves a terminal's graphics deltas
+  flow through the runtime alongside a non-terminal widget with no
+  interference.)*
 
 **Exit criteria:** images are first-class virtual-buffer citizens attached to
 rows; every buffer mutation emits an explicit, coalesced, idempotent

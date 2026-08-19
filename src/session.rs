@@ -1349,7 +1349,10 @@ impl TerminalSession {
         }
     }
 
-    fn consume_output(&mut self, bytes: &[u8]) -> Result<bool, SessionError> {
+    /// Feeds child output bytes into the session deterministically (the same
+    /// path the PTY reader drives), so crate-internal tests can drive a
+    /// session's graphics protocol and text without a real child process.
+    pub(crate) fn consume_output(&mut self, bytes: &[u8]) -> Result<bool, SessionError> {
         let remaining = MAX_GRAPHICS_PROTOCOL_CAPTURE_BYTES
             .saturating_sub(self.graphics_protocol_capture.len());
         self.graphics_protocol_capture
@@ -2909,6 +2912,49 @@ mod tests {
         // nothing remains even after scrolling the view to the top.
         session.scroll_display(Scroll::Top);
         assert!(session.graphics(Rect::new(0, 0, 20, 4)).is_empty());
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn view_navigation_is_pure_view_math_for_the_command_stream() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 6)).unwrap();
+        let surface = Rect::new(0, 0, 20, 6);
+        // Anchor the image on row 3 so a one-line scroll keeps it visible.
+        session
+            .consume_output(b"\x1b[4;1H\x1b_Ga=T,f=24,i=33,c=1,r=1,C=1,q=2;AQID\x1b\\")
+            .unwrap();
+        session.drain_graphics_deltas(surface);
+
+        // Three lines push the cursor past the bottom once: one scroll moves
+        // the image up from row 3 to row 2. The command stream emits the move,
+        // and its projection must match the render path exactly.
+        session.consume_output(b"a\r\nb\r\nc\r\n").unwrap();
+        let deltas = session.drain_graphics_deltas(surface);
+        let rendered = session.graphics(surface);
+        assert_eq!(deltas.removed.len(), 0);
+        assert_eq!(
+            deltas.changed, rendered,
+            "the scroll move projects identically to the render path"
+        );
+        assert_eq!(deltas.changed[0].placement().y(), 2);
+
+        // View navigation is pure view math: scrolling the viewport into
+        // history must not emit any move/delete command.
+        assert!(session.scroll_display(Scroll::Top));
+        let nav = session.drain_graphics_deltas(surface);
+        assert!(
+            nav.changed.is_empty() && nav.removed.is_empty(),
+            "view navigation must not emit commands"
+        );
+
+        // Returning to the live viewport is likewise silent, and a subsequent
+        // scroll keeps the stream in sync.
+        assert!(session.scroll_display(Scroll::Bottom));
+        let back = session.drain_graphics_deltas(surface);
+        assert!(back.changed.is_empty() && back.removed.is_empty());
+        session.consume_output(b"row2\r\nrow3\r\n").unwrap();
+        let after = session.drain_graphics_deltas(surface);
+        assert_eq!(after.changed, session.graphics(surface));
         session.shutdown().unwrap();
     }
 
