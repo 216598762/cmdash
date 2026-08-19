@@ -964,10 +964,16 @@ impl AppState {
         };
         let area = surface.area();
         let input_area = self.widget_runtime.content_area(widget_id, area);
-        if mouse.column < input_area.x
-            || mouse.row < input_area.y
-            || mouse.column >= input_area.x.saturating_add(input_area.width)
-            || mouse.row >= input_area.y.saturating_add(input_area.height)
+        // A terminal drag may leave the content area vertically to auto-scroll
+        // into scrollback (and the release that ends it may land outside), so
+        // Drag/Up events pass the row bounds check while the column must stay
+        // inside. Every other event must land inside the content area.
+        let vertical_escape = matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_));
+        let column_inside = mouse.column >= input_area.x
+            && mouse.column < input_area.x.saturating_add(input_area.width);
+        let row_inside =
+            mouse.row >= input_area.y && mouse.row < input_area.y.saturating_add(input_area.height);
+        if !(column_inside && (row_inside || vertical_escape))
             || !self.widget_runtime.handles_input(widget_id)
         {
             return Ok(false);
@@ -975,12 +981,14 @@ impl AppState {
         self.widget_runtime
             .handle_mouse(widget_id, mouse, (input_area.x, input_area.y))?;
         // A terminal that opts into copy-on-select/release auto-copies its
-        // finalized selection to the clipboard when the mouse button lifts.
+        // finalized selection to the clipboard when the mouse button lifts,
+        // then clears it (Kitty's clear-on-copy behavior).
         if matches!(mouse.kind, MouseEventKind::Up(_))
             && self.widget_runtime.auto_copy_selection(widget_id)
             && self.widget_runtime.has_selection(widget_id)
         {
             self.copy_focused_selection();
+            self.widget_runtime.clear_selection(widget_id);
         }
         self.reset_cursor_blink();
         Ok(true)
@@ -2036,6 +2044,77 @@ mod tests {
             ))
             .unwrap();
         assert!(state.take_clipboard().is_some());
+        // Kitty's clear-on-copy: the auto-copied selection is dropped.
+        assert!(
+            !state.widget_runtime.has_selection(WidgetId::new(1)),
+            "auto-copy clears the selection"
+        );
+        state.shutdown_widgets();
+    }
+
+    #[test]
+    fn drag_past_the_content_edge_routes_to_the_terminal_for_auto_scroll() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "terminal"
+            command = "sh"
+            "#,
+        )
+        .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        let surface = SurfaceId::new(1);
+        state
+            .dispatch(Command::Surface(SurfaceCommand::SetArea {
+                id: surface,
+                area: Rect::new(0, 0, 20, 8),
+            }))
+            .unwrap();
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(surface)))
+            .unwrap();
+
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        // A press inside the content area (bordered, so it starts at (1,1))
+        // begins a selection and is handled.
+        assert!(
+            state
+                .handle_mouse(mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    2,
+                    2,
+                ))
+                .unwrap()
+        );
+        // A drag above the content top still routes to the terminal (vertical
+        // escape for auto-scroll) instead of being dropped by the bounds check.
+        assert!(
+            state
+                .handle_mouse(mouse(
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                    2,
+                    0,
+                ))
+                .unwrap()
+        );
+        // A drag that leaves horizontally is still rejected.
+        assert!(
+            !state
+                .handle_mouse(mouse(
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                    0,
+                    2,
+                ))
+                .unwrap()
+        );
         state.shutdown_widgets();
     }
 

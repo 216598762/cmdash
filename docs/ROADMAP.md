@@ -1922,9 +1922,8 @@ selection anchored at the grid cursor, and the five settings
 (`double_click_timeout_ms`, `semantic_escape_chars`, `selection_auto_scroll`,
 `copy_on_select`, `copy_on_release`) are validated per terminal and wired into
 the session (`copy_on_select`/`copy_on_release` auto-copy on mouse release).
-Remaining increments: drag auto-scroll (gated by the now-parsed
-`selection_auto_scroll`), deterministic clear-on-bare-click/focus-loss, and the
-mouse-reporting handoff tests.
+Drag auto-scroll (gated by `selection_auto_scroll`), deterministic
+clear-on-focus-loss/on-copy, and the mouse-reporting handoff are now landed.
 
 ### Goals and boundaries
 
@@ -1972,14 +1971,19 @@ mouse-reporting handoff tests.
 - [x] On `Shift`+`MouseDown`, extend the current selection to the new point
   (update the tail, preserve the anchor and mode) instead of beginning a new
   selection.
-- [ ] Support drag auto-scroll: while the pointer is held beyond the top or
+- [x] Support drag auto-scroll: while the pointer is held beyond the top or
   bottom of the content area, advance the session's `display_offset` (bounded
   by history) so a selection can extend into scrollback, and stop when the
-  pointer returns inside.
-- [ ] Clear the selection deterministically: a bare click, focus leaving the
+  pointer returns inside. *(`Session::drag_selection` scrolls by a bounded
+  step and clamps the tail to the visible edge; `handle_focused_mouse` lets a
+  `Drag`/`Up` escape the content area vertically so the event reaches the
+  terminal.)*
+- [x] Clear the selection deterministically: a bare click, focus leaving the
   pane, and (configurable) on copy; keep the selection across child output,
   matching alacritty's behavior (Kitty clears on copy, which becomes the
-  `copy_on_select`/`copy_on_release` setting).
+  `copy_on_select`/`copy_on_release` setting). *(A single click yields an
+  empty selection; losing focus clears the selection; an auto-copied selection
+  is cleared on release.)*
 
 ### Coordinate translation and rendering
 
@@ -2033,14 +2037,18 @@ mouse-reporting handoff tests.
 - [x] Add flowed-copy tests: a wrapped line copies without `\n`, a hard line
   break copies with `\n`, wide/zero-width cells are skipped correctly, and
   `Block` mode copies a rectangle.
-- [ ] Add scrollback tests: select rows in history, navigate the view, and
+- [x] Add scrollback tests: select rows in history, navigate the view, and
   copy the same grid points; drag auto-scroll is bounded by history and stops
-  on release.
+  on release. *(`drag_auto_scroll_extends_selection_into_scrollback`,
+  `drag_auto_scroll_is_bounded_by_history`, and
+  `selection_auto_scroll_setting_gates_drag_auto_scroll` cover the
+  bounded/stop/gated behavior.)*
 - [x] Add render tests: the highlight follows the flowed `SelectionRange` and
   never over-paints continuation cells; the scrolled-back selection renders
   only while in view.
-- [ ] Add mouse-reporting tests: a child with mouse reporting (or an active
+- [x] Add mouse-reporting tests: a child with mouse reporting (or an active
   alternate screen) receives the events and no local selection is made.
+  *(`mouse_reporting_hands_off_to_the_child_without_a_local_selection`.)*
 - [x] Update the existing `selection_tracks_dragged_cells_and_copies_visible_text`
   and `selected_hyperlink` regressions to the emulator-owned model, and add
   click-count/keyboard-selection fixtures.

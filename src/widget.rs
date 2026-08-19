@@ -581,6 +581,10 @@ pub trait Widget: Send {
         false
     }
 
+    /// Clears the widget's current text selection. Non-terminal widgets have
+    /// none and are a no-op; a terminal clears its emulator-owned selection.
+    fn clear_selection(&mut self) {}
+
     /// Whether a finalized selection should be auto-copied to the clipboard
     /// (the terminal's `copy_on_select`/`copy_on_release` settings).
     fn auto_copy_selection(&self) -> bool {
@@ -1027,6 +1031,12 @@ impl WidgetRuntime {
             .is_some_and(|entry| entry.widget.has_selection())
     }
 
+    pub fn clear_selection(&mut self, id: WidgetId) {
+        if let Some(entry) = self.instances.get_mut(&id) {
+            entry.widget.clear_selection();
+        }
+    }
+
     pub fn auto_copy_selection(&self, id: WidgetId) -> bool {
         self.instances
             .get(&id)
@@ -1355,6 +1365,10 @@ impl Widget for TerminalWidget {
         self.session.has_selection()
     }
 
+    fn clear_selection(&mut self) {
+        self.session.clear_selection();
+    }
+
     fn auto_copy_selection(&self) -> bool {
         self.selection.copy_on_select() || self.selection.copy_on_release()
     }
@@ -1439,20 +1453,21 @@ impl Widget for TerminalWidget {
                 });
             }
         }
-        let position = (
-            mouse.column.saturating_sub(origin.0),
-            mouse.row.saturating_sub(origin.1),
-        );
+        let column = mouse.column.saturating_sub(origin.0);
+        let signed_row = i32::from(mouse.row) - i32::from(origin.1);
         // When the child has captured mouse reporting the terminal forwards
         // the event verbatim and must not run its own selection.
         if !self.session.reports_mouse() {
             match mouse.kind {
                 crossterm::event::MouseEventKind::Down(_) => {
-                    self.session
-                        .begin_selection(position, mouse.modifiers.contains(KeyModifiers::SHIFT));
+                    let row = signed_row.clamp(0, i32::from(self.session.size().rows)) as u16;
+                    self.session.begin_selection(
+                        (column, row),
+                        mouse.modifiers.contains(KeyModifiers::SHIFT),
+                    );
                 }
                 crossterm::event::MouseEventKind::Drag(_) => {
-                    self.session.update_selection(position);
+                    self.session.drag_selection(column, signed_row);
                 }
                 _ => {}
             }
@@ -1464,6 +1479,11 @@ impl Widget for TerminalWidget {
     }
 
     fn handle_focus(&mut self, focused: bool) -> Result<(), String> {
+        // Leaving the pane drops its selection so a stale highlight never
+        // lingers on an unfocused terminal.
+        if !focused {
+            self.session.clear_selection();
+        }
         self.session
             .write_focus(focused)
             .map_err(|error| error.to_string())
@@ -1984,6 +2004,74 @@ mod tests {
         assert_eq!(deltas.removed.len(), 0);
         assert_eq!(deltas.changed.len(), 1);
         assert_eq!(deltas.changed[0].placement().y(), 2);
+    }
+
+    #[test]
+    fn leaving_focus_clears_the_terminal_selection() {
+        let mut terminal = TerminalWidget {
+            title: " shell ".to_owned(),
+            label: true,
+            session: TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap(),
+            appearance: WidgetAppearance {
+                padding: 0,
+                border: WidgetBorderStyle::None,
+            },
+            theme: Theme::fallback(),
+            cursor_blink: CursorBlinkSettings::default(),
+            scrollback_chrome: ScrollbackChrome::default(),
+            selection: SelectionSettings::default(),
+        };
+        terminal.session.consume_output(b"abcdef\r\n").unwrap();
+        terminal.session.begin_selection((0, 0), false);
+        terminal.session.update_selection((3, 0));
+        assert!(terminal.session.has_selection());
+
+        // Losing focus drops the selection so a stale highlight never lingers.
+        terminal.handle_focus(false).unwrap();
+        assert!(
+            !terminal.session.has_selection(),
+            "focus loss clears the selection"
+        );
+        terminal.session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn mouse_reporting_hands_off_to_the_child_without_a_local_selection() {
+        let mut terminal = TerminalWidget {
+            title: " shell ".to_owned(),
+            label: true,
+            session: TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap(),
+            appearance: WidgetAppearance {
+                padding: 0,
+                border: WidgetBorderStyle::None,
+            },
+            theme: Theme::fallback(),
+            cursor_blink: CursorBlinkSettings::default(),
+            scrollback_chrome: ScrollbackChrome::default(),
+            selection: SelectionSettings::default(),
+        };
+        // The child enables mouse reporting, so a click is forwarded verbatim
+        // and the terminal makes no local selection.
+        terminal.session.consume_output(b"\x1b[?1002h").unwrap();
+        assert!(terminal.session.reports_mouse());
+        terminal
+            .handle_mouse(
+                MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column: 2,
+                    row: 2,
+                    modifiers: KeyModifiers::NONE,
+                },
+                (0, 0),
+            )
+            .unwrap();
+        assert!(
+            !terminal.session.has_selection(),
+            "mouse reporting disables the local selection"
+        );
+        terminal.session.shutdown().unwrap();
     }
 
     fn wait_for_scrollback(widget: &mut TerminalWidget) {

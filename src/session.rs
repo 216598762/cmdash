@@ -1058,6 +1058,28 @@ impl TerminalSession {
         self.rebuild_selection(ty, anchor, point);
     }
 
+    /// Advances a drag selection toward a content-area-relative pointer
+    /// position, auto-scrolling the viewport (bounded by history) when the
+    /// pointer is held past the top or bottom of the content area. Gated by
+    /// `selection_auto_scroll`. `row` is signed so an above/below position is
+    /// distinguishable from a row on the visible edge; the selection tail is
+    /// clamped to that edge so it follows the newly-visible line as the view
+    /// scrolls. Returns whether the viewport scrolled.
+    pub fn drag_selection(&mut self, column: u16, row: i32) -> bool {
+        let rows = i32::from(self.size.rows).max(1);
+        let mut scrolled = false;
+        if self.selection_auto_scroll {
+            if row < 0 {
+                scrolled = self.scroll_display(Scroll::Delta(3));
+            } else if row >= rows {
+                scrolled = self.scroll_display(Scroll::Delta(-3));
+            }
+        }
+        let clamped = row.clamp(0, rows - 1) as u16;
+        self.update_selection((column, clamped));
+        scrolled
+    }
+
     pub fn clear_selection(&mut self) {
         self.term.selection = None;
         self.selection_anchor = None;
@@ -3394,6 +3416,79 @@ mod tests {
             session.term.selection.as_ref().unwrap().ty,
             SelectionType::Simple
         );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn drag_auto_scroll_extends_selection_into_scrollback() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 6)).unwrap();
+        for line in 0..12u8 {
+            session
+                .processor
+                .advance(&mut session.term, format!("row{line}\r\n").as_bytes());
+        }
+        let history = session.scrollback_lines();
+        assert!(history > 0);
+        assert_eq!(session.scrollback_offset(), 0);
+
+        // Begin a selection on the live viewport and drag above the top edge:
+        // the view auto-scrolls into history and the tail follows the top
+        // visible row (now an earlier history line).
+        session.begin_selection((0, 0), false);
+        assert!(session.drag_selection(0, -1), "above-the-edge drag scrolls");
+        assert!(
+            session.scrollback_offset() > 0,
+            "the view moved into history"
+        );
+        assert!(session.has_selection(), "the selection spans into history");
+
+        // Dragging back inside the content area stops auto-scrolling.
+        let before = session.scrollback_offset();
+        assert!(
+            !session.drag_selection(0, 3),
+            "an inside drag does not scroll"
+        );
+        assert_eq!(session.scrollback_offset(), before);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn drag_auto_scroll_is_bounded_by_history() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 6)).unwrap();
+        for line in 0..12u8 {
+            session
+                .processor
+                .advance(&mut session.term, format!("row{line}\r\n").as_bytes());
+        }
+        let history = session.scrollback_lines();
+        session.begin_selection((0, 0), false);
+        // Dragging far above the top repeatedly clamps at the history limit
+        // rather than scrolling without bound.
+        for _ in 0..20 {
+            session.drag_selection(0, -1);
+        }
+        assert_eq!(session.scrollback_offset(), history);
+        // At the limit a further above-edge drag no longer changes the view.
+        assert!(!session.drag_selection(0, -1));
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn selection_auto_scroll_setting_gates_drag_auto_scroll() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 6)).unwrap();
+        for line in 0..12u8 {
+            session
+                .processor
+                .advance(&mut session.term, format!("row{line}\r\n").as_bytes());
+        }
+        assert!(session.scrollback_lines() > 0);
+
+        session.set_selection_settings(Duration::from_millis(500), false, false, false);
+        session.begin_selection((0, 0), false);
+        assert!(!session.drag_selection(0, -1), "auto-scroll is disabled");
+        assert_eq!(session.scrollback_offset(), 0, "the view did not scroll");
+        // The tail still follows the clamped top row.
+        assert!(session.has_selection());
         session.shutdown().unwrap();
     }
 
