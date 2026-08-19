@@ -409,6 +409,20 @@ impl ScrollScreenState {
     }
 }
 
+/// An insert/delete-line mutation observed within a DECSTBM region.
+///
+/// IL/DL scroll only `[from_row, bottom)` of the region rather than the whole
+/// region, so they are recorded separately from the monotonic region-scroll
+/// displacement and re-anchored directly by the graphics store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RegionShift {
+    /// The first (topmost) row of the scrolled sub-region: the cursor row for
+    /// IL/DL.
+    from_row: u16,
+    /// Positive moves the sub-region down (insert lines); negative up (delete).
+    rows_down: i32,
+}
+
 /// Observes the same VT stream as alacritty-terminal for the state it keeps
 /// private: DECSTBM margins and the scroll displacement caused by them.
 ///
@@ -423,6 +437,7 @@ struct ScrollRegionTracker {
     primary: ScrollScreenState,
     alternate: ScrollScreenState,
     pending_erases: Vec<GraphicsErase>,
+    pending_region_shifts: Vec<RegionShift>,
 }
 
 impl ScrollRegionTracker {
@@ -434,11 +449,16 @@ impl ScrollRegionTracker {
             primary: ScrollScreenState::new(columns, rows),
             alternate: ScrollScreenState::new(columns, rows),
             pending_erases: Vec::new(),
+            pending_region_shifts: Vec::new(),
         }
     }
 
     fn take_erases(&mut self) -> Vec<GraphicsErase> {
         std::mem::take(&mut self.pending_erases)
+    }
+
+    fn take_region_shifts(&mut self) -> Vec<RegionShift> {
+        std::mem::take(&mut self.pending_region_shifts)
     }
 
     fn current(&self) -> ScrollScreenState {
@@ -621,6 +641,29 @@ impl Handler for ScrollRegionTracker {
 
     fn scroll_down(&mut self, lines: usize) {
         self.current_mut().scroll_down(lines);
+    }
+
+    fn insert_blank_lines(&mut self, lines: usize) {
+        let region = self.current_region();
+        let cursor_row = self.current().cursor.1;
+        if cursor_row >= region.top() && cursor_row < region.bottom() {
+            self.pending_region_shifts.push(RegionShift {
+                from_row: cursor_row,
+                rows_down: i32::try_from(lines).unwrap_or(i32::MAX),
+            });
+        }
+    }
+
+    fn delete_lines(&mut self, lines: usize) {
+        let region = self.current_region();
+        let cursor_row = self.current().cursor.1;
+        if cursor_row >= region.top() && cursor_row < region.bottom() {
+            let rows_down = i32::try_from(lines).unwrap_or(i32::MAX);
+            self.pending_region_shifts.push(RegionShift {
+                from_row: cursor_row,
+                rows_down: rows_down.saturating_neg(),
+            });
+        }
     }
 
     fn reverse_index(&mut self) {
@@ -1343,13 +1386,38 @@ impl TerminalSession {
                         self.processor.advance(&mut self.term, &plain);
                         self.scroll_processor
                             .advance(&mut self.scroll_tracker, &plain);
-                        if region_before.is_full_screen() {
-                            let delta = self
-                                .scroll_tracker
-                                .current_region_scroll()
-                                .saturating_sub(region_scroll_before);
-                            if delta != 0 {
+                        // Mirror scrolls into the virtual buffer so its
+                        // mutation-driven command stream moves images with the
+                        // text (Workstream 8). A stable full-screen region is a
+                        // plain `record_scroll`; a stable DECSTBM region scrolls
+                        // only the placements anchored to it.
+                        let region_after = self.scroll_tracker.current_region();
+                        let delta = self
+                            .scroll_tracker
+                            .current_region_scroll()
+                            .saturating_sub(region_scroll_before);
+                        if delta != 0 && region_before == region_after {
+                            if region_before.is_full_screen() {
                                 self.graphics.record_scroll(delta);
+                            } else {
+                                self.graphics.record_region_scroll(region_before, delta);
+                            }
+                        }
+                        // Insert/delete-line scroll only [cursor, bottom) of a
+                        // region, so re-anchor those placements directly.
+                        let region_shifts = self.scroll_tracker.take_region_shifts();
+                        if !region_shifts.is_empty() {
+                            let region = self.scroll_tracker.current_region();
+                            let region_scroll = self.scroll_tracker.current_region_scroll();
+                            let scrollback = self.scrollback_lines();
+                            for shift in region_shifts {
+                                self.graphics.shift_region_rows(
+                                    region,
+                                    i32::from(shift.from_row),
+                                    shift.rows_down,
+                                    scrollback,
+                                    region_scroll,
+                                );
                             }
                         }
                         // The emulator does not answer XTVERSION (`CSI > q`),
@@ -2678,6 +2746,72 @@ mod tests {
         tracker.resize(20, 8);
         assert_eq!(tracker.current_region(), GraphicsScrollRegion::new(0, 8, 8));
         assert_eq!(tracker.current_region_scroll(), 0);
+    }
+
+    #[test]
+    fn decstbm_tracker_records_insert_and_delete_line_shifts() {
+        let mut parser = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        let mut tracker = ScrollRegionTracker::new(20, 6);
+        parser.advance(&mut tracker, b"\x1b[2;5r\x1b[3;1H");
+        assert_eq!(tracker.current_region(), GraphicsScrollRegion::new(1, 5, 6));
+        assert_eq!(tracker.current().cursor, (0, 2));
+
+        // Insert one line at the cursor (row 2): a downward sub-region shift.
+        parser.advance(&mut tracker, b"\x1b[1L");
+        assert_eq!(
+            tracker.take_region_shifts(),
+            vec![RegionShift {
+                from_row: 2,
+                rows_down: 1,
+            }]
+        );
+
+        // Delete one line at the same cursor: an upward sub-region shift.
+        parser.advance(&mut tracker, b"\x1b[1M");
+        assert_eq!(
+            tracker.take_region_shifts(),
+            vec![RegionShift {
+                from_row: 2,
+                rows_down: -1,
+            }]
+        );
+
+        // IL/DL above the region top are not region scrolls.
+        parser.advance(&mut tracker, b"\x1b[1;1H\x1b[2L");
+        assert!(tracker.take_region_shifts().is_empty());
+    }
+
+    #[test]
+    fn session_graphics_follow_insert_and_delete_lines_within_a_region() {
+        let mut session = TerminalSession::spawn_with_args(
+            Some("sh"),
+            &["-c", "sleep 5"],
+            TerminalSize::new(20, 6),
+        )
+        .unwrap();
+        // Place the image at row 4 inside a [1, 5) DECSTBM region.
+        session
+            .consume_output(b"\x1b[2;5r\x1b[5;1H\x1b_Ga=T,f=24,i=33,c=1,r=1,C=1,q=2;AQID\x1b\\")
+            .unwrap();
+        assert_eq!(
+            session.graphics(Rect::new(0, 0, 20, 6))[0].placement().y(),
+            4
+        );
+
+        // Insert a line at row 3 (above the image): the image moves down to 5.
+        session.consume_output(b"\x1b[4;1H\x1b[1L").unwrap();
+        assert_eq!(
+            session.graphics(Rect::new(0, 0, 20, 6))[0].placement().y(),
+            5
+        );
+
+        // Delete a line at row 3: the image moves back up to 4.
+        session.consume_output(b"\x1b[4;1H\x1b[1M").unwrap();
+        assert_eq!(
+            session.graphics(Rect::new(0, 0, 20, 6))[0].placement().y(),
+            4
+        );
+        session.shutdown().unwrap();
     }
 
     #[test]

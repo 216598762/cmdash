@@ -1833,6 +1833,96 @@ impl SessionGraphicsStore {
         }
     }
 
+    /// Mirrors a DECSTBM region scroll into the virtual buffer: every
+    /// non-virtual placement anchored in `region` moves by `delta` rows
+    /// (positive = scrolled up). Placements outside the region — or anchored to
+    /// a different region — are untouched. The region's monotonic scroll
+    /// displacement still owns the render-path resolution, so this only drives
+    /// the mutation command stream (and the buffer's row bookkeeping).
+    pub fn record_region_scroll(&mut self, region: GraphicsScrollRegion, delta: i64) {
+        if delta == 0 || region.is_full_screen() {
+            return;
+        }
+        let delta = i32::try_from(delta).unwrap_or(if delta > 0 { i32::MAX } else { i32::MIN });
+        let affected: Vec<(u32, u32)> = self
+            .placements
+            .values()
+            .filter(|placement| {
+                !placement.is_virtual() && placement.anchor().scroll_region() == region
+            })
+            .map(|placement| (placement.resource().image(), placement.outer_placement_id()))
+            .collect();
+        for (image, outer_placement_id) in affected {
+            let Some(object) = self.buffer.identity().object_for_client(image) else {
+                continue;
+            };
+            self.buffer
+                .move_placement(object, outer_placement_id, delta);
+        }
+    }
+
+    /// Re-anchors placements scrolled by insert/delete-line within a DECSTBM
+    /// region. IL/DL scroll only `[from_row, bottom)`, so they cannot be folded
+    /// into the region's monotonic scroll displacement; each affected placement
+    /// is re-anchored at its new resolved row (against the current region
+    /// scroll) and mirrored into the virtual buffer as a move. `rows_down > 0`
+    /// moves placements down (insert), `< 0` up (delete). Returns whether any
+    /// placement moved.
+    pub fn shift_region_rows(
+        &mut self,
+        region: GraphicsScrollRegion,
+        from_row: i32,
+        rows_down: i32,
+        current_scrollback: usize,
+        current_region_scroll: i64,
+    ) -> bool {
+        if rows_down == 0 || region.is_full_screen() {
+            return false;
+        }
+        let mut affected: Vec<(u64, i32)> = Vec::new();
+        for (key, placement) in &self.placements {
+            if placement.is_virtual()
+                || placement.parent().is_some()
+                || placement.anchor().scroll_region() != region
+            {
+                continue;
+            }
+            let row = placement.anchor().resolve_row_with_state(
+                current_scrollback,
+                region,
+                current_region_scroll,
+            );
+            if row >= from_row {
+                affected.push((*key, row.saturating_add(rows_down)));
+            }
+        }
+        if affected.is_empty() {
+            return false;
+        }
+        for (key, new_row) in affected {
+            let (image, outer_placement_id) = {
+                let Some(placement) = self.placements.get_mut(&key) else {
+                    continue;
+                };
+                let anchor = placement.anchor();
+                let new_row = u16::try_from(new_row.max(0)).unwrap_or(u16::MAX);
+                placement.anchor =
+                    GraphicsGridAnchor::new(anchor.column(), new_row, anchor.scrollback())
+                        .with_screen(anchor.screen())
+                        .with_scroll_region(region, current_region_scroll);
+                (placement.resource().image(), placement.outer_placement_id())
+            };
+            if let Some(object) = self.buffer.identity().object_for_client(image) {
+                // `move_placement` subtracts a positive delta (scroll up), so
+                // a downward insert is a negative delta and an upward delete is
+                // positive.
+                self.buffer
+                    .move_placement(object, outer_placement_id, -rows_down);
+            }
+        }
+        true
+    }
+
     /// Mirrors a freshly-inserted placement into the virtual buffer: resolves
     /// (or lazily creates) the object via the identity registry and upserts the
     /// placement at its resolved cell origin.
@@ -2299,6 +2389,7 @@ impl SessionGraphicsStore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_kitty_command_with_scroll_region(
         &mut self,
         parameters: &[u8],
@@ -5986,6 +6077,115 @@ mod tests {
             .map(|submission| submission.resource().image())
             .collect::<Vec<_>>();
         assert_eq!(images, vec![1, 2]);
+    }
+
+    #[test]
+    fn region_scroll_moves_only_placements_anchored_in_the_region() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(95));
+        let region = GraphicsScrollRegion::new(2, 6, 6);
+        // Image 1: anchored in the DECSTBM region [2, 6) at row 3.
+        store
+            .apply_kitty_command_with_scroll_region(
+                b"a=T,f=24,i=1,c=1,r=1,C=1,q=2",
+                b"AQID",
+                (0, 3),
+                (10, 20),
+                0,
+                GraphicsScreen::Primary,
+                region,
+                0,
+            )
+            .unwrap();
+        // Image 2: anchored to the full screen at row 5, so a DECSTBM region
+        // scroll must not move it.
+        store
+            .apply_kitty_command_with_scroll_region(
+                b"a=T,f=24,i=2,c=1,r=1,C=1,q=2",
+                b"BAUG",
+                (0, 5),
+                (10, 20),
+                0,
+                GraphicsScreen::Primary,
+                GraphicsScrollRegion::new(0, 6, 6),
+                0,
+            )
+            .unwrap();
+        store.take_graphics_commands();
+
+        store.record_region_scroll(region, 1);
+
+        // The drain projects image 1 one row up (row 2); image 2 is anchored
+        // to the full screen and must not be re-placed.
+        let surface = Rect::new(0, 0, 8, 8);
+        let deltas = store.drain_graphics_deltas(surface, 0, GraphicsScreen::Primary, region, 1, 0);
+        assert_eq!(
+            deltas.changed.len(),
+            1,
+            "only the region-anchored placement moves"
+        );
+        assert_eq!(deltas.changed[0].resource().image(), 1);
+        assert_eq!(deltas.changed[0].placement().y(), 2);
+    }
+
+    #[test]
+    fn shift_region_rows_reanchors_insert_and_delete_lines() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(96));
+        let region = GraphicsScrollRegion::new(2, 6, 6);
+        store
+            .apply_kitty_command_with_scroll_region(
+                b"a=T,f=24,i=1,c=1,r=1,C=1,q=2",
+                b"AQID",
+                (0, 3),
+                (10, 20),
+                0,
+                GraphicsScreen::Primary,
+                region,
+                0,
+            )
+            .unwrap();
+        store
+            .apply_kitty_command_with_scroll_region(
+                b"a=T,f=24,i=2,c=1,r=1,C=1,q=2",
+                b"BAUG",
+                (0, 5),
+                (10, 20),
+                0,
+                GraphicsScreen::Primary,
+                region,
+                0,
+            )
+            .unwrap();
+        store.take_graphics_commands();
+
+        // Insert two lines at cursor row 4: image 2 (row 5) moves down to 7;
+        // image 1 (row 3) is above the insert and stays.
+        assert!(store.shift_region_rows(region, 4, 2, 0, 0));
+        let commands = store.take_graphics_commands();
+        assert_eq!(commands.len(), 1, "only the sub-region placement moves");
+        assert!(
+            matches!(&commands[0], GraphicsCommand::Place { placement, .. } if placement.start_row == 7)
+        );
+
+        let surface = Rect::new(0, 0, 8, 10);
+        let rows = |store: &SessionGraphicsStore| -> Vec<(u32, u16)> {
+            store
+                .visible_submissions_with_scroll_state(
+                    surface,
+                    0,
+                    GraphicsScreen::Primary,
+                    region,
+                    0,
+                    0,
+                )
+                .iter()
+                .map(|submission| (submission.resource().image(), submission.placement().y()))
+                .collect()
+        };
+        assert_eq!(rows(&store), vec![(1, 3), (2, 7)]);
+
+        // Delete one line at row 4: image 2 (now row 7) moves back up to 6.
+        assert!(store.shift_region_rows(region, 4, -1, 0, 0));
+        assert_eq!(rows(&store), vec![(1, 3), (2, 6)]);
     }
 
     #[test]

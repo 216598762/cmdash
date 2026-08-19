@@ -502,6 +502,44 @@ impl VirtualBuffer {
         self.rebuild_attachments();
     }
 
+    /// Moves a single placement by `delta` rows and emits a move command.
+    /// Positive `delta` scrolls it up (toward history, `start_row -= delta`),
+    /// negative scrolls it down — the same convention as the store's scroll
+    /// mutation. Used for region-scoped scrolls, where only placements anchored
+    /// in the scrolled region move. Virtual placements never move. Returns
+    /// whether the placement was moved.
+    pub fn move_placement(
+        &mut self,
+        object: ImageObjectId,
+        outer_placement_id: u32,
+        delta: i32,
+    ) -> bool {
+        let moved = {
+            let Some(entry) = self.objects.get_mut(&object) else {
+                return false;
+            };
+            let Some(index) = entry
+                .placements
+                .iter()
+                .position(|placement| placement.outer_placement_id == outer_placement_id)
+            else {
+                return false;
+            };
+            if entry.placements[index].virtual_placement {
+                return false;
+            }
+            entry.placements[index].start_row =
+                entry.placements[index].start_row.saturating_sub(delta);
+            entry.placements[index]
+        };
+        self.pending_commands.push(GraphicsCommand::Place {
+            object,
+            placement: moved,
+        });
+        self.rebuild_attachments();
+        true
+    }
+
     /// Drains the coalesced command stream for the current frame: at most one
     /// command per object (a delete supersedes a move/place/upload), so a burst
     /// of mutations collapses to a single, idempotent, ordered command set.
@@ -981,6 +1019,54 @@ mod tests {
         assert!(
             matches!(commands[0], GraphicsCommand::Place { object: id, placement } if id == real && placement.start_row == 4)
         );
+    }
+
+    #[test]
+    fn move_placement_shifts_one_placement_and_emits_a_move() {
+        let mut buffer = VirtualBuffer::new();
+        let object = add(&mut buffer, 7, 3);
+        buffer.attach_placement(object, placement(5, 99));
+        buffer.drain_commands();
+
+        // Scroll up by 2 (positive delta): only placement 99 moves.
+        assert!(buffer.move_placement(object, 99, 2));
+        assert_eq!(buffer.object(object).unwrap().placements[0].start_row, 3);
+        assert_eq!(buffer.object(object).unwrap().placements[1].start_row, 3);
+        let commands = buffer.drain_commands();
+        assert_eq!(commands.len(), 1);
+        assert!(
+            matches!(commands[0], GraphicsCommand::Place { object: id, placement } if id == object && placement.outer_placement_id == 99 && placement.start_row == 3)
+        );
+
+        // Scroll down by 1 (negative delta).
+        assert!(buffer.move_placement(object, 99, -1));
+        assert_eq!(buffer.object(object).unwrap().placements[1].start_row, 4);
+
+        // A virtual placement never moves.
+        let virtual_ = buffer.add_object(
+            2,
+            0,
+            resource(2),
+            24,
+            1,
+            1,
+            1,
+            false,
+            ImagePlacement {
+                column: 0,
+                start_row: 2,
+                rows: 1,
+                columns: 1,
+                z_index: 0,
+                cell_x_offset: 0,
+                cell_y_offset: 0,
+                placement_id: 2,
+                outer_placement_id: 2,
+                parent: None,
+                virtual_placement: true,
+            },
+        );
+        assert!(!buffer.move_placement(virtual_, 2, 1));
     }
 
     #[test]

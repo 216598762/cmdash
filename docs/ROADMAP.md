@@ -791,10 +791,27 @@ their next frame without a render diff noticing the revision bump. Three
 parity tests prove the drained deltas equal `visible_submissions` for
 create/delete/scroll/clear.
 
-**Remaining increments:** region-scoped scroll/insert/delete-line and the
-ED/RIS/alternate-screen erase scopes are not yet wired to emit commands (only
-full-screen scroll is), reflow re-attachment is pending, and `kitty_verify.py`
-should replay the command stream against real Kitty.
+**Increment 5 (landed): region-scoped scroll and insert/delete-line.**
+`SessionGraphicsStore::record_region_scroll(region, delta)` moves every
+non-virtual placement anchored in a DECSTBM region (positive delta = scrolled
+up) via `VirtualBuffer::move_placement`, leaving full-screen-anchored
+placements untouched. Insert/delete-line scroll only `[cursor, bottom)` of a
+region, so they cannot fold into the region's monotonic scroll displacement:
+the `ScrollRegionTracker` now overrides `insert_blank_lines`/`delete_lines` and
+records a `RegionShift`, and `SessionGraphicsStore::shift_region_rows`
+re-anchors each affected placement at its new resolved row (and mirrors the
+move into the buffer) so both the render path and the command stream follow
+IL/DL. The session wires both: a stable full-screen region uses `record_scroll`,
+a stable DECSTBM region uses `record_region_scroll`, and drained `RegionShift`s
+are re-anchored after the scroll. Two store tests, one tracker test, and one
+session test cover the moves.
+
+**Remaining increments:** the ED/RIS/alternate-screen erase scopes are not yet
+wired to emit commands (only scroll is), reflow re-attachment is pending, and
+`kitty_verify.py` should replay the command stream against real Kitty. (A
+chunk that interleaves a region scroll and an IL/DL in one `Plain` batch
+applies the IL/DL re-anchor after the net scroll displacement, which is exact
+for separated batches and a close approximation otherwise.)
 
 ### Goals and boundaries
 
@@ -849,15 +866,18 @@ should replay the command stream against real Kitty.
 
 Define an explicit table from each buffer mutation to its command stream:
 
-- [ ] **Scroll / linefeed (N rows):** move each attached image object up N
+- [x] **Scroll / linefeed (N rows):** move each attached image object up N
   rows (emit `a=p` with the same `p=` id and the new row); objects whose
   resolved row passes the configured history limit are deleted (`d=i,i=X,
   p=P`, then `d=i,i=X` for the last placement) and their decoded bytes
-  freed.
-- [ ] **Insert / delete lines (DECSTBM region):** move objects inside the
+  freed. *(Full-screen scrolls emit one move per affected object via
+  `record_scroll`; the `evict_beyond` limit drop landed with the signed-row
+  space.)*
+- [x] **Insert / delete lines (DECSTBM region):** move objects inside the
   region by the delta; objects shifted out of the region or off-screen are
   deleted. Reverse index and origin-mode cursor movement map to the same
-  region-scoped move.
+  region-scoped move. *(`record_region_scroll` handles full-region scrolls and
+  reverse index; `shift_region_rows` re-anchors the IL/DL sub-region.)*
 - [ ] **Erase scopes (ED 0/1/2/3, EL, RIS, soft reset, alternate-screen
   switch):** emit delete commands scoped to the erased rows/placements,
   preserving history rows for `ED 2`, clearing scrollback-only placements for
