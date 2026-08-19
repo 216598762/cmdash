@@ -169,4 +169,5 @@ jobs:
         run: cargo test --locked --all-features --test kitty_protocol --test terminal_latency -- --include-ignored
 
       - name: Verify graphics stream against real Kitty
-        run: kitty +runpy "exec(open('tests/kitty_verify.py').read(), {'__name__': '__main__'})"
+        run: |
+          kitty +runpy "exec(open('tests/kitty_verify.py').read(), {'__name__': '__main__'})"
