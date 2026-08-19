@@ -311,7 +311,9 @@ impl Compositor {
 
     /// The retained composed buffer from the last `compose_and_diff`.
     pub fn frame(&self) -> &Scene {
-        self.composed.as_ref().expect("no frame has been composed yet")
+        self.composed
+            .as_ref()
+            .expect("no frame has been composed yet")
     }
 
     /// Number of times the retained buffers (re)allocated their cell storage.
@@ -384,8 +386,14 @@ impl Compositor {
         base: &Scene,
         changed_widgets: &[WidgetId],
     ) -> Damage {
-        let full_redraw = self.previous.as_ref().is_none_or(|previous| previous.area() != viewport)
-            || self.composed.as_ref().is_none_or(|composed| composed.area() != viewport)
+        let full_redraw = self
+            .previous
+            .as_ref()
+            .is_none_or(|previous| previous.area() != viewport)
+            || self
+                .composed
+                .as_ref()
+                .is_none_or(|composed| composed.area() != viewport)
             || state.animation_schedule().is_some();
 
         let invalidated: Vec<Rect> = self
@@ -708,8 +716,12 @@ fn base_diff_rect(previous: &Scene, current: &Scene, viewport: Rect) -> Rect {
         if previous.cells().get(index).copied() == Some(*cell) {
             continue;
         }
-        let x = viewport.x.saturating_add((index % viewport.width as usize) as u16);
-        let y = viewport.y.saturating_add((index / viewport.width as usize) as u16);
+        let x = viewport
+            .x
+            .saturating_add((index % viewport.width as usize) as u16);
+        let y = viewport
+            .y
+            .saturating_add((index / viewport.width as usize) as u16);
         min_x = min_x.min(x);
         min_y = min_y.min(y);
         max_x = max_x.max(x);
@@ -977,11 +989,19 @@ fn build_diff(
         .saturating_add(u64::from(changes.capacity() > changes_cap))
         .saturating_add(u64::from(spans.capacity() > spans_cap))
         .saturating_add(u64::from(graphics.capacity() > graphics_cap))
-        .saturating_add(u64::from(visible_graphics.capacity() > visible_graphics_cap))
-        .saturating_add(u64::from(removed_graphics.capacity() > removed_graphics_cap))
+        .saturating_add(u64::from(
+            visible_graphics.capacity() > visible_graphics_cap,
+        ))
+        .saturating_add(u64::from(
+            removed_graphics.capacity() > removed_graphics_cap,
+        ))
         .saturating_add(u64::from(placeholders.capacity() > placeholders_cap))
-        .saturating_add(u64::from(visible_placeholders.capacity() > visible_placeholders_cap))
-        .saturating_add(u64::from(removed_placeholders.capacity() > removed_placeholders_cap));
+        .saturating_add(u64::from(
+            visible_placeholders.capacity() > visible_placeholders_cap,
+        ))
+        .saturating_add(u64::from(
+            removed_placeholders.capacity() > removed_placeholders_cap,
+        ));
     #[cfg(feature = "sixel")]
     {
         pool.scratch_reallocations = pool
@@ -1529,10 +1549,7 @@ mod tests {
             .unwrap();
         let mut moved = Scene::new(Rect::new(0, 1, 2, 1));
         moved.text(0, 1, "AA", terminal_style());
-        let scenes = BTreeMap::from([
-            (SurfaceId::new(1), moved),
-            (SurfaceId::new(2), right),
-        ]);
+        let scenes = BTreeMap::from([(SurfaceId::new(1), moved), (SurfaceId::new(2), right)]);
         let diff = compositor.compose_and_diff(viewport, &state, &base, &scenes, &[]);
 
         assert!(!diff.full_redraw());
@@ -1606,10 +1623,7 @@ mod tests {
         left.text(0, 0, "AAAA", style);
         let mut right = Scene::new(Rect::new(4, 0, 4, 1));
         right.text(4, 0, "BBBB", style);
-        let scenes = BTreeMap::from([
-            (SurfaceId::new(1), left),
-            (SurfaceId::new(2), right),
-        ]);
+        let scenes = BTreeMap::from([(SurfaceId::new(1), left), (SurfaceId::new(2), right)]);
         compositor.compose_and_diff(viewport, &state, &base, &scenes, &[]);
 
         // Two distinct styles across the whole frame: the shared surface style
@@ -1639,7 +1653,8 @@ mod tests {
             ])
         };
 
-        let diff = compositor.compose_and_diff(viewport, &state, &base, &scenes("AAAA", "BBBB"), &[]);
+        let diff =
+            compositor.compose_and_diff(viewport, &state, &base, &scenes("AAAA", "BBBB"), &[]);
         compositor.recycle(diff);
         let after_first = compositor.scratch_reallocations();
         assert!(
@@ -1727,10 +1742,7 @@ mod tests {
         moved.text(0, 1, "AA", terminal_style());
         let mut right = Scene::new(Rect::new(4, 0, 4, 1));
         right.text(4, 0, "BBBB", terminal_style());
-        let scenes = BTreeMap::from([
-            (SurfaceId::new(1), moved),
-            (SurfaceId::new(2), right),
-        ]);
+        let scenes = BTreeMap::from([(SurfaceId::new(1), moved), (SurfaceId::new(2), right)]);
         compositor.compose_and_diff(viewport, &state, &base, &scenes, &[]);
         assert!(
             compositor.z_order_recomputations() > after_first,
@@ -1763,7 +1775,11 @@ mod tests {
         // Keep every placement except the last; the absent one (and only it)
         // must be reported as removed. The old image-id-only key would collapse
         // the shared image id and falsely remove the other kept placements.
-        let removed_key = submissions.last().expect("submissions are non-empty").placement().key();
+        let removed_key = submissions
+            .last()
+            .expect("submissions are non-empty")
+            .placement()
+            .key();
         let mut second_scene = Scene::new(area);
         for submission in &submissions[..submissions.len() - 1] {
             second_scene.add_image_layer(submission.clone());

@@ -10,8 +10,8 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -285,7 +285,11 @@ pub struct SessionEventReceiver {
 impl SessionEventReceiver {
     /// Takes all currently queued events, oldest first.
     pub fn drain(&self) -> Vec<SessionEvent> {
-        let mut queue = self.state.queue.lock().expect("session-event queue poisoned");
+        let mut queue = self
+            .state
+            .queue
+            .lock()
+            .expect("session-event queue poisoned");
         std::mem::take(&mut *queue).into_iter().collect()
     }
 

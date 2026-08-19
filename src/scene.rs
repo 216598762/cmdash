@@ -293,7 +293,8 @@ impl Scene {
         self.image_layers.clear();
         self.image_layers.extend(other.image_layers.iter().cloned());
         self.placeholder_layers.clear();
-        self.placeholder_layers.extend_from_slice(&other.placeholder_layers);
+        self.placeholder_layers
+            .extend_from_slice(&other.placeholder_layers);
         #[cfg(feature = "sixel")]
         {
             self.sixel_layers.clear();
@@ -871,8 +872,12 @@ mod tests {
     #[test]
     fn image_layers_tie_break_equal_z_by_image_id() {
         let mut store = crate::SessionGraphicsStore::new(crate::SessionId::new(5));
-        store.apply_kitty_command(b"a=T,f=24,i=6,z=0", b"AQID").unwrap();
-        store.apply_kitty_command(b"a=T,f=24,i=5,z=0", b"BAUG").unwrap();
+        store
+            .apply_kitty_command(b"a=T,f=24,i=6,z=0", b"AQID")
+            .unwrap();
+        store
+            .apply_kitty_command(b"a=T,f=24,i=5,z=0", b"BAUG")
+            .unwrap();
         let submissions = store.visible_submissions(Rect::new(0, 0, 8, 2));
         // Add the layers in reverse order to prove the scene re-sorts by
         // (z, image id) rather than preserving insertion order.

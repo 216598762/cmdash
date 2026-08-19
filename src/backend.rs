@@ -922,14 +922,21 @@ impl<W: Write> CrosstermBackend<W> {
     /// Emits a placement-scoped delete (`d=i` with a `p=` id), which removes
     /// exactly one placement while keeping the image data for its other
     /// placements, mirroring Kitty's `id_filter_func`.
-    fn graphics_delete_scoped_bytes(&self, image_id: u32, placement_id: u32) -> io::Result<Vec<u8>> {
+    fn graphics_delete_scoped_bytes(
+        &self,
+        image_id: u32,
+        placement_id: u32,
+    ) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         if self.capabilities.kitty_graphics_mode() == KittyGraphicsMode::Passthrough {
             write_passthrough_command(&mut bytes, |buffer| {
                 write!(buffer, "\x1b_Ga=d,d=i,i={image_id},p={placement_id};\x1b\\")
             })?;
         } else {
-            write!(&mut bytes, "\x1b_Ga=d,d=i,i={image_id},p={placement_id};\x1b\\")?;
+            write!(
+                &mut bytes,
+                "\x1b_Ga=d,d=i,i={image_id},p={placement_id};\x1b\\"
+            )?;
         }
         Ok(bytes)
     }
@@ -951,7 +958,9 @@ impl<W: Write> CrosstermBackend<W> {
         // A placement still present in this frame's visible set (possibly at
         // a new cell after scroll re-anchoring) is not being deleted: it is
         // re-placed with its stable `p=` id and the outer terminal moves it.
-        let alive = changed.iter().any(|candidate| candidate.placement().key() == key)
+        let alive = changed
+            .iter()
+            .any(|candidate| candidate.placement().key() == key)
             || visible
                 .iter()
                 .any(|candidate| candidate.placement().key() == key);
@@ -973,8 +982,10 @@ impl<W: Write> CrosstermBackend<W> {
             return Ok(());
         }
         if other_placements_visible {
-            let bytes = self
-                .graphics_delete_scoped_bytes(image_id, submission.placement().outer_placement_id())?;
+            let bytes = self.graphics_delete_scoped_bytes(
+                image_id,
+                submission.placement().outer_placement_id(),
+            )?;
             self.writer.write_all(&bytes)?;
             return Ok(());
         }
@@ -1752,9 +1763,7 @@ fn write_pixel_dimensions<W: Write>(
     writer: &mut W,
     submission: &GraphicsSubmission,
 ) -> io::Result<()> {
-    if submission.format() != 100
-        && submission.pixel_width() != 0
-        && submission.pixel_height() != 0
+    if submission.format() != 100 && submission.pixel_width() != 0 && submission.pixel_height() != 0
     {
         write!(
             writer,

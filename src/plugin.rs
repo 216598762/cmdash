@@ -306,8 +306,6 @@ pub fn widget_error(error: PluginError) -> WidgetError {
     WidgetError::Plugin(error.to_string())
 }
 
-
-
 pub struct ExternalTextPlugin;
 
 impl PluginModule for ExternalTextPlugin {

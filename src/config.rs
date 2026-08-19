@@ -198,8 +198,17 @@ impl ConfigMigration {
 /// The dashboard item types that were removed in Phase 17 and now migrate to
 /// script-driven `widget` items.
 pub const REMOVED_WIDGET_KINDS: &[&str] = &[
-    "text", "clock", "system", "status", "key_value", "gauge", "list", "log", "sparkline",
-    "separator", "spacer",
+    "text",
+    "clock",
+    "system",
+    "status",
+    "key_value",
+    "gauge",
+    "list",
+    "log",
+    "sparkline",
+    "separator",
+    "spacer",
 ];
 
 /// Single-quote escapes `value` so it can be embedded in a shell command.
@@ -229,14 +238,24 @@ fn migrate_widget_config(widget: &mut WidgetInstanceConfig) -> Option<ConfigMigr
             let tag = match widget.settings.get("state").map(String::as_str) {
                 Some("success" | "ok" | "healthy" | "up" | "green" | "passing") => "[ok]",
                 Some("warning" | "warn" | "degraded" | "yellow") => "[warn]",
-                Some("error" | "err" | "failed" | "failure" | "down" | "red" | "critical") => "[err]",
+                Some("error" | "err" | "failed" | "failure" | "down" | "red" | "critical") => {
+                    "[err]"
+                }
                 _ => "",
             };
-            (format!("printf {}", sh_quote(&format!("{tag}{text}"))), None, true)
+            (
+                format!("printf {}", sh_quote(&format!("{tag}{text}"))),
+                None,
+                true,
+            )
         }
         "key_value" => {
             let key = widget.settings.get("key").cloned().unwrap_or_default();
-            (format!("printf {}", sh_quote(&format!("{key}: {text}"))), None, false)
+            (
+                format!("printf {}", sh_quote(&format!("{key}: {text}"))),
+                None,
+                false,
+            )
         }
         "gauge" => {
             let value = widget
@@ -244,10 +263,22 @@ fn migrate_widget_config(widget: &mut WidgetInstanceConfig) -> Option<ConfigMigr
                 .get("value")
                 .cloned()
                 .unwrap_or_else(|| "0".to_owned());
-            (format!("printf {}", sh_quote(&format!("{value}%"))), None, false)
+            (
+                format!("printf {}", sh_quote(&format!("{value}%"))),
+                None,
+                false,
+            )
         }
-        "list" => (format!("printf {}", sh_quote(&format!("{text}\n"))), None, false),
-        "log" => (format!("printf {}", sh_quote(&format!("{text}\n"))), None, true),
+        "list" => (
+            format!("printf {}", sh_quote(&format!("{text}\n"))),
+            None,
+            false,
+        ),
+        "log" => (
+            format!("printf {}", sh_quote(&format!("{text}\n"))),
+            None,
+            true,
+        ),
         "sparkline" => {
             let values = widget
                 .settings
@@ -288,7 +319,11 @@ fn migrate_widget_config(widget: &mut WidgetInstanceConfig) -> Option<ConfigMigr
 /// Rewrites a removed data-widget table in the raw TOML source so that
 /// `--migrate-config` persists the same change the typed migration applies.
 fn migrate_widget_value(widget: &mut toml::Table) {
-    let Some(kind) = widget.get("type").and_then(|v| v.as_str()).map(str::to_owned) else {
+    let Some(kind) = widget
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+    else {
         return;
     };
     if !REMOVED_WIDGET_KINDS.contains(&kind.as_str()) {
@@ -317,11 +352,17 @@ fn migrate_widget_value(widget: &mut toml::Table) {
     let mut migrated = WidgetInstanceConfig {
         id: widget.get("id").and_then(|v| v.as_integer()).unwrap_or(0) as u64,
         kind,
-        title: widget.get("title").and_then(|v| v.as_str()).map(str::to_owned),
+        title: widget
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
         label: LabelPolicy::Auto,
         text: (!text.is_empty()).then_some(text),
         format: (!format.is_empty()).then_some(format),
-        command: widget.get("command").and_then(|v| v.as_str()).map(str::to_owned),
+        command: widget
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
         settings,
     };
     if migrate_widget_config(&mut migrated).is_none() {
@@ -338,10 +379,7 @@ fn migrate_widget_value(widget: &mut toml::Table) {
     for (key, value) in &migrated.settings {
         settings_table.insert(key.clone(), toml::Value::String(value.clone()));
     }
-    widget.insert(
-        "settings".to_owned(),
-        toml::Value::Table(settings_table),
-    );
+    widget.insert("settings".to_owned(), toml::Value::Table(settings_table));
 }
 
 impl AppConfig {
@@ -1012,7 +1050,10 @@ mod tests {
             Some("date '+%H:%M'")
         );
         assert_eq!(
-            config.workspace.widgets[1].settings.get("mode").map(String::as_str),
+            config.workspace.widgets[1]
+                .settings
+                .get("mode")
+                .map(String::as_str),
             Some("interval")
         );
         assert_eq!(migrations.len(), 2);

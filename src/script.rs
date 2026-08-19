@@ -11,8 +11,8 @@ use std::{
     io::{self, Read, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
-        mpsc::{self, Receiver},
         Arc, Mutex,
+        mpsc::{self, Receiver},
     },
     thread,
     time::{Duration, Instant, SystemTime},
@@ -33,12 +33,12 @@ use crate::{
     scene::{CellStyle, Scene},
     session::{SessionWakeup, TerminalSize},
     session_events::{
-        SessionEventBus, SessionEventMode, SessionEventReceiver, format_session_event,
-        DEFAULT_SESSION_EVENT_CAPACITY,
+        DEFAULT_SESSION_EVENT_CAPACITY, SessionEventBus, SessionEventMode, SessionEventReceiver,
+        format_session_event,
     },
     widget::{
-        bordered_chrome, parse_log_line, StatusLevel, Widget, WidgetAppearance, WidgetError,
-        WidgetHealth, WidgetUpdate,
+        StatusLevel, Widget, WidgetAppearance, WidgetError, WidgetHealth, WidgetUpdate,
+        bordered_chrome, parse_log_line,
     },
 };
 
@@ -77,7 +77,13 @@ impl ScriptSettings {
                 )));
             }
         };
-        let interval_ms = parse_bounded_u64(settings.get("interval_ms"), 1000, 100, 60_000, "interval_ms")?;
+        let interval_ms = parse_bounded_u64(
+            settings.get("interval_ms"),
+            1000,
+            100,
+            60_000,
+            "interval_ms",
+        )?;
         match settings.get("render").map(String::as_str) {
             None | Some("text") => {}
             Some(other) => {
@@ -90,8 +96,9 @@ impl ScriptSettings {
         let restart = parse_bool(settings.get("restart"), true, "restart")?;
         let handles_input = parse_bool(settings.get("handles_input"), false, "handles_input")?;
         let session_env = parse_bool(settings.get("session_env"), true, "session_env")?;
-        let session_events = SessionEventMode::parse(settings.get("session_events").map(String::as_str))
-            .map_err(WidgetError::InvalidConfiguration)?;
+        let session_events =
+            SessionEventMode::parse(settings.get("session_events").map(String::as_str))
+                .map_err(WidgetError::InvalidConfiguration)?;
         let max_lines =
             parse_bounded_u64(settings.get("max_lines"), 1024, 1, 1_000_000, "max_lines")? as usize;
         let max_bytes = parse_bounded_u64(
@@ -215,7 +222,9 @@ impl ScriptProcess {
             ScriptMode::Interval => self.interval,
             ScriptMode::Stream => {
                 let shift = self.consecutive_exits.min(5);
-                STREAM_RESTART_DELAY.saturating_mul(1_u32 << shift).min(MAX_BACKOFF)
+                STREAM_RESTART_DELAY
+                    .saturating_mul(1_u32 << shift)
+                    .min(MAX_BACKOFF)
             }
         }
     }
@@ -563,7 +572,10 @@ impl ScriptWidget {
         if self.process.is_failed() {
             let tail = self.process.stderr_tail();
             let detail = if tail.is_empty() {
-                format!("exited with code {}", self.process.exit_code().unwrap_or(-1))
+                format!(
+                    "exited with code {}",
+                    self.process.exit_code().unwrap_or(-1)
+                )
             } else {
                 tail
             };
@@ -608,7 +620,8 @@ impl Widget for ScriptWidget {
         }
         let mut changed = false;
         let mut buffer = Vec::new();
-        self.process.drain_stdout(|chunk| buffer.extend_from_slice(chunk));
+        self.process
+            .drain_stdout(|chunk| buffer.extend_from_slice(chunk));
         if !buffer.is_empty() {
             changed |= self.ingest(&buffer);
         }
@@ -655,7 +668,10 @@ impl Widget for ScriptWidget {
         }
         let background = self.theme.surface();
         let mut content = Scene::new(content_area);
-        content.fill(content_area, CellStyle::new(self.theme.foreground(), background));
+        content.fill(
+            content_area,
+            CellStyle::new(self.theme.foreground(), background),
+        );
 
         let height = usize::from(content_area.height);
         let start = self.lines.len().saturating_sub(height);
@@ -769,7 +785,8 @@ pub(crate) fn script_widget_factory(
         .unwrap_or_else(|| TerminalSize::new(80, 24));
     let bus = context.session_event_bus().cloned();
     let events = if settings.session_events.is_enabled() {
-        bus.as_ref().map(|bus| bus.subscribe(DEFAULT_SESSION_EVENT_CAPACITY))
+        bus.as_ref()
+            .map(|bus| bus.subscribe(DEFAULT_SESSION_EVENT_CAPACITY))
     } else {
         None
     };
@@ -784,7 +801,10 @@ pub(crate) fn script_widget_factory(
     );
     Ok(Box::new(ScriptWidget {
         id: config.id,
-        title: config.title.clone().unwrap_or_else(|| " widget ".to_owned()),
+        title: config
+            .title
+            .clone()
+            .unwrap_or_else(|| " widget ".to_owned()),
         label: config.label != LabelPolicy::Never,
         settings,
         appearance,
@@ -877,7 +897,11 @@ mod tests {
 
     #[test]
     fn interval_script_reruns_on_the_configured_cadence() {
-        let mut widget = make_widget_with("printf 'tick\\n'", ScriptMode::Interval, &[("interval_ms", "100")]);
+        let mut widget = make_widget_with(
+            "printf 'tick\\n'",
+            ScriptMode::Interval,
+            &[("interval_ms", "100")],
+        );
         pump(&mut widget, |w| w.lines.len() >= 2, 80);
         assert!(
             widget.lines.len() >= 2,
@@ -930,11 +954,7 @@ mod tests {
 
     #[test]
     fn restart_disabled_marks_an_exiting_script_failed() {
-        let mut widget = make_widget_with(
-            "exit 3",
-            ScriptMode::Stream,
-            &[("restart", "false")],
-        );
+        let mut widget = make_widget_with("exit 3", ScriptMode::Stream, &[("restart", "false")]);
         pump(&mut widget, |w| w.process.finished, 100);
         assert!(widget.process.finished);
         assert!(matches!(widget.compute_health(), WidgetHealth::Failed(_)));
@@ -1022,7 +1042,10 @@ mod tests {
         let (bus, mut widget) = make_event_widget(
             "printf '%s|%s|%s\\n' \"$CMDASH_SESSION_COUNT\" \"$CMDASH_FOCUSED_SESSION\" \"$CMDASH_FOCUSED_TITLE\"",
         );
-        bus.update_context(2, Some((crate::state::SessionId::new(5), "nvim".to_owned())));
+        bus.update_context(
+            2,
+            Some((crate::state::SessionId::new(5), "nvim".to_owned())),
+        );
         widget.initialize().unwrap();
         let expected = "2|5|nvim";
         let mut found = false;
