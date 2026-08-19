@@ -2311,6 +2311,13 @@ house.
   JPEG/BMP `decode_image` entry point for the script-widget/dashboard image
   path; the protocol slice keeps `png`+`gif` (Kitty `f=100` is PNG-only), and
   WebP is skipped because its decoder is not vendored for offline builds.
+- [x] Wire a runtime caller for `decode_image`: a script widget's stdout
+  `@@CMDASH_IMAGE <base64>` directive decodes JPEG/BMP into an RGBA dashboard
+  image, surfaced through the retained scene as raw-RGBA (`f=32`) Kitty
+  graphics when supported and sixel otherwise (see `WIDGETS.md`).
+  Non-terminal widget graphics now flow through the same upload/delete stream
+  as terminal graphics (diffed per frame in `WidgetRuntime`), so dashboard
+  images upload on change and are deleted when their widget hides or closes.
 - [x] Reconcile `docs/DEPENDENCIES.md` with the actual `Cargo.toml`: record
   that the async model is std threads (not `tokio`), mark the adopted crates,
   and move `tracing`/`proptest`/`insta`/`criterion` to an explicit "future,

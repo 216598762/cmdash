@@ -795,12 +795,16 @@ struct WidgetEntry {
 
 pub struct WidgetRuntime {
     instances: BTreeMap<WidgetId, WidgetEntry>,
+    /// Retained per-widget graphics output for non-terminal widgets, used to
+    /// diff their `graphics(area)` into upload/delete deltas each frame.
+    previous_graphics: BTreeMap<WidgetId, Vec<GraphicsSubmission>>,
 }
 
 impl WidgetRuntime {
     pub fn empty() -> Self {
         Self {
             instances: BTreeMap::new(),
+            previous_graphics: BTreeMap::new(),
         }
     }
 
@@ -841,7 +845,10 @@ impl WidgetRuntime {
             let health = widget.health();
             instances.insert(id, WidgetEntry { widget, health });
         }
-        Ok(Self { instances })
+        Ok(Self {
+            instances,
+            previous_graphics: BTreeMap::new(),
+        })
     }
 
     pub fn add_from_config(
@@ -1111,9 +1118,12 @@ impl WidgetRuntime {
             .collect()
     }
 
-    /// Drains every terminal widget's mutation-driven graphics deltas for the
-    /// frame (Workstream 8), aggregating `changed`/`removed` across widgets in
-    /// stable widget order.
+    /// Drains graphics deltas for the frame. Terminal widgets emit their
+    /// mutation-driven command stream (Workstream 8); non-terminal widgets own
+    /// their images directly, so their `graphics(area)` output is diffed
+    /// against the previous frame to derive uploads (`changed`) and deletes
+    /// (`removed`). Widgets that left the visible set have their remaining
+    /// images deleted.
     pub fn drain_graphics_deltas(&mut self, areas: &BTreeMap<WidgetId, Rect>) -> GraphicsDeltas {
         let mut changed = Vec::new();
         let mut removed = Vec::new();
@@ -1122,6 +1132,35 @@ impl WidgetRuntime {
                 let deltas = entry.widget.drain_graphics_deltas(area);
                 changed.extend(deltas.changed);
                 removed.extend(deltas.removed);
+                if entry.widget.session_id().is_none() {
+                    let current = entry.widget.graphics(area);
+                    let previous = self.previous_graphics.entry(id).or_default();
+                    for submission in &current {
+                        if !previous.contains(submission) {
+                            changed.push(submission.clone());
+                        }
+                    }
+                    for submission in previous.iter() {
+                        if !current.contains(submission) {
+                            removed.push(submission.clone());
+                        }
+                    }
+                    *previous = current;
+                }
+            }
+        }
+        // A non-terminal widget that is hidden or closed this frame no longer
+        // appears in `areas`; delete the images it previously uploaded.
+        let visible_ids: BTreeSet<WidgetId> = areas.keys().copied().collect();
+        let stale: Vec<WidgetId> = self
+            .previous_graphics
+            .keys()
+            .filter(|id| !visible_ids.contains(id))
+            .copied()
+            .collect();
+        for id in stale {
+            if let Some(previous) = self.previous_graphics.remove(&id) {
+                removed.extend(previous);
             }
         }
         GraphicsDeltas { changed, removed }
@@ -2004,6 +2043,78 @@ mod tests {
         assert_eq!(deltas.removed.len(), 0);
         assert_eq!(deltas.changed.len(), 1);
         assert_eq!(deltas.changed[0].placement().y(), 2);
+    }
+
+    /// A non-terminal widget that owns a single dashboard image, used to
+    /// exercise the render-diff delta path for non-terminal graphics.
+    struct GraphicsWidget {
+        submission: Option<GraphicsSubmission>,
+    }
+
+    impl Widget for GraphicsWidget {
+        fn kind(&self) -> &str {
+            "graphics"
+        }
+
+        fn render(&self, area: Rect, _focused: bool) -> Scene {
+            Scene::new(area)
+        }
+
+        fn graphics(&self, _area: Rect) -> Vec<GraphicsSubmission> {
+            self.submission.clone().into_iter().collect()
+        }
+    }
+
+    fn dashboard_submission() -> GraphicsSubmission {
+        let resource = crate::graphics::GraphicsResourceId::new(
+            crate::graphics::DASHBOARD_SESSION,
+            crate::graphics::allocate_dashboard_image_id(),
+        );
+        let placement =
+            crate::graphics::GraphicsPlacement::dashboard(resource, 0, 0, 4, 4, 0, 7, 0);
+        crate::graphics::GraphicsSubmission::from_rgba(
+            resource,
+            &[255, 0, 0, 255],
+            1,
+            1,
+            1,
+            placement,
+        )
+    }
+
+    #[test]
+    fn non_terminal_widget_graphics_upload_on_change_and_delete_on_hide() {
+        let mut runtime = WidgetRuntime::empty();
+        runtime.instances.insert(
+            WidgetId::new(1),
+            WidgetEntry {
+                widget: Box::new(GraphicsWidget {
+                    submission: Some(dashboard_submission()),
+                }),
+                health: WidgetHealth::Healthy,
+            },
+        );
+        let areas = BTreeMap::from([(WidgetId::new(1), Rect::new(0, 0, 20, 6))]);
+
+        // First frame: the new image is uploaded.
+        let deltas = runtime.drain_graphics_deltas(&areas);
+        assert_eq!(deltas.changed.len(), 1);
+        assert_eq!(deltas.removed.len(), 0);
+
+        // Steady frame: nothing changed, so nothing is emitted.
+        let deltas = runtime.drain_graphics_deltas(&areas);
+        assert_eq!(deltas.changed.len(), 0);
+        assert_eq!(deltas.removed.len(), 0);
+
+        // Hidden (removed from the visible set): the image is deleted once.
+        let empty_areas = BTreeMap::new();
+        let deltas = runtime.drain_graphics_deltas(&empty_areas);
+        assert_eq!(deltas.changed.len(), 0);
+        assert_eq!(deltas.removed.len(), 1);
+
+        // The deletion is idempotent: a further drain emits nothing.
+        let deltas = runtime.drain_graphics_deltas(&empty_areas);
+        assert_eq!(deltas.removed.len(), 0);
     }
 
     #[test]

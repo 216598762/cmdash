@@ -27,6 +27,17 @@ use std::os::unix::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::layout::Rect;
 
+use crate::graphics::GraphicsSubmission;
+#[cfg(feature = "image")]
+use crate::graphics::{
+    DASHBOARD_SESSION, GraphicsPlacement, GraphicsResourceId, allocate_dashboard_image_id,
+};
+#[cfg(feature = "image")]
+use crate::image::DecodedImage;
+#[cfg(all(feature = "sixel", feature = "image"))]
+use crate::sixel::SixelImage;
+#[cfg(feature = "sixel")]
+use crate::sixel::SixelSubmission;
 use crate::{
     appearance::Theme,
     config::{LabelPolicy, WidgetInstanceConfig},
@@ -41,6 +52,12 @@ use crate::{
         bordered_chrome, parse_log_line,
     },
 };
+
+/// A stdout line prefix that marks a dashboard image directive: the remainder
+/// of the line is standard-base64 of a JPEG or BMP file, decoded through the
+/// `image` feature's `decode_image`. Compiled-in only with `image`.
+#[cfg(feature = "image")]
+pub(crate) const IMAGE_DIRECTIVE_PREFIX: &str = "@@CMDASH_IMAGE ";
 
 /// How a script's stdout is consumed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -487,6 +504,15 @@ fn set_nonblocking(file: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// A decoded dashboard image: the RGBA pixels plus the stable resource
+/// identity and generation used to (re-)upload it to the outer terminal.
+#[cfg(feature = "image")]
+struct ScriptImage {
+    decoded: DecodedImage,
+    resource: GraphicsResourceId,
+    generation: u64,
+}
+
 struct ScriptWidget {
     id: u64,
     title: String,
@@ -504,6 +530,14 @@ struct ScriptWidget {
     pending: Vec<u8>,
     surface_size: TerminalSize,
     visible: bool,
+    #[cfg(feature = "image")]
+    image: Option<ScriptImage>,
+    #[cfg(feature = "image")]
+    image_error: Option<String>,
+    /// Whether the outer terminal advertises Kitty graphics; when false the
+    /// widget falls back to sixel (when compiled in).
+    #[cfg(feature = "image")]
+    kitty_graphics: bool,
 }
 
 impl ScriptWidget {
@@ -547,10 +581,49 @@ impl ScriptWidget {
                 line.pop();
             }
             let line = String::from_utf8_lossy(&line).into_owned();
+            #[cfg(feature = "image")]
+            if self.ingest_image_directive(&line) {
+                changed = true;
+                continue;
+            }
             self.push_line(line);
             changed = true;
         }
         changed
+    }
+
+    /// Consumes a line that begins with [`IMAGE_DIRECTIVE_PREFIX`], decoding
+    /// the base64 JPEG/BMP payload into a [`ScriptImage`]. Returns whether the
+    /// line was an image directive (so callers skip text rendering for it).
+    #[cfg(feature = "image")]
+    fn ingest_image_directive(&mut self, line: &str) -> bool {
+        let Some(encoded) = line.strip_prefix(IMAGE_DIRECTIVE_PREFIX) else {
+            return false;
+        };
+        match decode_directive_image(encoded.trim()) {
+            Some(decoded) => {
+                let (resource, generation) = match &self.image {
+                    Some(existing) => (existing.resource, existing.generation.saturating_add(1)),
+                    None => (
+                        GraphicsResourceId::new(DASHBOARD_SESSION, allocate_dashboard_image_id()),
+                        1,
+                    ),
+                };
+                self.image = Some(ScriptImage {
+                    decoded,
+                    resource,
+                    generation,
+                });
+                self.image_error = None;
+            }
+            None => {
+                // Keep the last good image; surface the failure as a
+                // diagnostic rather than flashing to an empty surface.
+                self.image_error =
+                    Some("image directive payload is not a decodable JPEG/BMP".to_owned());
+            }
+        }
+        true
     }
 
     fn push_line(&mut self, line: String) {
@@ -589,6 +662,10 @@ impl ScriptWidget {
                 "widget output exceeded its ring; oldest lines dropped".to_owned(),
             )
         } else {
+            #[cfg(feature = "image")]
+            if let Some(error) = &self.image_error {
+                return WidgetHealth::Degraded(error.clone());
+            }
             WidgetHealth::Healthy
         }
     }
@@ -601,6 +678,85 @@ impl Widget for ScriptWidget {
 
     fn content_area(&self, area: Rect) -> Rect {
         self.appearance.content_area(area)
+    }
+
+    /// Surfaces the decoded image as a raw-RGBA (`f=32`) Kitty submission when
+    /// the outer terminal advertises Kitty graphics. When it does not, the
+    /// widget falls back to its `sixel(area)` output instead.
+    fn graphics(&self, area: Rect) -> Vec<GraphicsSubmission> {
+        #[cfg(feature = "image")]
+        {
+            if !self.kitty_graphics {
+                return Vec::new();
+            }
+            let Some(image) = &self.image else {
+                return Vec::new();
+            };
+            let rect = image_cell_rect(&image.decoded, self.appearance.content_area(area));
+            if rect.width == 0 || rect.height == 0 {
+                return Vec::new();
+            }
+            let placement = GraphicsPlacement::dashboard(
+                image.resource,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                0,
+                self.id,
+                0,
+            );
+            vec![GraphicsSubmission::from_rgba(
+                image.resource,
+                &image.decoded.rgba,
+                image.decoded.width,
+                image.decoded.height,
+                image.generation,
+                placement,
+            )]
+        }
+        #[cfg(not(feature = "image"))]
+        {
+            let _ = area;
+            Vec::new()
+        }
+    }
+
+    #[cfg(feature = "sixel")]
+    fn sixel(&self, area: Rect) -> Vec<SixelSubmission> {
+        #[cfg(feature = "image")]
+        {
+            if self.kitty_graphics {
+                return Vec::new();
+            }
+            let Some(image) = &self.image else {
+                return Vec::new();
+            };
+            let content = self.appearance.content_area(area);
+            if content.width == 0 || content.height == 0 {
+                return Vec::new();
+            }
+            let Ok(width) = u16::try_from(image.decoded.width) else {
+                return Vec::new();
+            };
+            let Ok(height) = u16::try_from(image.decoded.height) else {
+                return Vec::new();
+            };
+            let rgb = rgba_to_rgb(&image.decoded.rgba);
+            let sixel_image = SixelImage {
+                width,
+                height,
+                rgb: &rgb,
+            };
+            SixelSubmission::new(content.x, content.y, sixel_image)
+                .map(|submission| vec![submission])
+                .unwrap_or_default()
+        }
+        #[cfg(not(feature = "image"))]
+        {
+            let _ = area;
+            Vec::new()
+        }
     }
 
     fn initialize(&mut self) -> Result<(), String> {
@@ -738,6 +894,50 @@ impl Widget for ScriptWidget {
     }
 }
 
+/// Decodes a base64 JPEG/BMP payload into a [`DecodedImage`]. The `image`
+/// feature's decoder rejects PNG/GIF (owned by the terminal graphics protocol
+/// slice) and any unrecognized payload.
+#[cfg(feature = "image")]
+fn decode_directive_image(encoded: &str) -> Option<DecodedImage> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    crate::image::decode_image(&bytes)
+}
+
+/// Computes the cell rectangle an image occupies inside `content`, preserving
+/// the image's pixel aspect ratio and never exceeding the content area.
+#[cfg(feature = "image")]
+fn image_cell_rect(decoded: &DecodedImage, content: Rect) -> Rect {
+    if content.width == 0 || content.height == 0 || decoded.width == 0 || decoded.height == 0 {
+        return Rect::new(content.x, content.y, 0, 0);
+    }
+    let scale_x = f64::from(content.width) / f64::from(decoded.width);
+    let scale_y = f64::from(content.height) / f64::from(decoded.height);
+    let scale = scale_x.min(scale_y);
+    let width = ((f64::from(decoded.width) * scale).round() as u16).max(1);
+    let height = ((f64::from(decoded.height) * scale).round() as u16).max(1);
+    Rect::new(
+        content.x,
+        content.y,
+        width.min(content.width),
+        height.min(content.height),
+    )
+}
+
+/// Drops the alpha channel from packed RGBA8, yielding packed RGB8. JPEG/BMP
+/// decode is always opaque, so this is lossless for the `image` feature's
+/// supported formats.
+#[cfg(all(feature = "image", feature = "sixel"))]
+fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
+    for pixel in rgba.chunks_exact(4) {
+        rgb.extend_from_slice(&pixel[..3]);
+    }
+    rgb
+}
+
 fn key_event_bytes(key: KeyEvent) -> Vec<u8> {
     match key.code {
         KeyCode::Char(character) => {
@@ -819,6 +1019,12 @@ pub(crate) fn script_widget_factory(
         pending: Vec::new(),
         surface_size,
         visible: true,
+        #[cfg(feature = "image")]
+        image: None,
+        #[cfg(feature = "image")]
+        image_error: None,
+        #[cfg(feature = "image")]
+        kitty_graphics: context.kitty_graphics(),
     }))
 }
 
@@ -870,6 +1076,12 @@ mod tests {
             pending: Vec::new(),
             surface_size: TerminalSize::new(80, 24),
             visible: true,
+            #[cfg(feature = "image")]
+            image: None,
+            #[cfg(feature = "image")]
+            image_error: None,
+            #[cfg(feature = "image")]
+            kitty_graphics: true,
         }
     }
 
@@ -1008,6 +1220,12 @@ mod tests {
             pending: Vec::new(),
             surface_size: TerminalSize::new(80, 24),
             visible: true,
+            #[cfg(feature = "image")]
+            image: None,
+            #[cfg(feature = "image")]
+            image_error: None,
+            #[cfg(feature = "image")]
+            kitty_graphics: true,
         };
         (bus, widget)
     }
@@ -1075,5 +1293,94 @@ mod tests {
             settings: Default::default(),
         };
         assert!(script_widget_factory(&config, &context).is_err());
+    }
+
+    /// Builds a valid 1x1 24-bit BMP encoding an opaque red pixel (matches the
+    /// fixture used by `crate::image`'s decode tests).
+    #[cfg(feature = "image")]
+    fn one_pixel_bmp() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"BM");
+        bytes.extend_from_slice(&58u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&54u32.to_le_bytes());
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&24u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0x00, 0x00, 0xFF, 0x00]);
+        bytes
+    }
+
+    #[cfg(feature = "image")]
+    fn bmp_directive() -> String {
+        use base64::Engine as _;
+        format!(
+            "{}{}\n",
+            IMAGE_DIRECTIVE_PREFIX,
+            base64::engine::general_purpose::STANDARD.encode(one_pixel_bmp())
+        )
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn image_directive_surfaces_a_kitty_submission() {
+        let mut widget = make_widget("true", ScriptMode::Stream);
+        assert!(widget.ingest(bmp_directive().as_bytes()));
+        assert!(widget.lines.is_empty(), "directives are not text lines");
+
+        let area = Rect::new(0, 0, 20, 6);
+        let submissions = widget.graphics(area);
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].format(), 32);
+        assert_eq!(submissions[0].pixel_width(), 1);
+        assert_eq!(submissions[0].pixel_height(), 1);
+        let placement = submissions[0].placement();
+        assert!(!placement.is_virtual());
+        assert!(placement.width() > 0 && placement.height() > 0);
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn plain_lines_are_still_rendered_as_text() {
+        let mut widget = make_widget("true", ScriptMode::Stream);
+        widget.ingest(b"plain text\n");
+        assert_eq!(
+            widget.lines.iter().cloned().collect::<Vec<_>>(),
+            vec!["plain text".to_owned()]
+        );
+        assert!(widget.graphics(Rect::new(0, 0, 20, 6)).is_empty());
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn malformed_image_directive_reports_degraded_health_and_keeps_last_image() {
+        let mut widget = make_widget("true", ScriptMode::Stream);
+        widget.ingest(bmp_directive().as_bytes());
+        assert_eq!(widget.graphics(Rect::new(0, 0, 20, 6)).len(), 1);
+
+        widget.ingest(format!("{IMAGE_DIRECTIVE_PREFIX}not-base64\n").as_bytes());
+        assert!(widget.image_error.is_some());
+        assert!(matches!(widget.health(), WidgetHealth::Degraded(_)));
+        // The last good image is retained rather than flashing to empty.
+        assert_eq!(widget.graphics(Rect::new(0, 0, 20, 6)).len(), 1);
+    }
+
+    #[cfg(all(feature = "image", feature = "sixel"))]
+    #[test]
+    fn image_directive_falls_back_to_sixel_when_kitty_is_unsupported() {
+        let mut widget = make_widget("true", ScriptMode::Stream);
+        widget.kitty_graphics = false;
+        widget.ingest(bmp_directive().as_bytes());
+        assert!(widget.graphics(Rect::new(0, 0, 20, 6)).is_empty());
+        let sixel = widget.sixel(Rect::new(0, 0, 20, 6));
+        assert_eq!(sixel.len(), 1);
     }
 }

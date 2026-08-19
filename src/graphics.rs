@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::File,
     io::{Read, Seek, SeekFrom},
+    sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
 };
 
@@ -30,6 +31,19 @@ impl GraphicsResourceId {
     pub const fn image(self) -> u32 {
         self.image
     }
+}
+
+/// The session id reserved for dashboard-owned (non-terminal) image resources.
+/// Terminal sessions allocate ids from 1 upward, so 0 is never claimed by a
+/// child PTY and dashboard images cannot collide with session images.
+pub const DASHBOARD_SESSION: SessionId = SessionId::new(0);
+
+/// Allocates a fresh, process-unique image number for a dashboard-owned image
+/// resource. Combined with [`DASHBOARD_SESSION`] this yields a
+/// [`GraphicsResourceId`] that cannot collide with any terminal-session image.
+pub fn allocate_dashboard_image_id() -> u32 {
+    static NEXT_IMAGE: AtomicU32 = AtomicU32::new(1);
+    NEXT_IMAGE.fetch_add(1, Ordering::Relaxed)
 }
 
 /// The emulator screen that owns a graphics placement.
@@ -415,6 +429,46 @@ impl GraphicsPlacement {
 
     pub const fn area(&self) -> Rect {
         Rect::new(self.x, self.y, self.width, self.height)
+    }
+
+    /// Builds a simple cell-aligned placement for a dashboard-owned image: no
+    /// sub-cell offset, source crop, relative parent, or virtual flag. The
+    /// placement never moves the cursor and carries a stable `key` plus an
+    /// `outer_placement_id`, so a later re-place is recognized as a move of
+    /// the same placement rather than a new stacked image.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dashboard(
+        resource: GraphicsResourceId,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        z_index: i32,
+        key: u64,
+        outer_placement_id: u32,
+    ) -> Self {
+        Self {
+            resource,
+            placement_id: None,
+            x,
+            y,
+            width,
+            height,
+            z_index,
+            source: None,
+            cursor_static: true,
+            anchor: GraphicsGridAnchor::new(x, y, 0),
+            cell_x_offset: 0,
+            cell_y_offset: 0,
+            drawn_width: 0,
+            drawn_height: 0,
+            cell_width_pixels: 0,
+            cell_height_pixels: 0,
+            parent: None,
+            virtual_placement: false,
+            key,
+            outer_placement_id,
+        }
     }
 }
 
@@ -1087,6 +1141,29 @@ impl GraphicsSubmission {
                 ..self.placement
             },
         })
+    }
+
+    /// Builds a dashboard-owned raw-RGBA (`f=32`) submission from decoded
+    /// pixels and a cell-aligned placement. `rgba` must contain
+    /// `pixel_width * pixel_height * 4` bytes; the payload is copied so the
+    /// caller may drop its source buffer.
+    pub fn from_rgba(
+        resource: GraphicsResourceId,
+        rgba: &[u8],
+        pixel_width: u32,
+        pixel_height: u32,
+        generation: u64,
+        placement: GraphicsPlacement,
+    ) -> Self {
+        Self {
+            resource,
+            format: 32,
+            generation,
+            encoded_payload: rgba.to_vec(),
+            pixel_width,
+            pixel_height,
+            placement,
+        }
     }
 }
 
@@ -5751,6 +5828,37 @@ fn intersect_signed(first: (i32, i32, u16, u16), second: Rect) -> Option<Rect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashboard_submission_is_raw_rgba_and_serializes_cell_geometry() {
+        let image_id = allocate_dashboard_image_id();
+        let resource = GraphicsResourceId::new(DASHBOARD_SESSION, image_id);
+        assert_eq!(resource.session(), DASHBOARD_SESSION);
+        assert_eq!(terminal_image_id(resource), image_id);
+
+        let placement = GraphicsPlacement::dashboard(resource, 3, 4, 5, 6, 0, 42, 0);
+        assert_eq!(placement.area(), Rect::new(3, 4, 5, 6));
+        assert!(!placement.is_virtual());
+        assert!(placement.cursor_static());
+        assert_eq!(placement.source(), None);
+        assert_eq!(placement.key(), 42);
+
+        let rgba = [255, 0, 0, 255, 0, 255, 0, 255];
+        let submission = GraphicsSubmission::from_rgba(resource, &rgba, 2, 1, 1, placement);
+        assert_eq!(submission.format(), 32);
+        assert_eq!(submission.generation(), 1);
+        assert_eq!(submission.pixel_width(), 2);
+        assert_eq!(submission.pixel_height(), 1);
+        assert_eq!(submission.encoded_payload(), &rgba);
+        assert_eq!(submission.placement().area(), Rect::new(3, 4, 5, 6));
+    }
+
+    #[test]
+    fn dashboard_image_ids_are_unique_across_allocations() {
+        let first = allocate_dashboard_image_id();
+        let second = allocate_dashboard_image_id();
+        assert_ne!(first, second);
+    }
 
     fn removed_images(deltas: &GraphicsDeltas) -> Vec<u32> {
         deltas
