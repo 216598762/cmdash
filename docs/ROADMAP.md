@@ -1126,6 +1126,117 @@ move references with the cells they cover, the emission path is reconciled
 against the grid on every frame, and the projection layer is documented as the
 load-bearing anchor→viewport mapping rather than a deletable mirror.
 
+### Workstream 10 — Zellij-parity placement geometry and grid-sync hooks
+
+**Status:** planned. Workstream 9 left placements anchored in signed,
+screen-relative cell rows, with the composed grid as the verification layer.
+This workstream adopts the transportable halves of Zellij's merged kitty
+architecture (`zellij-org/zellij#5428`): **canonical-line anchoring in pixel
+space** and **grid-sync hooks driven by the emulator's own line mutations**,
+plus the supporting store and capability machinery. Zellij's
+re-emit-every-damaged-rect model is *not* adopted wholesale — the mutation
+stream stays authoritative — but its source-crop chunk slicing becomes an
+alternative emission adapter so both models can be exercised and compared.
+U=1 placeholders, animation, and per-frame delete (cmdash strengths Zellij
+explicitly deferred) are out of scope and must not regress.
+
+### Phase 1 — Canonical-line anchor migration (the core)
+
+- [ ] Introduce a canonical anchor `{ line: i64, offset_px_from_line_start:
+  isize }` alongside the existing signed `start_row`: the canonical anchor is
+  the mutation-time identity, the signed row stays the projection-time
+  viewport position, and every `ImagePlacement` resolves through both.
+- [ ] Maintain a logical-line tag per composed-grid row across scroll,
+  insert/delete, and erase so the grid can answer "which logical line is this
+  row" in O(1).
+- [ ] Re-anchor on line merges/splits: wrap reflow splits one logical line
+  into two (placements shift by whole lines and re-slice across the boundary),
+  and column shrink merges lines back (placements clamp to the surviving line
+  start) — mirroring Zellij's `split_line_start_into_rows` and
+  `merge_rows_into_line_start`.
+- [ ] Byte-parity harness: run the signed-row projection and the
+  canonical-line projection in parallel over the conformance corpus; every
+  emitted placement must agree (outer placement id, viewport cell, source
+  crop).
+
+### Phase 2 — Cell-size discovery and pixel-space geometry
+
+- [ ] Add a startup/first-frame cell-size probe (CSI 14t/16t text-area and
+  character-cell queries) with a cached `SizeInPixels`, mirroring Zellij's
+  startup query batch; resolve to cell coordinates only at emission time.
+- [ ] Store placement geometry in pixel space (`display_rect`, `source_rect`)
+  derived from the cached cell size, preserving the existing `cell_offset_x/y`
+  sub-cell offsets.
+- [ ] On cell-size change, re-scale and re-regenerate affected placements
+  (Zellij's `character_cell_size_possibly_changed` semantics): mark their
+  generations dirty so the outer terminal receives re-scaled payloads.
+- [ ] Gate pixel geometry behind the capability probe; fall back to
+  cell-row anchoring (current behavior) when the host answers no pixel
+  queries.
+
+### Phase 3 — Grid-sync hook parity
+
+- [ ] Port the full region-scroll hook set from Zellij's `apply_region_scroll`:
+  entirely-inside / intersecting / outside classification,
+  `preserve_above_region_top` semantics, and crop advancement
+  (`emit_y += cut`) when a region clip trims a placement top or bottom,
+  freeing placements that scroll fully out.
+- [ ] Port the front-drop and scrollback-frame hooks: `offset_grid_top` (drop
+  the top row; free placements whose pixel extent leaves the buffer) and
+  `settle_placements_below_the_viewport` (shift placements when the scrollback
+  frame moves) — the pixel-space complement of the existing signed-row history
+  handling.
+- [ ] Port the canonical-line lifecycle ops (`drop_first_canonical_anchor_line`,
+  `insert_canonical_anchor_line_at_front`) so history entry/exit re-anchors by
+  line rather than by pixel delta.
+- [ ] Reconcile with the existing `ScrollRegionTracker` and region-scoped
+  mutation mapping: one observer feeding both the mutation stream and the
+  pixel-space hooks.
+
+### Phase 4 — Changed-rect emission adapter (optional mode)
+
+- [ ] Feed the compositor's per-surface damage regions (Phase 19) into an
+  emission adapter that, per damaged line rect, slices every intersecting
+  placement into source-cropped chunks (the `changed_kitty_chunks_in_viewport`
+  shape) and emits uploads+places for the changed slices only.
+- [ ] Mode switch: `mutation-stream` (default, current) vs `damage-driven`
+  (Zellij parity); conformance tests assert both produce identical final
+  outer-terminal state on a scroll/erase/refresh corpus.
+- [ ] Keep the placement-uid identity (already present) as the chunk
+  deduplication key across both modes.
+
+### Phase 5 — Store upgrades for scaled regeneration
+
+- [ ] Cache `scaled_variants` per (dest cols, rows) on each resource,
+  regenerated when cell size or source rect changes (Zellij's
+  `add_scaled_variant`), with the existing generation counter marking dirty
+  variants.
+- [ ] Add a payload/base64 cache keyed by (resource, variant) so re-emissions
+  of the same scaled slice do not re-encode.
+- [ ] Reconcile quotas and eviction with the new variant bytes: count variants
+  against the decoded-byte budget and evict unreferenced variants before
+  images, preserving the existing tier order.
+
+### Phase 6 — Host capability probe (three-state)
+
+- [ ] Adopt Zellij's startup probe verbatim: APC `a=q,i=31,s=1,v=1,t=d,f=24`
+  followed by a Primary-DA barrier; classify the reply (or its absence) into
+  `Supported / Unsupported / ProtocolDisabled`, with a config escape hatch
+  (`support_kitty_graphics_protocol`).
+- [ ] Route the probe through the reply broker so host replies never reach the
+  focused pane's input path (cmdash already swallows replies; assert the same
+  for the graphics probe specifically).
+- [ ] Advertise graphics capability to children only when the probe resolved
+  `Supported`, matching Zellij's post-#5432 posture.
+
+**Exit criteria:** a placement's identity survives scroll, wrap reflow, region
+clip, and cell-size change with no re-uploads beyond the changed slices; the
+canonical-line anchor and the signed-row projection agree byte-for-byte on the
+conformance corpus; the damage-driven adapter and the mutation stream converge
+on identical final state; capability is three-state and host-honest; the
+default suite, `--all-features`, clippy, fmt, and the real-Kitty harness stay
+green; and U=1 / animation / per-frame delete coverage is unchanged.
+
 ## Phase 14 — Built-in widget catalog and widget authoring guide
 
 This phase expands the default dashboard widget catalog and makes widget creation
