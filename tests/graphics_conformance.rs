@@ -1276,6 +1276,128 @@ fn resource_removal_emits_delete_immediately_without_upload_ack() {
 }
 
 #[test]
+fn full_redraw_frames_do_not_clear_and_erase_outer_placements() {
+    // Regression for images tearing away from text after a resize or a UI
+    // animation. A full redraw rewrites every cell, so emitting `ED 2` on such
+    // frames is redundant — and destructive: Kitty's `ED 2` erases visible
+    // image placements at the outer terminal, and the graphics path only
+    // re-places images whose projection changed, so the images would stay
+    // missing until the next scroll. The first frame here is a full redraw and
+    // must place the image without clearing it away.
+    let script = r"printf '\033[2;1H\033_Ga=T,f=24,i=21,s=1,v=1,c=1,r=1,C=1,q=2;AQID\033\\'; printf 'A\nB\nC\nD\nE\n'";
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(21),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(8, 6),
+    )
+    .expect("could not spawn full-redraw fixture");
+    let area = Rect::new(0, 0, 8, 6);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && session.scrollback_lines() < 1 {
+        session
+            .poll_output()
+            .expect("full-redraw fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    session.poll_output().expect("final poll");
+
+    let mut compositor = Compositor::new();
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+    let mut scene = session.render(area, false);
+    for graphics in session.graphics(area) {
+        scene.add_image_layer(graphics);
+    }
+    let diff = compositor.diff(&scene);
+    assert!(diff.full_redraw(), "the first frame is a full redraw");
+    backend.submit_diff(&diff).unwrap();
+    backend
+        .submit_graphics_frame(
+            diff.graphics(),
+            diff.visible_graphics(),
+            diff.removed_graphics(),
+            diff.visible_placeholders(),
+            diff.removed_placeholders(),
+        )
+        .unwrap();
+    assert!(
+        !backend
+            .writer()
+            .windows(4)
+            .any(|window| window == b"\x1b[2J"),
+        "a full redraw must not emit ED 2: {:?}",
+        String::from_utf8_lossy(backend.writer())
+    );
+    let terminal = HeadlessKittyTerminal::replay(backend.writer()).unwrap();
+    assert_eq!(terminal.placement_count(), 1);
+    assert_eq!(terminal.actions(), &["transmit"]);
+    session
+        .shutdown()
+        .expect("could not shut down full-redraw fixture");
+}
+
+#[test]
+fn delete_ack_keeps_a_tombstone_so_reentry_replaces_without_reuploading() {
+    // Regression for the scroll-edge flicker: a scrolled-away image is deleted
+    // (lowercase `d=i`, data retained at the outer terminal) and the delete is
+    // acknowledged. Re-entry must re-place with a bare `a=p` (same image id
+    // and generation) instead of re-uploading the payload, which blinked the
+    // image every time it crossed the scroll edge.
+    let submission = captured_submission(17, 2, 2);
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+    backend
+        .submit_graphics(
+            std::slice::from_ref(&submission),
+            std::slice::from_ref(&submission),
+            &[],
+        )
+        .expect("initial upload should write");
+    assert_eq!(backend.metrics().graphics_uploads, 1);
+    let upload_ack = backend.feed_outer_input(b"\x1b_Gi=17;OK\x1b\\");
+    assert_eq!(upload_ack.graphics_acknowledgements.len(), 1);
+
+    // The placement leaves the view; the delete is written immediately.
+    backend
+        .submit_graphics(&[], &[], std::slice::from_ref(&submission))
+        .expect("removal should write the delete immediately");
+    assert_eq!(backend.metrics().graphics_gc, 0);
+
+    // The outer terminal confirms the delete, retaining the image data.
+    let delete_ack = backend.feed_outer_input(b"\x1b_Gi=17;OK\x1b\\");
+    assert_eq!(delete_ack.graphics_acknowledgements.len(), 1);
+    assert!(delete_ack.graphics_acknowledgements[0].success);
+    assert_eq!(backend.metrics().graphics_gc, 1);
+
+    // Re-entry must re-place with the stable `p=` id, not re-upload.
+    let reentry_start = backend.writer().len();
+    backend
+        .submit_graphics(
+            std::slice::from_ref(&submission),
+            std::slice::from_ref(&submission),
+            &[],
+        )
+        .expect("re-entry should reuse the retained resource");
+    let reentry = &backend.writer()[reentry_start..];
+    let re_place = format!("q=2,p={};", submission.placement().outer_placement_id());
+    assert!(
+        reentry
+            .windows(re_place.len())
+            .any(|window| window == re_place.as_bytes()),
+        "re-entry must re-place without re-uploading: {:?}",
+        String::from_utf8_lossy(reentry)
+    );
+    assert!(
+        !reentry.windows(4).any(|window| window == b"a=T,"),
+        "re-entry must not re-upload the payload: {:?}",
+        String::from_utf8_lossy(reentry)
+    );
+    assert_eq!(backend.metrics().graphics_uploads, 1);
+    assert_eq!(backend.metrics().graphics_reuses, 1);
+}
+
+#[test]
 fn missing_outer_acknowledgements_are_retried_with_a_bounded_budget() {
     let submission = captured_submission(15, 1, 1);
     let mut backend = CrosstermBackend::new(Vec::new())

@@ -296,13 +296,21 @@ where
         let window_size = backend.window_size()?;
         let area = window_size.area();
         sync_dashboard_surfaces(state, window_size)?;
-        // Key-driven viewport navigation (scrollback, selection, cursor
+        // Key/mouse-driven viewport navigation (scrollback, selection, cursor
         // presentation) changes a widget scene without necessarily producing
         // a PTY output update. Consume the state redraw request here so the
         // retained compositor does not preserve stale cells from the live
-        // viewport while the emulator is rendering history rows.
+        // viewport while the emulator is rendering history rows. Invalidate
+        // only the widget surfaces, not the whole viewport: a full-area
+        // invalidate forces every cell (chrome, borders, unrelated widgets) to
+        // be re-emitted on each wheel notch or drag, which wastes bandwidth
+        // and visibly repaints the dashboard.
         if state.take_redraw_request() {
-            compositor.invalidate(area);
+            for surface in state.workspace().surfaces().values() {
+                if surface.visible() {
+                    compositor.invalidate(surface.area());
+                }
+            }
         }
         let widget_health =
             (!state.widget_runtime().is_empty()).then(|| state.widget_runtime().health_summary());
@@ -329,7 +337,33 @@ where
         // Workstream 8 adapter swap: the mutation-driven command stream is the
         // source of truth for which placements need upload/place/delete; the
         // render diff still supplies the visible set and placeholder regions.
-        let graphics_deltas = state.drain_graphics_deltas();
+        let mut graphics_deltas = state.drain_graphics_deltas();
+        // A full redraw can erase the outer terminal's visible placements
+        // (resize repaints, UI animations). Images whose projection did not
+        // change would otherwise never be re-placed and would stay missing
+        // until the next scroll — tearing graphics away from text. Re-place
+        // every visible submission as a safety net on such frames.
+        if diff.full_redraw() {
+            let mut known = graphics_deltas
+                .changed
+                .iter()
+                .map(|submission| {
+                    (
+                        submission.resource().image(),
+                        submission.placement().outer_placement_id(),
+                    )
+                })
+                .collect::<std::collections::HashSet<_>>();
+            for submission in diff.visible_graphics() {
+                let key = (
+                    submission.resource().image(),
+                    submission.placement().outer_placement_id(),
+                );
+                if known.insert(key) {
+                    graphics_deltas.changed.push(submission.clone());
+                }
+            }
+        }
         let graphics_status = backend.submit_graphics_frame(
             &graphics_deltas.changed,
             diff.visible_graphics(),

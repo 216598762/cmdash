@@ -1011,7 +1011,19 @@ impl<W: Write> CrosstermBackend<W> {
         }
         self.graphics_acknowledgements += 1;
         if resource.pending_delete && resource.delete_sent {
-            self.uploaded_generations.remove(&acknowledgement.image_id);
+            // The lowercase `d=i` delete retains the image data at the outer
+            // terminal, so a placement that scrolls back into view must be
+            // re-displayed with a bare `a=p` (same image id and generation)
+            // instead of re-uploading the payload. Keep a lightweight
+            // tombstone — the generation is enough for the re-use check — and
+            // drop the retry payload so the image bytes are released. Dropping
+            // the entry entirely would force a full re-upload on re-entry,
+            // which visibly blinks the image at the scroll edge.
+            resource.pending_delete = false;
+            resource.delete_sent = false;
+            resource.acknowledged = false;
+            resource.last_command.clear();
+            resource.retries = 0;
             self.graphics_gc += 1;
             return Ok(());
         }
@@ -1501,9 +1513,13 @@ fn write_scene_cursor<W: Write>(writer: &mut W, cursor: Option<SceneCursor>) -> 
 
 fn write_diff<W: Write>(writer: &mut W, diff: &FrameDiff, grouped: bool) -> io::Result<()> {
     queue!(writer, Hide)?;
-    if diff.full_redraw() {
-        queue!(writer, Clear(ClearType::All))?;
-    }
+    // A full redraw rewrites every cell (the scan covers the whole viewport),
+    // so no `ED 2` clear is needed — and emitting one would be destructive:
+    // Kitty's `ED 2` erases visible image placements at the outer terminal
+    // (the data is retained, but the placement is gone), so any frame that
+    // clears would tear images away from the text they belong to until the
+    // next scroll re-places them. The full cell rewrite paints over the old
+    // frame with the same result and leaves images intact.
     let mut active_style = None;
     if grouped {
         for span in diff.spans() {
