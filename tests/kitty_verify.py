@@ -637,6 +637,61 @@ def main():
           f'original_ref={original_ref_id} reentry={describe_layers(history_again)}')
 
     # -----------------------------------------------------------------------
+    # Scenario 9: full-screen image scroll loop — no re-upload. cmdash keeps
+    # image data alive across a lowercase `d=i` delete (the delete-ack
+    # tombstone fix), so a full-screen placement that scrolls out of the view
+    # and back in is re-displayed with a bare `a=p` and never re-transmits its
+    # payload. Real Kitty must retain the data, keep exactly one image, and
+    # restore the placement on every cycle; if the data had been freed, the
+    # bare re-place would fail (ENOENT) and no placement would appear.
+    import base64 as _b64_9
+    FULL_SCREEN_PAYLOAD = bytes(range(36))  # 4x3 RGB, a distinct byte per pixel
+    full_screen_b64 = _b64_9.b64encode(FULL_SCREEN_PAYLOAD).decode()
+
+    def full_screen_upload():
+        return (
+            f'\x1b[1;1H\x1b_Ga=T,f=24,i=21,s=4,v=3,c=4,r=3,C=1,q=2,p=21;'
+            f'{full_screen_b64}\x1b\\'
+        ).encode()
+
+    def full_screen_replace():
+        return b'\x1b[1;1H\x1b_Ga=p,i=21,c=4,r=3,C=1,q=2,p=21;\x1b\\'
+
+    s, c = create_screen(4, 3, scrollback=100)
+    parse_bytes(s, full_screen_upload())
+    ls = layers(s)
+    check('9.1 full-screen upload creates one placement at the top row',
+          len(ls) == 1 and row_of(ls[0], 3) == 0, describe_layers(ls))
+    check('9.2 upload retained exactly one image', s.grman.image_count == 1,
+          f'image_count={s.grman.image_count}')
+
+    for cycle in range(1, 6):
+        # Three lines of text scroll the full-screen image into history.
+        parse_bytes(s, b'row0\nrow1\nrow2\n')
+        hist = [lyr for lyr in layers(s, scrolled_by=3) if lyr['image_id'] == 1]
+        check(f'9.{cycle}.1 cycle {cycle}: reachable in history after scrolling out',
+              len(hist) == 1, describe_layers(hist))
+        # Leaving the view: cmdash emits a data-retaining lowercase delete.
+        parse_bytes(s, b'\x1b_Ga=d,d=i,i=21,p=21;\x1b\\')
+        check(f'9.{cycle}.2 cycle {cycle}: scrolled-out delete leaves no placement',
+              len(layers(s, 0)) == 0 and len(layers(s, 3)) == 0,
+              describe_layers(layers(s, 3)))
+        check(f'9.{cycle}.3 cycle {cycle}: lowercase delete retained the image data',
+              s.grman.image_count == 1, f'image_count={s.grman.image_count}')
+        # Re-entry: a bare a=p re-place must restore the placement from the
+        # retained data — no re-upload, no payload retransmission.
+        parse_bytes(s, full_screen_replace())
+        ls = layers(s)
+        check(f'9.{cycle}.4 cycle {cycle}: bare re-place restores the full-screen placement',
+              len(ls) == 1 and row_of(ls[0], 3) == 0, describe_layers(ls))
+        check(f'9.{cycle}.5 cycle {cycle}: no re-upload — image data count stays one',
+              s.grman.image_count == 1, f'image_count={s.grman.image_count}')
+        d = s.grman.image_for_client_id(21)
+        check(f'9.{cycle}.6 cycle {cycle}: image data byte-identical across cycles',
+              d is not None and d['data'] == FULL_SCREEN_PAYLOAD,
+              f"len={len(d['data']) if d else None}")
+
+    # -----------------------------------------------------------------------
     failed = [name for name, ok, _ in checks if not ok]
     print()
     print(f"{len(checks) - len(failed)}/{len(checks)} checks passed")
