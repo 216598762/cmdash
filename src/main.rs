@@ -333,7 +333,6 @@ where
             &surface_scenes,
             widget_report.changed(),
         );
-        backend.submit_diff(&diff)?;
         // Workstream 8 adapter swap: the mutation-driven command stream is the
         // source of truth for which placements need upload/place/delete; the
         // render diff still supplies the visible set and placeholder regions.
@@ -364,13 +363,33 @@ where
                 }
             }
         }
-        let graphics_status = backend.submit_graphics_frame(
-            &graphics_deltas.changed,
-            diff.visible_graphics(),
-            &graphics_deltas.removed,
-            diff.visible_placeholders(),
-            diff.removed_placeholders(),
-        )?;
+        // In direct placement mode the graphics commands are tiny (a=p moves
+        // and a=d deletes) and independent of the text frame, so emit them
+        // *before* the text: when the viewport scrolls, images snap to their
+        // new rows first and the text frame catches up, instead of images
+        // trailing the scrolled text by one repaint. Unicode-placeholder mode
+        // must keep text first — the placeholder glyphs are part of the text
+        // grid and a subsequent full rewrite would clobber them.
+        let graphics_status = if !backend.capabilities().kitty_unicode_placeholders {
+            let status = backend.submit_graphics_frame(
+                &graphics_deltas.changed,
+                diff.visible_graphics(),
+                &graphics_deltas.removed,
+                diff.visible_placeholders(),
+                diff.removed_placeholders(),
+            )?;
+            backend.submit_diff(&diff)?;
+            status
+        } else {
+            backend.submit_diff(&diff)?;
+            backend.submit_graphics_frame(
+                &graphics_deltas.changed,
+                diff.visible_graphics(),
+                &graphics_deltas.removed,
+                diff.visible_placeholders(),
+                diff.removed_placeholders(),
+            )?
+        };
         if !graphics_status.is_successful()
             && graphics_status.placements() > 0
             && (!graphics_deltas.changed.is_empty() || !graphics_deltas.removed.is_empty())

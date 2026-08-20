@@ -1054,6 +1054,111 @@ fn pty_scroll_moves_and_removes_outer_placements_in_step_with_text() {
 }
 
 #[test]
+fn direct_mode_emits_graphics_before_the_text_frame() {
+    // Images must lead, not trail, the scrolled text: in direct placement
+    // mode the graphics commands (upload/place/delete) are independent of the
+    // text frame, so they are flushed first. Mirror the ordering main.rs
+    // applies and assert the byte order the outer terminal receives.
+    let script = r"printf '\033[1;1H\033_Ga=T,f=24,i=31,s=1,v=1,c=1,r=1,C=1,q=2;AQID\033\\'; for i in 0 1 2 3 4 5 6 7 8 9; do echo row$i; done";
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(31),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(6, 4),
+    )
+    .expect("could not spawn graphics-first fixture");
+    let area = Rect::new(0, 0, 6, 4);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && session.scrollback_lines() < 1 {
+        session
+            .poll_output()
+            .expect("graphics-first fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        session.scrollback_lines() >= 1,
+        "image should have scrolled into history"
+    );
+
+    let mut compositor = Compositor::new();
+    let mut backend = CrosstermBackend::new(Vec::new())
+        .with_capabilities(capabilities(true, false, false, false));
+
+    // Frame 1: scroll to the top so the image is at row 0. The `a=T` upload
+    // must land before the text frame (the frame starts with the cursor
+    // Hide `ESC[?25l`; the graphics flush's own MoveTo is not a text frame).
+    assert!(session.scroll_display(alacritty_terminal::grid::Scroll::Top));
+    let mut scene1 = session.render(area, false);
+    for graphics in session.graphics(area) {
+        scene1.add_image_layer(graphics);
+    }
+    let diff1 = compositor.diff(&scene1);
+    let deltas1 = session.drain_graphics_deltas(area);
+    backend
+        .submit_graphics_frame(
+            &deltas1.changed,
+            diff1.visible_graphics(),
+            &deltas1.removed,
+            diff1.visible_placeholders(),
+            diff1.removed_placeholders(),
+        )
+        .unwrap();
+    backend.submit_diff(&diff1).unwrap();
+    let frame1_end = backend.writer().len();
+    let frame1 = &backend.writer()[..frame1_end];
+    let upload_at = frame1
+        .windows(3)
+        .position(|window| window == b"a=T")
+        .expect("frame 1 must upload the image");
+    let text_at = frame1
+        .windows(6)
+        .position(|window| window == b"\x1b[?25l")
+        .expect("frame 1 must emit a text frame");
+    assert!(
+        upload_at < text_at,
+        "direct-mode upload must precede the text frame"
+    );
+
+    // Frame 2: scroll down one line so the image leaves the view. The
+    // placement delete must arrive before the scrolled text frame.
+    assert!(session.scroll_display(alacritty_terminal::grid::Scroll::Delta(-1)));
+    let mut scene2 = session.render(area, false);
+    for graphics in session.graphics(area) {
+        scene2.add_image_layer(graphics);
+    }
+    assert!(scene2.image_layers().is_empty());
+    let diff2 = compositor.diff(&scene2);
+    let deltas2 = session.drain_graphics_deltas(area);
+    backend
+        .submit_graphics_frame(
+            &deltas2.changed,
+            diff2.visible_graphics(),
+            &deltas2.removed,
+            diff2.visible_placeholders(),
+            diff2.removed_placeholders(),
+        )
+        .unwrap();
+    backend.submit_diff(&diff2).unwrap();
+    let frame2 = &backend.writer()[frame1_end..];
+    let delete_at = frame2
+        .windows(3)
+        .position(|window| window == b"a=d")
+        .expect("frame 2 must delete the scrolled-out placement");
+    let text_at = frame2
+        .windows(6)
+        .position(|window| window == b"\x1b[?25l")
+        .expect("frame 2 must emit a text frame");
+    assert!(
+        delete_at < text_at,
+        "direct-mode delete must precede the scrolled text frame"
+    );
+
+    session
+        .shutdown()
+        .expect("could not shut down graphics-first fixture");
+}
+
+#[test]
 fn removing_one_placement_keeps_the_image_for_its_other_placements() {
     // Two placements of the same image; removing one must delete exactly that
     // placement (`d=i` scoped with `p=`), keeping the image data alive for
