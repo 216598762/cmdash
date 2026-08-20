@@ -978,8 +978,12 @@ impl AppState {
         {
             return Ok(false);
         }
-        self.widget_runtime
-            .handle_mouse(widget_id, mouse, (input_area.x, input_area.y))?;
+        let update =
+            self.widget_runtime
+                .handle_mouse(widget_id, mouse, (input_area.x, input_area.y))?;
+        if update == crate::widget::WidgetUpdate::Redraw {
+            self.redraw_requested = true;
+        }
         // A terminal that opts into copy-on-select/release auto-copies its
         // finalized selection to the clipboard when the mouse button lifts,
         // then clears it (Kitty's clear-on-copy behavior).
@@ -989,6 +993,7 @@ impl AppState {
         {
             self.copy_focused_selection();
             self.widget_runtime.clear_selection(widget_id);
+            self.redraw_requested = true;
         }
         self.reset_cursor_blink();
         Ok(true)
@@ -2115,6 +2120,84 @@ mod tests {
                 ))
                 .unwrap()
         );
+        state.shutdown_widgets();
+    }
+
+    #[test]
+    fn mouse_wheel_scroll_requests_a_redraw() {
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [[workspace.widgets]]
+            id = 1
+            type = "terminal"
+            command = "env"
+            "#,
+        )
+        .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        let surface = SurfaceId::new(1);
+        state
+            .dispatch(Command::Surface(SurfaceCommand::SetArea {
+                id: surface,
+                area: Rect::new(0, 0, 20, 4),
+            }))
+            .unwrap();
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(surface)))
+            .unwrap();
+
+        // Let the child overrun the two-row content area so scrollback history
+        // exists (`env` prints the environment, which always exceeds it).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            state.update_widgets(SystemTime::now());
+            if state
+                .widget_runtime()
+                .scrollback_lines(WidgetId::new(1))
+                .is_some_and(|lines| lines > 0)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            state
+                .widget_runtime()
+                .scrollback_lines(WidgetId::new(1))
+                .is_some_and(|lines| lines > 0),
+            "terminal scrollback did not arrive"
+        );
+        assert_eq!(
+            state.widget_runtime().scrollback_offset(WidgetId::new(1)),
+            Some(0)
+        );
+        // Clear the redraw requested by the focus dispatch and initial output
+        // so the assertion isolates the wheel scroll.
+        let _ = state.take_redraw_request();
+
+        let handled = state
+            .handle_mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 2,
+                row: 2,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            })
+            .unwrap();
+        assert!(handled);
+        assert!(
+            state
+                .widget_runtime()
+                .scrollback_offset(WidgetId::new(1))
+                .is_some_and(|offset| offset > 0),
+            "the wheel must scroll the viewport into history"
+        );
+        assert!(
+            state.take_redraw_request(),
+            "a mouse wheel scroll must invalidate the retained text frame"
+        );
+
         state.shutdown_widgets();
     }
 

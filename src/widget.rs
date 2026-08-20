@@ -576,6 +576,16 @@ pub trait Widget: Send {
         None
     }
 
+    /// The terminal session's scrollback history size (lines), if it has one.
+    fn scrollback_lines(&self) -> Option<usize> {
+        None
+    }
+
+    /// The terminal session's current scrollback view offset, if it has one.
+    fn scrollback_offset(&self) -> Option<usize> {
+        None
+    }
+
     /// Whether the widget currently holds a non-empty text selection.
     fn has_selection(&self) -> bool {
         false
@@ -888,6 +898,18 @@ impl WidgetRuntime {
         self.instances
             .get(&id)
             .and_then(|entry| entry.widget.session_title())
+    }
+
+    pub fn scrollback_lines(&self, id: WidgetId) -> Option<usize> {
+        self.instances
+            .get(&id)
+            .and_then(|entry| entry.widget.scrollback_lines())
+    }
+
+    pub fn scrollback_offset(&self, id: WidgetId) -> Option<usize> {
+        self.instances
+            .get(&id)
+            .and_then(|entry| entry.widget.scrollback_offset())
     }
 
     pub fn statuses(&self) -> impl Iterator<Item = WidgetStatus> + '_ {
@@ -1400,6 +1422,14 @@ impl Widget for TerminalWidget {
         Some(self.title.clone())
     }
 
+    fn scrollback_lines(&self) -> Option<usize> {
+        Some(self.session.scrollback_lines())
+    }
+
+    fn scrollback_offset(&self) -> Option<usize> {
+        Some(self.session.scrollback_offset())
+    }
+
     fn has_selection(&self) -> bool {
         self.session.has_selection()
     }
@@ -1496,6 +1526,7 @@ impl Widget for TerminalWidget {
         let signed_row = i32::from(mouse.row) - i32::from(origin.1);
         // When the child has captured mouse reporting the terminal forwards
         // the event verbatim and must not run its own selection.
+        let mut selection_changed = false;
         if !self.session.reports_mouse() {
             match mouse.kind {
                 crossterm::event::MouseEventKind::Down(_) => {
@@ -1504,17 +1535,23 @@ impl Widget for TerminalWidget {
                         (column, row),
                         mouse.modifiers.contains(KeyModifiers::SHIFT),
                     );
+                    selection_changed = true;
                 }
                 crossterm::event::MouseEventKind::Drag(_) => {
                     self.session.drag_selection(column, signed_row);
+                    selection_changed = true;
                 }
                 _ => {}
             }
         }
         self.session
             .write_mouse(mouse, origin)
-            .map(|_| WidgetUpdate::Unchanged)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Ok(if selection_changed {
+            WidgetUpdate::Redraw
+        } else {
+            WidgetUpdate::Unchanged
+        })
     }
 
     fn handle_focus(&mut self, focused: bool) -> Result<(), String> {
@@ -2224,7 +2261,7 @@ mod tests {
         wait_for_scrollback(&mut widget);
         assert_eq!(widget.session.scrollback_offset(), 0);
 
-        widget
+        let update = widget
             .handle_mouse(
                 MouseEvent {
                     kind: crossterm::event::MouseEventKind::ScrollUp,
@@ -2235,9 +2272,10 @@ mod tests {
                 (0, 0),
             )
             .unwrap();
+        assert_eq!(update, WidgetUpdate::Redraw);
         assert!(widget.session.scrollback_offset() > 0);
 
-        widget
+        let update = widget
             .handle_mouse(
                 MouseEvent {
                     kind: crossterm::event::MouseEventKind::ScrollDown,
@@ -2248,6 +2286,7 @@ mod tests {
                 (0, 0),
             )
             .unwrap();
+        assert_eq!(update, WidgetUpdate::Redraw);
         assert_eq!(widget.session.scrollback_offset(), 0);
 
         widget.session.shutdown().unwrap();
