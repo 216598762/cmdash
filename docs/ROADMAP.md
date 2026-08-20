@@ -1168,20 +1168,27 @@ explicitly deferred) are out of scope and must not regress.
   drives a real PTY and asserts the rendered scene's tag at the placement's
   row is invariant across the scroll while the image moves up with its text.
 
-### Phase 2 — Cell-size discovery and pixel-space geometry
+### Phase 2 — Cell-size discovery and pixel-space geometry (landed)
 
-- [ ] Add a startup/first-frame cell-size probe (CSI 14t/16t text-area and
-  character-cell queries) with a cached `SizeInPixels`, mirroring Zellij's
-  startup query batch; resolve to cell coordinates only at emission time.
-- [ ] Store placement geometry in pixel space (`display_rect`, `source_rect`)
-  derived from the cached cell size, preserving the existing `cell_offset_x/y`
-  sub-cell offsets.
-- [ ] On cell-size change, re-scale and re-regenerate affected placements
-  (Zellij's `character_cell_size_possibly_changed` semantics): mark their
-  generations dirty so the outer terminal receives re-scaled payloads.
-- [ ] Gate pixel geometry behind the capability probe; fall back to
-  cell-row anchoring (current behavior) when the host answers no pixel
-  queries.
+- [x] The startup probe now mirrors Zellij's query batch: CSI 14t (text area
+  in pixels) *and* CSI 16t (character cell in pixels), parsed into
+  `GraphicsCapabilityReport.pixel_size` / `.cell_size` (wire order height,
+  width), with `derive_cell_size_from_text_area` for terminals that answer
+  only 14t (`cell = text_area / grid`).
+- [x] The discovered cell size is plumbed end-to-end at spawn time:
+  `BackendCapabilities.cell_size` → `WidgetRuntimeContext.outer_cell_size` →
+  `Session::set_outer_cell_size` → the per-command `cell_size` parameter, so
+  placements capture the real outer cell pixels (instead of the child-side
+  zero) and the occlusion-clip math runs its pixel-exact path instead of the
+  whole-cell fallback. Sub-cell `X`/`Y` offsets are preserved unchanged.
+- [x] Cell-size change re-emission: `SessionGraphicsStore::set_outer_cell_size`
+  updates every placement's captured cell pixels and marks the keys
+  geometry-dirty; the next drain forces those placements into `changed` so
+  their occlusion clips re-derive in the new pixel space even though their
+  cell positions did not move. Unchanged sizes are a no-op.
+- [x] Gated by the probe: `None` (unresolved probe) keeps the child-side cell
+  size and the whole-cell clip fallback — the current behavior — so pixel
+  geometry engages only when the outer terminal actually answered.
 
 ### Phase 3 — Grid-sync hook parity
 

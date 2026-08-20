@@ -153,7 +153,8 @@ fn main() -> io::Result<()> {
         WidgetRuntimeContext::with_session_wakeup(pty_wakeup.clone())
             .with_session_event_bus(session_event_bus)
             .with_initial_terminal_size(initial_window_size.terminal_size())
-            .with_kitty_graphics(backend.capabilities().kitty_graphics),
+            .with_kitty_graphics(backend.capabilities().kitty_graphics)
+            .with_outer_cell_size(backend.capabilities().cell_size),
     );
     let mut state = AppState::from_config(backend.capabilities(), &registry, &config)
         .map_err(|error| io::Error::other(format!("application config rejected: {error}")))?;
@@ -1141,6 +1142,7 @@ mod tests {
             kitty_passthrough: false,
             kitty_text_fallback: false,
             sixel: false,
+            cell_size: None,
         }
     }
 

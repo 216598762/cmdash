@@ -635,6 +635,12 @@ pub struct WidgetRuntimeContext {
     session_event_bus: Option<SessionEventBus>,
     initial_terminal_size: Option<TerminalSize>,
     kitty_graphics: bool,
+    /// The outer terminal's character cell in pixels, `(width, height)`, when
+    /// the startup CSI 16t probe resolved it (Workstream 10 phase 2).
+    /// Sessions use it as the placement cell size so occlusion clipping is
+    /// pixel-exact; `None` keeps the child-side cell size and the whole-cell
+    /// fallback.
+    outer_cell_size: Option<(u16, u16)>,
     theme: Theme,
     clipboard: Arc<Mutex<Option<String>>>,
 }
@@ -650,6 +656,7 @@ impl WidgetRuntimeContext {
             session_event_bus: None,
             initial_terminal_size: None,
             kitty_graphics: false,
+            outer_cell_size: None,
             theme: Theme::default(),
             clipboard: Arc::new(Mutex::new(None)),
         }
@@ -667,6 +674,11 @@ impl WidgetRuntimeContext {
 
     pub fn with_kitty_graphics(mut self, supported: bool) -> Self {
         self.kitty_graphics = supported;
+        self
+    }
+
+    pub fn with_outer_cell_size(mut self, cell_size: Option<(u16, u16)>) -> Self {
+        self.outer_cell_size = cell_size;
         self
     }
 
@@ -689,6 +701,10 @@ impl WidgetRuntimeContext {
 
     pub const fn kitty_graphics(&self) -> bool {
         self.kitty_graphics
+    }
+
+    pub const fn outer_cell_size(&self) -> Option<(u16, u16)> {
+        self.outer_cell_size
     }
 
     pub const fn theme(&self) -> Theme {
@@ -1704,6 +1720,7 @@ fn terminal_widget_factory(
         reason: error.to_string(),
     })?;
     session.set_kitty_graphics_support(context.kitty_graphics());
+    session.set_outer_cell_size(context.outer_cell_size());
     session.set_selection_settings(
         selection.double_click_timeout(),
         selection.selection_auto_scroll(),

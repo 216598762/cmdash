@@ -768,6 +768,11 @@ pub struct TerminalSession {
     graphics_broker: GraphicsProtocolBroker,
     graphics_protocol: GraphicsProtocolAdapter,
     graphics_protocol_capture: Vec<u8>,
+    /// The outer terminal's character cell in pixels, `(width, height)`, from
+    /// the startup CSI 16t probe when it resolved (Workstream 10 phase 2).
+    /// `None` keeps the child-side cell size, which is usually (0, 0) and
+    /// routes the occlusion clip math through the whole-cell fallback.
+    outer_cell_size: Option<(u16, u16)>,
     scrollback_limit: usize,
     ui: Option<Sender<UiEvent>>,
     clipboard: Arc<Mutex<Option<String>>>,
@@ -920,6 +925,7 @@ impl TerminalSession {
             graphics_broker: GraphicsProtocolBroker::default(),
             graphics_protocol: GraphicsProtocolAdapter::default(),
             graphics_protocol_capture: Vec::new(),
+            outer_cell_size: None,
             scrollback_limit: 10_000,
             ui,
             clipboard,
@@ -1012,6 +1018,19 @@ impl TerminalSession {
 
     pub fn set_kitty_graphics_support(&mut self, supported: bool) {
         self.graphics.set_outer_kitty_graphics(supported);
+    }
+
+    /// Records the outer terminal's character cell size (from the CSI 16t
+    /// probe) so placements capture pixel-exact cell geometry instead of the
+    /// child-side (usually zero) cell size. Changing the size re-marks
+    /// existing placements for re-emission so their occlusion clips re-derive
+    /// in the new pixel space (Workstream 10 phase 2).
+    pub fn set_outer_cell_size(&mut self, cell_size: Option<(u16, u16)>) {
+        if self.outer_cell_size == cell_size {
+            return;
+        }
+        self.outer_cell_size = cell_size;
+        self.graphics.set_outer_cell_size(cell_size);
     }
 
     /// Attaches the coordinator-owned session-event bus so this session can
@@ -1543,7 +1562,8 @@ impl TerminalSession {
                         parameters,
                         payload,
                         self.cursor_position(),
-                        (self.size.cell_width(), self.size.cell_height()),
+                        self.outer_cell_size
+                            .unwrap_or((self.size.cell_width(), self.size.cell_height())),
                         self.scrollback_lines(),
                         self.scroll_tracker.active_screen(),
                         self.scroll_tracker.current_region(),

@@ -1260,6 +1260,7 @@ mod tests {
             kitty_passthrough: false,
             kitty_text_fallback: false,
             sixel: false,
+            cell_size: None,
         }
     }
 

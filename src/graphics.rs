@@ -1631,6 +1631,15 @@ pub struct SessionGraphicsStore {
     /// view re-entry from a placement that was only registered before its
     /// first mutation drain.
     known_projection_keys: BTreeSet<(u32, u32)>,
+    /// Placements whose captured cell-pixel geometry changed (the outer
+    /// terminal's character cell size moved) and must be re-emitted so their
+    /// occlusion clips re-derive in the new pixel space, even though their
+    /// cell positions did not move (Workstream 10 phase 2). Drained into the
+    /// `changed` set on the next drain.
+    geometry_dirty: BTreeSet<(u32, u32)>,
+    /// The outer terminal's character cell size, `(width, height)`, when the
+    /// CSI 16t probe resolved it. `None` keeps the child-side cell size.
+    outer_cell_size: Option<(u16, u16)>,
     limits: GraphicsLimits,
     decoded_bytes: usize,
     pending_upload: Option<PendingUpload>,
@@ -1675,6 +1684,8 @@ impl SessionGraphicsStore {
             removed_submissions: Vec::new(),
             last_visible_submissions: BTreeMap::new(),
             known_projection_keys: BTreeSet::new(),
+            geometry_dirty: BTreeSet::new(),
+            outer_cell_size: None,
             limits,
             decoded_bytes: 0,
             pending_upload: None,
@@ -1897,6 +1908,7 @@ impl SessionGraphicsStore {
             }
         }
 
+        let geometry_dirty = std::mem::take(&mut self.geometry_dirty);
         let mut changed = Vec::new();
         let mut changed_keys = BTreeSet::new();
         for command in commands {
@@ -1939,6 +1951,32 @@ impl SessionGraphicsStore {
             };
             if projection_changed && changed_keys.insert(*key) {
                 changed.push(submission.clone());
+            }
+        }
+        // Geometry-dirty placements (the outer cell size changed): re-project
+        // them so their occlusion clips re-derive in the new pixel space, even
+        // though their cell positions are unchanged. Placements scrolled out of
+        // view project to `None` and are skipped; their captured size is still
+        // updated, so they re-emit when they re-enter.
+        for key in geometry_dirty {
+            if !changed_keys.insert(key) {
+                continue;
+            }
+            let Some(store_placement) = self.placements.values().find(|candidate| {
+                candidate.resource().image() == key.0 && candidate.outer_placement_id() == key.1
+            }) else {
+                continue;
+            };
+            if let Some(submission) = self.submission_for_placement(
+                store_placement,
+                surface,
+                current_scrollback,
+                current_screen,
+                current_region,
+                current_region_scroll,
+                view_offset,
+            ) {
+                changed.push(submission);
             }
         }
         for (key, submission) in previous {
@@ -2456,6 +2494,25 @@ impl SessionGraphicsStore {
 
     pub fn set_outer_kitty_graphics(&mut self, supported: bool) {
         self.outer_kitty_graphics = supported;
+    }
+
+    /// Records the outer terminal's character cell size (`(width, height)`) so
+    /// new placements capture pixel-exact cell geometry and existing
+    /// placements re-emit with the updated size (their occlusion clips
+    /// re-derive in the new pixel space). No-op when the size is unchanged;
+    /// `None` restores the child-side fallback.
+    pub fn set_outer_cell_size(&mut self, cell_size: Option<(u16, u16)>) {
+        if self.outer_cell_size == cell_size {
+            return;
+        }
+        self.outer_cell_size = cell_size;
+        let (width, height) = cell_size.unwrap_or((0, 0));
+        for placement in self.placements.values_mut() {
+            placement.cell_width_pixels = width;
+            placement.cell_height_pixels = height;
+            self.geometry_dirty
+                .insert((placement.resource().image(), placement.outer_placement_id()));
+        }
     }
 
     /// Returns and clears the cursor advancement recorded by the most recent
@@ -6157,6 +6214,73 @@ mod tests {
             &commands[0],
             GraphicsCommand::Delete { all: true, .. }
         ));
+    }
+
+    #[test]
+    fn changing_the_outer_cell_size_reemits_placements_with_updated_geometry() {
+        // Workstream 10 phase 2: when the CSI 16t probe delivers the outer
+        // terminal's character cell size, placements that captured the old
+        // (child-side, usually zero) cell size must re-emit so their
+        // occlusion clips re-derive in the new pixel space — even though
+        // their cell positions did not move.
+        let surface = Rect::new(0, 0, 8, 6);
+        let mut store = SessionGraphicsStore::new(SessionId::new(0));
+        store
+            .apply_kitty_command_with_context(
+                b"a=T,f=24,i=9,c=2,r=1,C=1,q=2",
+                b"AP8A",
+                (0, 2),
+                (0, 0),
+            )
+            .expect("fixture image should place");
+
+        let first = store.drain_graphics_deltas(
+            surface,
+            0,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::unbounded(),
+            0,
+            0,
+        );
+        assert_eq!(first.changed.len(), 1);
+        assert_eq!(
+            first.changed[0].placement().cell_width_pixels(),
+            0,
+            "the child-side cell size is captured initially"
+        );
+
+        store.set_outer_cell_size(Some((10, 20)));
+        let second = store.drain_graphics_deltas(
+            surface,
+            0,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::unbounded(),
+            0,
+            0,
+        );
+        assert_eq!(
+            second.changed.len(),
+            1,
+            "the geometry-dirty placement re-emits"
+        );
+        assert_eq!(second.changed[0].placement().cell_width_pixels(), 10);
+        assert_eq!(second.changed[0].placement().cell_height_pixels(), 20);
+
+        // An unchanged size is a no-op: no re-emission, nothing in the set.
+        store.set_outer_cell_size(Some((10, 20)));
+        let third = store.drain_graphics_deltas(
+            surface,
+            0,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::unbounded(),
+            0,
+            0,
+        );
+        assert_eq!(
+            third.changed.len(),
+            0,
+            "no re-emission for an unchanged size"
+        );
     }
 
     #[test]

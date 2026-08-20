@@ -193,7 +193,13 @@ pub struct GraphicsCapabilityReport {
     pub kitty_graphics: bool,
     pub kitty_unicode_placeholders: bool,
     pub da1_seen: bool,
+    /// The outer terminal's text area in pixels, `(height, width)` — CSI 14t
+    /// (`CSI 4;h;w t`).
     pub pixel_size: Option<(u16, u16)>,
+    /// The outer terminal's character cell in pixels, `(height, width)` — CSI
+    /// 16t (`CSI 6;h;w t`). When the terminal answers 14t but not 16t, derive
+    /// it as `text_area / grid` via [`derive_cell_size_from_text_area`].
+    pub cell_size: Option<(u16, u16)>,
     pub source: GraphicsCapabilitySource,
     pub confidence: GraphicsCapabilityConfidence,
     pub diagnostic: Option<String>,
@@ -242,6 +248,7 @@ pub struct GraphicsCapabilityProbe {
     max_response_bytes: usize,
     da1_seen: bool,
     pixel_size: Option<(u16, u16)>,
+    cell_size: Option<(u16, u16)>,
 }
 
 impl Default for GraphicsCapabilityProbe {
@@ -260,6 +267,7 @@ impl GraphicsCapabilityProbe {
             max_response_bytes: max_response_bytes.max(64),
             da1_seen: false,
             pixel_size: None,
+            cell_size: None,
         }
     }
 
@@ -274,9 +282,15 @@ impl GraphicsCapabilityProbe {
         self.buffer.clear();
         self.da1_seen = false;
         self.pixel_size = None;
+        self.cell_size = None;
         self.deadline = Some(now + self.timeout);
         self.state = GraphicsProbeState::AwaitingResponse;
-        Some(b"\x1b_Ga=q,i=0,t=d,s=1,v=1,f=24;\x1b\\\x1b[c\x1b[14t".to_vec())
+        // The startup query batch mirrors Zellij's: the Kitty graphics probe,
+        // Primary DA (the barrier that resolves the probe negatively when it
+        // goes unanswered), CSI 14t (text area in pixels) and CSI 16t
+        // (character cell in pixels). The cell size feeds pixel-exact
+        // placement geometry (Workstream 10 phase 2).
+        Some(b"\x1b_Ga=q,i=0,t=d,s=1,v=1,f=24;\x1b\\\x1b[c\x1b[14t\x1b[16t".to_vec())
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Option<GraphicsCapabilityReport> {
@@ -296,24 +310,13 @@ impl GraphicsCapabilityProbe {
             ));
         }
         self.da1_seen |= self.buffer.windows(3).any(|window| window == b"\x1b[?");
-        if let Some(start) = self
-            .buffer
-            .windows(3)
-            .position(|window| window == b"\x1b[4")
-            && let Some(end) = self.buffer[start..].iter().position(|byte| *byte == b't')
-        {
-            let response = &self.buffer[start..start + end];
-            let mut values = response[4..].split(|byte| *byte == b';');
-            self.pixel_size = values
-                .next()
-                .and_then(|height| std::str::from_utf8(height).ok())
-                .and_then(|height| height.parse::<u16>().ok())
-                .zip(
-                    values
-                        .next()
-                        .and_then(|width| std::str::from_utf8(width).ok())
-                        .and_then(|width| width.parse::<u16>().ok()),
-                );
+        // CSI 14t: text area in pixels (`CSI 4;h;w t`).
+        if let Some(size) = parse_window_size_reply(&self.buffer, b"\x1b[4") {
+            self.pixel_size = Some(size);
+        }
+        // CSI 16t: character cell in pixels (`CSI 6;h;w t`).
+        if let Some(size) = parse_window_size_reply(&self.buffer, b"\x1b[6") {
+            self.cell_size = Some(size);
         }
         let start = self
             .buffer
@@ -373,11 +376,49 @@ impl GraphicsCapabilityProbe {
             kitty_unicode_placeholders: kitty_graphics,
             da1_seen: self.da1_seen,
             pixel_size: self.pixel_size,
+            cell_size: self.cell_size,
             source: GraphicsCapabilitySource::ActiveProbe,
             confidence,
             diagnostic: Some(diagnostic.to_owned()),
         }
     }
+}
+
+/// Parses a CSI window-size reply (`CSI 4;h;w t` for 14t, `CSI 6;h;w t` for
+/// 16t) out of a buffer that may contain other outer-terminal responses. The
+/// marker is `\x1b[4` / `\x1b[6` and the reply ends at the next `t`. Returns
+/// `(height, width)` in pixels, matching the CSI argument order.
+fn parse_window_size_reply(buffer: &[u8], marker: &[u8]) -> Option<(u16, u16)> {
+    let start = buffer
+        .windows(marker.len())
+        .position(|window| window == marker)?;
+    let end = buffer[start..].iter().position(|byte| *byte == b't')?;
+    let response = &buffer[start..start + end];
+    let mut values = response[marker.len() + 1..].split(|byte| *byte == b';');
+    let height = values
+        .next()
+        .and_then(|height| std::str::from_utf8(height).ok())
+        .and_then(|height| height.parse::<u16>().ok())?;
+    let width = values
+        .next()
+        .and_then(|width| std::str::from_utf8(width).ok())
+        .and_then(|width| width.parse::<u16>().ok())?;
+    Some((height, width))
+}
+
+/// Derives the character cell size from a CSI 14t text-area reply and the
+/// grid dimensions: `cell = text_area / grid`. Returns `(width, height)` in
+/// the store's cell-size convention (the wire order is height, width).
+pub fn derive_cell_size_from_text_area(
+    text_area: (u16, u16),
+    columns: u16,
+    rows: u16,
+) -> Option<(u16, u16)> {
+    let (text_height, text_width) = text_area;
+    if text_height == 0 || text_width == 0 || columns == 0 || rows == 0 {
+        return None;
+    }
+    Some((text_width / columns, text_height / rows))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -393,6 +434,13 @@ pub struct BackendCapabilities {
     pub kitty_passthrough: bool,
     pub kitty_text_fallback: bool,
     pub sixel: bool,
+    /// The outer terminal's character cell in pixels, `(width, height)`
+    /// (converted from the CSI 16t wire order). When the startup probe
+    /// resolved it, placements capture the real outer cell size for
+    /// pixel-exact occlusion clipping (Workstream 10 phase 2); otherwise the
+    /// child-side cell size is used and the clip math falls back to
+    /// whole-cell fractions.
+    pub cell_size: Option<(u16, u16)>,
 }
 
 impl BackendCapabilities {
@@ -496,6 +544,7 @@ impl BackendCapabilities {
             sixel: cfg!(feature = "sixel")
                 && (terminal_hint.contains("sixel")
                     || std::env::var("CMDASH_SIXEL").is_ok_and(|value| value == "1")),
+            cell_size: None,
         }
     }
 }
@@ -816,6 +865,9 @@ impl<W: Write> CrosstermBackend<W> {
         self.capabilities.kitty_unicode_placeholders = report.kitty_unicode_placeholders;
         self.capabilities.graphics_source = report.source;
         self.capabilities.graphics_confidence = report.confidence;
+        // The report's cell size is `(height, width)`; the capability carries
+        // `(width, height)` to match the store's cell-size convention.
+        self.capabilities.cell_size = report.cell_size.map(|(height, width)| (width, height));
         Some(report)
     }
 
@@ -1972,6 +2024,7 @@ mod tests {
         let report = probe.feed(b"\x1b_Gi=0;OK\x1b\\").unwrap();
         assert!(report.da1_seen);
         assert_eq!(report.pixel_size, Some((160, 400)));
+        assert_eq!(report.cell_size, None, "16t not answered by this terminal");
         assert_eq!(report.source, GraphicsCapabilitySource::ActiveProbe);
         assert_eq!(report.confidence, GraphicsCapabilityConfidence::Confirmed);
         assert!(report.kitty_graphics);
@@ -1979,17 +2032,85 @@ mod tests {
     }
 
     #[test]
+    fn probe_parses_the_character_cell_size_from_csi_16t() {
+        // Workstream 10 phase 2: CSI 16t answers `CSI 6;h;w t` — the
+        // character cell in pixels, `(height, width)` on the wire.
+        let mut probe = GraphicsCapabilityProbe::new(Duration::from_secs(1), 256);
+        probe.begin(Instant::now()).unwrap();
+        assert_eq!(probe.feed(b"\x1b[?1;2c\x1b[6;20;10t"), None);
+
+        let report = probe.feed(b"\x1b_Gi=0;OK\x1b\\").unwrap();
+        assert_eq!(report.cell_size, Some((20, 10)));
+        assert_eq!(report.pixel_size, None, "14t not answered by this terminal");
+    }
+
+    #[test]
+    fn probe_parses_text_area_and_character_cell_together() {
+        // A full-featured terminal answers both window-size queries in the
+        // same startup reply burst, in either order.
+        let mut probe = GraphicsCapabilityProbe::new(Duration::from_secs(1), 256);
+        probe.begin(Instant::now()).unwrap();
+        assert_eq!(
+            probe.feed(b"\x1b[4;160;400t\x1b[6;20;10t"),
+            None,
+            "window-size replies alone do not resolve the probe"
+        );
+
+        let report = probe.feed(b"\x1b_Gi=0;OK\x1b\\").unwrap();
+        assert_eq!(report.pixel_size, Some((160, 400)));
+        assert_eq!(report.cell_size, Some((20, 10)));
+    }
+
+    #[test]
+    fn derive_cell_size_from_text_area_divides_by_the_grid() {
+        // 400x160 px text area over an 80x24 grid: a 5x6 px cell (the
+        // `(width, height)` convention used by placement capture).
+        assert_eq!(
+            derive_cell_size_from_text_area((160, 400), 80, 24),
+            Some((5, 6))
+        );
+        assert_eq!(
+            derive_cell_size_from_text_area((0, 400), 80, 24),
+            None,
+            "a degenerate text area cannot yield a cell size"
+        );
+        assert_eq!(
+            derive_cell_size_from_text_area((160, 400), 0, 24),
+            None,
+            "a degenerate grid cannot yield a cell size"
+        );
+    }
+
+    #[test]
     fn backend_probe_uses_the_outer_queue_and_updates_capabilities() {
         let mut backend = CrosstermBackend::new(Vec::<u8>::new());
         assert!(backend.begin_graphics_probe().unwrap());
         assert!(backend.writer().windows(4).any(|window| window == b"a=q,"));
-        let report = backend.feed_graphics_probe(b"\x1b_Gi=0;OK\x1b\\").unwrap();
+        // The startup query must ask for the character cell size (CSI 16t)
+        // alongside the text area (CSI 14t), mirroring Zellij's batch.
+        assert!(
+            backend
+                .writer()
+                .windows(5)
+                .any(|window| window == b"\x1b[14t")
+        );
+        assert!(
+            backend
+                .writer()
+                .windows(5)
+                .any(|window| window == b"\x1b[16t")
+        );
+        let report = backend
+            .feed_graphics_probe(b"\x1b[4;160;400t\x1b[6;20;10t\x1b_Gi=0;OK\x1b\\")
+            .unwrap();
         assert_eq!(report.source, GraphicsCapabilitySource::ActiveProbe);
         assert!(backend.capabilities().kitty_graphics);
         assert_eq!(
             backend.capabilities().graphics_confidence,
             GraphicsCapabilityConfidence::Confirmed
         );
+        // The capability carries the cell size in `(width, height)` order.
+        assert_eq!(backend.capabilities().cell_size, Some((10, 20)));
     }
 
     #[test]
@@ -2041,6 +2162,7 @@ mod tests {
             kitty_passthrough: false,
             kitty_text_fallback: false,
             sixel: false,
+            cell_size: None,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
         let status = backend.submit_graphics(&graphics, &graphics, &[]).unwrap();
@@ -2063,6 +2185,7 @@ mod tests {
             kitty_passthrough: false,
             kitty_text_fallback: false,
             sixel: false,
+            cell_size: None,
         };
         assert_eq!(disabled.kitty_graphics_mode(), KittyGraphicsMode::Disabled);
 
@@ -2323,6 +2446,7 @@ mod tests {
             kitty_passthrough: false,
             kitty_text_fallback: false,
             sixel: false,
+            cell_size: None,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
         backend.submit_graphics(&graphics, &graphics, &[]).unwrap();
@@ -2358,6 +2482,7 @@ mod tests {
             kitty_passthrough: false,
             kitty_text_fallback: false,
             sixel: false,
+            cell_size: None,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
         backend.submit_graphics(&graphics, &graphics, &[]).unwrap();
@@ -2396,6 +2521,7 @@ mod tests {
             kitty_passthrough: false,
             kitty_text_fallback: false,
             sixel: false,
+            cell_size: None,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
         backend
@@ -2446,6 +2572,7 @@ mod tests {
             kitty_passthrough: false,
             kitty_text_fallback: false,
             sixel: false,
+            cell_size: None,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
         backend
@@ -2484,6 +2611,7 @@ mod tests {
             kitty_passthrough: false,
             kitty_text_fallback: false,
             sixel: false,
+            cell_size: None,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
         backend.submit_graphics(&graphics, &graphics, &[]).unwrap();
@@ -2516,6 +2644,7 @@ mod tests {
             kitty_passthrough: false,
             kitty_text_fallback: false,
             sixel: false,
+            cell_size: None,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
         backend.submit_graphics(&graphics, &graphics, &[]).unwrap();
@@ -2550,6 +2679,7 @@ mod tests {
             kitty_passthrough: true,
             kitty_text_fallback: false,
             sixel: false,
+            cell_size: None,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
         backend.submit_graphics(&graphics, &graphics, &[]).unwrap();
@@ -2577,6 +2707,7 @@ mod tests {
             kitty_passthrough: false,
             kitty_text_fallback: true,
             sixel: false,
+            cell_size: None,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
         let status = backend.submit_graphics(&graphics, &graphics, &[]).unwrap();
@@ -2607,6 +2738,7 @@ mod tests {
             kitty_passthrough: false,
             kitty_text_fallback: false,
             sixel: false,
+            cell_size: None,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
         let status = backend.submit_graphics(&graphics, &graphics, &[]).unwrap();
@@ -2641,6 +2773,7 @@ mod tests {
             kitty_passthrough: false,
             kitty_text_fallback: false,
             sixel: false,
+            cell_size: None,
         };
         let mut backend = CrosstermBackend::new(Vec::<u8>::new()).with_capabilities(capabilities);
         backend.submit_diff(&first).unwrap();

@@ -54,6 +54,7 @@ fn capabilities(
         kitty_passthrough,
         kitty_text_fallback,
         sixel: false,
+        cell_size: None,
     }
 }
 
@@ -2489,6 +2490,7 @@ fn sixel_adapter_is_accepted_as_a_bounded_outer_stream() {
         kitty_passthrough: false,
         kitty_text_fallback: false,
         sixel: true,
+        cell_size: None,
     };
     let mut backend = CrosstermBackend::new(Vec::new()).with_capabilities(capabilities);
     backend.submit_sixel(&[image]).unwrap();
@@ -2727,6 +2729,47 @@ fn scene_line_tags_agree_with_placement_canonical_lines_across_a_scroll() {
     session
         .shutdown()
         .expect("could not shut down canonical-line tag fixture");
+}
+
+#[test]
+fn session_captures_the_discovered_outer_cell_size_on_placements() {
+    // Workstream 10 phase 2 end-to-end: when the CSI 16t probe delivers the
+    // outer terminal's character cell size, placements capture it (instead of
+    // the child-side zero size), so occlusion clipping becomes pixel-exact.
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(21),
+        Some("sh"),
+        &[],
+        TerminalSize::new(8, 6),
+    )
+    .expect("could not spawn outer-cell-size fixture");
+    session.set_outer_cell_size(Some((10, 20)));
+    session
+        .write_paste("printf '\\033_Ga=T,f=24,i=21,c=2,r=1,C=1,q=2;AP8A\\033\\\\'\n")
+        .expect("paste the kitty placement script");
+    let area = Rect::new(0, 0, 8, 6);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && session.graphics(area).is_empty() {
+        session
+            .poll_output()
+            .expect("outer-cell-size fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let submissions = session.graphics(area);
+    assert_eq!(submissions.len(), 1, "one placement reaches the surface");
+    assert_eq!(
+        submissions[0].placement().cell_width_pixels(),
+        10,
+        "the placement captures the discovered outer cell width"
+    );
+    assert_eq!(
+        submissions[0].placement().cell_height_pixels(),
+        20,
+        "the placement captures the discovered outer cell height"
+    );
+    session
+        .shutdown()
+        .expect("could not shut down outer-cell-size fixture");
 }
 
 #[test]
