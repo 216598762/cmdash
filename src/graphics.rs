@@ -1621,6 +1621,16 @@ pub struct SessionGraphicsStore {
     /// stream can reconstruct full `removed` submissions even after the
     /// placement (and, for uppercase deletes, its resource) is gone.
     removed_submissions: Vec<GraphicsSubmission>,
+    /// The last surface projection delivered to the outer adapter. This is
+    /// intentionally separate from the virtual-buffer command queue: changing
+    /// the scrollback *view* does not mutate terminal rows, but it still moves
+    /// or removes the pixels currently visible in the host terminal.
+    last_visible_submissions: BTreeMap<(u32, u32), GraphicsSubmission>,
+    /// Placement keys that have been seen by a projection drain, including
+    /// placements that were clipped at that time. This distinguishes a true
+    /// view re-entry from a placement that was only registered before its
+    /// first mutation drain.
+    known_projection_keys: BTreeSet<(u32, u32)>,
     limits: GraphicsLimits,
     decoded_bytes: usize,
     pending_upload: Option<PendingUpload>,
@@ -1663,6 +1673,8 @@ impl SessionGraphicsStore {
             placements: BTreeMap::new(),
             buffer: VirtualBuffer::new(),
             removed_submissions: Vec::new(),
+            last_visible_submissions: BTreeMap::new(),
+            known_projection_keys: BTreeSet::new(),
             limits,
             decoded_bytes: 0,
             pending_upload: None,
@@ -1814,18 +1826,12 @@ impl SessionGraphicsStore {
     /// surface-projected `changed`/`removed` submissions for the backend
     /// adapters (Workstream 8 adapter swap).
     ///
-    /// `changed` is one submission per surviving `Place` command (a move or a
-    /// re-upload), reconstructed from the store's authoritative placement and
-    /// resource and projected with the exact geometry of the render path. A
-    /// transmit-only `Upload` has no placement, so it produces no `changed`
-    /// entry — its bumped generation is reflected in the resource and picked
-    /// up by the next `Place` of that object, matching the render path which
-    /// only ever emits visible placements.
-    ///
-    /// `removed` is the mutation-time removal log projected through the same
-    /// helper; when projection fails (a removed relative placement whose
-    /// parent is already gone, or a placement scrolled fully off-surface), the
-    /// raw geometry is kept so the outer deletion is still emitted.
+    /// The virtual-buffer commands remain the mutation source of truth, but
+    /// the outer terminal also needs a projection diff: scrolling the view
+    /// changes which grid rows occupy the surface without mutating any text
+    /// row or image object. Comparing the last projection catches those
+    /// view-only moves and removals, preventing stale image ghosts while the
+    /// compositor redraws the corresponding text.
     pub fn drain_graphics_deltas(
         &mut self,
         surface: Rect,
@@ -1836,7 +1842,39 @@ impl SessionGraphicsStore {
         view_offset: usize,
     ) -> GraphicsDeltas {
         let view_offset = i32::try_from(view_offset).unwrap_or(i32::MAX);
+        // Drain commands even when this frame is driven only by viewport
+        // navigation; otherwise a later mutation would replay stale commands.
         let commands = self.buffer.drain_commands();
+        let current = self
+            .visible_submissions_with_scroll_state(
+                surface,
+                current_scrollback,
+                current_screen,
+                current_region,
+                current_region_scroll,
+                usize::try_from(view_offset).unwrap_or(usize::MAX),
+            )
+            .into_iter()
+            .map(|submission| {
+                (
+                    (
+                        submission.resource().image(),
+                        submission.placement().outer_placement_id(),
+                    ),
+                    submission,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let previous = std::mem::replace(&mut self.last_visible_submissions, current.clone());
+        let known_before = self.known_projection_keys.clone();
+        let live_keys = self
+            .placements
+            .values()
+            .map(|placement| (placement.resource().image(), placement.outer_placement_id()))
+            .collect::<BTreeSet<_>>();
+        self.known_projection_keys
+            .retain(|key| live_keys.contains(key));
+        self.known_projection_keys.extend(live_keys);
 
         let logged_removals = std::mem::take(&mut self.removed_submissions);
         let mut removed = Vec::with_capacity(logged_removals.len());
@@ -1860,7 +1898,7 @@ impl SessionGraphicsStore {
         }
 
         let mut changed = Vec::new();
-        let mut seen = BTreeSet::new();
+        let mut changed_keys = BTreeSet::new();
         for command in commands {
             let GraphicsCommand::Place { object, placement } = command else {
                 continue;
@@ -1872,13 +1910,14 @@ impl SessionGraphicsStore {
             else {
                 continue;
             };
+            let key = (image, placement.outer_placement_id);
             let Some(store_placement) = self.placements.values().find(|candidate| {
                 candidate.resource().image() == image
                     && candidate.outer_placement_id() == placement.outer_placement_id
             }) else {
                 continue;
             };
-            if !seen.insert((image, placement.outer_placement_id)) {
+            if !changed_keys.insert(key) {
                 continue;
             }
             if let Some(submission) = self.submission_for_placement(
@@ -1891,6 +1930,25 @@ impl SessionGraphicsStore {
                 view_offset,
             ) {
                 changed.push(submission);
+            }
+        }
+        for (key, submission) in &current {
+            let projection_changed = match previous.get(key) {
+                Some(previous) => !same_projected_submission(previous, submission),
+                None => known_before.contains(key),
+            };
+            if projection_changed && changed_keys.insert(*key) {
+                changed.push(submission.clone());
+            }
+        }
+        for (key, submission) in previous {
+            if !current.contains_key(&key)
+                && !removed.iter().any(|candidate| {
+                    candidate.resource().image() == key.0
+                        && candidate.placement().outer_placement_id() == key.1
+                })
+            {
+                removed.push(submission);
             }
         }
 
@@ -4853,6 +4911,25 @@ impl SessionGraphicsStore {
     }
 }
 
+/// Compares the state serialized to the outer terminal while ignoring the
+/// logical grid anchor. A resize reflow may legitimately recapture an anchor
+/// with a different scrollback depth even when the image occupies the same
+/// projected surface cells; that must not create a spurious outer move.
+fn same_projected_submission(left: &GraphicsSubmission, right: &GraphicsSubmission) -> bool {
+    if left.resource != right.resource
+        || left.format != right.format
+        || left.generation != right.generation
+        || left.encoded_payload != right.encoded_payload
+        || left.pixel_width != right.pixel_width
+        || left.pixel_height != right.pixel_height
+    {
+        return false;
+    }
+    let mut left_placement = left.placement.clone();
+    left_placement.anchor = right.placement.anchor;
+    left_placement == right.placement
+}
+
 fn parse_parameters(parameters: &[u8]) -> Result<BTreeMap<String, String>, GraphicsError> {
     let mut values = BTreeMap::new();
     for parameter in parameters.split(|byte| *byte == b',') {
@@ -6754,17 +6831,25 @@ mod tests {
             -9
         );
 
-        // A column reflow grows the scrollback 10 -> 14; the placement keeps
-        // resolving to the same history row (-9), so no move is emitted.
+        // A column reflow grows the scrollback 10 -> 14. The first drain
+        // models viewing the history row; returning to the live viewport then
+        // correctly removes the image from the outer terminal projection even
+        // though its logical buffer row remains unchanged.
         assert!(store.reanchor_on_resize(8, 4, 10, 14, full, 0));
-        store.drain_graphics_deltas(surface, 10, GraphicsScreen::Primary, full, 0, 10);
-        let deltas = store.drain_graphics_deltas(surface, 14, GraphicsScreen::Primary, full, 0, 0);
+        let history_view =
+            store.drain_graphics_deltas(surface, 10, GraphicsScreen::Primary, full, 0, 10);
         assert_eq!(
-            deltas.changed.len(),
-            0,
-            "reflow must not emit spurious moves"
+            history_view.changed.len(),
+            1,
+            "history projection: {history_view:?}"
         );
-        assert_eq!(deltas.removed.len(), 0);
+        let deltas = store.drain_graphics_deltas(surface, 14, GraphicsScreen::Primary, full, 0, 0);
+        assert_eq!(deltas.changed.len(), 0);
+        assert_eq!(
+            deltas.removed.len(),
+            1,
+            "leaving history must delete the outer projection"
+        );
         assert_eq!(
             store.buffer.object(object).unwrap().placements[0].start_row,
             -9
@@ -6903,6 +6988,77 @@ mod tests {
             10,
         );
         assert_eq!(scrolled[0].placement().area(), Rect::new(1, 1, 1, 1));
+    }
+
+    #[test]
+    fn drain_graphics_deltas_replays_placements_after_view_reentry() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(20));
+        let surface = Rect::new(0, 0, 8, 6);
+        store
+            .apply_kitty_command_with_scroll_region(
+                b"a=T,f=24,i=9,c=1,r=1,q=2",
+                b"AQID",
+                (1, 1),
+                (10, 20),
+                0,
+                GraphicsScreen::Primary,
+                GraphicsScrollRegion::new(0, 6, 6),
+                0,
+            )
+            .unwrap();
+
+        // The image starts above the live viewport. Its initial Place command
+        // is consumed while clipped, so entering history must be able to
+        // rediscover it from the projection rather than relying on that stale
+        // command.
+        let initial = store.drain_graphics_deltas(
+            surface,
+            10,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::new(0, 6, 6),
+            0,
+            0,
+        );
+        assert!(initial.changed.is_empty());
+        assert!(initial.removed.is_empty());
+
+        let history = store.drain_graphics_deltas(
+            surface,
+            10,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::new(0, 6, 6),
+            0,
+            10,
+        );
+        assert_eq!(history.changed.len(), 1);
+        assert!(history.removed.is_empty());
+        assert_eq!(history.changed[0].placement().area(), Rect::new(1, 1, 1, 1));
+
+        let live = store.drain_graphics_deltas(
+            surface,
+            10,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::new(0, 6, 6),
+            0,
+            0,
+        );
+        assert!(live.changed.is_empty());
+        assert_eq!(live.removed.len(), 1);
+
+        let history_again = store.drain_graphics_deltas(
+            surface,
+            10,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::new(0, 6, 6),
+            0,
+            10,
+        );
+        assert_eq!(history_again.changed.len(), 1);
+        assert!(history_again.removed.is_empty());
+        assert_eq!(
+            history_again.changed[0].placement().area(),
+            Rect::new(1, 1, 1, 1)
+        );
     }
 
     #[test]

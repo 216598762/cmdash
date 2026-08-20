@@ -2941,7 +2941,7 @@ mod tests {
     }
 
     #[test]
-    fn view_navigation_is_pure_view_math_for_the_command_stream() {
+    fn view_navigation_reconciles_the_outer_image_projection() {
         let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 6)).unwrap();
         let surface = Rect::new(0, 0, 20, 6);
         // Anchor the image on row 3 so a one-line scroll keeps it visible.
@@ -2963,20 +2963,21 @@ mod tests {
         );
         assert_eq!(deltas.changed[0].placement().y(), 2);
 
-        // View navigation is pure view math: scrolling the viewport into
-        // history must not emit any move/delete command.
+        // View navigation changes the image's projected surface row even
+        // though it does not mutate the image object. The outer adapter must
+        // receive a stable-id re-place so the pixels follow the history text.
         assert!(session.scroll_display(Scroll::Top));
         let nav = session.drain_graphics_deltas(surface);
-        assert!(
-            nav.changed.is_empty() && nav.removed.is_empty(),
-            "view navigation must not emit commands"
-        );
+        assert_eq!(nav.removed.len(), 0);
+        assert_eq!(nav.changed.len(), 1);
+        assert_eq!(nav.changed[0].placement().y(), 3);
 
-        // Returning to the live viewport is likewise silent, and a subsequent
-        // scroll keeps the stream in sync.
+        // Returning to the live viewport re-places it at its live row as well.
         assert!(session.scroll_display(Scroll::Bottom));
         let back = session.drain_graphics_deltas(surface);
-        assert!(back.changed.is_empty() && back.removed.is_empty());
+        assert_eq!(back.removed.len(), 0);
+        assert_eq!(back.changed.len(), 1);
+        assert_eq!(back.changed[0].placement().y(), 2);
         session.consume_output(b"row2\r\nrow3\r\n").unwrap();
         let after = session.drain_graphics_deltas(surface);
         assert_eq!(after.changed, session.graphics(surface));

@@ -296,6 +296,14 @@ where
         let window_size = backend.window_size()?;
         let area = window_size.area();
         sync_dashboard_surfaces(state, window_size)?;
+        // Key-driven viewport navigation (scrollback, selection, cursor
+        // presentation) changes a widget scene without necessarily producing
+        // a PTY output update. Consume the state redraw request here so the
+        // retained compositor does not preserve stale cells from the live
+        // viewport while the emulator is rendering history rows.
+        if state.take_redraw_request() {
+            compositor.invalidate(area);
+        }
         let widget_health =
             (!state.widget_runtime().is_empty()).then(|| state.widget_runtime().health_summary());
         let base = render_static_dashboard_shell_with_theme(
