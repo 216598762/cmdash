@@ -2570,3 +2570,111 @@ fn grid_moved_matches_the_mutation_stream_scroll_move() {
     );
     assert_eq!(grid.moved[0].placement().key(), after[0].placement().key());
 }
+
+#[test]
+fn view_scroll_is_a_grid_displacement_tracked_by_both_authorities() {
+    // Workstream 9 phase 4: navigating the scrollback view is pure view math
+    // on the store, but it *is* a displacement of the displayed grid — and
+    // both the mutation stream's projection move and the composed grid's
+    // per-cell references must report the same relocation.
+    let surface = Rect::new(0, 0, 8, 6);
+    let mut store = SessionGraphicsStore::new(SessionId::new(0));
+    store
+        .apply_kitty_command_with_context(
+            b"a=T,f=24,i=7,c=2,r=1,C=1,q=2",
+            b"AQID",
+            (0, 2),
+            (10, 20),
+        )
+        .expect("fixture image should transmit");
+
+    let before = store.visible_submissions(surface);
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].placement().y(), 2);
+    let mut compositor = Compositor::new();
+    let mut first = Scene::new(surface);
+    first.add_image_layer(before[0].clone());
+    first.annotate_image_cells();
+    compositor.diff(&first);
+
+    // Two rows scroll off the top: the placement moves up with the text, and
+    // the grid diff reports the same relocation as the mutation move.
+    store.record_scroll(2);
+    let scrolled = store.drain_graphics_deltas(
+        surface,
+        2,
+        GraphicsScreen::Primary,
+        GraphicsScrollRegion::unbounded(),
+        0,
+        0,
+    );
+    assert_eq!(scrolled.changed.len(), 1, "the scroll emits one move");
+    assert_eq!(
+        scrolled.changed[0].placement().y(),
+        0,
+        "scrolled to the top row"
+    );
+    let scrolled_visible = store.visible_submissions_at(surface, 2);
+    assert_eq!(scrolled_visible[0].placement().y(), 0);
+    let mut scrolled_scene = Scene::new(surface);
+    scrolled_scene.add_image_layer(scrolled_visible[0].clone());
+    scrolled_scene.annotate_image_cells();
+    let scrolled_diff = compositor.diff(&scrolled_scene);
+    assert_eq!(
+        scrolled_diff.grid_graphics().moved.len(),
+        1,
+        "the grid sees the scroll"
+    );
+    assert_eq!(
+        scrolled_diff.grid_graphics().moved[0].placement().key(),
+        scrolled.changed[0].placement().key(),
+        "grid diff and mutation move agree on the scroll"
+    );
+
+    // The user scrolls the view back two rows: the placement returns to its
+    // original grid row (pure view math on the store), and the drain emits
+    // the projection move while the grid reports the same relocation.
+    let navigated = store.drain_graphics_deltas(
+        surface,
+        2,
+        GraphicsScreen::Primary,
+        GraphicsScrollRegion::unbounded(),
+        0,
+        2,
+    );
+    assert_eq!(
+        navigated.changed.len(),
+        1,
+        "view navigation emits one projection move"
+    );
+    assert_eq!(
+        navigated.changed[0].placement().y(),
+        2,
+        "back at the original row"
+    );
+
+    let after = store.visible_submissions_with_scroll_state(
+        surface,
+        2,
+        GraphicsScreen::Primary,
+        GraphicsScrollRegion::unbounded(),
+        0,
+        2,
+    );
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].placement().y(), 2);
+    let mut second = Scene::new(surface);
+    second.add_image_layer(after[0].clone());
+    second.annotate_image_cells();
+    let diff = compositor.diff(&second);
+
+    let grid = diff.grid_graphics();
+    assert_eq!(grid.moved.len(), 1, "the grid sees the view displacement");
+    assert!(grid.appeared.is_empty());
+    assert!(grid.removed.is_empty());
+    assert_eq!(
+        grid.moved[0].placement().key(),
+        navigated.changed[0].placement().key(),
+        "grid diff and projection move agree under view navigation"
+    );
+}

@@ -958,6 +958,83 @@ impl Scene {
         }
     }
 
+    /// Re-lays out the grid at a new column width (Termux-style display
+    /// reflow), wrapping rows that overflow and carrying cells *and* their
+    /// image references together. A placement whose references cross a wrap
+    /// boundary is re-sliced onto the wrapped rows — its handle is unchanged,
+    /// so the grid still resolves it to the same covering submission. Wide
+    /// glyphs are never split: a lead and its continuation wrap as one unit.
+    ///
+    /// The layer lists are cleared because placement rectangles are not
+    /// reflow-aware (a split placement cannot be one rect); the caller
+    /// re-accumulates layers from the source scenes — which the compositor
+    /// does every frame — before the next `annotate_image_cells`. The
+    /// reference array is the grid's own truth and survives the reflow.
+    pub fn reflow(&mut self, columns: u16) {
+        if columns == 0 || columns == self.area.width {
+            return;
+        }
+        let old_width = usize::from(self.area.width);
+        let new_width = usize::from(columns);
+        let old_cells = std::mem::take(&mut self.cells);
+        let old_refs = std::mem::take(&mut self.image_refs);
+        let mut new_cells: Vec<Cell> = Vec::with_capacity(old_cells.len());
+        let mut new_refs: Vec<u32> = Vec::with_capacity(old_refs.len());
+
+        let blank = Cell::blank(CellStyle::new(Color::reset(), Color::reset()));
+        for row_start in (0..old_cells.len()).step_by(old_width) {
+            let row_end = (row_start + old_width).min(old_cells.len());
+            // Tokenize the row, merging each wide lead with its continuation
+            // so a glyph never splits across a wrap boundary.
+            let mut tokens: Vec<Vec<(Cell, u32)>> = Vec::new();
+            let mut i = row_start;
+            while i < row_end {
+                let cell = old_cells[i];
+                let reference = old_refs[i];
+                if cell.width == CellWidth::Wide && i + 1 < row_end {
+                    tokens.push(vec![(cell, reference), (old_cells[i + 1], old_refs[i + 1])]);
+                    i += 2;
+                } else {
+                    tokens.push(vec![(cell, reference)]);
+                    i += 1;
+                }
+            }
+            // Wrap the token stream into rows of at most `columns` cells. A
+            // token wider than the row starts a new row even if it overflows
+            // (a degenerate 1-column scene), rather than being dropped. Each
+            // old row re-wraps independently (the composed grid has no
+            // line-wrap metadata, so every row is its own paragraph), and the
+            // final partial segment is padded to the new width so the buffer
+            // stays strictly row-major.
+            let mut segment: Vec<(Cell, u32)> = Vec::with_capacity(new_width);
+            for token in tokens {
+                if !segment.is_empty() && segment.len() + token.len() > new_width {
+                    for (cell, reference) in segment.drain(..) {
+                        new_cells.push(cell);
+                        new_refs.push(reference);
+                    }
+                }
+                segment.extend(token);
+            }
+            while segment.len() < new_width {
+                segment.push((blank, IMAGE_REF_NONE));
+            }
+            for (cell, reference) in segment {
+                new_cells.push(cell);
+                new_refs.push(reference);
+            }
+        }
+
+        self.cells = new_cells;
+        self.image_refs = new_refs;
+        self.area.width = columns;
+        self.area.height = u16::try_from(self.cells.len() / new_width.max(1)).unwrap_or(u16::MAX);
+        self.image_layers.clear();
+        self.placeholder_layers.clear();
+        #[cfg(feature = "sixel")]
+        self.sixel_layers.clear();
+    }
+
     /// Blanks the entire scene, dropping every image reference. Keeps the
     /// area and cursor; layers are cleared so a later `annotate_image_cells`
     /// has nothing to restore.
@@ -1351,5 +1428,60 @@ mod tests {
         scene.clear();
         assert!(scene.image_refs().iter().all(|r| *r == IMAGE_REF_NONE));
         assert!(scene.image_layers().is_empty());
+    }
+
+    #[test]
+    fn reflow_wraps_rows_and_carries_image_refs_across_the_boundary() {
+        // A 6-column scene: text in row 0, an image anchored on the wrap
+        // boundary at columns 4-5 of row 2.
+        let mut scene = Scene::new(Rect::new(0, 0, 6, 3));
+        for (x, symbol) in ['a', 'b', 'c', 'd', 'e', 'f'].into_iter().enumerate() {
+            scene.set(x as u16, 0, symbol, style());
+        }
+        scene.add_image_layer(dashboard_submission(4, 2, 2, 1, 7));
+        scene.annotate_image_cells();
+        let handle = scene.image_ref_at(4, 2);
+        assert_ne!(handle, IMAGE_REF_NONE);
+
+        scene.reflow(4);
+
+        assert_eq!(scene.area().width, 4);
+        assert_eq!(scene.area().height, 6, "each old row re-wraps to two rows");
+        // Row 0's text re-wrapped: 'a'..'d' on the first row, 'e','f' padded
+        // with blanks on the second.
+        assert_eq!(scene.cell_at(0, 0).unwrap().symbol, 'a');
+        assert_eq!(scene.cell_at(3, 0).unwrap().symbol, 'd');
+        assert_eq!(scene.cell_at(0, 1).unwrap().symbol, 'e');
+        assert_eq!(scene.cell_at(1, 1).unwrap().symbol, 'f');
+        // The placement's references re-sliced onto the wrapped rows: old row
+        // 2 becomes rows 4-5, and the image's columns 4-5 land on row 5.
+        assert_eq!(scene.image_ref_at(0, 4), IMAGE_REF_NONE);
+        assert_eq!(scene.image_ref_at(0, 5), handle);
+        assert_eq!(scene.image_ref_at(1, 5), handle);
+        assert_eq!(scene.image_ref_at(2, 5), IMAGE_REF_NONE);
+        assert!(
+            scene.image_layers().is_empty(),
+            "layer rects are not reflow-aware"
+        );
+    }
+
+    #[test]
+    fn reflow_never_splits_a_wide_glyph_across_a_wrap_boundary() {
+        let mut scene = Scene::new(Rect::new(0, 0, 5, 1));
+        scene.set(0, 0, 'a', style());
+        scene.set(1, 0, '界', style()); // wide: lead at 1, continuation at 2
+        scene.set(3, 0, 'b', style());
+        scene.set(4, 0, 'c', style());
+
+        scene.reflow(3);
+
+        // The wide pair must stay together; the wrap happens before it.
+        assert_eq!(scene.cell_at(0, 0).unwrap().symbol, 'a');
+        assert_eq!(scene.cell_at(1, 0).unwrap().symbol, '界');
+        assert_eq!(scene.cell_at(2, 0).unwrap().width, CellWidth::Continuation);
+        assert_eq!(scene.cell_at(0, 1).unwrap().symbol, 'b');
+        assert_eq!(scene.cell_at(1, 1).unwrap().symbol, 'c');
+        // No continuation cell dangles at a row start.
+        assert_ne!(scene.cell_at(0, 1).unwrap().width, CellWidth::Continuation);
     }
 }

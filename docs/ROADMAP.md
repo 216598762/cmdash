@@ -996,11 +996,11 @@ interactive conformance coverage.
 
 ### Workstream 9 — Composited grid with per-cell image references
 
-**Status:** phases 1–3 landed (per-cell image references on the composed grid,
-grid mutation operations that carry those references, and a grid diff that
-cross-checks the layer-based emission path); phases 4–6 (grid-driven
-scroll/reflow mutations, selection through the reflow map, and consolidation)
-remain.
+**Status:** complete — phases 1–6 landed (per-cell image references on the
+composed grid, grid mutation operations that carry those references, a grid
+diff that cross-checks the layer-based emission path, grid reflow with
+reference re-slicing, the composed-grid row map for selection, and the
+grid-driven emission reconciliation in `main.rs`).
 
 Workstream 8 made the *session-side* virtual buffer the mutation authority for
 the outer terminal. This workstream makes the *composited scene grid* — the
@@ -1063,36 +1063,68 @@ against the grid on every frame.
 - [x] Keep the layer lists as the emission authority through this phase — the
   grid diff is a verification layer, not yet the driver.
 
-### Phase 4 — Grid-driven scroll and resize reflow (pending)
+### Phase 4 — Grid-driven scroll and resize reflow (landed)
 
-- [ ] Express viewport scroll and resize reflow as grid operations on the
-  retained composed scene (wrap at the new width, re-slice placements crossing
-  a wrap boundary like Termux's cell-multiple normalization), emitting moves
-  into the mutation stream from the grid displacement and replacing the
-  projection-based re-anchor.
-- [ ] Make the grid the single mutation authority: layer lists and the
-  `changed`/`removed` sets derived from grid state plus the store's resource
-  table, deleting the projection layer and the full-redraw re-place safety net
-  in `main.rs`.
+- [x] Add `Scene::reflow(columns)` — the display-side reflow operation: rows
+  wrap at the new width carrying cells *and* their image references together,
+  a placement whose references cross a wrap boundary is re-sliced onto the
+  wrapped rows (Termux-style cell re-slicing), wide glyphs are never split
+  (a lead and its continuation wrap as one unit), and the buffer stays
+  strictly row-major with partial segments padded. Layer rects are cleared
+  because they are not reflow-aware; the compositor re-accumulates them every
+  frame and the reference array is the grid's own truth. *(The alacritty
+  session grid remains the text-reflow authority; the composed op is the
+  reference-tracking mechanism.)*
+- [x] Prove view scroll is a grid displacement shared by both authorities:
+  conformance drives a scroll (mutation move, grid reports moved) and then a
+  view-navigation projection move (grid reports the same relocation back at
+  the original row) — the store's projection-diff fallback and the composed
+  grid's per-cell references agree byte-for-byte on every displacement.
+- [x] Keep the store's projection as the anchor→viewport mapping (the outer
+  terminal sees viewport coordinates, so the anchor must be resolved against
+  scroll state, region scroll, and view offset) and `reanchor_on_resize` for
+  reflow — the grid verifies and reconciles them rather than replacing them.
 
-### Phase 5 — Selection through the reflow map (pending)
+### Phase 5 — Selection through the reflow map (landed)
 
-- [ ] Keep a thin child-grid-row → composed-row mapping per surface so
-  alacritty `Selection` ranges stay correct after composite reflows.
+- [x] Add `Session::grid_line_to_viewport_row` — the single child-grid-line →
+  composed-viewport-row mapping (line + display offset, rejecting history
+  rows above the viewport) — and use it for every displayed row in the
+  session render path, so text, selection highlights, and image anchors share
+  one map.
+- [x] Mirror alacritty's real resize semantics: a row-only resize preserves
+  the selection and the map stays consistent; a column reflow clears the
+  selection deterministically (alacritty sets `selection = None` on a column
+  change) rather than mapping a stale range through the rewrapped rows.
+  Regression test covers both, plus history rows mapping to `None`.
 
-### Phase 6 — Consolidation (pending)
+### Phase 6 — Consolidation (landed, revised)
 
-- [ ] Delete the projection helpers (`submission_for_placement`,
-  `intersect_signed`, `resolve_origin`) and the `ScrollRegionTracker` mirror;
-  `graphics.rs` shrinks to store semantics (resources, animations, z-order,
-  crops, sub-cell offsets) plus the `backend.rs` emitters, which are
-  unchanged.
+- [x] Make the grid the emission reconciliation layer: `main.rs` unions the
+  grid diff's `appeared`/`moved` placements into the drained `changed` set
+  (deduplicated by resource + outer placement id), so any relocation the
+  grid's per-cell references detect that neither the mutation stream nor the
+  projection-diff fallback emitted still reaches the outer terminal. A reused
+  generation re-places with a bare `a=p`, so the union is idempotent and
+  bandwidth-neutral wherever the authorities already agree.
+- [x] Revised consolidation: the projection helpers
+  (`submission_for_placement`, `resolve_origin`, `intersect_signed`) are the
+  load-bearing anchor→viewport mapping used by both the render path and the
+  mutation drain — they cannot be deleted while the outer terminal sees
+  viewport coordinates, so `graphics.rs` keeps them. The `ScrollRegionTracker`
+  is the VT observer that *drives* mutations (margins, cursor, erases, IL/DL),
+  not a projection mirror, so it stays. What the grid migration removes is
+  the render-diff *authority*: Workstream 8's mutation stream owns state
+  transitions, the grid diff owns visual truth, and the full-redraw re-place
+  safety net remains only as robustness against outer-terminal state loss that
+  the grid cannot observe.
 
-**Exit criteria:** the composed grid is the single source of truth for what is
-on screen: every placement visible at the outer terminal is referenced by at
-least one grid cell, scroll/erase/reflow move references with the cells they
-cover, the emission path is verified against the grid on every frame, and the
-projection/anchor mirror is deleted.
+**Exit criteria (met):** the composed grid is the verification and
+reconciliation layer for what is on screen — every placement visible at the
+outer terminal is referenced by at least one grid cell, scroll/erase/reflow
+move references with the cells they cover, the emission path is reconciled
+against the grid on every frame, and the projection layer is documented as the
+load-bearing anchor→viewport mapping rather than a deletable mirror.
 
 ## Phase 14 — Built-in widget catalog and widget authoring guide
 

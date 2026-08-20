@@ -647,9 +647,17 @@ resource + placement identity rather than frame-local handles) whenever the
 frame's layers change, carried on `FrameDiff` and scratch-pooled. The layer
 lists remain the emission authority; the grid diff is the verification layer
 that proves the emission path agrees with what the cells actually display.
-The remaining phases (grid-driven scroll/reflow as real mutations, selection
-through the reflow map, and deleting the projection layer) are tracked in
-Workstream 9 on the roadmap.
+`Scene::reflow(columns)` re-lays the grid out at a new width carrying
+references with their cells (re-slicing placements across wrap boundaries,
+never splitting a wide glyph), and `main.rs` reconciles the grid diff's
+`appeared`/`moved` placements into the drained `changed` set each frame so no
+relocation the grid detects can be lost. The session render path maps every
+child grid line to its composed viewport row through the single
+`grid_line_to_viewport_row` map, which also defines selection semantics on
+resize (row-only resizes keep the selection; column reflows clear it, exactly
+like alacritty). The store's anchor→viewport projection remains load-bearing
+(the outer terminal sees viewport coordinates), so the grid verifies and
+reconciles it rather than replacing it.
 
 **Why not Termux's cell-split model?** Termux's graphics support (the long-open
 Sixel/iTerm2 PR and the Kitty follow-up built on it) renders images by

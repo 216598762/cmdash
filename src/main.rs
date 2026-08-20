@@ -337,6 +337,38 @@ where
         // source of truth for which placements need upload/place/delete; the
         // render diff still supplies the visible set and placeholder regions.
         let mut graphics_deltas = state.drain_graphics_deltas();
+        // Workstream 9 phase 6: the composed grid is the final reconciliation
+        // layer for what must reach the outer terminal. The mutation stream
+        // emits store-driven moves and the projection-diff fallback emits
+        // view-navigation moves, but any relocation the grid's per-cell
+        // references detect that neither authority emitted would leave the
+        // outer placement at a stale cell. Union the grid's appeared/moved
+        // placements into the changed set (deduplicated by resource + outer
+        // placement id); a reused generation re-places with a bare `a=p`, so
+        // this is idempotent and bandwidth-neutral on every path where the
+        // authorities already agree.
+        let grid = diff.grid_graphics();
+        if !grid.appeared.is_empty() || !grid.moved.is_empty() {
+            let mut known = graphics_deltas
+                .changed
+                .iter()
+                .map(|submission| {
+                    (
+                        submission.resource().image(),
+                        submission.placement().outer_placement_id(),
+                    )
+                })
+                .collect::<std::collections::HashSet<_>>();
+            for submission in grid.appeared.iter().chain(grid.moved.iter()) {
+                let key = (
+                    submission.resource().image(),
+                    submission.placement().outer_placement_id(),
+                );
+                if known.insert(key) {
+                    graphics_deltas.changed.push(submission.clone());
+                }
+            }
+        }
         // A full redraw can erase the outer terminal's visible placements
         // (resize repaints, UI animations). Images whose projection did not
         // change would otherwise never be re-placed and would stay missing

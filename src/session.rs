@@ -1201,6 +1201,24 @@ impl TerminalSession {
         self.selection_click_count
     }
 
+    /// The composed-grid row map: translates an absolute emulator grid line
+    /// (which can be negative inside history) into the viewport row the
+    /// session renders it at, applying the current display offset. `None` when
+    /// the line is above the viewport (scrolled out of the displayed window).
+    ///
+    /// This is the single mapping point between the child grid and the
+    /// composed scene, so selection ranges (resolved on the child grid) and
+    /// image anchors (resolved against the same offset) stay glued to the
+    /// text after a reflow — alacritty rewraps its grid on a column resize and
+    /// re-derives `display_offset`, so the map follows the reflowed rows.
+    fn grid_line_to_viewport_row(&self, line: i32) -> Option<u16> {
+        let display_offset = self.term.grid().display_offset() as i32;
+        let viewport_row = line.saturating_add(display_offset);
+        u16::try_from(viewport_row)
+            .ok()
+            .filter(|_| viewport_row >= 0)
+    }
+
     /// Translates a content-area-relative viewport cell into a grid `Point`
     /// (absolute line), applying the current scrollback display offset so
     /// selection and hyperlink lookup never drift by one row in history.
@@ -1871,13 +1889,11 @@ impl TerminalSession {
             area.x.saturating_add(cursor_point.column.0 as u16),
             area.y.saturating_add(cursor_point.line.0 as u16),
         );
-        // `display_iter` yields absolute grid lines: when the view is scrolled
-        // back into history the visible rows are negative. Like
-        // alacritty's own `point_to_viewport`, the viewport row is the grid
-        // line plus the display offset; casting the raw line into `u16`
-        // would wrap history rows ~to 65535 and silently drop them, tearing
-        // scrolled text away from its images.
-        let display_offset = self.term.grid().display_offset() as i32;
+        // `display_iter` yields absolute grid lines; when the view is scrolled
+        // back into history the visible rows are negative. The row map is
+        // `grid_line_to_viewport_row` (line + display offset), which rejects
+        // history rows above the viewport instead of wrapping them ~to 65535
+        // and silently tearing scrolled text away from its images.
         // Resolve the flowed selection range once per frame so the highlight
         // follows the text across wrapped lines and never over-paints
         // continuation cells.
@@ -1889,12 +1905,11 @@ impl TerminalSession {
         for indexed in self.term.grid().display_iter() {
             let point = indexed.point;
             let cell = indexed.cell;
-            let viewport_row = point.line.0 + display_offset;
-            if viewport_row < 0 {
+            let Some(viewport_row) = self.grid_line_to_viewport_row(point.line.0) else {
                 continue;
-            }
+            };
             let x = area.x.saturating_add(point.column.0 as u16);
-            let y = area.y.saturating_add(viewport_row as u16);
+            let y = area.y.saturating_add(viewport_row);
             if x >= area.x.saturating_add(area.width) || y >= area.y.saturating_add(area.height) {
                 continue;
             }
@@ -3237,6 +3252,54 @@ mod tests {
                 .area(),
             Rect::new(5, 1, 1, 1)
         );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn selection_tracks_rows_through_the_composed_grid_map() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 6)).unwrap();
+        session
+            .consume_output(b"abcdefghijklmnopqrst\r\nABCDE")
+            .unwrap();
+        let area = Rect::new(0, 0, 20, 6);
+        session.begin_selection((0, 0), false);
+        session.update_selection((19, 0));
+        assert_eq!(
+            session.selected_text(area).as_deref(),
+            Some("abcdefghijklmnopqrst")
+        );
+
+        // A row-only resize (columns unchanged) preserves the selection and
+        // the row map stays consistent.
+        session.resize(TerminalSize::new(20, 8)).unwrap();
+        assert_eq!(
+            session.selected_text(area).as_deref(),
+            Some("abcdefghijklmnopqrst"),
+            "the selection survives a row-only resize"
+        );
+
+        // A column change reflows (rewraps) the grid; like alacritty, the
+        // selection is cleared deterministically rather than mapping a stale
+        // range through the reflowed rows.
+        session.resize(TerminalSize::new(10, 8)).unwrap();
+        assert_eq!(
+            session.selected_text(area),
+            None,
+            "a column reflow clears the selection"
+        );
+
+        // The composed-grid row map follows the reflow: the rewrapped
+        // continuation renders at the row the map predicts, and history lines
+        // above the viewport map to nothing.
+        assert_eq!(session.grid_line_to_viewport_row(0), Some(0));
+        assert_eq!(session.grid_line_to_viewport_row(1), Some(1));
+        assert_eq!(
+            session.grid_line_to_viewport_row(-1),
+            None,
+            "history above the viewport"
+        );
+        let scene = session.render(Rect::new(0, 0, 10, 8), false);
+        assert_eq!(scene.cell_at(0, 0).unwrap().symbol, 'k');
         session.shutdown().unwrap();
     }
 
