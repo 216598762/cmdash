@@ -681,6 +681,33 @@ retaining the placement model's pixel-exact offsets, z-order, animations, and
 bounded resource policy — accepting the sub-frame two-flush lag that is
 inherent to driving an external terminal.
 
+**The multiplexer landscape.** cmdash is the only multiplexer that drives an
+external terminal with full kitty protocol coverage. The only other
+multiplexers with any graphics support sit at opposite ends of the design
+space, which is what makes cmdash's position distinctive:
+
+- **tmux** renders nothing itself. Kitty output works only via
+  `allow-passthrough on`, which forwards the raw escape stream to the outer
+  terminal untouched; tmux never tracks images, so there is no scroll/erase/
+  reflow accounting at all — output is correct only because kitty Unicode
+  placeholders survive the grid copy. Sixel is an opt-in build flag
+  (`--enable-sixel`, disabled by default; tmux 3.4 shipped without it), so most
+  tmux builds silently mangle sixel streams.
+- **Zellij** is an in-process emulator-and-mux, like Termux: it owns the grid,
+  so images anchor to lines natively and scroll correctly by construction. It
+  shipped native Sixel in 2022 and merged a full kitty protocol implementation
+  into `main` in July 2026 (`zellij-org/zellij#5428`) — cutting Unicode
+  placeholders (U=1) and animation from the first pass, the two areas cmdash
+  implements fully — and now advertises graphics capabilities only when the
+  host terminal also supports them. Because it renders pixels itself it never
+  faces the sync problem cmdash solves with the virtual buffer, but it also
+  cannot be driven *through* another terminal.
+
+So the landscape is: tmux's passthrough buys no scroll correctness, Zellij's
+in-process renderer cannot be embedded, and cmdash is the external-commander
+design that keeps pixel-exact placement while making scroll/reflow correct
+through mirrored state (Workstream 8) and grid anchoring (Workstream 9).
+
 ### 5.5 Other graphics protocols
 
 The scene model is Kitty-first, behind a capability-aware adapter boundary. Kitty graphics are re-emitted protocol-faithfully; sixel is an opt-in dashboard path. Text and layout remain correct when graphics are unavailable, and protocol handling belongs behind the capability-aware adapter rather than in dashboard widgets.
