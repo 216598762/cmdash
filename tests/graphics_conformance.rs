@@ -2515,3 +2515,58 @@ fn text_fallback_matches_captured_degraded_stream() {
     assert_eq!(model.text(), "[image:11]");
     assert_eq!(model.resource_count(), 0);
 }
+
+#[test]
+fn grid_moved_matches_the_mutation_stream_scroll_move() {
+    // Workstream 9 parity: the composed grid's per-cell image references and
+    // the session's mutation-driven command stream must agree on which
+    // placement moved when a scroll relocates an image.
+    let surface = Rect::new(0, 0, 8, 6);
+    let mut store = SessionGraphicsStore::new(SessionId::new(0));
+    store
+        .apply_kitty_command_with_context(
+            b"a=T,f=24,i=7,c=2,r=1,C=1,q=2",
+            b"AQID",
+            (0, 2),
+            (10, 20),
+        )
+        .expect("fixture image should transmit");
+
+    let before = store.visible_submissions(surface);
+    assert_eq!(before.len(), 1, "one placement is visible");
+    let mut compositor = Compositor::new();
+    let mut first = Scene::new(surface);
+    first.add_image_layer(before[0].clone());
+    first.annotate_image_cells();
+    compositor.diff(&first);
+
+    store.record_scroll(1);
+    let deltas = store.drain_graphics_deltas(
+        surface,
+        1,
+        GraphicsScreen::Primary,
+        GraphicsScrollRegion::unbounded(),
+        0,
+        0,
+    );
+    assert_eq!(deltas.changed.len(), 1, "the scroll emits one place move");
+    assert_eq!(deltas.removed.len(), 0);
+
+    let after = store.visible_submissions_at(surface, 1);
+    assert_eq!(after.len(), 1);
+    let mut second = Scene::new(surface);
+    second.add_image_layer(after[0].clone());
+    second.annotate_image_cells();
+    let diff = compositor.diff(&second);
+
+    let grid = diff.grid_graphics();
+    assert_eq!(grid.moved.len(), 1, "the grid reports the same relocation");
+    assert!(grid.appeared.is_empty());
+    assert!(grid.removed.is_empty());
+    assert_eq!(
+        grid.moved[0].placement().key(),
+        deltas.changed[0].placement().key(),
+        "grid diff and mutation stream agree on the moved placement"
+    );
+    assert_eq!(grid.moved[0].placement().key(), after[0].placement().key());
+}

@@ -994,6 +994,106 @@ movement, overlays, tabs, and lifecycle changes; unsupported modes never report
 silent success; and every advertised outer-terminal mode has capture-based or
 interactive conformance coverage.
 
+### Workstream 9 — Composited grid with per-cell image references
+
+**Status:** phases 1–3 landed (per-cell image references on the composed grid,
+grid mutation operations that carry those references, and a grid diff that
+cross-checks the layer-based emission path); phases 4–6 (grid-driven
+scroll/reflow mutations, selection through the reflow map, and consolidation)
+remain.
+
+Workstream 8 made the *session-side* virtual buffer the mutation authority for
+the outer terminal. This workstream makes the *composited scene grid* — the
+buffer that is actually displayed — carry image references per cell, mirroring
+how Kitty anchors every image to the cell grid (`grman_scroll_images`) and how
+Termux's bitmap support stores a bitmap reference inside each covered cell's
+style. Once the grid owns image references, scroll/reflow/erase are grid
+operations instead of re-projections, and the emission path can be verified
+against the grid on every frame.
+
+### Phase 1 — Per-cell image annotation (landed)
+
+- [x] Give the composed `Scene` a parallel `image_refs` array (one `u32` per
+  cell; 0 = none, otherwise a handle into the frame's image/placeholder layer
+  lists) so image coverage is a property of the grid itself without changing
+  `Cell` equality or the text-span diff.
+- [x] Add an idempotent `annotate_image_cells` pass that stamps each covered
+  cell with the *topmost* covering layer's handle (layers are z-sorted, so the
+  last write wins), run once by the compositor after each composition (both
+  full-redraw and partial paths) so the retained frame always carries fresh
+  annotations.
+- [x] Expose `image_ref_at` / `image_refs` accessors and assert the Phase 1
+  invariant in tests: every annotated cell lies within its layer's area and is
+  present in the visible set, and every visible layer covers at least one
+  annotated cell unless it is fully occluded by a higher-z layer (which the
+  layer lists still carry for z-stacking at the outer terminal).
+
+### Phase 2 — Grid mutations carry image references (landed)
+
+- [x] Add `Scene` grid operations that move cells *and* their image references
+  in lockstep (row-slice memmoves on the parallel arrays): `scroll_region` /
+  `scroll_rows` (positive = content moves up, matching `record_scroll`),
+  `insert_lines` / `delete_lines` (within the region to the scene bottom),
+  and `erase_rows` / `erase_region` / `clear` (drop references with the text).
+  Wide/continuation cells stay intact because rows never share a wide glyph.
+- [x] Unit-test the reference-carrying semantics: a scroll moves a placement's
+  references by the delta, insert shifts them down, delete pulls them up, and
+  erase drops them — the same displacements the session-side virtual buffer
+  computes for its commands.
+- [x] Keep the ops as the Phase 4 foundation; the retained compositor still
+  recomposes surfaces per frame, so the ops have no pipeline consumer until
+  scroll/reflow are re-expressed as grid mutations.
+
+### Phase 3 — Grid-diff cross-check on the emission path (landed)
+
+- [x] Compute a `GridGraphicsDiff` in `build_diff` whenever the frame's layers
+  changed: `appeared` / `removed` are the handles referenced by the current /
+  previous grids but not the other; `moved` are handles whose covered cell set
+  changed. Resolve handles back to `GraphicsSubmission`s and carry the result
+  on `FrameDiff` (scratch-pooled).
+- [x] Assert parity in conformance tests: with no image-over-image occlusion
+  the grid's `appeared`/`removed` equal the layer keyed-set diff exactly;
+  under full occlusion the grid reports only the topmost while the layer lists
+  retain every placement (both are correct for their roles — the grid is the
+  visual truth, the layer lists are the emission truth).
+- [x] Assert in a store-driven fixture that the grid's `moved` set matches the
+  mutation stream's moves on a scroll (they agree on store-driven frames; view
+  navigation is pure view math, so it intentionally produces grid moves
+  without mutation commands).
+- [x] Keep the layer lists as the emission authority through this phase — the
+  grid diff is a verification layer, not yet the driver.
+
+### Phase 4 — Grid-driven scroll and resize reflow (pending)
+
+- [ ] Express viewport scroll and resize reflow as grid operations on the
+  retained composed scene (wrap at the new width, re-slice placements crossing
+  a wrap boundary like Termux's cell-multiple normalization), emitting moves
+  into the mutation stream from the grid displacement and replacing the
+  projection-based re-anchor.
+- [ ] Make the grid the single mutation authority: layer lists and the
+  `changed`/`removed` sets derived from grid state plus the store's resource
+  table, deleting the projection layer and the full-redraw re-place safety net
+  in `main.rs`.
+
+### Phase 5 — Selection through the reflow map (pending)
+
+- [ ] Keep a thin child-grid-row → composed-row mapping per surface so
+  alacritty `Selection` ranges stay correct after composite reflows.
+
+### Phase 6 — Consolidation (pending)
+
+- [ ] Delete the projection helpers (`submission_for_placement`,
+  `intersect_signed`, `resolve_origin`) and the `ScrollRegionTracker` mirror;
+  `graphics.rs` shrinks to store semantics (resources, animations, z-order,
+  crops, sub-cell offsets) plus the `backend.rs` emitters, which are
+  unchanged.
+
+**Exit criteria:** the composed grid is the single source of truth for what is
+on screen: every placement visible at the outer terminal is referenced by at
+least one grid cell, scroll/erase/reflow move references with the cells they
+cover, the emission path is verified against the grid on every frame, and the
+projection/anchor mirror is deleted.
+
 ## Phase 14 — Built-in widget catalog and widget authoring guide
 
 This phase expands the default dashboard widget catalog and makes widget creation

@@ -236,12 +236,26 @@ impl Cell {
 pub struct Scene {
     area: Rect,
     cells: Vec<Cell>,
+    /// One reference per cell, parallel to `cells`: `IMAGE_REF_NONE` (0) when
+    /// the cell displays no image, otherwise a handle into this scene's
+    /// `image_layers` or `placeholder_layers` (see `annotate_image_cells`).
+    /// Kept separate from `Cell` so the text-span diff, span grouping, and
+    /// cell equality are untouched — the reference is a property of the
+    /// *grid*, exactly like Kitty anchoring every image to the cell grid and
+    /// Termux storing a bitmap reference inside each covered cell's style.
+    image_refs: Vec<u32>,
     cursor: Option<SceneCursor>,
     image_layers: Vec<GraphicsSubmission>,
     placeholder_layers: Vec<GraphicsPlaceholderLayer>,
     #[cfg(feature = "sixel")]
     sixel_layers: Vec<SixelSubmission>,
 }
+
+/// No image covers this cell.
+pub const IMAGE_REF_NONE: u32 = 0;
+/// Kind bit for handles that resolve into `placeholder_layers` rather than
+/// `image_layers`; the low bits (minus 1) are the layer index.
+const PLACEHOLDER_REF_KIND: u32 = 0x8000_0000;
 
 impl Scene {
     pub fn new(area: Rect) -> Self {
@@ -250,6 +264,7 @@ impl Scene {
         Self {
             area,
             cells: vec![Cell::blank(style); cell_count],
+            image_refs: vec![IMAGE_REF_NONE; cell_count],
             cursor: None,
             image_layers: Vec::new(),
             placeholder_layers: Vec::new(),
@@ -267,9 +282,12 @@ impl Scene {
         let blank = Cell::blank(CellStyle::new(Color::reset(), Color::reset()));
         if self.cells.len() == cell_count {
             self.cells.fill(blank);
+            self.image_refs.fill(IMAGE_REF_NONE);
         } else {
             self.cells.clear();
             self.cells.resize(cell_count, blank);
+            self.image_refs.clear();
+            self.image_refs.resize(cell_count, IMAGE_REF_NONE);
         }
         self.cursor = None;
         self.image_layers.clear();
@@ -285,9 +303,12 @@ impl Scene {
         self.area = other.area;
         if self.cells.len() == other.cells.len() {
             self.cells.copy_from_slice(&other.cells);
+            self.image_refs.copy_from_slice(&other.image_refs);
         } else {
             self.cells.clear();
             self.cells.extend_from_slice(&other.cells);
+            self.image_refs.clear();
+            self.image_refs.extend_from_slice(&other.image_refs);
         }
         self.cursor = other.cursor;
         self.image_layers.clear();
@@ -330,6 +351,82 @@ impl Scene {
 
     pub fn placeholder_layers(&self) -> &[GraphicsPlaceholderLayer] {
         &self.placeholder_layers
+    }
+
+    /// The image reference stamped on the cell at `(x, y)`, or `IMAGE_REF_NONE`.
+    pub fn image_ref_at(&self, x: u16, y: u16) -> u32 {
+        match self.index(x, y) {
+            Some(index) => self.image_refs[index],
+            None => IMAGE_REF_NONE,
+        }
+    }
+
+    /// The per-cell image references, parallel to `cells()` (row-major).
+    pub fn image_refs(&self) -> &[u32] {
+        &self.image_refs
+    }
+
+    /// Whether `handle` resolves into `image_layers` (kind bit clear) rather
+    /// than `placeholder_layers` or none.
+    pub const fn is_image_ref(handle: u32) -> bool {
+        handle != IMAGE_REF_NONE && handle & PLACEHOLDER_REF_KIND == 0
+    }
+
+    /// Resolves an image-layer handle (kind bit clear) to its submission.
+    pub fn image_layer_for_ref(&self, handle: u32) -> Option<&GraphicsSubmission> {
+        if handle == IMAGE_REF_NONE || handle & PLACEHOLDER_REF_KIND != 0 {
+            return None;
+        }
+        self.image_layers.get((handle as usize) - 1)
+    }
+
+    /// Resolves a placeholder-layer handle (kind bit set) to its layer.
+    pub fn placeholder_layer_for_ref(&self, handle: u32) -> Option<&GraphicsPlaceholderLayer> {
+        if handle == IMAGE_REF_NONE || handle & PLACEHOLDER_REF_KIND == 0 {
+            return None;
+        }
+        self.placeholder_layers
+            .get((handle & !PLACEHOLDER_REF_KIND) as usize - 1)
+    }
+
+    /// Recomputes the per-cell image references from the current layer lists:
+    /// every cell covered by an image/placeholder layer is stamped with that
+    /// layer's handle, and layers are applied in z order so the *topmost*
+    /// covering layer wins per cell (the last write). Idempotent; the
+    /// compositor runs it once after each composition so the retained frame
+    /// always carries fresh annotations, and cells outside every layer are
+    /// reset to `IMAGE_REF_NONE`.
+    pub fn annotate_image_cells(&mut self) {
+        self.image_refs.fill(IMAGE_REF_NONE);
+        // Collect (area, handle) pairs first so the layer borrows end before
+        // the cell stamps mutate `self`.
+        let mut stamps =
+            Vec::with_capacity(self.image_layers.len() + self.placeholder_layers.len());
+        for (index, layer) in self.image_layers.iter().enumerate() {
+            stamps.push((layer.placement().area(), (index as u32) + 1));
+        }
+        for (index, layer) in self.placeholder_layers.iter().enumerate() {
+            stamps.push((layer.area(), PLACEHOLDER_REF_KIND | ((index as u32) + 1)));
+        }
+        for (area, handle) in stamps {
+            self.stamp_image_ref(area, handle);
+        }
+    }
+
+    fn stamp_image_ref(&mut self, area: Rect, handle: u32) {
+        let x_start = area.x.max(self.area.x);
+        let y_start = area.y.max(self.area.y);
+        let x_end = (area.x as u32 + area.width as u32)
+            .min(self.area.x as u32 + self.area.width as u32) as u16;
+        let y_end = (area.y as u32 + area.height as u32)
+            .min(self.area.y as u32 + self.area.height as u32) as u16;
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                if let Some(index) = self.index(x, y) {
+                    self.image_refs[index] = handle;
+                }
+            }
+        }
     }
 
     /// Clears all image/placeholder/sixel layers in place, keeping the cell
@@ -731,6 +828,148 @@ impl Scene {
         let row = (y - self.area.y) as usize;
         Some(row * self.area.width as usize + column)
     }
+
+    /// Clips a vertical `[top, bottom)` region to this scene and requires it
+    /// to be non-empty; `None` when there is nothing to operate on.
+    fn clamp_region(&self, top: u16, bottom: u16) -> Option<(u16, u16)> {
+        let top = top.max(self.area.y);
+        let bottom = bottom.min(self.area.y.saturating_add(self.area.height));
+        (top < bottom).then_some((top, bottom))
+    }
+
+    fn blank_rows(&mut self, y: u16, count: u16) {
+        let width = self.area.width as usize;
+        let start = self.index(self.area.x, y).unwrap_or(self.cells.len());
+        let end = start
+            .saturating_add(count as usize * width)
+            .min(self.cells.len());
+        let blank = Cell::blank(CellStyle::new(Color::reset(), Color::reset()));
+        for index in start..end {
+            self.cells[index] = blank;
+            self.image_refs[index] = IMAGE_REF_NONE;
+        }
+    }
+
+    /// Scrolls the rows in `[top, bottom)` by `delta` rows, moving cells and
+    /// their image references in lockstep. A positive delta moves content up
+    /// (blanking the bottom `delta` rows), matching `record_scroll`'s
+    /// convention; a negative delta moves content down. Wide/continuation
+    /// cells stay intact because a wide glyph never spans rows.
+    pub fn scroll_region(&mut self, top: u16, bottom: u16, delta: i16) {
+        let Some((top, bottom)) = self.clamp_region(top, bottom) else {
+            return;
+        };
+        let width = self.area.width as usize;
+        let height = (bottom - top) as usize;
+        if delta.unsigned_abs() as usize >= height {
+            self.blank_rows(top, bottom - top);
+            return;
+        }
+        if delta > 0 {
+            let shift = delta as usize;
+            let src = (top as usize + shift) * width..(bottom as usize) * width;
+            self.cells.copy_within(src.clone(), (top as usize) * width);
+            self.image_refs.copy_within(src, (top as usize) * width);
+            self.blank_rows(bottom - shift as u16, shift as u16);
+        } else {
+            let shift = delta.unsigned_abs() as usize;
+            let src = (top as usize) * width..(bottom as usize - shift) * width;
+            self.cells
+                .copy_within(src.clone(), (top as usize + shift) * width);
+            self.image_refs
+                .copy_within(src, (top as usize + shift) * width);
+            self.blank_rows(top, shift as u16);
+        }
+    }
+
+    /// Scrolls the whole scene by `delta` rows (positive = content moves up).
+    pub fn scroll_rows(&mut self, delta: i16) {
+        self.scroll_region(
+            self.area.y,
+            self.area.y.saturating_add(self.area.height),
+            delta,
+        );
+    }
+
+    /// Inserts `count` blank rows at `top`, pushing rows in `[top, bottom)`
+    /// down and dropping the rows that fall off the bottom of the scene. The
+    /// blanked rows carry no image references.
+    pub fn insert_lines(&mut self, top: u16, count: u16) {
+        if count == 0 {
+            return;
+        }
+        let bottom = self.area.y.saturating_add(self.area.height);
+        let Some((top, bottom)) = self.clamp_region(top, bottom) else {
+            return;
+        };
+        let width = self.area.width as usize;
+        let shift = (count as usize).min((bottom - top) as usize);
+        let src = (top as usize) * width..(bottom as usize - shift) * width;
+        self.cells
+            .copy_within(src.clone(), (top as usize + shift) * width);
+        self.image_refs
+            .copy_within(src, (top as usize + shift) * width);
+        self.blank_rows(top, shift as u16);
+    }
+
+    /// Deletes `count` rows starting at `top`, pulling the rows below them up
+    /// and blanking the rows revealed at the bottom of the scene. Image
+    /// references move with their rows; the blanked rows carry none.
+    pub fn delete_lines(&mut self, top: u16, count: u16) {
+        if count == 0 {
+            return;
+        }
+        let bottom = self.area.y.saturating_add(self.area.height);
+        let Some((top, bottom)) = self.clamp_region(top, bottom) else {
+            return;
+        };
+        let width = self.area.width as usize;
+        let shift = (count as usize).min((bottom - top) as usize);
+        let src = (top as usize + shift) * width..(bottom as usize) * width;
+        self.cells.copy_within(src.clone(), (top as usize) * width);
+        self.image_refs.copy_within(src, (top as usize) * width);
+        self.blank_rows(bottom - shift as u16, shift as u16);
+    }
+
+    /// Blanks `count` rows starting at `y`, dropping their image references.
+    pub fn erase_rows(&mut self, y: u16, count: u16) {
+        let Some((top, _)) = self.clamp_region(y, y.saturating_add(count)) else {
+            return;
+        };
+        self.blank_rows(top, count);
+    }
+
+    /// Blanks the cells inside `rect`, dropping their image references.
+    pub fn erase_region(&mut self, rect: Rect) {
+        let x_start = rect.x.max(self.area.x);
+        let y_start = rect.y.max(self.area.y);
+        let x_end = (rect.x as u32 + rect.width as u32)
+            .min(self.area.x as u32 + self.area.width as u32) as u16;
+        let y_end = (rect.y as u32 + rect.height as u32)
+            .min(self.area.y as u32 + self.area.height as u32) as u16;
+        let blank = Cell::blank(CellStyle::new(Color::reset(), Color::reset()));
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                if let Some(index) = self.index(x, y) {
+                    self.cells[index] = blank;
+                    self.image_refs[index] = IMAGE_REF_NONE;
+                }
+            }
+        }
+    }
+
+    /// Blanks the entire scene, dropping every image reference. Keeps the
+    /// area and cursor; layers are cleared so a later `annotate_image_cells`
+    /// has nothing to restore.
+    pub fn clear(&mut self) {
+        let blank = Cell::blank(CellStyle::new(Color::reset(), Color::reset()));
+        self.cells.fill(blank);
+        self.image_refs.fill(IMAGE_REF_NONE);
+        self.image_layers.clear();
+        self.placeholder_layers.clear();
+        #[cfg(feature = "sixel")]
+        self.sixel_layers.clear();
+    }
 }
 
 fn contains(area: Rect, x: u16, y: u16) -> bool {
@@ -969,5 +1208,148 @@ mod tests {
 
         assert!(scene.cell_at(0, 0).is_none());
         assert_eq!(scene.cell_at(2, 3).unwrap().symbol, 'o');
+    }
+
+    fn dashboard_submission(x: u16, y: u16, w: u16, h: u16, key: u64) -> GraphicsSubmission {
+        let resource = crate::graphics::GraphicsResourceId::new(
+            crate::graphics::DASHBOARD_SESSION,
+            key as u32,
+        );
+        let placement =
+            crate::graphics::GraphicsPlacement::dashboard(resource, x, y, w, h, 0, key, key as u32);
+        GraphicsSubmission::from_rgba(resource, &[255, 0, 0, 255], 1, 1, 1, placement)
+    }
+
+    #[test]
+    fn image_refs_stamp_covered_cells_and_leave_the_rest_empty() {
+        let mut scene = Scene::new(Rect::new(0, 0, 6, 4));
+        scene.add_image_layer(dashboard_submission(1, 1, 2, 2, 7));
+        scene.annotate_image_cells();
+
+        let handle = scene.image_ref_at(1, 1);
+        assert_ne!(handle, IMAGE_REF_NONE);
+        assert_eq!(handle, scene.image_ref_at(2, 1));
+        assert_eq!(handle, scene.image_ref_at(1, 2));
+        assert_eq!(handle, scene.image_ref_at(2, 2));
+        assert_eq!(scene.image_ref_at(0, 0), IMAGE_REF_NONE);
+        assert_eq!(scene.image_ref_at(3, 1), IMAGE_REF_NONE);
+        assert_eq!(scene.image_ref_at(1, 3), IMAGE_REF_NONE);
+
+        // The handle resolves back to the covering submission.
+        let resolved = scene.image_layer_for_ref(handle).expect("handle resolves");
+        assert_eq!(resolved.placement().key(), 7);
+        assert!(scene.placeholder_layer_for_ref(handle).is_none());
+    }
+
+    #[test]
+    fn placeholder_layers_stamp_with_the_kind_bit() {
+        let resource =
+            crate::graphics::GraphicsResourceId::new(crate::graphics::DASHBOARD_SESSION, 1);
+        let mut scene = Scene::new(Rect::new(0, 0, 4, 2));
+        scene.add_placeholder_layer(crate::graphics::GraphicsPlaceholderLayer::new(
+            resource,
+            Rect::new(2, 0, 1, 1),
+            0,
+        ));
+        scene.annotate_image_cells();
+
+        assert_eq!(scene.image_ref_at(1, 0), IMAGE_REF_NONE);
+        let handle = scene.image_ref_at(2, 0);
+        assert_ne!(handle, IMAGE_REF_NONE);
+        assert!(
+            !Scene::is_image_ref(handle),
+            "placeholder handles are not image handles"
+        );
+        assert!(scene.placeholder_layer_for_ref(handle).is_some());
+        assert!(scene.image_layer_for_ref(handle).is_none());
+    }
+
+    #[test]
+    fn annotate_image_cells_is_idempotent() {
+        let mut scene = Scene::new(Rect::new(0, 0, 4, 2));
+        scene.add_image_layer(dashboard_submission(0, 0, 2, 2, 7));
+        scene.annotate_image_cells();
+        let first = scene.image_refs().to_vec();
+        scene.annotate_image_cells();
+        assert_eq!(first, scene.image_refs());
+    }
+
+    #[test]
+    fn scroll_region_moves_image_refs_with_cells() {
+        let mut scene = Scene::new(Rect::new(0, 0, 4, 6));
+        scene.add_image_layer(dashboard_submission(1, 3, 1, 1, 7));
+        scene.annotate_image_cells();
+        let handle = scene.image_ref_at(1, 3);
+        assert_ne!(handle, IMAGE_REF_NONE);
+
+        scene.scroll_region(0, 6, 2);
+        assert_eq!(scene.image_ref_at(1, 3), IMAGE_REF_NONE);
+        assert_eq!(
+            scene.image_ref_at(1, 1),
+            handle,
+            "content moved up two rows"
+        );
+        for y in 4..6 {
+            assert_eq!(
+                scene.image_ref_at(1, y),
+                IMAGE_REF_NONE,
+                "vacated rows are blank"
+            );
+        }
+
+        scene.scroll_region(0, 6, -1);
+        assert_eq!(
+            scene.image_ref_at(1, 2),
+            handle,
+            "content moved back down one row"
+        );
+    }
+
+    #[test]
+    fn insert_and_delete_lines_shift_image_refs() {
+        let mut scene = Scene::new(Rect::new(0, 0, 4, 6));
+        scene.add_image_layer(dashboard_submission(1, 3, 1, 1, 7));
+        scene.annotate_image_cells();
+        let handle = scene.image_ref_at(1, 3);
+
+        scene.insert_lines(2, 2);
+        assert_eq!(
+            scene.image_ref_at(1, 5),
+            handle,
+            "insert pushes content down"
+        );
+        assert_eq!(scene.image_ref_at(1, 2), IMAGE_REF_NONE);
+        assert_eq!(scene.image_ref_at(1, 3), IMAGE_REF_NONE);
+
+        scene.delete_lines(2, 2);
+        assert_eq!(
+            scene.image_ref_at(1, 3),
+            handle,
+            "delete pulls content back up"
+        );
+    }
+
+    #[test]
+    fn erase_ops_drop_image_refs_and_clear_drops_everything() {
+        let mut scene = Scene::new(Rect::new(0, 0, 6, 4));
+        scene.add_image_layer(dashboard_submission(1, 1, 3, 2, 7));
+        scene.annotate_image_cells();
+        assert_ne!(scene.image_ref_at(2, 1), IMAGE_REF_NONE);
+
+        scene.erase_region(Rect::new(0, 0, 2, 4));
+        assert_eq!(scene.image_ref_at(1, 1), IMAGE_REF_NONE);
+        assert_ne!(
+            scene.image_ref_at(2, 1),
+            IMAGE_REF_NONE,
+            "outside the erased region"
+        );
+
+        scene.erase_rows(2, 1);
+        assert_eq!(scene.image_ref_at(2, 2), IMAGE_REF_NONE);
+        assert_ne!(scene.image_ref_at(2, 1), IMAGE_REF_NONE);
+
+        scene.clear();
+        assert!(scene.image_refs().iter().all(|r| *r == IMAGE_REF_NONE));
+        assert!(scene.image_layers().is_empty());
     }
 }

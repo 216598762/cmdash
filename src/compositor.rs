@@ -60,6 +60,9 @@ struct FrameBufferPool {
     placeholders: Vec<crate::graphics::GraphicsPlaceholderLayer>,
     visible_placeholders: Vec<crate::graphics::GraphicsPlaceholderLayer>,
     removed_placeholders: Vec<crate::graphics::GraphicsPlaceholderLayer>,
+    grid_appeared: Vec<crate::graphics::GraphicsSubmission>,
+    grid_removed: Vec<crate::graphics::GraphicsSubmission>,
+    grid_moved: Vec<crate::graphics::GraphicsSubmission>,
     #[cfg(feature = "sixel")]
     sixel: Vec<crate::sixel::SixelSubmission>,
     styles: StyleInterner,
@@ -105,6 +108,23 @@ impl CellSpan {
     }
 }
 
+/// The grid-derived graphics changes for a frame: placements the composed
+/// grid started or stopped referencing, and placements whose covered cell set
+/// changed between the previous and current grid. This is the *visual truth*
+/// — the layer lists remain the emission truth while the grid migration is in
+/// progress (see Workstream 9 in the roadmap), and conformance tests assert
+/// the two agree.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GridGraphicsDiff {
+    /// Placements referenced by the current grid but not the previous one.
+    pub appeared: Vec<crate::graphics::GraphicsSubmission>,
+    /// Placements referenced by the previous grid but no longer by the current
+    /// one.
+    pub removed: Vec<crate::graphics::GraphicsSubmission>,
+    /// Placements referenced by both grids whose covered cell set changed.
+    pub moved: Vec<crate::graphics::GraphicsSubmission>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameDiff {
     viewport: Rect,
@@ -118,6 +138,7 @@ pub struct FrameDiff {
     placeholders: Vec<crate::graphics::GraphicsPlaceholderLayer>,
     visible_placeholders: Vec<crate::graphics::GraphicsPlaceholderLayer>,
     removed_placeholders: Vec<crate::graphics::GraphicsPlaceholderLayer>,
+    grid_graphics: GridGraphicsDiff,
     cursor: Option<SceneCursor>,
     cursor_changed: bool,
     #[cfg(feature = "sixel")]
@@ -167,6 +188,10 @@ impl FrameDiff {
 
     pub fn removed_placeholders(&self) -> &[crate::graphics::GraphicsPlaceholderLayer] {
         &self.removed_placeholders
+    }
+
+    pub fn grid_graphics(&self) -> &GridGraphicsDiff {
+        &self.grid_graphics
     }
 
     pub const fn cursor(&self) -> Option<SceneCursor> {
@@ -356,6 +381,12 @@ impl Compositor {
             placeholders,
             visible_placeholders,
             removed_placeholders,
+            grid_graphics:
+                GridGraphicsDiff {
+                    appeared: grid_appeared,
+                    removed: grid_removed,
+                    moved: grid_moved,
+                },
             #[cfg(feature = "sixel")]
             sixel,
             ..
@@ -369,6 +400,9 @@ impl Compositor {
         pool.placeholders = placeholders;
         pool.visible_placeholders = visible_placeholders;
         pool.removed_placeholders = removed_placeholders;
+        pool.grid_appeared = grid_appeared;
+        pool.grid_removed = grid_removed;
+        pool.grid_moved = grid_moved;
         #[cfg(feature = "sixel")]
         {
             pool.sixel = sixel;
@@ -567,6 +601,7 @@ impl Compositor {
         if damage.full_redraw {
             composed.reset(viewport);
             blit_frame(composed, viewport, state, base, surface_scenes);
+            composed.annotate_image_cells();
             return;
         }
 
@@ -611,6 +646,10 @@ impl Compositor {
                 composed.blit_cells(&scene, *region);
             }
         }
+        // The retained frame always carries fresh per-cell image references:
+        // layers were rebuilt above and cells were re-blitted for the dirty
+        // regions, so stamp the covered cells now (idempotent).
+        composed.annotate_image_cells();
     }
 
     pub fn invalidate(&mut self, area: Rect) {
@@ -876,10 +915,26 @@ fn build_diff(
     let (mut removed_placeholders, removed_placeholders_cap) =
         take_scratch(&mut pool.removed_placeholders);
     removed_placeholders.clear();
+    let (mut grid_appeared, grid_appeared_cap) = take_scratch(&mut pool.grid_appeared);
+    grid_appeared.clear();
+    let (mut grid_removed, grid_removed_cap) = take_scratch(&mut pool.grid_removed);
+    grid_removed.clear();
+    let (mut grid_moved, grid_moved_cap) = take_scratch(&mut pool.grid_moved);
+    grid_moved.clear();
     #[cfg(feature = "sixel")]
     let (mut sixel, sixel_cap) = take_scratch(&mut pool.sixel);
     #[cfg(feature = "sixel")]
     sixel.clear();
+
+    if graphics_changed {
+        compute_grid_graphics(
+            current,
+            previous_scene,
+            &mut grid_appeared,
+            &mut grid_removed,
+            &mut grid_moved,
+        );
+    }
 
     if graphics_changed {
         graphics.extend_from_slice(current.image_layers());
@@ -1001,7 +1056,10 @@ fn build_diff(
         ))
         .saturating_add(u64::from(
             removed_placeholders.capacity() > removed_placeholders_cap,
-        ));
+        ))
+        .saturating_add(u64::from(grid_appeared.capacity() > grid_appeared_cap))
+        .saturating_add(u64::from(grid_removed.capacity() > grid_removed_cap))
+        .saturating_add(u64::from(grid_moved.capacity() > grid_moved_cap));
     #[cfg(feature = "sixel")]
     {
         pool.scratch_reallocations = pool
@@ -1021,11 +1079,90 @@ fn build_diff(
         placeholders,
         visible_placeholders,
         removed_placeholders,
+        grid_graphics: GridGraphicsDiff {
+            appeared: grid_appeared,
+            removed: grid_removed,
+            moved: grid_moved,
+        },
         cursor: current.cursor(),
         cursor_changed,
         #[cfg(feature = "sixel")]
         sixel,
     }
+}
+
+/// Builds the grid-derived graphics diff: which placements the composed grid
+/// started referencing (`appeared`), stopped referencing (`removed`), and
+/// still references from different cells (`moved`) since the previous frame.
+/// Placeholder-kind handles are excluded because placeholder layers mirror
+/// their image submissions one-to-one; only image handles resolve to
+/// submissions for the frame diff.
+/// A placement's stable identity: the session-qualified image resource plus
+/// the placement key. Handles are frame-local indices, so cross-frame
+/// comparison must go through the resolved layer's identity.
+type PlacementIdentity = (u32, u64);
+
+fn compute_grid_graphics(
+    current: &Scene,
+    previous: Option<&Scene>,
+    appeared: &mut Vec<crate::graphics::GraphicsSubmission>,
+    removed: &mut Vec<crate::graphics::GraphicsSubmission>,
+    moved: &mut Vec<crate::graphics::GraphicsSubmission>,
+) {
+    let current_cover = grid_cover_map(current);
+    let previous_cover = previous.map(grid_cover_map).unwrap_or_default();
+    for (identity, cells) in &current_cover {
+        match previous_cover.get(identity) {
+            None => {
+                if let Some(submission) = submission_for_identity(current, identity) {
+                    appeared.push(submission.clone());
+                }
+            }
+            Some(previous_cells) if previous_cells != cells => {
+                if let Some(submission) = submission_for_identity(current, identity) {
+                    moved.push(submission.clone());
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    for identity in previous_cover.keys() {
+        if !current_cover.contains_key(identity)
+            && let Some(submission) =
+                previous.and_then(|scene| submission_for_identity(scene, identity))
+        {
+            removed.push(submission.clone());
+        }
+    }
+}
+
+/// Maps each placement referenced by the scene's cells to the sorted set of
+/// cell indices it covers (cells are scanned row-major, so the vector is
+/// naturally sorted and duplicate-free). Keyed by stable identity so a
+/// placement is recognized across frames regardless of layer-list ordering.
+fn grid_cover_map(scene: &Scene) -> BTreeMap<PlacementIdentity, Vec<usize>> {
+    let mut cover: BTreeMap<PlacementIdentity, Vec<usize>> = BTreeMap::new();
+    for (index, handle) in scene.image_refs().iter().enumerate() {
+        if !Scene::is_image_ref(*handle) {
+            continue;
+        }
+        let Some(layer) = scene.image_layer_for_ref(*handle) else {
+            continue;
+        };
+        let identity = (layer.resource().image(), layer.placement().key());
+        cover.entry(identity).or_default().push(index);
+    }
+    cover
+}
+
+fn submission_for_identity<'a>(
+    scene: &'a Scene,
+    identity: &PlacementIdentity,
+) -> Option<&'a crate::graphics::GraphicsSubmission> {
+    scene
+        .image_layers()
+        .iter()
+        .find(|layer| (layer.resource().image(), layer.placement().key()) == *identity)
 }
 
 /// Groups adjacent same-style changes into row spans, keying the style
@@ -1407,6 +1544,46 @@ mod tests {
         let frame = retained.frame();
         assert_eq!(owned.cells(), frame.cells());
         assert_eq!(owned.cursor(), frame.cursor());
+    }
+
+    #[test]
+    fn retained_composition_annotates_image_cells_and_grid_diffs_moves() {
+        let viewport = Rect::new(0, 0, 8, 4);
+        let mut state = crate::AppState::new(capabilities());
+        let surface = Surface::new(SurfaceId::new(1), Rect::new(0, 0, 8, 4)).with_z_index(0);
+        state
+            .dispatch(Command::Surface(SurfaceCommand::Add(surface)))
+            .unwrap();
+        let base = Scene::new(viewport);
+        let mut compositor = Compositor::new();
+
+        let mut surface_scene = Scene::new(surface.area());
+        surface_scene.add_image_layer(dashboard_submission(1, 1, 2, 1, 7));
+        let scenes = BTreeMap::from([(surface.id(), surface_scene)]);
+        let first = compositor.compose_and_diff(viewport, &state, &base, &scenes, &[]);
+        let frame = compositor.frame();
+        assert_eq!(
+            frame.image_ref_at(1, 1),
+            frame.image_ref_at(2, 1),
+            "the retained path stamps the covered cells"
+        );
+        assert_ne!(frame.image_ref_at(1, 1), crate::scene::IMAGE_REF_NONE);
+        assert_eq!(frame.image_ref_at(3, 1), crate::scene::IMAGE_REF_NONE);
+        assert_eq!(
+            first.grid_graphics().appeared.len(),
+            1,
+            "first frame: appeared"
+        );
+
+        // Move the placement down one row; the retained diff must detect the
+        // relocation through the per-cell references.
+        let mut moved_scene = Scene::new(surface.area());
+        moved_scene.add_image_layer(dashboard_submission(1, 2, 2, 1, 7));
+        let scenes = BTreeMap::from([(surface.id(), moved_scene)]);
+        let second = compositor.compose_and_diff(viewport, &state, &base, &scenes, &[]);
+        assert_eq!(second.grid_graphics().moved.len(), 1);
+        assert!(second.grid_graphics().appeared.is_empty());
+        assert!(second.grid_graphics().removed.is_empty());
     }
 
     #[test]
@@ -1795,6 +1972,132 @@ mod tests {
             removed_keys,
             vec![removed_key],
             "exactly the absent placement is removed"
+        );
+    }
+
+    fn dashboard_submission(x: u16, y: u16, w: u16, h: u16, key: u64) -> crate::GraphicsSubmission {
+        let resource = crate::graphics::GraphicsResourceId::new(
+            crate::graphics::DASHBOARD_SESSION,
+            key as u32,
+        );
+        let placement =
+            crate::graphics::GraphicsPlacement::dashboard(resource, x, y, w, h, 0, key, key as u32);
+        crate::GraphicsSubmission::from_rgba(resource, &[255, 0, 0, 255], 1, 1, 1, placement)
+    }
+
+    #[test]
+    fn grid_diff_reports_moved_placements_when_their_cells_change() {
+        let viewport = Rect::new(0, 0, 10, 6);
+        let mut compositor = Compositor::new();
+        let mut first = Scene::new(viewport);
+        first.add_image_layer(dashboard_submission(1, 1, 2, 1, 7));
+        first.annotate_image_cells();
+        compositor.diff(&first);
+
+        let mut second = Scene::new(viewport);
+        second.add_image_layer(dashboard_submission(1, 3, 2, 1, 7));
+        second.annotate_image_cells();
+        let diff = compositor.diff(&second);
+
+        let grid = diff.grid_graphics();
+        assert!(
+            grid.appeared.is_empty(),
+            "the placement was already on screen"
+        );
+        assert!(grid.removed.is_empty(), "the placement never left the grid");
+        assert_eq!(grid.moved.len(), 1, "the grid detected the relocation");
+        assert_eq!(grid.moved[0].placement().key(), 7);
+        // The layer keyed-set diff sees the old geometry as removed and the
+        // new geometry as visible; the grid sees one continuous placement that
+        // moved. The emission path relies on the mutation stream, so both
+        // views stay observational here.
+        assert_eq!(diff.visible_graphics().len(), 1);
+        assert_eq!(diff.visible_graphics()[0].placement().key(), 7);
+    }
+
+    #[test]
+    fn grid_diff_reports_appeared_and_removed_placements() {
+        let viewport = Rect::new(0, 0, 10, 6);
+        let mut compositor = Compositor::new();
+        let mut first = Scene::new(viewport);
+        first.add_image_layer(dashboard_submission(1, 1, 2, 1, 7));
+        first.annotate_image_cells();
+        compositor.diff(&first);
+
+        let mut second = Scene::new(viewport);
+        second.add_image_layer(dashboard_submission(2, 2, 1, 1, 9));
+        second.annotate_image_cells();
+        let diff = compositor.diff(&second);
+
+        let grid = diff.grid_graphics();
+        assert_eq!(grid.appeared.len(), 1);
+        assert_eq!(grid.appeared[0].placement().key(), 9);
+        assert_eq!(grid.removed.len(), 1);
+        assert_eq!(grid.removed[0].placement().key(), 7);
+        assert!(grid.moved.is_empty());
+
+        // Without occlusion the grid diff and the layer keyed-set diff agree.
+        assert_eq!(grid.removed, diff.removed_graphics());
+    }
+
+    #[test]
+    fn grid_diff_matches_layer_diffs_without_occlusion() {
+        let viewport = Rect::new(0, 0, 10, 6);
+        let mut compositor = Compositor::new();
+        let mut first = Scene::new(viewport);
+        first.add_image_layer(dashboard_submission(1, 1, 3, 2, 7));
+        first.annotate_image_cells();
+        compositor.diff(&first);
+
+        // The placement is removed: the grid must agree with the layer diff.
+        let removed_scene = Scene::new(viewport);
+        let diff = compositor.diff(&removed_scene);
+        assert_eq!(diff.grid_graphics().removed, diff.removed_graphics());
+        assert_eq!(diff.grid_graphics().removed.len(), 1);
+    }
+
+    #[test]
+    fn grid_diff_topmost_wins_under_occlusion_while_layers_keep_all() {
+        let viewport = Rect::new(0, 0, 6, 4);
+        let mut compositor = Compositor::new();
+        let mut scene = Scene::new(viewport);
+        let low = crate::graphics::GraphicsResourceId::new(crate::graphics::DASHBOARD_SESSION, 1);
+        let high = crate::graphics::GraphicsResourceId::new(crate::graphics::DASHBOARD_SESSION, 2);
+        let low_submission = crate::GraphicsSubmission::from_rgba(
+            low,
+            &[255, 0, 0, 255],
+            1,
+            1,
+            1,
+            crate::graphics::GraphicsPlacement::dashboard(low, 1, 1, 3, 2, 0, 7, 7),
+        );
+        let high_submission = crate::GraphicsSubmission::from_rgba(
+            high,
+            &[0, 255, 0, 255],
+            1,
+            1,
+            1,
+            crate::graphics::GraphicsPlacement::dashboard(high, 1, 1, 3, 2, 5, 9, 9),
+        );
+        scene.add_image_layer(low_submission.clone());
+        scene.add_image_layer(high_submission.clone());
+        scene.annotate_image_cells();
+        let diff = compositor.diff(&scene);
+
+        // The cells reference only the topmost placement, but the layer lists
+        // keep both for z-stacking at the outer terminal.
+        let handle = scene.image_ref_at(1, 1);
+        assert_eq!(
+            scene.image_layer_for_ref(handle).unwrap().placement().key(),
+            9,
+            "the topmost layer wins per cell"
+        );
+        assert_eq!(diff.grid_graphics().appeared.len(), 1);
+        assert_eq!(diff.grid_graphics().appeared[0].placement().key(), 9);
+        assert_eq!(
+            diff.visible_graphics().len(),
+            2,
+            "the layer lists keep every placement"
         );
     }
 }
