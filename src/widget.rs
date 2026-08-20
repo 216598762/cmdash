@@ -2235,6 +2235,72 @@ mod tests {
     }
 
     #[test]
+    fn plain_click_without_drag_never_selects_but_drag_does() {
+        let mut terminal = TerminalWidget {
+            title: " shell ".to_owned(),
+            label: true,
+            session: TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap(),
+            appearance: WidgetAppearance {
+                padding: 0,
+                border: WidgetBorderStyle::None,
+            },
+            theme: Theme::fallback(),
+            cursor_blink: CursorBlinkSettings::default(),
+            scrollback_chrome: ScrollbackChrome::default(),
+            selection: SelectionSettings::default(),
+        };
+        terminal.session.consume_output(b"abcdef\r\n").unwrap();
+
+        // A plain click (Down + Up with no drag) must not leave a highlight:
+        // the armed selection stays pending until the pointer moves.
+        let down = MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        terminal.handle_mouse(down, (0, 0)).unwrap();
+        let up = MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        terminal.handle_mouse(up, (0, 0)).unwrap();
+        assert!(
+            !terminal.session.has_selection(),
+            "click without drag must not select"
+        );
+
+        // Clicking again elsewhere and dragging selects the spanned cells.
+        let down = MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        terminal.handle_mouse(down, (0, 0)).unwrap();
+        terminal
+            .handle_mouse(
+                MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Drag(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column: 5,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                (0, 0),
+            )
+            .unwrap();
+        assert!(
+            terminal.session.has_selection(),
+            "drag after click must select"
+        );
+        terminal.session.shutdown().unwrap();
+    }
+
+    #[test]
     fn terminal_widget_scrolls_scrollback_with_shifted_navigation_keys() {
         let mut widget = scrollback_widget();
         wait_for_scrollback(&mut widget);

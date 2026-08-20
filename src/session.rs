@@ -778,6 +778,10 @@ pub struct TerminalSession {
     last_exit_code: Option<i32>,
     selection_anchor: Option<Point>,
     selection_tail: Option<Point>,
+    /// The selection mode armed by the most recent press. A plain click arms
+    /// `Simple` as *pending* (installed on the first drag, like alacritty);
+    /// double/triple clicks install `Semantic`/`Lines` immediately.
+    selection_type: Option<SelectionType>,
     selection_click_count: u8,
     last_click_time: Option<Instant>,
     last_click_position: Option<(u16, u16)>,
@@ -926,6 +930,7 @@ impl TerminalSession {
             last_exit_code: None,
             selection_anchor: None,
             selection_tail: None,
+            selection_type: None,
             selection_click_count: 0,
             last_click_time: None,
             last_click_position: None,
@@ -1027,11 +1032,7 @@ impl TerminalSession {
         if shift && let Some(anchor) = self.selection_anchor {
             // Extend the existing selection to the new point, preserving the
             // anchor and mode while recomputing both endpoints' sides.
-            let ty = self
-                .term
-                .selection
-                .as_ref()
-                .map_or(SelectionType::Simple, |selection| selection.ty);
+            let ty = self.selection_type.unwrap_or(SelectionType::Simple);
             self.selection_tail = Some(point);
             self.rebuild_selection(ty, anchor, point);
             return;
@@ -1044,7 +1045,16 @@ impl TerminalSession {
         };
         self.selection_anchor = Some(point);
         self.selection_tail = Some(point);
-        self.rebuild_selection(ty, point, point);
+        self.selection_type = Some(ty);
+        if ty == SelectionType::Simple {
+            // A plain click only *arms* a pending selection: any previous
+            // selection is dropped and the highlight is installed on the
+            // first drag, matching alacritty's click-without-drag behavior.
+            self.term.selection = None;
+        } else {
+            // Double/triple clicks select the word/line immediately.
+            self.rebuild_selection(ty, point, point);
+        }
     }
 
     /// Updates the tail of the current selection to the given cell, computing
@@ -1053,10 +1063,9 @@ impl TerminalSession {
         let Some(anchor) = self.selection_anchor else {
             return;
         };
-        let Some(selection) = self.term.selection.as_ref() else {
-            return;
-        };
-        let ty = selection.ty;
+        // The armed type may be pending (a plain click with no drag yet), so
+        // the first drag installs the selection rather than being dropped.
+        let ty = self.selection_type.unwrap_or(SelectionType::Simple);
         let point = self.viewport_to_point(position);
         self.selection_tail = Some(point);
         self.rebuild_selection(ty, anchor, point);
@@ -1088,6 +1097,13 @@ impl TerminalSession {
         self.term.selection = None;
         self.selection_anchor = None;
         self.selection_tail = None;
+        self.selection_type = None;
+    }
+
+    /// The selection mode armed by the most recent press (`None` after a
+    /// clear). A `Simple` armed selection stays pending until the first drag.
+    pub const fn selection_type(&self) -> Option<SelectionType> {
+        self.selection_type
     }
 
     /// Whether a non-empty selection is currently active.
@@ -1153,6 +1169,7 @@ impl TerminalSession {
     /// tail, deriving each endpoint's `Side` so that a backward drag removes
     /// exactly the first/last cells instead of over-selecting by one column.
     fn rebuild_selection(&mut self, ty: SelectionType, anchor: Point, tail: Point) {
+        self.selection_type = Some(ty);
         let (anchor_side, tail_side) = if tail < anchor {
             (Side::Right, Side::Left)
         } else {
@@ -3335,26 +3352,29 @@ mod tests {
     #[test]
     fn click_count_maps_to_simple_semantic_and_lines_modes() {
         let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        // A plain click arms a *pending* Simple selection: nothing is
+        // installed until the first drag, so a click without drag never
+        // highlights.
         session.begin_selection((0, 0), false);
-        assert_eq!(
-            session.term.selection.as_ref().unwrap().ty,
-            SelectionType::Simple
-        );
+        assert!(!session.has_selection());
+        assert_eq!(session.selection_type(), Some(SelectionType::Simple));
+        // Double/triple clicks select immediately.
         session.begin_selection((0, 0), false);
+        assert_eq!(session.selection_type(), Some(SelectionType::Semantic));
         assert_eq!(
             session.term.selection.as_ref().unwrap().ty,
             SelectionType::Semantic
         );
         session.begin_selection((0, 0), false);
+        assert_eq!(session.selection_type(), Some(SelectionType::Lines));
         assert_eq!(
             session.term.selection.as_ref().unwrap().ty,
             SelectionType::Lines
         );
+        // The next click resets to pending Simple again.
         session.begin_selection((0, 0), false);
-        assert_eq!(
-            session.term.selection.as_ref().unwrap().ty,
-            SelectionType::Simple
-        );
+        assert!(!session.has_selection());
+        assert_eq!(session.selection_type(), Some(SelectionType::Simple));
         session.shutdown().unwrap();
     }
 
@@ -3468,15 +3488,17 @@ mod tests {
         );
 
         // A zero-length window can never contain a second press, so every
-        // press restarts a single-click selection.
+        // press restarts a single-click selection, which stays *pending*
+        // until the first drag.
         session.set_selection_settings(Duration::ZERO, true, false, false);
         session.clear_selection();
         session.begin_selection((0, 0), false);
         session.begin_selection((0, 0), false);
-        assert_eq!(
-            session.term.selection.as_ref().unwrap().ty,
-            SelectionType::Simple
-        );
+        assert!(!session.has_selection());
+        assert_eq!(session.selection_type(), Some(SelectionType::Simple));
+        // The first drag installs the armed Simple selection.
+        session.drag_selection(3, 0);
+        assert!(session.has_selection());
         session.shutdown().unwrap();
     }
 
