@@ -622,13 +622,64 @@ before an outer adapter reports a rendered result.
 
 This is why a global image map or a single terminal emulator shared by tabs is explicitly out of scope.
 
-### 5.4 Other graphics protocols
+### 5.4 Composited grid with per-cell image references (Workstream 9)
+
+`src/scene.rs` treats the *displayed* grid — the retained composed scene, not
+the child emulator's grid — as the place where images are anchored. A parallel
+`image_refs` array (one `u32` per cell, parallel to `cells`) records which
+image/placeholder layer covers each cell, with `0` meaning none and nonzero
+values resolving into the frame's `image_layers`/`placeholder_layers` via a
+kind bit. `Scene::annotate_image_cells` re-stamps the covered cells after every
+composition (full-redraw and partial paths), applying layers in z order so the
+*topmost* covering layer wins per cell; the layer lists still carry every
+placement for z-stacking at the outer terminal. Keeping the references out of
+`Cell` means the text-span diff, span grouping, and cell equality are
+untouched — image coverage is a property of the grid, mirroring how Kitty
+anchors every image to the cell grid (`grman_scroll_images`) and how Termux
+stores a bitmap reference inside each covered cell's style.
+
+The grid owns the scroll/erase vocabulary: `scroll_region`/`scroll_rows`
+(positive = content moves up, matching `record_scroll`), `insert_lines`/
+`delete_lines`, `erase_rows`/`erase_region`, and `clear` move cells *and*
+their references in lockstep as row-slice memmoves. `build_diff` computes a
+`GridGraphicsDiff` (`appeared`/`removed`/`moved`, keyed by stable
+resource + placement identity rather than frame-local handles) whenever the
+frame's layers change, carried on `FrameDiff` and scratch-pooled. The layer
+lists remain the emission authority; the grid diff is the verification layer
+that proves the emission path agrees with what the cells actually display.
+The remaining phases (grid-driven scroll/reflow as real mutations, selection
+through the reflow map, and deleting the projection layer) are tracked in
+Workstream 9 on the roadmap.
+
+**Why not Termux's cell-split model?** Termux's graphics support (the long-open
+Sixel/iTerm2 PR and the Kitty follow-up built on it) renders images by
+*rasterizing them into the text grid*: each covered cell's packed style
+encodes `(bitmap number, slice x, slice y)`, the full decoded bitmap is cached
+per image, and the renderer draws the cell-sized slice with
+`Canvas.drawBitmap` instead of text. Because images live inside the same rows
+as text, scrolling, erasing, and resize reflow are *atomically* correct — the
+same reason Kitty's `INDEX_GRAPHICS` shifts placements with the grid — and a
+placeholder-style path in cmdash (Unicode placeholder glyphs written into the
+text grid) inherits that atomicity for free. That model is unreachable for
+cmdash's direct mode, which drives an *external* terminal: there is no canvas
+to draw onto, so images must be commanded (`a=p`/`a=d`) rather than baked into
+cells, and the scroll accounting must be mirrored (Workstream 8) instead of
+being a side effect of moving rows. Termux's approach also trades expressiveness
+for that atomicity: cell-granular only (no sub-cell `X`/`Y` offsets, no z-index,
+no placement lifetime), it retains one full decoded bitmap per image with a
+known OOM failure mode on large payloads, and its interrupted-sequence handling
+can wedge the emulator. cmdash keeps the grid anchoring (Workstream 9) while
+retaining the placement model's pixel-exact offsets, z-order, animations, and
+bounded resource policy — accepting the sub-frame two-flush lag that is
+inherent to driving an external terminal.
+
+### 5.5 Other graphics protocols
 
 The scene model is Kitty-first, behind a capability-aware adapter boundary. Kitty graphics are re-emitted protocol-faithfully; sixel is an opt-in dashboard path. Text and layout remain correct when graphics are unavailable, and protocol handling belongs behind the capability-aware adapter rather than in dashboard widgets.
 
 The graphics-state adapter sits next to the mature `alacritty_terminal` parser/emulator and has conformance tests based on captured escape sequences. The opt-in sixel path uses the same retained scene boundary: dashboard submissions are clipped, diffed, and emitted only after backend capability negotiation.
 
-### 5.5 Resource policy
+### 5.6 Resource policy
 
 Graphics are retained in memory while a session is alive, whether it is visible
 or hidden, subject to per-session limits:
