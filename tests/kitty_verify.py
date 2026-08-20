@@ -13,7 +13,9 @@ Kitty's own `grman`/`update_layers`, that:
     protocol's re-display-without-retransmission contract), while uppercase
     `d=I` frees the data too;
   * text scrolling pushes a placement into history where it appears exactly
-    once at any view depth and is reachable by scrolling back;
+    once at any view depth and is reachable by scrolling back; a live-view /
+    history-view / live-view / history-view round trip re-enters with the same
+    Kitty placement identity;
   * Unicode-placeholder mode (the exact `write_placeholder_upload` /
     `write_placeholder_cells` / `clear_placeholder_cells` byte streams): the
     24-bit-color lower id, the 0-based row/col combining marks, and the
@@ -594,6 +596,45 @@ def main():
     check('7.3 region-scrolled placement stays reachable in region history',
           region_rows(s, 1) == [(1, 4)] and region_rows(s, 2) == [(1, 5)],
           f"dep1={region_rows(s, 1)} dep2={region_rows(s, 2)}")
+
+    # -----------------------------------------------------------------------
+    # Scenario 8: history re-entry. This is the exact projection lifecycle
+    # that previously exposed missing outer image replay: the placement starts
+    # in retained history, is absent from the live projection, appears after
+    # scrolling into history, disappears again when returning live, and must
+    # reappear with the same Kitty `ref_id` when history is revisited.
+    s, c = create_screen(4, 3, scrollback=100)
+    parse_bytes(s, b'\x1b[2;1H\x1b_Ga=T,f=24,i=17,s=1,v=1,c=1,r=1,C=1,q=2,p=17;AQID\x1b\\')
+    parse_bytes(s, b'row0\nrow1\nrow2\nrow3\nrow4\n')
+
+    def image_layers_at(screen, depth):
+        return [lyr for lyr in layers(screen, scrolled_by=depth) if lyr['image_id'] == 1]
+
+    live = image_layers_at(s, 0)
+    check('8.1 history placement is absent from the live projection',
+          len(live) == 0, describe_layers(layers(s, scrolled_by=0)))
+
+    reentry_depth = next(
+        (depth for depth in range(1, 20) if image_layers_at(s, depth)),
+        None,
+    )
+    history = image_layers_at(s, reentry_depth) if reentry_depth is not None else []
+    original_ref_id = history[0]['ref_id'] if history else None
+    original_row = row_of(history[0], 3) if history else None
+    check('8.2 scrolling into history reveals exactly one placement',
+          len(history) == 1 and reentry_depth is not None,
+          f'depth={reentry_depth} layers={describe_layers(history)}')
+
+    live_again = image_layers_at(s, 0)
+    check('8.3 returning to the live viewport removes the projection',
+          len(live_again) == 0, describe_layers(layers(s, scrolled_by=0)))
+
+    history_again = image_layers_at(s, reentry_depth) if reentry_depth is not None else []
+    check('8.4 history re-entry restores the same placement identity and row',
+          len(history_again) == 1
+          and history_again[0]['ref_id'] == original_ref_id
+          and row_of(history_again[0], 3) == original_row,
+          f'original_ref={original_ref_id} reentry={describe_layers(history_again)}')
 
     # -----------------------------------------------------------------------
     failed = [name for name, ok, _ in checks if not ok]
