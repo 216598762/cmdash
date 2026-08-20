@@ -2202,6 +2202,200 @@ mod tests {
     }
 
     #[test]
+    fn click_focus_animation_and_scroll_keep_images_placed_every_frame() {
+        // Full cycle regression for images vanishing during the focus
+        // animation: a click focuses the terminal and starts the focus
+        // animation, and every animation frame is a full redraw. The retained
+        // compositor must keep the image in the diff's visible set on every
+        // one of those frames (the outer terminal needs the placement each
+        // time), and wheel scrolling must move the placement with the text.
+        let config = AppConfig::parse(
+            r#"
+            version = 1
+            [animation]
+            enabled = true
+            duration_ms = 3000
+            [[workspace.widgets]]
+            id = 1
+            type = "terminal"
+            command = "sh"
+            "#,
+        )
+        .unwrap();
+        let registry = WidgetRegistry::builtins();
+        let mut state = AppState::from_config(capabilities(), &registry, &config).unwrap();
+        let surface = SurfaceId::new(1);
+        let area = Rect::new(0, 0, 24, 10);
+        state
+            .dispatch(Command::Surface(SurfaceCommand::SetArea {
+                id: surface,
+                area,
+            }))
+            .unwrap();
+        // Mirror main.rs's `sync_dashboard_surfaces`: the widget's session is
+        // spawned at the default terminal size and must be resized to its
+        // surface before the child runs, or the image projection resolves
+        // against the wrong grid.
+        let mut surface_areas = std::collections::BTreeMap::new();
+        surface_areas.insert(surface, area);
+        state
+            .resize_widget_surfaces(
+                &surface_areas,
+                crate::backend::TerminalWindowSize {
+                    columns: 24,
+                    rows: 10,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            )
+            .unwrap();
+        // The terminal widget carries a border, so the content area (where the
+        // image lands) is inset from the surface origin.
+        let content = state.widget_runtime().content_area(WidgetId::new(1), area);
+        assert!(
+            content.height >= 4,
+            "test needs a content area tall enough to scroll: {content:?}"
+        );
+        // Focusing the terminal starts the focus animation — the full-redraw
+        // window that used to erase outer image placements.
+        state
+            .dispatch(Command::Focus(FocusCommand::Surface(surface)))
+            .unwrap();
+
+        // Drive a real child (interactive sh) through the input path: fill the
+        // scrollback, then place a 1x1 image at the top row of the live view.
+        state
+            .handle_focused_paste(
+                "for i in $(seq 1 30); do echo row$i; done; printf '\\033[1;1H\\033_Ga=T,f=24,i=33,s=1,v=1,c=1,r=1,C=1,q=2;AQID\\033\\\\'; sleep 30\n",
+            )
+            .unwrap();
+
+        let mut compositor = crate::compositor::Compositor::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && state.visible_graphics().is_empty() {
+            state.update_widgets(SystemTime::now());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !state.visible_graphics().is_empty(),
+            "the image never became visible"
+        );
+        let base = crate::dashboard::render_static_dashboard_shell_with_theme(
+            area,
+            crate::backend::OutputMetrics::default(),
+            None,
+            state.latest_diagnostic(),
+            state.theme(),
+        );
+
+        let compose = |compositor: &mut crate::compositor::Compositor,
+                       state: &mut AppState|
+         -> crate::compositor::FrameDiff {
+            // Mirror main.rs: surface invalidations, then the redraw request
+            // invalidates the visible widget surfaces, then compose.
+            for invalidation in state.take_surface_invalidations() {
+                compositor.invalidate(invalidation);
+            }
+            if state.take_redraw_request() {
+                let visible: Vec<Rect> = state
+                    .workspace()
+                    .surfaces()
+                    .values()
+                    .filter(|surface| surface.visible())
+                    .map(|surface| surface.area())
+                    .collect();
+                for area in visible {
+                    compositor.invalidate(area);
+                }
+            }
+            let report = state.update_widgets(SystemTime::now());
+            let scenes = state.widget_surface_scenes();
+            compositor.compose_and_diff(area, state, &base, &scenes, report.changed())
+        };
+
+        // Compose one frame per animation step while the focus animation is
+        // still running. Every such frame is a full redraw, and the image must
+        // be in the visible set on all of them.
+        let mut animation_frames = 0;
+        while state.animation_schedule().is_some() && animation_frames < 20 {
+            let diff = compose(&mut compositor, &mut state);
+            animation_frames += 1;
+            assert!(
+                diff.full_redraw(),
+                "animation frames must be full redraws (frame {animation_frames})"
+            );
+            assert!(
+                !diff.visible_graphics().is_empty(),
+                "image must stay placed during the focus animation (frame {animation_frames})"
+            );
+            assert_eq!(
+                diff.visible_graphics()[0].placement().y(),
+                content.y,
+                "image must stay at the content top row during the focus animation (frame {animation_frames})"
+            );
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        assert!(
+            animation_frames >= 3,
+            "expected several full-redraw animation frames, composed {animation_frames}"
+        );
+
+        // Let the animation finish deterministically (a far-future timestamp
+        // completes every sample); the composed frame must still carry the
+        // image — the post-animation state is where the old bug left it gone.
+        while state.animation_schedule().is_some() {
+            state.update_widgets(SystemTime::now() + Duration::from_secs(60));
+        }
+        let diff = compose(&mut compositor, &mut state);
+        assert!(
+            !diff.visible_graphics().is_empty(),
+            "image must survive the focus animation"
+        );
+
+        // Wheel-scroll up one notch: the image follows the text to row 3.
+        state
+            .handle_mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 2,
+                row: 2,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            })
+            .unwrap();
+        let diff = compose(&mut compositor, &mut state);
+        assert!(
+            !diff.visible_graphics().is_empty(),
+            "image must stay placed when scrolling into history"
+        );
+        assert_eq!(
+            diff.visible_graphics()[0].placement().y(),
+            content.y.saturating_add(3),
+            "image must move down three rows with the scrolled text"
+        );
+
+        // Wheel-scroll back down: the image returns to the content top row.
+        state
+            .handle_mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 2,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            })
+            .unwrap();
+        let diff = compose(&mut compositor, &mut state);
+        assert!(
+            !diff.visible_graphics().is_empty(),
+            "image must stay placed when scrolling back to the live view"
+        );
+        assert_eq!(
+            diff.visible_graphics()[0].placement().y(),
+            content.y,
+            "image must return to the content top row with the text"
+        );
+
+        state.shutdown_widgets();
+    }
+
+    #[test]
     fn consecutive_bells_collapse_into_a_single_diagnostic() {
         let mut state = AppState::new(capabilities());
         state.record_bell();
