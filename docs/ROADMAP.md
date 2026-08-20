@@ -2350,6 +2350,12 @@ house.
 - [x] Re-run the full suite (`cargo test`, `kitty_verify.py`, clippy) with no
   behavioral change, and verify no new dependency is pulled into the default
   or `sixel` builds beyond the four adopted crates.
+- [x] Boot the actual `cmdash` binary under a real `portable-pty` in
+  `tests/binary_boot.rs`: feed a terminal child through the complete
+  PTY → emulator → scene → compositor → backend path, assert a marker is
+  serialized at its absolute pane coordinate, resize the outer PTY, assert the
+  child observes the resized pane dimensions, and exit through the real input
+  and cleanup path.
 
 **Exit criteria (met):** the four adopted crates replace their hand-rolled
 counterparts with byte-identical behavior and passing parity tests;
