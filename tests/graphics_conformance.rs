@@ -4,8 +4,8 @@ mod headless_kitty;
 use cmdash::{
     Backend, BackendCapabilities, Compositor, CrosstermBackend, GraphicsAnimationState,
     GraphicsCapabilityConfidence, GraphicsCapabilitySource, GraphicsScreen, GraphicsScrollRegion,
-    GraphicsSubmission, GraphicsSubmissionStatus, Scene, SessionGraphicsStore, SessionId,
-    TerminalSession, TerminalSize,
+    GraphicsSubmission, GraphicsSubmissionStatus, ImagePlacement, Scene, SessionGraphicsStore,
+    SessionId, TerminalSession, TerminalSize,
 };
 use headless_kitty::{HeadlessKittyTerminal, HeadlessPixel};
 use ratatui::layout::Rect;
@@ -2569,6 +2569,164 @@ fn grid_moved_matches_the_mutation_stream_scroll_move() {
         "grid diff and mutation stream agree on the moved placement"
     );
     assert_eq!(grid.moved[0].placement().key(), after[0].placement().key());
+}
+
+#[test]
+fn canonical_line_is_the_invariant_identity_across_full_screen_scrolls() {
+    // Workstream 10 phase 1 parity harness: the signed-row projection (the
+    // buffer's `start_row`, mutated by scrolls) and the canonical-line
+    // projection (`canonical_line - current_scrollback`) must agree on the
+    // placement's viewport position after every scroll, with the canonical
+    // line itself invariant — it is the placement's mutation-time identity.
+    let mut store = SessionGraphicsStore::new(SessionId::new(0));
+    let creation_scrollback = 3;
+    store
+        .apply_kitty_command_with_grid_context(
+            b"a=T,f=24,i=5,c=2,r=1,C=1,q=2",
+            b"AQID",
+            (0, 2),
+            (10, 20),
+            creation_scrollback,
+        )
+        .expect("fixture image should transmit and place");
+
+    let placements: Vec<&ImagePlacement> = store.buffer_placements().collect();
+    assert_eq!(
+        placements.len(),
+        1,
+        "one placement from the combined transmit+place"
+    );
+    let canonical = creation_scrollback as i64 + 2;
+    assert_eq!(
+        placements[0].canonical_line, canonical,
+        "the canonical line is the absolute logical line at creation"
+    );
+    assert_eq!(placements[0].start_row, 2);
+
+    store.record_scroll(2);
+    let placements: Vec<&ImagePlacement> = store.buffer_placements().collect();
+    assert_eq!(
+        placements[0].canonical_line, canonical,
+        "the canonical line is invariant under full-screen scroll"
+    );
+    assert_eq!(
+        placements[0].start_row, 0,
+        "the signed row tracks the moving viewport position"
+    );
+    let current_scrollback = creation_scrollback + 2;
+    assert_eq!(
+        i64::from(placements[0].start_row),
+        placements[0].canonical_line - current_scrollback as i64,
+        "parity: signed-row projection == canonical-line projection"
+    );
+    // Copy the identity out before the drain mutates the store.
+    let outer_placement_id = placements[0].outer_placement_id;
+    drop(placements);
+
+    // The mutation drain still emits the move under the stable outer
+    // placement id — the identity the outer terminal uses to relocate it.
+    let deltas = store.drain_graphics_deltas(
+        Rect::new(0, 0, 8, 6),
+        current_scrollback,
+        GraphicsScreen::Primary,
+        GraphicsScrollRegion::unbounded(),
+        0,
+        0,
+    );
+    assert_eq!(deltas.changed.len(), 1, "the scroll emits one place move");
+    assert_eq!(
+        deltas.changed[0].placement().outer_placement_id(),
+        outer_placement_id,
+        "the move reuses the stable outer placement id"
+    );
+}
+
+/// Scans `scene` for the first cell carrying an image reference and returns
+/// its row and that row's logical-line tag.
+fn image_row_and_line_tag(scene: &Scene) -> (u16, i64) {
+    for y in 0..scene.area().height {
+        for x in 0..scene.area().width {
+            if scene.image_ref_at(x, y) != 0 {
+                return (y, scene.line_tag_at(y));
+            }
+        }
+    }
+    panic!("no image reference in scene");
+}
+
+#[test]
+fn scene_line_tags_agree_with_placement_canonical_lines_across_a_scroll() {
+    // Workstream 10 phase 1 e2e: the rendered scene's line tags (absolute
+    // logical lines, oldest-history-relative) must be invariant under a
+    // full-screen scroll — the same property as the placement's canonical
+    // line — so the row displaying the image carries the same tag before and
+    // after the scroll, and the image moves up with its text.
+    let script = r"printf 'a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n'; printf '\033[4;1H'; printf '\033_Ga=T,f=24,i=77,s=1,v=1,c=1,r=1,C=1,q=2;/wAA\033\\'; printf '\033[8;1H'; cat";
+    let mut session = TerminalSession::spawn_with_session_id(
+        SessionId::new(77),
+        Some("sh"),
+        &["-c", script],
+        TerminalSize::new(6, 8),
+    )
+    .expect("could not spawn canonical-line tag fixture");
+    let area = Rect::new(0, 0, 6, 8);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && session.graphics(area).is_empty() {
+        session
+            .poll_output()
+            .expect("canonical-line tag fixture PTY failed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let mut scene = session.render(area, false);
+    for submission in session.graphics(area) {
+        scene.add_image_layer(submission);
+    }
+    scene.annotate_image_cells();
+    let (row_before, tag_before) = image_row_and_line_tag(&scene);
+    assert_eq!(row_before, 3, "the image was placed at row 3");
+    assert_eq!(
+        tag_before, 6,
+        "canonical = row 3 + 3 lines of history (the 8th line's newline scrolls)"
+    );
+
+    // `cat` echoes the pasted newline, and the PTY line discipline (ECHO +
+    // ONLCR) doubles it into two linefeeds: the screen scrolls up two rows,
+    // carrying the placement (and its tag) up with the text.
+    session
+        .write_paste("\n")
+        .expect("paste one line into the fixture");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        session
+            .poll_output()
+            .expect("canonical-line tag fixture PTY failed");
+        let mut scene = session.render(area, false);
+        for submission in session.graphics(area) {
+            scene.add_image_layer(submission);
+        }
+        scene.annotate_image_cells();
+        let (row_after, tag_after) = image_row_and_line_tag(&scene);
+        if row_after == 1 {
+            assert_eq!(
+                tag_after, tag_before,
+                "the line tag is invariant under the full-screen scroll"
+            );
+            assert_eq!(
+                row_after,
+                row_before - 2,
+                "the image moved up two rows with its text"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "image never reached row 1 after the scroll"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    session
+        .shutdown()
+        .expect("could not shut down canonical-line tag fixture");
 }
 
 #[test]

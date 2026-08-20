@@ -244,6 +244,15 @@ pub struct Scene {
     /// *grid*, exactly like Kitty anchoring every image to the cell grid and
     /// Termux storing a bitmap reference inside each covered cell's style.
     image_refs: Vec<u32>,
+    /// One logical-line tag per row, parallel to the grid's rows (index
+    /// `y - area.y`). A tag is the absolute logical line (oldest-history-
+    /// relative) the row displays — the same space as a placement's
+    /// `canonical_line` — so the grid can answer "which logical line is this
+    /// row" in O(1) and verify that placements sit on the line they are
+    /// anchored to (Workstream 10). The tag moves with its row through every
+    /// grid mutation; a blank/revealed row carries [`LINE_TAG_NONE`] until the
+    /// next render stamps it.
+    line_tags: Vec<i64>,
     cursor: Option<SceneCursor>,
     image_layers: Vec<GraphicsSubmission>,
     placeholder_layers: Vec<GraphicsPlaceholderLayer>,
@@ -253,6 +262,10 @@ pub struct Scene {
 
 /// No image covers this cell.
 pub const IMAGE_REF_NONE: u32 = 0;
+/// A row that currently displays no logical line (blank, revealed by a
+/// scroll/insert/delete, or never stamped). `i64::MIN` can never collide with
+/// a real tag: absolute logical lines start at 0 (the oldest history line).
+pub const LINE_TAG_NONE: i64 = i64::MIN;
 /// Kind bit for handles that resolve into `placeholder_layers` rather than
 /// `image_layers`; the low bits (minus 1) are the layer index.
 const PLACEHOLDER_REF_KIND: u32 = 0x8000_0000;
@@ -265,6 +278,7 @@ impl Scene {
             area,
             cells: vec![Cell::blank(style); cell_count],
             image_refs: vec![IMAGE_REF_NONE; cell_count],
+            line_tags: vec![LINE_TAG_NONE; area.height as usize],
             cursor: None,
             image_layers: Vec::new(),
             placeholder_layers: Vec::new(),
@@ -289,6 +303,12 @@ impl Scene {
             self.image_refs.clear();
             self.image_refs.resize(cell_count, IMAGE_REF_NONE);
         }
+        if self.line_tags.len() == area.height as usize {
+            self.line_tags.fill(LINE_TAG_NONE);
+        } else {
+            self.line_tags.clear();
+            self.line_tags.resize(area.height as usize, LINE_TAG_NONE);
+        }
         self.cursor = None;
         self.image_layers.clear();
         self.placeholder_layers.clear();
@@ -309,6 +329,12 @@ impl Scene {
             self.cells.extend_from_slice(&other.cells);
             self.image_refs.clear();
             self.image_refs.extend_from_slice(&other.image_refs);
+        }
+        if self.line_tags.len() == other.line_tags.len() {
+            self.line_tags.copy_from_slice(&other.line_tags);
+        } else {
+            self.line_tags.clear();
+            self.line_tags.extend_from_slice(&other.line_tags);
         }
         self.cursor = other.cursor;
         self.image_layers.clear();
@@ -358,6 +384,25 @@ impl Scene {
         match self.index(x, y) {
             Some(index) => self.image_refs[index],
             None => IMAGE_REF_NONE,
+        }
+    }
+
+    /// The logical-line tag of the row at `y` (absolute history-relative
+    /// line, or [`LINE_TAG_NONE`] when the row displays no line yet). O(1).
+    pub fn line_tag_at(&self, y: u16) -> i64 {
+        self.line_tags
+            .get((y - self.area.y) as usize)
+            .copied()
+            .unwrap_or(LINE_TAG_NONE)
+    }
+
+    /// Stamps the logical-line tag of the row at `y`. The render path stamps
+    /// every displayed row each frame from the emulator's absolute line;
+    /// grid mutations move existing tags with their rows.
+    pub fn set_line_tag(&mut self, y: u16, tag: i64) {
+        let index = (y - self.area.y) as usize;
+        if index < self.line_tags.len() {
+            self.line_tags[index] = tag;
         }
     }
 
@@ -609,6 +654,13 @@ impl Scene {
                 }
             }
         }
+        // Line tags travel with the blitted rows: the destination rows now
+        // display the source's content, so they inherit its logical lines.
+        // Tags are per-row, so a partial-width clip still transfers the whole
+        // row's tag — in the compose flow a row comes from one source scene.
+        for y in y_start..y_end {
+            self.set_line_tag(y, source.line_tag_at(y));
+        }
     }
 
     /// Removes image fragments covered by an opaque composed surface or
@@ -848,6 +900,9 @@ impl Scene {
             self.cells[index] = blank;
             self.image_refs[index] = IMAGE_REF_NONE;
         }
+        let tag_start = (y - self.area.y) as usize;
+        let tag_end = (tag_start + count as usize).min(self.line_tags.len());
+        self.line_tags[tag_start..tag_end].fill(LINE_TAG_NONE);
     }
 
     /// Scrolls the rows in `[top, bottom)` by `delta` rows, moving cells and
@@ -870,6 +925,8 @@ impl Scene {
             let src = (top as usize + shift) * width..(bottom as usize) * width;
             self.cells.copy_within(src.clone(), (top as usize) * width);
             self.image_refs.copy_within(src, (top as usize) * width);
+            let tag_src = (top as usize + shift)..(bottom as usize);
+            self.line_tags.copy_within(tag_src, top as usize);
             self.blank_rows(bottom - shift as u16, shift as u16);
         } else {
             let shift = delta.unsigned_abs() as usize;
@@ -878,6 +935,8 @@ impl Scene {
                 .copy_within(src.clone(), (top as usize + shift) * width);
             self.image_refs
                 .copy_within(src, (top as usize + shift) * width);
+            let tag_src = (top as usize)..(bottom as usize - shift);
+            self.line_tags.copy_within(tag_src, top as usize + shift);
             self.blank_rows(top, shift as u16);
         }
     }
@@ -909,6 +968,10 @@ impl Scene {
             .copy_within(src.clone(), (top as usize + shift) * width);
         self.image_refs
             .copy_within(src, (top as usize + shift) * width);
+        self.line_tags.copy_within(
+            (top as usize)..(bottom as usize - shift),
+            top as usize + shift,
+        );
         self.blank_rows(top, shift as u16);
     }
 
@@ -928,6 +991,8 @@ impl Scene {
         let src = (top as usize + shift) * width..(bottom as usize) * width;
         self.cells.copy_within(src.clone(), (top as usize) * width);
         self.image_refs.copy_within(src, (top as usize) * width);
+        self.line_tags
+            .copy_within((top as usize + shift)..(bottom as usize), top as usize);
         self.blank_rows(bottom - shift as u16, shift as u16);
     }
 
@@ -956,6 +1021,12 @@ impl Scene {
                 }
             }
         }
+        for y in y_start..y_end {
+            let row = usize::from(y.saturating_sub(self.area.y));
+            if row < self.line_tags.len() {
+                self.line_tags[row] = LINE_TAG_NONE;
+            }
+        }
     }
 
     /// Re-lays out the grid at a new column width (Termux-style display
@@ -980,10 +1051,21 @@ impl Scene {
         let old_refs = std::mem::take(&mut self.image_refs);
         let mut new_cells: Vec<Cell> = Vec::with_capacity(old_cells.len());
         let mut new_refs: Vec<u32> = Vec::with_capacity(old_refs.len());
+        let mut new_tags: Vec<i64> = Vec::with_capacity(self.line_tags.len());
 
         let blank = Cell::blank(CellStyle::new(Color::reset(), Color::reset()));
         for row_start in (0..old_cells.len()).step_by(old_width) {
             let row_end = (row_start + old_width).min(old_cells.len());
+            // Every row this old row re-wraps into keeps its logical-line tag:
+            // a wrapped paragraph is one logical line, so the split segments
+            // (and their recombination on a later grow) all share the parent
+            // tag, exactly like Zellij's line-merge/split anchoring.
+            let tag = self
+                .line_tags
+                .get(row_start / old_width)
+                .copied()
+                .unwrap_or(LINE_TAG_NONE);
+            let before = new_cells.len();
             // Tokenize the row, merging each wide lead with its continuation
             // so a glyph never splits across a wrap boundary.
             let mut tokens: Vec<Vec<(Cell, u32)>> = Vec::new();
@@ -1023,10 +1105,13 @@ impl Scene {
                 new_cells.push(cell);
                 new_refs.push(reference);
             }
+            let rows_produced = (new_cells.len() - before) / new_width;
+            new_tags.extend(std::iter::repeat_n(tag, rows_produced));
         }
 
         self.cells = new_cells;
         self.image_refs = new_refs;
+        self.line_tags = new_tags;
         self.area.width = columns;
         self.area.height = u16::try_from(self.cells.len() / new_width.max(1)).unwrap_or(u16::MAX);
         self.image_layers.clear();
@@ -1042,6 +1127,7 @@ impl Scene {
         let blank = Cell::blank(CellStyle::new(Color::reset(), Color::reset()));
         self.cells.fill(blank);
         self.image_refs.fill(IMAGE_REF_NONE);
+        self.line_tags.fill(LINE_TAG_NONE);
         self.image_layers.clear();
         self.placeholder_layers.clear();
         #[cfg(feature = "sixel")]
@@ -1483,5 +1569,106 @@ mod tests {
         assert_eq!(scene.cell_at(1, 1).unwrap().symbol, 'c');
         // No continuation cell dangles at a row start.
         assert_ne!(scene.cell_at(0, 1).unwrap().width, CellWidth::Continuation);
+    }
+
+    #[test]
+    fn line_tags_are_stamped_and_move_with_scroll_region() {
+        let mut scene = Scene::new(Rect::new(0, 0, 4, 6));
+        assert_eq!(scene.line_tag_at(0), LINE_TAG_NONE, "rows start untagged");
+        for y in 0..6 {
+            scene.set_line_tag(y, 100 + i64::from(y));
+        }
+
+        scene.scroll_region(0, 6, 2);
+        // Content moved up two rows: the tag that was on row 2 is on row 0.
+        assert_eq!(scene.line_tag_at(0), 102);
+        assert_eq!(scene.line_tag_at(3), 105);
+        assert_eq!(
+            scene.line_tag_at(4),
+            LINE_TAG_NONE,
+            "vacated rows are untagged"
+        );
+        assert_eq!(scene.line_tag_at(5), LINE_TAG_NONE);
+
+        scene.scroll_region(0, 6, -1);
+        // Content moved back down one row.
+        assert_eq!(scene.line_tag_at(1), 102);
+        assert_eq!(scene.line_tag_at(2), 103);
+    }
+
+    #[test]
+    fn line_tags_move_with_insert_and_delete_lines() {
+        let mut scene = Scene::new(Rect::new(0, 0, 4, 6));
+        for y in 0..6 {
+            scene.set_line_tag(y, 50 + i64::from(y));
+        }
+
+        scene.insert_lines(2, 2);
+        assert_eq!(scene.line_tag_at(2), LINE_TAG_NONE);
+        assert_eq!(scene.line_tag_at(3), LINE_TAG_NONE);
+        assert_eq!(scene.line_tag_at(4), 52, "content pushed down");
+        assert_eq!(scene.line_tag_at(5), 53);
+
+        scene.delete_lines(2, 2);
+        assert_eq!(scene.line_tag_at(2), 52, "content pulled back up");
+        assert_eq!(scene.line_tag_at(3), 53);
+        assert_eq!(scene.line_tag_at(5), LINE_TAG_NONE);
+    }
+
+    #[test]
+    fn erase_and_clear_drop_line_tags() {
+        let mut scene = Scene::new(Rect::new(0, 0, 6, 4));
+        for y in 0..4 {
+            scene.set_line_tag(y, 200 + i64::from(y));
+        }
+
+        scene.erase_region(Rect::new(0, 0, 2, 4));
+        assert_eq!(scene.line_tag_at(0), LINE_TAG_NONE);
+        assert_eq!(scene.line_tag_at(1), LINE_TAG_NONE);
+        assert_eq!(scene.line_tag_at(3), LINE_TAG_NONE);
+
+        scene.set_line_tag(2, 202);
+        scene.erase_rows(2, 1);
+        assert_eq!(scene.line_tag_at(2), LINE_TAG_NONE);
+
+        scene.set_line_tag(3, 203);
+        scene.clear();
+        assert!(scene.line_tags.iter().all(|tag| *tag == LINE_TAG_NONE));
+    }
+
+    #[test]
+    fn reflow_split_rows_keep_the_parent_line_tag() {
+        let mut scene = Scene::new(Rect::new(0, 0, 6, 2));
+        scene.set_line_tag(0, 10);
+        scene.set_line_tag(1, 11);
+
+        scene.reflow(4);
+
+        // Each old row re-wraps into two rows sharing the parent tag: a
+        // wrapped paragraph is one logical line.
+        assert_eq!(scene.line_tag_at(0), 10);
+        assert_eq!(scene.line_tag_at(1), 10);
+        assert_eq!(scene.line_tag_at(2), 11);
+        assert_eq!(scene.line_tag_at(3), 11);
+    }
+
+    #[test]
+    fn blit_copies_line_tags_with_cells() {
+        let mut source = Scene::new(Rect::new(0, 0, 4, 3));
+        for y in 0..3 {
+            source.set_line_tag(y, 300 + i64::from(y));
+        }
+        let mut scene = Scene::new(Rect::new(0, 0, 6, 4));
+
+        scene.blit_cells(&source, Rect::new(0, 0, 4, 3));
+
+        assert_eq!(scene.line_tag_at(0), 300);
+        assert_eq!(scene.line_tag_at(1), 301);
+        assert_eq!(scene.line_tag_at(2), 302);
+        assert_eq!(
+            scene.line_tag_at(3),
+            LINE_TAG_NONE,
+            "rows outside the blit keep their state"
+        );
     }
 }

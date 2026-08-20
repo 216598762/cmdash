@@ -1140,24 +1140,33 @@ alternative emission adapter so both models can be exercised and compared.
 U=1 placeholders, animation, and per-frame delete (cmdash strengths Zellij
 explicitly deferred) are out of scope and must not regress.
 
-### Phase 1 — Canonical-line anchor migration (the core)
+### Phase 1 — Canonical-line anchor migration (landed)
 
-- [ ] Introduce a canonical anchor `{ line: i64, offset_px_from_line_start:
-  isize }` alongside the existing signed `start_row`: the canonical anchor is
-  the mutation-time identity, the signed row stays the projection-time
-  viewport position, and every `ImagePlacement` resolves through both.
-- [ ] Maintain a logical-line tag per composed-grid row across scroll,
-  insert/delete, and erase so the grid can answer "which logical line is this
-  row" in O(1).
-- [ ] Re-anchor on line merges/splits: wrap reflow splits one logical line
-  into two (placements shift by whole lines and re-slice across the boundary),
-  and column shrink merges lines back (placements clamp to the surviving line
-  start) — mirroring Zellij's `split_line_start_into_rows` and
-  `merge_rows_into_line_start`.
-- [ ] Byte-parity harness: run the signed-row projection and the
-  canonical-line projection in parallel over the conformance corpus; every
-  emitted placement must agree (outer placement id, viewport cell, source
-  crop).
+- [x] `ImagePlacement` carries `canonical_line: i64` — the absolute logical
+  line (oldest-history-relative) captured once at creation as
+  `anchor.row + anchor.scrollback`. It is the mutation-time identity:
+  `scroll`, `insert_lines`, and `move_placement` shift only `start_row`, never
+  the canonical line, and the relation `start_row == canonical_line -
+  current_scrollback` is exactly the store's `resolve_row` identity for
+  full-screen placements.
+- [x] The composed grid maintains a per-row logical-line tag (`Scene::line_tags`,
+  O(1) via `line_tag_at`), moved with its row through `scroll_region`,
+  `insert_lines`/`delete_lines`, `blit`, and `clear`; the session render
+  stamps each displayed row from the emulator (`point.line + history_size`),
+  which is invariant under full-screen scrolls and therefore agrees with
+  placement canonical lines.
+- [x] Re-anchor on wrap reflow: a row that splits into segments on a column
+  shrink keeps the parent tag on every segment (a wrapped paragraph is one
+  logical line), so a later grow recombines them under the same tag — the
+  Zellij merge/split semantics in cell-row form. The pixel-space
+  `offset_px_from_line_start` half of the anchor is deferred to Phase 2,
+  which introduces pixel geometry.
+- [x] Byte-parity harness: the conformance suite drives a store through
+  transmit+place at a known scrollback, scrolls, and asserts the canonical
+  line is invariant, the signed row tracks `canonical_line - current_scrollback`,
+  and the drained move reuses the stable outer placement id; a second test
+  drives a real PTY and asserts the rendered scene's tag at the placement's
+  row is invariant across the scroll while the image moves up with its text.
 
 ### Phase 2 — Cell-size discovery and pixel-space geometry
 

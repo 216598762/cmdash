@@ -2058,6 +2058,16 @@ impl SessionGraphicsStore {
         true
     }
 
+    /// The virtual buffer's placements, in object order — the mutation-time
+    /// mirror of the store's placements. Exposed for the Workstream 10
+    /// canonical-line parity harness (and diagnostics); the drained command
+    /// stream remains the emission authority.
+    pub fn buffer_placements(&self) -> impl Iterator<Item = &ImagePlacement> {
+        self.buffer
+            .objects()
+            .flat_map(|(_, object)| object.placements.iter())
+    }
+
     /// Mirrors a freshly-inserted placement into the virtual buffer: resolves
     /// (or lazily creates) the object via the identity registry and upserts the
     /// placement at its resolved cell origin.
@@ -2147,8 +2157,19 @@ impl SessionGraphicsStore {
     }
 
     fn to_buffer_placement(&self, placement: &GraphicsPlacement) -> ImagePlacement {
+        let anchor = placement.anchor();
         ImagePlacement {
             column: placement.x(),
+            // The canonical line is the absolute logical line (oldest-history-
+            // relative) this placement is anchored to: the creation-time
+            // screen row plus the history depth captured when the anchor was
+            // created. It is invariant under full-screen scrolls — the store's
+            // `resolve_row` identity is exactly
+            // `canonical_line - current_scrollback` — so it survives as the
+            // mutation-time identity while `start_row` tracks the moving
+            // viewport position. The anchor (not the submission's resolved
+            // `y`, which is viewport-relative) is the stable source.
+            canonical_line: anchor.scrollback() as i64 + i64::from(anchor.row()),
             start_row: i32::from(placement.y()),
             rows: placement.height(),
             columns: placement.width(),

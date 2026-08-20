@@ -48,9 +48,23 @@ pub struct ImageResource {
 /// anchor resolution, so history placements survive scrolls instead of being
 /// deleted on underflow — eviction past the scrollback limit is the only thing
 /// that drops them.
+///
+/// `canonical_line` is the **absolute logical line** this placement is anchored
+/// to, counting from the oldest retained history line (the Zellij-style
+/// `vertical_anchor.canonical_line` of Workstream 10). It is captured once at
+/// creation as `anchor.row + anchor.scrollback` and is invariant under
+/// full-screen scrolls: every linefeed moves the content up one screen row
+/// while growing the history depth by one, so the sum is unchanged. Mutations
+/// (`scroll`, `insert_lines`, `move_placement`) shift only `start_row` — the
+/// projection-time viewport position — never `canonical_line`. The two relate
+/// as `start_row == canonical_line - current_scrollback` for full-screen
+/// placements, which is exactly the store's `resolve_row` identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImagePlacement {
     pub column: u16,
+    /// Absolute logical line (oldest-history-relative) this placement is
+    /// attached to; invariant under scroll, the mutation-time identity.
+    pub canonical_line: i64,
     pub start_row: i32,
     pub rows: u16,
     pub columns: u16,
@@ -226,6 +240,11 @@ impl VirtualBuffer {
 
     pub fn object(&self, id: ImageObjectId) -> Option<&ImageObject> {
         self.objects.get(&id)
+    }
+
+    /// Iterates the buffer's objects, in id order.
+    pub fn objects(&self) -> impl Iterator<Item = (&ImageObjectId, &ImageObject)> {
+        self.objects.iter()
     }
 
     pub fn object_count(&self) -> usize {
@@ -693,6 +712,7 @@ mod tests {
     fn placement(start_row: i32, outer_id: u32) -> ImagePlacement {
         ImagePlacement {
             column: 0,
+            canonical_line: i64::from(start_row),
             start_row,
             rows: 1,
             columns: 1,
@@ -992,6 +1012,7 @@ mod tests {
             false,
             ImagePlacement {
                 column: 0,
+                canonical_line: 3,
                 start_row: 3,
                 rows: 1,
                 columns: 1,
@@ -1054,6 +1075,7 @@ mod tests {
             false,
             ImagePlacement {
                 column: 0,
+                canonical_line: 2,
                 start_row: 2,
                 rows: 1,
                 columns: 1,

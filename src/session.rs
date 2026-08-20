@@ -1902,6 +1902,13 @@ impl TerminalSession {
             .selection
             .as_ref()
             .and_then(|selection| selection.to_range(&self.term));
+        // Total history depth, used to convert each displayed line into its
+        // absolute (oldest-history-relative) logical line so the scene's line
+        // tags agree with placement canonical lines: a placement anchored at
+        // `canonical_line` must sit on the row whose tag equals it
+        // (Workstream 10 phase 1).
+        let history_size = self.term.grid().history_size() as i64;
+        let mut last_tagged_row: Option<u16> = None;
         for indexed in self.term.grid().display_iter() {
             let point = indexed.point;
             let cell = indexed.cell;
@@ -1910,6 +1917,15 @@ impl TerminalSession {
             };
             let x = area.x.saturating_add(point.column.0 as u16);
             let y = area.y.saturating_add(viewport_row);
+            // Stamp the row's logical line once per row (display_iter is
+            // row-major). The tag is invariant under full-screen scrolls:
+            // scrolling up decreases `point.line` while growing history, so
+            // their sum stays fixed. Tags are keyed by the absolute scene row
+            // `y` (the content area may be inset from the scene origin).
+            if last_tagged_row != Some(viewport_row) {
+                scene.set_line_tag(y, i64::from(point.line.0) + history_size);
+                last_tagged_row = Some(viewport_row);
+            }
             if x >= area.x.saturating_add(area.width) || y >= area.y.saturating_add(area.height) {
                 continue;
             }
