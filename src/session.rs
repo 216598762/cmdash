@@ -1257,10 +1257,19 @@ impl TerminalSession {
         let mut reader_finished = false;
         // Always drain available output, even after the child has exited: a
         // slow reader thread may still be delivering the final buffered bytes,
-        // and an early `closed` flag would strand them.
+        // and an early `closed` flag would strand them. Drain is budgeted to
+        // the channel capacity: a reader blocked on `send` refills each freed
+        // slot instantly, so draining until `Empty` would spin forever once
+        // the consumer falls behind; the budget hands control back to the
+        // caller and the next poll (woken by the reader) continues the batch.
+        let mut drained = 0;
         loop {
+            if drained >= READER_CHUNK_QUEUE {
+                break;
+            }
             match self.output.receiver.try_recv() {
                 Ok(Ok(bytes)) => {
+                    drained += 1;
                     changed = self.consume_output(&bytes)? || changed || !bytes.is_empty();
                 }
                 Ok(Err(error)) => {
@@ -2061,11 +2070,23 @@ fn default_command() -> CommandBuilder {
     }
 }
 
+/// Maximum number of PTY chunks the reader may queue ahead of the consumer.
+/// Each chunk is at most 4096 bytes, so the in-flight backlog is bounded to
+/// `READER_CHUNK_QUEUE * 4 KiB`. The reader blocks past this, the PTY buffer
+/// fills, and the child writer throttles — the same flow control a real
+/// terminal applies.
+const READER_CHUNK_QUEUE: usize = 64;
+
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     wakeup: Option<SessionWakeup>,
 ) -> Receiver<io::Result<Vec<u8>>> {
-    let (sender, receiver) = mpsc::channel();
+    // A bounded channel applies backpressure: when the consumer (VTE parsing)
+    // falls behind the child's output rate, `send` blocks instead of queueing
+    // chunks without limit. An unbounded channel grew to gigabytes under
+    // `yes`, OOM-killing the process; the grid and capture buffers were never
+    // the problem.
+    let (sender, receiver) = mpsc::sync_channel(READER_CHUNK_QUEUE);
     thread::spawn(move || {
         loop {
             let mut buffer = vec![0; 4096];
@@ -2954,6 +2975,83 @@ mod tests {
         // nothing remains even after scrolling the view to the top.
         session.scroll_display(Scroll::Top);
         assert!(session.graphics(Rect::new(0, 0, 20, 4)).is_empty());
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn unbounded_child_output_keeps_internal_state_bounded() {
+        // Regression for the OOM under `yes`: feeding an endless plain-text
+        // stream directly through `consume_output` (no reader thread, no
+        // channel) must never grow the session's internal accumulators. The
+        // emulator grid is capped by `scrollback_limit` and the protocol
+        // capture by `MAX_GRAPHICS_PROTOCOL_CAPTURE_BYTES`; if this stays
+        // bounded, the only unbounded path left is the reader channel, which
+        // must apply backpressure.
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        session.set_scrollback_limit(4);
+        // ~32 MiB of `yes`-style output (two bytes per line) with no newline
+        // gaps larger than a chunk, so the VTE parser sees continuous scrolls.
+        let mut chunk = Vec::new();
+        for _ in 0..4096 {
+            chunk.extend_from_slice(b"y\n");
+        }
+        let mut fed = 0usize;
+        while fed < 32 * 1024 * 1024 {
+            session.consume_output(&chunk).unwrap();
+            fed += chunk.len();
+        }
+        assert!(
+            session.scrollback_lines() <= 4,
+            "history exceeded the configured cap: {}",
+            session.scrollback_lines()
+        );
+        assert!(
+            session.graphics_protocol_capture().len() <= MAX_GRAPHICS_PROTOCOL_CAPTURE_BYTES,
+            "protocol capture exceeded its bound: {}",
+            session.graphics_protocol_capture().len()
+        );
+        assert!(
+            session.line_buffer.len() <= MAX_LINE_EVENT_BYTES,
+            "line accumulator exceeded its bound: {}",
+            session.line_buffer.len()
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn endless_child_output_never_hangs_or_grows_unbounded() {
+        // End-to-end regression for the OOM under `yes` (18 GiB before the
+        // kernel killed the process). The reader channel is bounded and the
+        // per-poll drain is budgeted, so a child that outruns the VTE
+        // consumer blocks on the PTY instead of queuing chunks forever, and
+        // `poll_output` returns promptly rather than spinning. Without the
+        // drain budget this test hangs on the first poll; without the bounded
+        // channel it grows without limit.
+        let mut session = TerminalSession::spawn_with_session_id(
+            SessionId::new(97),
+            Some("yes"),
+            &[],
+            TerminalSize::new(40, 8),
+        )
+        .expect("could not spawn yes");
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        let mut polls = 0u64;
+        while Instant::now() < deadline {
+            // `poll_output` must return promptly; a spin here is a hang.
+            session.poll_output().expect("yes PTY failed");
+            polls += 1;
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Debug VTE parsing budgets ~35 ms per poll (64 chunks of 4 KiB), so
+        // a two-second window yields roughly forty polls; an unbudgeted spin
+        // never returns at all. Ten is a generous floor that still proves
+        // prompt return.
+        assert!(
+            polls >= 10,
+            "poll_output did not return promptly ({polls} polls in 2s)"
+        );
+        // History is pinned at the emulator cap, not growing with the stream.
+        assert_eq!(session.scrollback_lines(), 10_000);
         session.shutdown().unwrap();
     }
 
