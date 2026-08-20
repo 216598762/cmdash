@@ -559,6 +559,27 @@ impl VirtualBuffer {
         true
     }
 
+    /// Re-indexes every placement's canonical line after `count` history
+    /// lines are dropped from the front of the bounded scrollback (the
+    /// history cap or an explicit shrink). The canonical coordinate space is
+    /// oldest-retained-relative, so dropping the oldest line shifts every
+    /// retained placement's canonical line down by one (Zellij's
+    /// `drop_first_canonical_anchor_line`). `start_row` is untouched — it
+    /// already moved with the scroll — so the parity
+    /// `canonical_line - current_scrollback == start_row` keeps holding when
+    /// `current_scrollback` (the capped history size) stops growing.
+    pub fn drop_first_canonical_lines(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let count = i64::try_from(count).unwrap_or(i64::MAX);
+        for object in self.objects.values_mut() {
+            for placement in &mut object.placements {
+                placement.canonical_line = placement.canonical_line.saturating_sub(count);
+            }
+        }
+    }
+
     /// Drains the coalesced command stream for the current frame: at most one
     /// command per object (a delete supersedes a move/place/upload), so a burst
     /// of mutations collapses to a single, idempotent, ordered command set.
@@ -828,6 +849,33 @@ mod tests {
         assert!(commands.iter().any(
             |command| matches!(command, GraphicsCommand::Delete { object, all: true, .. } if *object == evicted)
         ));
+    }
+
+    #[test]
+    fn drop_first_canonical_lines_reindexes_every_placement() {
+        let mut buffer = VirtualBuffer::new();
+        let first = add(&mut buffer, 1, 3);
+        let second = add(&mut buffer, 2, 1);
+        buffer.drain_commands();
+        let canonical = |buffer: &VirtualBuffer, object: ImageObjectId| {
+            buffer.object(object).unwrap().placements[0].canonical_line
+        };
+        assert_eq!(canonical(&buffer, first), 3);
+        assert_eq!(canonical(&buffer, second), 1);
+
+        // Dropping three history lines re-indexes the canonical space; the
+        // placements' start rows are untouched (they already scrolled).
+        buffer.drop_first_canonical_lines(3);
+        assert_eq!(canonical(&buffer, first), 0);
+        assert_eq!(canonical(&buffer, second), -2);
+        assert_eq!(buffer.object(first).unwrap().placements[0].start_row, 3);
+        assert_eq!(buffer.object(second).unwrap().placements[0].start_row, 1);
+
+        // No commands are emitted: it is a re-indexing, not a mutation.
+        assert!(buffer.drain_commands().is_empty());
+        // A zero drop is a no-op.
+        buffer.drop_first_canonical_lines(0);
+        assert_eq!(canonical(&buffer, first), 0);
     }
 
     #[test]

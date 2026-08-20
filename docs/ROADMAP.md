@@ -1192,22 +1192,37 @@ explicitly deferred) are out of scope and must not regress.
 
 ### Phase 3 — Grid-sync hook parity
 
-- [ ] Port the full region-scroll hook set from Zellij's `apply_region_scroll`:
+- [x] Port the full region-scroll hook set from Zellij's `apply_region_scroll`:
   entirely-inside / intersecting / outside classification,
   `preserve_above_region_top` semantics, and crop advancement
   (`emit_y += cut`) when a region clip trims a placement top or bottom,
-  freeing placements that scroll fully out.
-- [ ] Port the front-drop and scrollback-frame hooks: `offset_grid_top` (drop
-  the top row; free placements whose pixel extent leaves the buffer) and
-  `settle_placements_below_the_viewport` (shift placements when the scrollback
-  frame moves) — the pixel-space complement of the existing signed-row history
-  handling.
-- [ ] Port the canonical-line lifecycle ops (`drop_first_canonical_anchor_line`,
-  `insert_canonical_anchor_line_at_front`) so history entry/exit re-anchors by
-  line rather than by pixel delta.
-- [ ] Reconcile with the existing `ScrollRegionTracker` and region-scoped
-  mutation mapping: one observer feeding both the mutation stream and the
-  pixel-space hooks.
+  freeing placements that scroll fully out. `record_region_scroll` now
+  classifies every region-anchored placement: entirely-inside placements move
+  up and are freed when they scroll out the top (non-preserved) or bottom;
+  straddling placements clip to their static out-of-region extent, with
+  bottom-straddlers pinned at the region bottom and their source crop advanced
+  (`clip_placement` re-derives the source rectangle at mutation time); a
+  region whose top is the screen top preserves scrolled-out lines into
+  history instead of deleting them.
+- [ ] Port the front-drop and scrollback-frame hooks in pixel space:
+  `offset_grid_top` (drop the top row; free placements whose pixel extent
+  leaves the buffer) and `settle_placements_below_the_viewport` (shift
+  placements when the scrollback frame moves). The line-space half landed with
+  the canonical-line lifecycle below; these remain for the Phase 4 damage
+  adapter, where the pixel-space frame is the natural unit.
+- [x] Port the canonical-line lifecycle ops: `drop_first_canonical_lines`
+  re-indexes every placement's canonical identity (and the virtual buffer's
+  mirror) when history lines are dropped from the front — at the scrollback
+  cap, where `history_size` stops growing and the raw resolution would freeze
+  the image, and on `set_scrollback_limit` shrinks, which the session feeds as
+  the dropped count. Eviction now resolves the placement row (folding the
+  drops in) so placements deepened by a shrink are freed too. Front insertion
+  has no cmdash equivalent, so `insert_canonical_anchor_line_at_front` is N/A.
+- [x] Reconcile with the existing `ScrollRegionTracker` and region-scoped
+  mutation mapping: the session feeds pre-scroll scrollback/region-scroll
+  state into `record_region_scroll` and computes the dropped-line count for
+  full-screen scrolls at the cap, so one observer drives both the mutation
+  stream and the canonical-line hooks.
 
 ### Phase 4 — Changed-rect emission adapter (optional mode)
 

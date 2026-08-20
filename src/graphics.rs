@@ -308,6 +308,16 @@ pub struct GraphicsPlacement {
     /// at a new cell reuses this id, which makes Kitty move the existing
     /// placement instead of stacking a new one.
     outer_placement_id: u32,
+    /// Number of history lines dropped from the front of the bounded
+    /// scrollback since this placement was created (the history cap). At the
+    /// cap the emulator drops lines instead of growing `history_size`, so the
+    /// capped scrollback term in anchor resolution stops tracking; this
+    /// re-indexes the placement's canonical identity
+    /// (`anchor.row + anchor.scrollback - front_drops`) to keep it moving
+    /// with the text — Zellij's `drop_first_canonical_anchor_line`. Only
+    /// full-screen placements consume it; region-anchored placements resolve
+    /// purely from their region scroll displacement.
+    front_drops: u32,
 }
 
 /// A source rectangle in the logical image, in pixels.
@@ -427,8 +437,35 @@ impl GraphicsPlacement {
         self.outer_placement_id
     }
 
+    pub const fn front_drops(&self) -> u32 {
+        self.front_drops
+    }
+
     pub const fn area(&self) -> Rect {
         Rect::new(self.x, self.y, self.width, self.height)
+    }
+
+    /// Resolves this placement's current grid row, folding in the canonical
+    /// drops accumulated by [`Self::front_drops`] (history evictions) that
+    /// the capped scrollback counter cannot express. Full-screen placements
+    /// subtract the drops; region-anchored placements resolve purely from
+    /// their region scroll displacement and ignore them.
+    fn resolved_row_with_state(
+        &self,
+        current_scrollback: usize,
+        current_region: GraphicsScrollRegion,
+        current_region_scroll: i64,
+    ) -> i32 {
+        let row = self.anchor.resolve_row_with_state(
+            current_scrollback,
+            current_region,
+            current_region_scroll,
+        );
+        if self.anchor.scroll_region().is_full_screen() {
+            row.saturating_sub(i32::try_from(self.front_drops).unwrap_or(i32::MAX))
+        } else {
+            row
+        }
     }
 
     /// Builds a simple cell-aligned placement for a dashboard-owned image: no
@@ -468,6 +505,7 @@ impl GraphicsPlacement {
             virtual_placement: false,
             key,
             outer_placement_id,
+            front_drops: 0,
         }
     }
 }
@@ -1179,6 +1217,26 @@ pub struct GraphicsDeltas {
     pub removed: Vec<GraphicsSubmission>,
 }
 
+/// One classified DECSTBM region-scroll mutation, decided in a read-only pass
+/// before any placement is mutated so the classification can borrow the store
+/// immutably. Mirrors Zellij's `apply_region_scroll` outcome per placement:
+/// delete (scrolled out of the region), clean move, or a move with a crop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegionScrollMutation {
+    /// Delete the placement and release its image when unreferenced.
+    Delete,
+    /// Move the placement to `new_row` (clean, uncropped).
+    Move { new_row: i32 },
+    /// Move to `new_row`, shrink to `height` rows, and advance the source
+    /// crop by `top_crop` rows — the rows that scrolled out through the
+    /// region top or were pinned below the region bottom.
+    MoveCropped {
+        new_row: i32,
+        height: i32,
+        top_crop: i32,
+    },
+}
+
 /// The pixel-accurate result of clipping a placement to a cell-aligned region:
 /// the visible source crop plus the sub-cell geometry the clipped placement
 /// must re-anchor at so a subsequent clip stays exact.
@@ -1189,6 +1247,28 @@ struct PlacementClip {
     cell_y_offset: u16,
     drawn_width: u32,
     drawn_height: u32,
+}
+
+/// Re-anchors a placement at a fresh resolved row against the current region
+/// scroll state, keeping its screen and column. The captured scrollback is
+/// refreshed and the canonical-drop counter reset, so the new anchor is fully
+/// consistent with the current coordinate space (the region-scroll displacement
+/// is folded into `region_scroll`, not the row).
+fn reanchor_region_placement(
+    placement: &mut GraphicsPlacement,
+    new_row: i32,
+    current_scrollback: usize,
+    region: GraphicsScrollRegion,
+    region_scroll: i64,
+) {
+    let new_row = u16::try_from(new_row.max(0)).unwrap_or(u16::MAX);
+    placement.x = placement.anchor().column();
+    placement.y = new_row;
+    placement.anchor =
+        GraphicsGridAnchor::new(placement.anchor().column(), new_row, current_scrollback)
+            .with_screen(placement.anchor().screen())
+            .with_scroll_region(region, region_scroll);
+    placement.front_drops = 0;
 }
 
 /// Computes the source rectangle (in pixels) for the visible sub-region of a
@@ -2006,31 +2086,277 @@ impl SessionGraphicsStore {
         }
     }
 
-    /// Mirrors a DECSTBM region scroll into the virtual buffer: every
-    /// non-virtual placement anchored in `region` moves by `delta` rows
-    /// (positive = scrolled up). Placements outside the region — or anchored to
-    /// a different region — are untouched. The region's monotonic scroll
-    /// displacement still owns the render-path resolution, so this only drives
-    /// the mutation command stream (and the buffer's row bookkeeping).
-    pub fn record_region_scroll(&mut self, region: GraphicsScrollRegion, delta: i64) {
+    /// Re-indexes the canonical-line coordinate space after `count` history
+    /// lines are dropped from the front of the bounded scrollback (the
+    /// history cap, or an explicit `set_scrollback_limit` shrink). At the cap
+    /// the emulator drops the oldest lines instead of growing `history_size`,
+    /// so the capped scrollback term in anchor resolution stops tracking; this
+    /// shifts every placement's canonical identity down by `count` — Zellij's
+    /// `drop_first_canonical_anchor_line` — keeping retained placements
+    /// resolving to the rows they occupy. The virtual buffer mirror is
+    /// re-indexed in lockstep so the drained command stream and the
+    /// `canonical_line - current_scrollback == start_row` parity hold.
+    pub fn drop_first_canonical_lines(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        for placement in self.placements.values_mut() {
+            placement.front_drops = placement.front_drops.saturating_add(count);
+        }
+        self.buffer.drop_first_canonical_lines(count as usize);
+    }
+
+    /// Mirrors a DECSTBM region scroll into the virtual buffer with Zellij's
+    /// `apply_region_scroll` classification: every non-virtual placement
+    /// anchored in `region` is classed as entirely-inside, intersecting a
+    /// region boundary, or outside it, and each class is handled by its own
+    /// rule (`delta` positive = scrolled up).
+    ///
+    /// - **Entirely inside**: moves up by `delta` rows. A placement scrolled
+    ///   out through the region bottom — or through the top when the top is
+    ///   not preserved — is deleted (Zellij's `store.free`). A placement
+    ///   clipped at the top advances its source crop (the visible part comes
+    ///   from deeper in the image); a placement clipped at the bottom shrinks
+    ///   to the region's remaining rows without a crop.
+    /// - **Intersecting a boundary**: the in-region part scrolled away, so the
+    ///   placement is clipped to its static out-of-region extent. Straddling
+    ///   the top keeps the part above the region (source unchanged);
+    ///   straddling the bottom pins it at the region bottom with the source
+    ///   crop advanced so the surviving rows keep showing the same slice.
+    /// - **Outside**: untouched. Placements anchored to another region never
+    ///   move, and a region whose top is the screen top preserves the lines
+    ///   that scroll out of it into history (their placements resolve to
+    ///   negative rows instead of being deleted).
+    ///
+    /// `current_scrollback`/`current_region_scroll` are the *pre-scroll*
+    /// state, so the classification sees each placement's pre-scroll row; the
+    /// re-anchored placements capture the post-scroll region displacement.
+    pub fn record_region_scroll(
+        &mut self,
+        region: GraphicsScrollRegion,
+        delta: i64,
+        current_scrollback: usize,
+        current_region_scroll: i64,
+    ) {
         if delta == 0 || region.is_full_screen() {
             return;
         }
-        let delta = i32::try_from(delta).unwrap_or(if delta > 0 { i32::MAX } else { i32::MIN });
-        let affected: Vec<(u32, u32)> = self
-            .placements
-            .values()
-            .filter(|placement| {
-                !placement.is_virtual() && placement.anchor().scroll_region() == region
-            })
-            .map(|placement| (placement.resource().image(), placement.outer_placement_id()))
-            .collect();
-        for (image, outer_placement_id) in affected {
-            let Some(object) = self.buffer.identity().object_for_client(image) else {
+        let delta_rows =
+            i32::try_from(delta).unwrap_or(if delta > 0 { i32::MAX } else { i32::MIN });
+        let preserve_above = region.top() == 0;
+        let region_top = i32::from(region.top());
+        let region_bottom = i32::from(region.bottom());
+        let new_region_scroll = current_region_scroll.saturating_add(delta);
+        let mut decisions: Vec<(u64, RegionScrollMutation)> = Vec::new();
+        for (key, placement) in &self.placements {
+            if placement.is_virtual() || placement.parent().is_some() {
                 continue;
-            };
-            self.buffer
-                .move_placement(object, outer_placement_id, delta);
+            }
+            if placement.anchor().scroll_region() != region {
+                continue;
+            }
+            let row = placement.resolved_row_with_state(
+                current_scrollback,
+                region,
+                current_region_scroll,
+            );
+            let height = i32::from(placement.height());
+            let end = row.saturating_add(height);
+            let entirely_inside = row >= region_top && end <= region_bottom;
+            let intersects = row < region_bottom && end > region_top;
+            if entirely_inside {
+                let new_row = row.saturating_sub(delta_rows);
+                if new_row >= region_bottom
+                    || (!preserve_above && new_row.saturating_add(height) <= region_top)
+                {
+                    decisions.push((*key, RegionScrollMutation::Delete));
+                } else if !preserve_above && new_row < region_top {
+                    let cut = region_top - new_row;
+                    decisions.push((
+                        *key,
+                        RegionScrollMutation::MoveCropped {
+                            new_row: region_top,
+                            height: height.saturating_sub(cut),
+                            top_crop: cut,
+                        },
+                    ));
+                } else if preserve_above && new_row < region_top {
+                    // The placement scrolled out through the screen-top
+                    // region into history; its anchor resolution already
+                    // tracks the negative row, so no mutation is needed.
+                    continue;
+                } else if new_row.saturating_add(height) > region_bottom {
+                    decisions.push((
+                        *key,
+                        RegionScrollMutation::MoveCropped {
+                            new_row,
+                            height: region_bottom.saturating_sub(new_row),
+                            top_crop: 0,
+                        },
+                    ));
+                } else {
+                    decisions.push((*key, RegionScrollMutation::Move { new_row }));
+                }
+            } else if intersects {
+                if preserve_above && row < region_top {
+                    // The part above the screen top is in history; resolution
+                    // already tracks it, so no mutation is needed.
+                    continue;
+                }
+                if row < region_top {
+                    // Straddles the region top: the in-region part scrolled
+                    // out the top and is lost; keep the static part above it.
+                    let height = region_top - row;
+                    if height <= 0 {
+                        decisions.push((*key, RegionScrollMutation::Delete));
+                    } else {
+                        decisions.push((
+                            *key,
+                            RegionScrollMutation::MoveCropped {
+                                new_row: row,
+                                height,
+                                top_crop: 0,
+                            },
+                        ));
+                    }
+                } else {
+                    // Straddles the region bottom: the in-region part scrolled
+                    // away; pin the static below-region part at the region
+                    // bottom with the source crop advanced (Zellij pins at
+                    // `shifted_region_bottom` and advances `emit_y`).
+                    let height = end - region_bottom;
+                    if height <= 0 {
+                        decisions.push((*key, RegionScrollMutation::Delete));
+                    } else {
+                        decisions.push((
+                            *key,
+                            RegionScrollMutation::MoveCropped {
+                                new_row: region_bottom,
+                                height,
+                                top_crop: region_bottom - row,
+                            },
+                        ));
+                    }
+                }
+            }
+            // Entirely outside the region: untouched.
+        }
+        for (key, mutation) in decisions {
+            self.apply_region_scroll_mutation(
+                key,
+                mutation,
+                region,
+                new_region_scroll,
+                current_scrollback,
+            );
+        }
+        self.prune_orphaned_relatives();
+    }
+
+    /// Applies one classified region-scroll mutation: a clean move, a move
+    /// with a top/bottom crop (the source crop advances via `clip_placement`
+    /// so the surviving rows keep showing the same image slice), or a delete
+    /// that also releases the image when its last placement is gone. Every
+    /// mutation is mirrored into the virtual buffer as an upsert, so the
+    /// drained command stream re-places the outer placement at its new
+    /// geometry.
+    fn apply_region_scroll_mutation(
+        &mut self,
+        key: u64,
+        mutation: RegionScrollMutation,
+        region: GraphicsScrollRegion,
+        new_region_scroll: i64,
+        current_scrollback: usize,
+    ) {
+        match mutation {
+            RegionScrollMutation::Delete => {
+                let image = self
+                    .placements
+                    .get(&key)
+                    .map(|placement| placement.resource().image());
+                if self.remove_placement_key(key).is_some()
+                    && let Some(image) = image
+                {
+                    self.free_resource_if_unreferenced(image);
+                }
+            }
+            RegionScrollMutation::Move { new_row } => {
+                let Some(placement) = self.placements.get_mut(&key) else {
+                    return;
+                };
+                let image = placement.resource().image();
+                reanchor_region_placement(
+                    placement,
+                    new_row,
+                    current_scrollback,
+                    region,
+                    new_region_scroll,
+                );
+                if let Some(object) = self.buffer.identity().object_for_client(image) {
+                    let placement = self
+                        .placements
+                        .get(&key)
+                        .expect("placement still present after re-anchor");
+                    self.buffer
+                        .attach_placement(object, self.to_buffer_placement(placement));
+                }
+            }
+            RegionScrollMutation::MoveCropped {
+                new_row,
+                height,
+                top_crop,
+            } => {
+                let Some(placement) = self.placements.get_mut(&key) else {
+                    return;
+                };
+                let Some(pixel_size) = self
+                    .resources
+                    .get(&placement.resource().image())
+                    .map(|resource| (resource.pixel_width, resource.pixel_height))
+                else {
+                    return;
+                };
+                let height = u16::try_from(height.max(1)).unwrap_or(u16::MAX);
+                let top_crop = u32::try_from(top_crop.max(0)).unwrap_or(u32::MAX);
+                let Some(clip) = clip_placement(
+                    placement,
+                    0,
+                    top_crop,
+                    placement.width(),
+                    height,
+                    pixel_size,
+                ) else {
+                    // The crop wiped the placement out entirely; delete it.
+                    let image = placement.resource().image();
+                    if self.remove_placement_key(key).is_some() {
+                        self.free_resource_if_unreferenced(image);
+                    }
+                    return;
+                };
+                let image = placement.resource().image();
+                placement.height = height;
+                placement.source = clip.source;
+                placement.cell_x_offset = clip.cell_x_offset;
+                placement.cell_y_offset = clip.cell_y_offset;
+                placement.drawn_width = clip.drawn_width;
+                placement.drawn_height = clip.drawn_height;
+                reanchor_region_placement(
+                    placement,
+                    new_row,
+                    current_scrollback,
+                    region,
+                    new_region_scroll,
+                );
+                if let Some(object) = self.buffer.identity().object_for_client(image) {
+                    let placement = self
+                        .placements
+                        .get(&key)
+                        .expect("placement still present after crop");
+                    self.buffer
+                        .attach_placement(object, self.to_buffer_placement(placement));
+                }
+            }
         }
     }
 
@@ -2060,7 +2386,7 @@ impl SessionGraphicsStore {
             {
                 continue;
             }
-            let row = placement.anchor().resolve_row_with_state(
+            let row = placement.resolved_row_with_state(
                 current_scrollback,
                 region,
                 current_region_scroll,
@@ -2240,6 +2566,7 @@ impl SessionGraphicsStore {
     pub fn evict_beyond_scrollback_limit(
         &mut self,
         scrollback_limit: usize,
+        current_scrollback: usize,
         current_screen: GraphicsScreen,
         current_region: GraphicsScrollRegion,
         current_region_scroll: i64,
@@ -2271,8 +2598,17 @@ impl SessionGraphicsStore {
             if !participates {
                 return true;
             }
-            let scroll_delta = current_region_scroll.saturating_sub(anchor.region_scroll());
-            if scroll_delta > i64::from(anchor.row()).saturating_add(limit) {
+            // Evict once the placement has scrolled more than `limit` lines
+            // above the top of the screen. The resolution folds in the
+            // canonical drops (front evictions), so this also catches
+            // placements deepened by a scrollback-limit shrink, which a raw
+            // feed counter cannot express.
+            let resolved_row = placement.resolved_row_with_state(
+                current_scrollback,
+                current_region,
+                current_region_scroll,
+            );
+            if i64::from(resolved_row).saturating_neg() > limit {
                 unreferenced_images.insert(placement.resource().image());
                 evicted = true;
                 scrolled_out.push(*key);
@@ -2347,10 +2683,12 @@ impl SessionGraphicsStore {
                 continue;
             }
             let anchor = placement.anchor;
-            let row = anchor.resolve_row_with_state(old_scrollback, old_region, old_region_scroll);
+            let row =
+                placement.resolved_row_with_state(old_scrollback, old_region, old_region_scroll);
             // Fold a negative (in-history) row into the captured scrollback so
             // the placement keeps resolving to the same position above the top
-            // of the visible screen.
+            // of the visible screen. The fresh anchor captures the current
+            // canonical state, so the accumulated front drops reset.
             let (new_row, new_scrollback) = if row >= 0 {
                 (u16::try_from(row).unwrap_or(u16::MAX), new_scrollback)
             } else {
@@ -2364,6 +2702,7 @@ impl SessionGraphicsStore {
             placement.anchor = GraphicsGridAnchor::new(anchor.column(), new_row, new_scrollback)
                 .with_screen(anchor.screen())
                 .with_scroll_region(anchor.scroll_region(), anchor.region_scroll());
+            placement.front_drops = 0;
             changed = true;
         }
         changed
@@ -3850,7 +4189,7 @@ impl SessionGraphicsStore {
                         view_offset,
                     );
                 }
-                let mut row = placement.anchor().resolve_row_with_state(
+                let mut row = placement.resolved_row_with_state(
                     current_scrollback,
                     current_region,
                     current_region_scroll,
@@ -4738,6 +5077,7 @@ impl SessionGraphicsStore {
             virtual_placement,
             key,
             outer_placement_id,
+            front_drops: 0,
         };
         // Relative and virtual placements never move the cursor, regardless of
         // the `C` key (Kitty excludes `unicode_placement` from cursor motion).
@@ -6614,7 +6954,7 @@ mod tests {
             .unwrap();
         store.take_graphics_commands();
 
-        store.record_region_scroll(region, 1);
+        store.record_region_scroll(region, 1, 0, 0);
 
         // The drain projects image 1 one row up (row 2); image 2 is anchored
         // to the full screen and must not be re-placed.
@@ -6627,6 +6967,238 @@ mod tests {
         );
         assert_eq!(deltas.changed[0].resource().image(), 1);
         assert_eq!(deltas.changed[0].placement().y(), 2);
+    }
+
+    #[test]
+    fn record_region_scroll_classifies_inside_intersecting_and_scrolled_out_placements() {
+        let region = GraphicsScrollRegion::new(2, 6, 10);
+        let surface = Rect::new(0, 0, 8, 10);
+        let place = |store: &mut SessionGraphicsStore, image: u32, row: u16, rows: u16| {
+            store
+                .apply_kitty_command_with_scroll_region(
+                    &format!("a=T,f=24,i={image},c=1,r={rows},s=30,v=60,C=1,q=2").into_bytes(),
+                    b"AAAA",
+                    (0, row),
+                    (10, 20),
+                    0,
+                    GraphicsScreen::Primary,
+                    region,
+                    0,
+                )
+                .unwrap();
+        };
+        let visible = |store: &SessionGraphicsStore| {
+            store.visible_submissions_with_scroll_state(
+                surface,
+                0,
+                GraphicsScreen::Primary,
+                region,
+                1,
+                0,
+            )
+        };
+
+        // A: entirely inside the region [2, 6) at row 3: scrolls up to row 2.
+        // B: straddles the region bottom (rows [5, 8)): pinned at row 6 with
+        //    the source crop advanced by one row.
+        // C: straddles the region top (rows [1, 4)): shrinks to the static
+        //    one-row part above the region.
+        let mut store = SessionGraphicsStore::new(SessionId::new(97));
+        place(&mut store, 1, 3, 1);
+        place(&mut store, 2, 5, 3);
+        place(&mut store, 3, 1, 3);
+        store.take_graphics_commands();
+        store.record_region_scroll(region, 1, 0, 0);
+        let submissions = visible(&store);
+        let by_image = |image: u32| {
+            submissions
+                .iter()
+                .find(|submission| submission.resource().image() == image)
+                .map(|submission| submission.placement().clone())
+        };
+        let a = by_image(1).expect("A survived");
+        assert_eq!(a.y(), 2);
+        assert_eq!(a.height(), 1);
+        let b = by_image(2).expect("B survived");
+        assert_eq!(b.y(), 6, "B pinned at the region bottom");
+        assert_eq!(b.height(), 2, "B shrank to its below-region extent");
+        // The pinned rows show the slice of the source that sat at the region
+        // bottom: one 20px row into a 60px source drawn over 60px.
+        let b_source = b.source().expect("B carries a source crop");
+        assert_eq!(b_source.y(), 20, "B's source advanced by the crop");
+        assert_eq!(b_source.height(), 40);
+        let c = by_image(3).expect("C survived");
+        assert_eq!(c.y(), 1, "C kept its above-region position");
+        assert_eq!(c.height(), 1, "C shrank to its above-region extent");
+        assert_eq!(store.placement_count(), 3);
+
+        // The mutation stream carries the cropped geometry: B re-places at
+        // row 6 with two rows, C at row 1 with one row.
+        let placed = store
+            .take_graphics_commands()
+            .iter()
+            .filter_map(|command| match command {
+                GraphicsCommand::Place { placement, .. } => Some(*placement),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(placed.len(), 3, "A moves, B and C re-place cropped");
+        let b_buffer = placed
+            .iter()
+            .find(|placement| placement.column == 0 && placement.start_row == 6)
+            .expect("B's buffer mirror");
+        assert_eq!(b_buffer.rows, 2);
+        let c_buffer = placed
+            .iter()
+            .find(|placement| placement.column == 0 && placement.start_row == 1)
+            .expect("C's buffer mirror");
+        assert_eq!(c_buffer.rows, 1);
+
+        // D: scrolled out through the top (non-preserved region top): deleted.
+        let mut top = SessionGraphicsStore::new(SessionId::new(101));
+        place(&mut top, 4, 3, 1);
+        top.take_graphics_commands();
+        top.record_region_scroll(region, 2, 0, 0);
+        assert_eq!(top.placement_count(), 0);
+        assert!(
+            top.visible_submissions_with_scroll_state(
+                surface,
+                0,
+                GraphicsScreen::Primary,
+                region,
+                2,
+                0,
+            )
+            .is_empty()
+        );
+
+        // E: scrolled out through the bottom on a reverse scroll: deleted.
+        let mut bottom = SessionGraphicsStore::new(SessionId::new(102));
+        place(&mut bottom, 5, 5, 1);
+        bottom.take_graphics_commands();
+        bottom.record_region_scroll(region, -1, 0, 0);
+        assert_eq!(bottom.placement_count(), 0);
+    }
+
+    #[test]
+    fn record_region_scroll_preserves_lines_scrolled_above_a_screen_top_region() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(99));
+        // A region whose top is the screen top preserves scrolled-out lines
+        // into history instead of deleting them.
+        let region = GraphicsScrollRegion::new(0, 4, 10);
+        store
+            .apply_kitty_command_with_scroll_region(
+                b"a=T,f=24,i=6,c=1,r=1,C=1,q=2",
+                b"AAAA",
+                (0, 1),
+                (10, 20),
+                0,
+                GraphicsScreen::Primary,
+                region,
+                0,
+            )
+            .unwrap();
+        store.take_graphics_commands();
+
+        store.record_region_scroll(region, 2, 0, 0);
+        assert_eq!(
+            store.placement_count(),
+            1,
+            "preserved region keeps its scrolled-into-history placement"
+        );
+        // Resolved against the post-scroll region displacement the placement
+        // sits at row -1: above the screen, exactly where the preserved line
+        // moved (region-anchored placements do not participate in view-offset
+        // navigation, so it stays there).
+        let submissions = store.visible_submissions_with_scroll_state(
+            Rect::new(0, 0, 8, 10),
+            0,
+            GraphicsScreen::Primary,
+            region,
+            2,
+            1,
+        );
+        assert!(submissions.is_empty(), "in history, not on screen");
+        // A non-preserved region deletes the same placement instead.
+        let mut dropped = SessionGraphicsStore::new(SessionId::new(103));
+        dropped
+            .apply_kitty_command_with_scroll_region(
+                b"a=T,f=24,i=6,c=1,r=1,s=30,v=60,C=1,q=2",
+                b"AAAA",
+                (0, 3),
+                (10, 20),
+                0,
+                GraphicsScreen::Primary,
+                GraphicsScrollRegion::new(2, 6, 10),
+                0,
+            )
+            .unwrap();
+        dropped.take_graphics_commands();
+        dropped.record_region_scroll(GraphicsScrollRegion::new(2, 6, 10), 2, 0, 0);
+        assert_eq!(
+            dropped.placement_count(),
+            0,
+            "non-preserved region deletes the scrolled-out placement"
+        );
+    }
+
+    #[test]
+    fn drop_first_canonical_lines_reindexes_placements_past_the_history_cap() {
+        let mut store = SessionGraphicsStore::new(SessionId::new(98));
+        // A full-screen placement created at row 3 with five lines of history:
+        // canonical line 8.
+        store
+            .apply_kitty_command_with_scroll_region(
+                b"a=T,f=24,i=7,c=1,r=1,C=1,q=2",
+                b"AAAA",
+                (0, 3),
+                (10, 20),
+                5,
+                GraphicsScreen::Primary,
+                GraphicsScrollRegion::new(0, 6, 6),
+                0,
+            )
+            .unwrap();
+        store.take_graphics_commands();
+        assert_eq!(
+            store
+                .buffer_placements()
+                .next()
+                .map(|placement| placement.canonical_line),
+            Some(8)
+        );
+
+        // Three feeds at the cap: `history_size` stays 5 (capped) so the raw
+        // resolution would freeze the placement at row 3; re-indexing the
+        // canonical lines by the dropped count keeps it tracking up to row 0.
+        store.record_scroll(3);
+        store.drop_first_canonical_lines(3);
+
+        let submissions = store.visible_submissions_with_scroll_state(
+            Rect::new(0, 0, 8, 6),
+            5,
+            GraphicsScreen::Primary,
+            GraphicsScrollRegion::new(0, 6, 6),
+            3,
+            0,
+        );
+        assert_eq!(submissions[0].placement().y(), 0);
+        assert_eq!(
+            store
+                .buffer_placements()
+                .next()
+                .map(|placement| placement.canonical_line),
+            Some(5),
+            "the buffer mirror re-indexed in lockstep"
+        );
+
+        // And the parity identity `canonical_line - current_scrollback ==
+        // start_row` still holds: 5 - 5 == 0.
+        let buffer_placement = store.buffer_placements().next().unwrap();
+        assert_eq!(
+            buffer_placement.canonical_line - 5,
+            i64::from(buffer_placement.start_row)
+        );
     }
 
     #[test]
@@ -7257,6 +7829,7 @@ mod tests {
         // topmost retained line, so it survives.
         assert!(!store.evict_beyond_scrollback_limit(
             10,
+            10,
             GraphicsScreen::Primary,
             GraphicsScrollRegion::new(0, 6, 6),
             10,
@@ -7266,6 +7839,7 @@ mod tests {
         // One more scroll line pushes it above the retained history.
         assert!(store.evict_beyond_scrollback_limit(
             10,
+            11,
             GraphicsScreen::Primary,
             GraphicsScrollRegion::new(0, 6, 6),
             11,
@@ -7295,6 +7869,7 @@ mod tests {
         // anchored to a partial (DECSTBM) region.
         assert!(!store.evict_beyond_scrollback_limit(
             1,
+            1_000_000,
             GraphicsScreen::Primary,
             region,
             1_000_000,

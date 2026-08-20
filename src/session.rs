@@ -1491,8 +1491,24 @@ impl TerminalSession {
                         if delta != 0 && region_before == region_after {
                             if region_before.is_full_screen() {
                                 self.graphics.record_scroll(delta);
+                                // At the history cap the emulator drops lines
+                                // from the front of the scrollback instead of
+                                // growing it, so `history_size` stops tracking:
+                                // re-index the canonical-line space by the
+                                // dropped count so retained placements keep
+                                // resolving to the rows they occupy (Zellij's
+                                // `drop_first_canonical_anchor_line`).
+                                let dropped = scrollback_before
+                                    .saturating_add(usize::try_from(delta).unwrap_or(usize::MAX))
+                                    .saturating_sub(self.scrollback_limit);
+                                self.graphics.drop_first_canonical_lines(dropped);
                             } else {
-                                self.graphics.record_region_scroll(region_before, delta);
+                                self.graphics.record_region_scroll(
+                                    region_before,
+                                    delta,
+                                    scrollback_before,
+                                    region_scroll_before,
+                                );
                             }
                         }
                         // Insert/delete-line scroll only [cursor, bottom) of a
@@ -1628,6 +1644,7 @@ impl TerminalSession {
         // terminal frees images once they pass the scrollback limit.
         if self.graphics.evict_beyond_scrollback_limit(
             self.scrollback_limit,
+            self.scrollback_lines(),
             self.scroll_tracker.active_screen(),
             self.scroll_tracker.current_region(),
             self.scroll_tracker.current_region_scroll(),
@@ -1825,10 +1842,21 @@ impl TerminalSession {
     /// Re-bounds the emulator's scrollback history and evicts any retained
     /// image data that no longer fits inside it.
     pub fn set_scrollback_limit(&mut self, limit: usize) {
+        let old_limit = self.scrollback_limit;
         self.scrollback_limit = limit;
+        // A shrink drops lines from the front of the history (the oldest
+        // lines), which re-indexes the canonical-line coordinate space: every
+        // retained placement's canonical identity shifts down by the dropped
+        // count, and placements that were on the dropped lines fall below the
+        // new limit where the eviction pass removes them.
+        let shrunk = old_limit.saturating_sub(limit);
+        if shrunk > 0 {
+            self.graphics.drop_first_canonical_lines(shrunk);
+        }
         self.term.grid_mut().update_history(limit);
         self.graphics.evict_beyond_scrollback_limit(
             self.scrollback_limit,
+            self.scrollback_lines(),
             self.scroll_tracker.active_screen(),
             self.scroll_tracker.current_region(),
             self.scroll_tracker.current_region_scroll(),
@@ -3026,6 +3054,58 @@ mod tests {
         // nothing remains even after scrolling the view to the top.
         session.scroll_display(Scroll::Top);
         assert!(session.graphics(Rect::new(0, 0, 20, 4)).is_empty());
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn image_keeps_tracking_text_after_the_scrollback_cap_is_reached() {
+        let mut session = TerminalSession::spawn(Some("sh"), TerminalSize::new(20, 4)).unwrap();
+        session.set_scrollback_limit(3);
+        // Move the cursor to row 2, then anchor a 1x1 image there (C=1).
+        session.consume_output(b"\n\n").unwrap();
+        session
+            .consume_output(b"\x1b_Ga=T,f=24,i=34,c=1,r=1,C=1,q=2;AQID\x1b\\")
+            .unwrap();
+        assert_eq!(
+            session.graphics(Rect::new(0, 0, 20, 4))[0].placement().y(),
+            2
+        );
+
+        // The cursor sits at row 2, so the first three feeds scroll twice
+        // (history 2) and push the image up to the top row.
+        for line in 0..3u8 {
+            session
+                .consume_output(format!("row{line}\r\n").as_bytes())
+                .unwrap();
+        }
+        assert_eq!(session.scrollback_lines(), 2);
+        assert_eq!(
+            session.graphics(Rect::new(0, 0, 20, 4))[0].placement().y(),
+            0,
+            "before the cap the image tracks text normally"
+        );
+
+        // Two more feeds reach the cap (history 3) and then drop one line
+        // from the front without growing it; the canonical-line re-indexing
+        // must keep the image tracking up into history instead of freezing
+        // at row 0 (which would put it one row too low when re-shown).
+        for line in 3..5u8 {
+            session
+                .consume_output(format!("row{line}\r\n").as_bytes())
+                .unwrap();
+        }
+        assert_eq!(session.scrollback_lines(), 3, "history stays capped");
+        assert!(
+            session.graphics(Rect::new(0, 0, 20, 4)).is_empty(),
+            "the image scrolled into history"
+        );
+        session.scroll_display(Scroll::Top);
+        let scrolled = session.graphics(Rect::new(0, 0, 20, 4));
+        assert_eq!(
+            scrolled[0].placement().y(),
+            1,
+            "scrolling to the top re-shows the image on its preserved line"
+        );
         session.shutdown().unwrap();
     }
 
